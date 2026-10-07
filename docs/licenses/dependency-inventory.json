@@ -256,7 +256,7 @@
   "supplementary_inputs": {
     "falcon/native/assets/fonts/Inter-OFL.txt": "262481e844521b326f5ecd053e59b98c8b2da78c8ee1bdbb6e8174305e54935a",
     "falcon/vendor/winit/LICENSE": "6dc0e068dcf3a5bc8e054205b85b7720e1d49265bbc64bf515d2cf79197df69a",
-    "docs/third-party/winit-hosted-view.txt": "c4466bb5def4d2368f361793c33520a20714b5a00828c9fa1ec7da3832c6dd17",
+    "docs/third-party/winit-hosted-view.txt": "82548694643fc87536c6d6d320060b61b928b7d414c923c7eb2ce76a6c187268",
     "docs/third-party/chromium-chrome02.txt": "9c7ada3e360a89b692d4e9c790082f3e638b33df4890675e6ba716789ff91a54",
     "falcon/vendor/zune-jpeg/FALCON-CHANGES.md": "7a1ed06ff622d5c2ad46f45a03dd37f7faebeab3b82a5dfab9664523fe23d033",
     "falcon/vendor/femtovg/FALCON-CHANGES.md": "ca3138f99a685c6e7715459ffd6df1ad020e0ae9c0d82aa32ba178b7da224d48"
@@ -3525,5 +3525,5 @@
       ]
     }
   ],
-  "notices_sha256": "dedd6808f77bdb98406a78c56c4728f76201922728c6bded4a5bf8524dcc1ac1"
+  "notices_sha256": "cd4c34818c0f5d6e73c0d15ca54f718a820d32103d2da53bf63ca4383601a903"
 }

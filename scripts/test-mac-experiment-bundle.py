@@ -74,11 +74,11 @@ class BundleTest(unittest.TestCase):
         smoke_spec = importlib.util.spec_from_file_location("smoke", pathlib.Path(__file__).with_name("test-mac-chrome-smoke.py"))
         smoke = importlib.util.module_from_spec(smoke_spec)
         smoke_spec.loader.exec_module(smoke)
-        ready = {"build": "1.0.8-mac-full04", "ready": True, "welcome": False, "association": False, "photo_width": 960, "full_toolbar": True, "toolbar_roundtrip": True, "toolbar_clipped": False, "titlebar_height": 38.0}
+        ready = {"build": "1.0.8-mac-full04", "ready": True, "welcome": False, "association": False, "photo_width": 960, "full_toolbar": True, "toolbar_roundtrip": True, "toolbar_clipped": False, "toolbar_mouse_down_can_move_window": False, "titlebar_height": 38.0}
         smoke.validate_report(ready)
         # toolbar_clipped True / None: the full04-3 build drew a 44 pt toolbar into a 38 pt title bar (run 36111887084).
         for key, value in (("full_toolbar", False), ("toolbar_roundtrip", False), ("ready", False), ("welcome", True), ("association", True), ("photo_width", 0), ("build", "1.0.8-mac-chrome02"),
-                           ("toolbar_clipped", True), ("toolbar_clipped", None), ("titlebar_height", None), ("titlebar_height", 0)):
+                           ("toolbar_mouse_down_can_move_window", True), ("toolbar_mouse_down_can_move_window", None), ("toolbar_clipped", True), ("toolbar_clipped", None), ("titlebar_height", None), ("titlebar_height", 0)):
             with self.assertRaises(RuntimeError):
                 smoke.validate_report(dict(ready, **{key: value}))
 
@@ -191,7 +191,7 @@ class BundleTest(unittest.TestCase):
         smoke_spec.loader.exec_module(smoke)
         report = {"build": "1.0.8", "ready": True, "welcome": False, "association": False,
                   "photo_width": 960, "full_toolbar": True, "toolbar_roundtrip": True,
-                  "toolbar_clipped": False, "titlebar_height": 38}
+                  "toolbar_clipped": False, "toolbar_mouse_down_can_move_window": False, "titlebar_height": 38}
         smoke.validate_report(report, "1.0.8")
         with self.assertRaises(RuntimeError):
             smoke.validate_report(report, "1.0.8-mac-full04")

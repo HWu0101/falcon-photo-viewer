@@ -1906,6 +1906,8 @@ mod mac_experiment;
 #[cfg(target_os = "macos")]
 mod mac_assoc; // v0.9.16 (Round B): the LaunchServices default-handler machinery (Settings Mac card + first-launch popup)
 #[cfg(target_os = "macos")]
+mod mac_titlebar_action;
+#[cfg(target_os = "macos")]
 mod mac_menu; // v0.9.22: the native NSMenu menu bar (graft onto muda's default bar; queue → tick dispatch)
 #[cfg(target_os = "macos")]
 mod macos_open; // v0.9.15 (B-spike): the Apple-Events "odoc" (open-documents) delegate arm — Finder "Open With → Falcon"
@@ -9773,15 +9775,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
     let aw = app.as_weak();
     let wm_max = want_max.clone();
+    #[cfg(not(target_os = "macos"))]
     let cs_mx = chrome_settle.clone();
     app.on_maximize_requested(move || {
         if let Some(a) = aw.upgrade() {
+            #[cfg(target_os = "macos")]
+            {
+                use objc2::{msg_send, runtime::AnyObject};
+                let action = mac_titlebar_action::requested_action();
+                if action == mac_titlebar_action::Action::None { return; }
+                if let Some(view) = mac_ns_view_of(a.window()) {
+                    unsafe {
+                        let window: *mut AnyObject = msg_send![view.cast::<AnyObject>(), window];
+                        if let Some(window) = window.as_ref() {
+                            // AppKit owns the resulting zoom/fill/minimise state. Clear
+                            // the old intent BEFORE dispatch so the watchdog cannot undo it.
+                            wm_max.set(false);
+                            mac_titlebar_action::perform(window, action);
+                        }
+                    }
+                }
+                return;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
             let nm = !a.window().is_maximized();
             // v0.8.23 M-2: raise the DWM transition mask BEFORE the OS state change so the
             // whole maximize/restore animation runs under the system's own rounding.
             chrome_transition_begin(&a, &cs_mx, dbg_chrome_armed, "maximize-button");
             a.window().set_maximized(nm);
             wm_max.set(nm); // remember intent so the tick can re-assert it if winit drops it
+            }
         }
     });
     let aw = app.as_weak();

@@ -53,6 +53,13 @@ fn main() {
             let frame = NSRect::new(NSPoint::new(13., 21.), NSSize::new(417., 44.));
             let shell: Retained<NSView> =
                 unsafe { msg_send_id![msg_send_id![class!(NSView), alloc], initWithFrame: frame] };
+            unsafe {
+                assert_eq!(host_view.isOpaque(), shell.isOpaque());
+                assert_eq!(
+                    host_view.mouseDownCanMoveWindow(), shell.mouseDownCanMoveWindow(),
+                    "ordinary views must retain AppKit's inherited mouse handling"
+                );
+            }
             unsafe { host_view.addSubview(&shell) };
 
             for width in [417., 263., 701.] {
@@ -62,6 +69,10 @@ fn main() {
                 unsafe {
                     shell.addSubview(&renderer);
                     renderer.setFrame(NSRect::new(NSPoint::new(0., 0.), NSSize::new(width, 44.)));
+                    assert!(
+                        !renderer.mouseDownCanMoveWindow(),
+                        "hosted toolbar input must not also drag/zoom the native title bar"
+                    );
                 }
                 assert_ne!(
                     donor_native.contentView().as_deref(),

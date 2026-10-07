@@ -1404,7 +1404,7 @@ pub(crate) fn start(app: &MainWindow) {
                                     "TITLE-BAR TOOLBAR FAILED: {e}; normal toolbar and window state restored, no retry"
                                 ));
                                 TIMER.with(slint::Timer::stop);
-                                finish_smoke(&app, false, (None, None));
+                                finish_smoke(&app, false, (None, None, None));
                                 return;
                             }
                         }
@@ -1423,7 +1423,7 @@ pub(crate) fn start(app: &MainWindow) {
                                 app.set_mac_experiment_status(format!("TITLE-BAR TOOLBAR FAILED, normal toolbar in use: {e}").into());
                                 record(format!("TITLE-BAR TOOLBAR FAILED: {e}; normal toolbar and window state restored"));
                                 TIMER.with(slint::Timer::stop);
-                                finish_smoke(&app, false, (None, None));
+                                finish_smoke(&app, false, (None, None, None));
                                 return;
                             }
                         }
@@ -1519,7 +1519,13 @@ pub(crate) fn start(app: &MainWindow) {
                     if host.initialized && now.duration_since(started) >= Duration::from_secs(2)
                         && app.get_photo().size().width > 0 && hosted_frame {
                         // Drawn is not visible: the report carries whether AppKit cut the toolbar off.
-                        let geometry = unsafe { (host.clip_state(), host.bar_h) };
+                        let geometry = unsafe {
+                            let native_mouse_down = host.donor_view.as_ref().map(|view| {
+                                let moves: Bool = msg_send![&**view, mouseDownCanMoveWindow];
+                                moves.as_bool()
+                            });
+                            (host.clip_state(), host.bar_h, native_mouse_down)
+                        };
                         if super::full_toolbar() && std::env::var_os("FALCON_MAC_PROBE_SMOKE_OUT").is_some() {
                             // Each step waits for its queued press to have run, never for the
                             // next tick (see `super::smoke_round_trip`).
@@ -1611,10 +1617,11 @@ fn smoke_toggle_grid() {
 }
 
 /// `geometry`: (whether AppKit shows less of the toolbar than its height, the measured title-bar
-/// height). A cut-off toolbar fails the launch check even though it drew.
-fn finish_smoke(app: &MainWindow, ready: bool, geometry: (Option<bool>, Option<f64>)) {
-    let (clipped, titlebar_height) = geometry;
-    let ready = ready && clipped == Some(false);
+/// height, whether AppKit can also move the window for the toolbar's mouseDown).
+/// A cut-off toolbar or duplicated native title-bar handling fails the launch check.
+fn finish_smoke(app: &MainWindow, ready: bool, geometry: (Option<bool>, Option<f64>, Option<bool>)) {
+    let (clipped, titlebar_height, native_mouse_down) = geometry;
+    let ready = ready && clipped == Some(false) && native_mouse_down == Some(false);
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let Some(path) = std::env::var_os("FALCON_MAC_PROBE_SMOKE_OUT").map(std::path::PathBuf::from)
     else {
@@ -1633,6 +1640,7 @@ fn finish_smoke(app: &MainWindow, ready: bool, geometry: (Option<bool>, Option<f
         "photo_width": app.get_photo().size().width,
         "full_toolbar": super::full_toolbar(), "toolbar_roundtrip": app.get_mac_smoke_toolbar_ok(),
         "toolbar_clipped": clipped, "titlebar_height": titlebar_height,
+        "toolbar_mouse_down_can_move_window": native_mouse_down,
         "log": crate::support::log_path().map(|p| p.display().to_string())
     });
     if let Err(e) = std::fs::OpenOptions::new()

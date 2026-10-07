@@ -160,6 +160,17 @@ declare_class!(
     }
 
     unsafe impl WinitView {
+        // A hosted toolbar handles its own buttons, background drag and double-click.
+        // Letting AppKit treat the same mouseDown as title-bar input also zooms/drags
+        // the main window, even when Slint consumed it for a button.
+        #[cfg(feature = "falcon-macos-hosted-view")]
+        #[method(mouseDownCanMoveWindow)]
+        fn mouse_down_can_move_window(&self) -> bool {
+            !self.ivars().hosted && unsafe {
+                objc2::msg_send![super(self), mouseDownCanMoveWindow]
+            }
+        }
+
         #[method(isFlipped)]
         fn is_flipped(&self) -> bool {
             // `winit` uses the upper-left corner as the origin.

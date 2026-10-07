@@ -6325,6 +6325,8 @@ The title-bar toolbar described below is built on top of this chrome.
 
 ### The title-bar toolbar
 
+The hosted toolbar declines AppKit's implicit mouse-down window handling (`mouseDownCanMoveWindow = false`); Slint alone routes background drag/double-click, so controls do not also move or zoom the host. On Mac, the existing double-click callback reads `AppleActionOnDoubleClick` each time, accepting both capitalized and lowercase values. Zoom and Minimize dispatch `performZoom:` and `performMiniaturize:` to the real host window; Fill uses AppKit's availability-checked `_zoomFill:` action (Zoom fallback on older systems); None and unknown settings do nothing. Missing preferences default to Zoom. The re-maximise intent is cleared before an AppKit action, preventing Falcon's watchdog from undoing the native result. The hidden donor window and unhosted views retain their existing roles. This changes event handling, not toolbar layout or design.
+
 On a Mac, Falcon shows its normal toolbar (`MainToolbar`, the same design Windows uses) inside Apple's title-bar slot (`NSTitlebarAccessoryViewController`). macOS keeps that slot visible and correctly placed in Mac full screen, so the green button gives full screen with a working toolbar. Falcon does not imitate full screen by maximizing the window, and it does not keep a second, Mac-only toolbar built from Apple controls.
 
 The main window (`MainWindow`) still owns all state, panels, actions and the keyboard handler. The toolbar surface (`MacToolbarWindow` in `ui/mac_toolbar.slint`) only displays and forwards:

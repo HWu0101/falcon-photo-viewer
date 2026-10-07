@@ -14,6 +14,7 @@ def validate_report(report, expected_build="1.0.8-mac-full04"):
             and report.get("full_toolbar") is True and report.get("toolbar_roundtrip") is True
             # A toolbar taller than the title bar is drawn but cut off; "drew" is not "visible".
             and report.get("toolbar_clipped") is False
+            and report.get("toolbar_mouse_down_can_move_window") is False
             and isinstance(report.get("titlebar_height"), (int, float)) and report["titlebar_height"] > 0
             and report.get("build") == expected_build):
         raise RuntimeError(f"native host smoke failed: {report}")

@@ -14870,6 +14870,12 @@ Falcon modifications, 2026-09-25:
 - After a window-style change, the hidden window does not make the view its
   first responder (keyboard focus) while another window holds it.
 
+Additional Falcon modification, 2026-10-05:
+- Hosted views refuse AppKit's mouseDownCanMoveWindow propagation. The toolbar
+  owns its buttons, background drag and double-click, so AppKit cannot also
+  move or zoom the main window for the same mouse event. Unhosted views retain
+  the superclass behavior.
+
 Normal and diagnostic Mac builds share the tested toolbar. Only its hidden
 window opts in. Windows and other non-Mac backend source files are unchanged.
 The full source and the recorded upstream file hashes are in the Falcon repository.
