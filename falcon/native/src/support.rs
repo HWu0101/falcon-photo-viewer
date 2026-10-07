@@ -12617,8 +12617,9 @@ pub(crate) fn config_dir() -> Option<PathBuf> {
             .map(|p| p.join("Falcon"))
     }
 }
-/// Durable, crash-safe write: write to a UNIQUE temp sibling, **fsync it** (`sync_all` — the bytes hit
-/// the platter, not just the page cache), then atomically rename over the target. v0.8.36 hardened this:
+/// Write a unique sibling temp, synchronize it, then atomically replace the target.
+/// macOS SMB uses ordinary fsync only when full sync is unsupported; see `file_io`.
+/// v0.8.36 hardened this:
 /// the old path did `fs::write` + rename with NO fsync AND a FIXED `.tmp` name, so a power-cut after the
 /// rename but before the OS flushed could leave a zero-byte/truncated file where a session's ratings
 /// lived, and a crash between write and rename left a stable `<name>.tmp` as junk in the shoot folder.
@@ -12643,22 +12644,7 @@ pub(crate) fn config_dir() -> Option<PathBuf> {
 /// goes through `enqueue_write` / `enqueue_review_data` / `enqueue_xmp_rating` and pays no fsync on
 /// the caller at all.
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    static TMP_CTR: AtomicU64 = AtomicU64::new(0);
-    let n = TMP_CTR.fetch_add(1, Ordering::Relaxed);
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let base = path.file_name().and_then(|s| s.to_str()).unwrap_or("falcon");
-    let tmp = dir.join(format!("{base}.{}.{n}.falcontmp", std::process::id()));
-    {
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?; // durability barrier: the temp's bytes are on disk BEFORE we rename it in
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp); // don't leave the temp as junk on a rename failure (read-only/locked target)
-        return Err(e);
-    }
-    Ok(())
+    falcon_decode::file_io::write_atomic(path, data)
 }
 
 // ─── v0.8.128 (J10 / A1.2): THE SHUTDOWN ORDER, AS A DECIDABLE OBJECT ──────────────────────────

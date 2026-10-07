@@ -348,7 +348,7 @@ pub fn patch_jpeg_orientation(path: &Path, expected: u8, target: u8) -> Result<J
     f.seek(SeekFrom::Start(loc.value_offset))?;
     f.write_all(&loc.endian.enc16(target as u16))?;
     f.flush()?;
-    f.sync_all()?; // durability: the value must survive a crash before the read-back / delta clear
+    crate::file_io::sync_file(&f)?; // durability: the value must survive a crash before the read-back / delta clear
     drop(f); // close before the normal reader re-opens it
     // Read-back through the NORMAL bounded path (contract item 2 / the A1 bounded-read discipline).
     match exif_orientation(path) {
@@ -581,35 +581,11 @@ fn tiff_insertion_context(existing: &str) -> Option<(usize, bool)> {
     }
 }
 
-/// Durable, crash-safe full-file write: write to a UNIQUE temp sibling, **fsync it** (`sync_all` — the
-/// bytes hit the platter, not just the page cache), then atomically rename over the target. v0.8.36 made
-/// the "crash-safe" claim TRUE: the old path did `fs::write` + rename with NO fsync, so a power-loss
-/// after the rename but before the OS flushed could still leave a zero-byte/torn sidecar. Runs on the
-/// Apply WORKER thread (never the UI thread — see `native::main::apply_rotations`), so the fsync cost is
-/// off the smooth path. Mirrors `native::support::write_atomic`, duplicated so the crate stays
-/// self-contained/testable. The unique temp name (pid + a monotonic counter) means a crash between write
-/// and rename leaves a uniquely-named leftover — never a fixed `.xmp.tmp` that persists as stable junk,
-/// and two writers never collide over one temp name.
+/// Synchronize a unique sibling temp before replacing an XMP sidecar. Runs on
+/// the Apply worker and shares review JSON's macOS SMB synchronization fallback.
+/// A failed stage removes only its own temp and keeps the previous target.
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_CTR: AtomicU64 = AtomicU64::new(0);
-    let n = TMP_CTR.fetch_add(1, Ordering::Relaxed);
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let base = path.file_name().and_then(|s| s.to_str()).unwrap_or("sidecar");
-    let tmp = dir.join(format!("{base}.{}.{n}.falcontmp", std::process::id()));
-    {
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?; // durability barrier before the rename swaps it in
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        // Windows: rename over a read-only or locked target (the `.xmp` open in Lightroom, a read-only
-        // folder) fails — best-effort remove the temp so a permanent block doesn't leave an orphan in the
-        // user's photo folder. The original error still propagates (delta kept).
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    crate::file_io::write_atomic(path, data)
 }
 
 /// Create or surgically-update `sidecar_path` so its `tiff:Orientation == target`. A missing sidecar

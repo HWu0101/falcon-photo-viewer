@@ -36,6 +36,7 @@ use serde::Serialize;
 // v0.8.0 stage 2 — the rotation APPLY pipeline (EXIF 2-byte patch + XMP sidecars + the mirror-safe
 // FILE-side composer). Kept in its own module (the app's first mutation of user originals gets its own
 // clearly-sectioned, heavily-tested home) and re-exported flat so callers see `falcon_decode::…`.
+pub mod file_io;
 mod apply;
 pub use apply::*;
 
