@@ -50263,3 +50263,59 @@ mod r35_export {
         let _ = fs::remove_dir_all(&base);
     }
 }
+
+/// Render structured decoder failures here, where the active language is available.
+pub(crate) fn rotation_failure_message(failure: &falcon_decode::RotationFailure) -> String {
+    use crate::i18n::tr;
+    use falcon_decode::RotationFailureReason as Reason;
+    let reason = match &failure.reason {
+        Reason::ReadOnly => tr("rotation target is read-only").to_string(),
+        Reason::NotFile => tr("rotation path is not a file").to_string(),
+        Reason::NotDirectory => tr("rotation parent is not a directory").to_string(),
+        Reason::InvalidPath => tr("rotation path contains NUL").to_string(),
+        Reason::SidecarUnrecognised => tr("existing sidecar structure unrecognised — not modified").to_string(),
+        Reason::SidecarTooLarge => tr("existing sidecar exceeds the 4 MB read cap — not modified").to_string(),
+        Reason::SidecarNotUtf8 => tr("existing sidecar is not valid UTF-8 — not modified").to_string(),
+        Reason::Verify { target, found: Some(found) } => tr_format!(
+            "rotation verification failed: read {found}, expected {target}", found = found, target = target),
+        Reason::Verify { target, found: None } => tr_format!(
+            "rotation verification failed: orientation unreadable, expected {target}", target = target),
+        Reason::Io(error) => tr_format!("rotation I/O failed: {error}", error = error),
+    };
+    tr_format!("{path}: {reason}", path = failure.path.display(), reason = reason)
+}
+
+#[cfg(test)]
+mod rotation_failure_message_tests {
+    use super::*;
+    use falcon_decode::{RotationFailure, RotationFailureReason as Reason};
+
+    #[test]
+    fn every_failure_is_translated_and_preserves_path_and_os_details() {
+        let cases = [
+            (Reason::ReadOnly, "旋转目标为只读"),
+            (Reason::NotFile, "旋转路径不是文件"),
+            (Reason::NotDirectory, "旋转目标的父路径不是文件夹"),
+            (Reason::InvalidPath, "旋转路径包含空字符"),
+            (Reason::SidecarUnrecognised, "无法识别现有附属文件的结构，未作修改"),
+            (Reason::SidecarTooLarge, "现有附属文件超过 4 MB 读取上限，未作修改"),
+            (Reason::SidecarNotUtf8, "现有附属文件不是有效的 UTF-8 编码，未作修改"),
+            (Reason::Verify { target: 6, found: Some(1) }, "旋转校验失败：读取到 1，预期为 6"),
+            (Reason::Verify { target: 6, found: None }, "旋转校验失败：无法读取方向，预期为 6"),
+            (Reason::Io("OS sharing violation 32".into()), "旋转读写失败：OS sharing violation 32"),
+        ];
+        for (reason, expected) in cases {
+            let failure = RotationFailure { path: PathBuf::from("照片{6}.xmp"), reason };
+            crate::i18n::use_test_pack("zh-CN", "none", include_str!("../translations/zh-CN.json"));
+            assert_eq!(rotation_failure_message(&failure), format!("照片{{6}}.xmp：{expected}"));
+            #[cfg(falcon_pseudo_language)] {
+                crate::i18n::use_pseudo_language();
+                let text = rotation_failure_message(&failure);
+                assert_eq!(text.matches("⟦").count(), 2, "both path template and reason must be translated: {text}");
+                assert!(text.contains("照片{6}.xmp"), "{text}");
+                assert_ne!(text, format!("照片{{6}}.xmp: {expected}"));
+            }
+            crate::i18n::use_english();
+        }
+    }
+}

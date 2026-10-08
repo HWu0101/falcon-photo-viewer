@@ -1079,3 +1079,146 @@ fn sidecar_path_for_pair_names_never_collide() {
     assert_eq!(raw, PathBuf::from("/s/HWU_0141.xmp"));
     assert_eq!(jpg, PathBuf::from("/s/HWU_0141.JPG.xmp"));
 }
+
+fn rotation_readonly(path: &Path, readonly: bool) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(if readonly { 0o444 } else { 0o644 });
+    }
+    #[cfg(not(unix))] permissions.set_readonly(readonly);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+fn one_rotation(path: &Path, jpeg: bool, raw: bool) -> RotApplyPlan {
+    RotApplyPlan { finished: (!raw).then(|| path.to_owned()), finished_is_jpeg: jpeg,
+        raw: raw.then(|| path.to_owned()), base_turns: 0, delta: 1 }
+}
+#[test]
+fn rotation_readonly_raw_and_png_write_only_their_sidecars() {
+    for raw in [false, true] {
+        let dir = tmp_dir();
+        let bytes = portrait_jpeg(Endian::Little, 1).0;
+        let source = write_tmp(&dir, if raw { "original.CR3" } else { "original.png" }, &bytes);
+        rotation_readonly(&source, true);
+        let report = apply_rotation(&one_rotation(&source, false, raw));
+        rotation_readonly(&source, false);
+        assert!(report.ok, "{:?} / {:?}", report.finished_action, report.raw_action);
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert_eq!(sidecar_orientation(&source, raw), Some(6));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+#[test]
+fn rotation_denied_sidecar_preserves_both_pair_members_and_reports_path() {
+    let dir = tmp_dir();
+    let bytes = portrait_jpeg(Endian::Little, 1).0;
+    let jpg = write_tmp(&dir, "pair.jpg", &bytes);
+    let raw = write_tmp(&dir, "pair.CR3", b"RAW");
+    let xmp = sidecar_basename(&raw);
+    write_xmp_sidecar(&xmp, 1).unwrap();
+    let old_xmp = std::fs::read(&xmp).unwrap();
+    rotation_readonly(&xmp, true);
+    let plan = RotApplyPlan { finished: Some(jpg.clone()), finished_is_jpeg: true, raw: Some(raw), base_turns: 0, delta: 1 };
+    let report = apply_rotation(&plan);
+    rotation_readonly(&xmp, false);
+    assert!(!report.ok); assert_eq!(report.new_base_turns, 0);
+    match &report.finished_action { SideAction::Failed(reason) => {
+        assert_eq!(reason.path, xmp); assert_eq!(reason.reason, RotationFailureReason::ReadOnly);
+    }, _ => panic!("expected path-specific refusal") }
+    assert_eq!(std::fs::read(&jpg).unwrap(), bytes);
+    assert_eq!(std::fs::read(&xmp).unwrap(), old_xmp);
+    assert!(apply_rotation(&plan).ok);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn rotation_readonly_patch_target_is_refused_then_recovers() {
+    let dir = tmp_dir(); let bytes = portrait_jpeg(Endian::Little, 1).0;
+    let jpg = write_tmp(&dir, "patch.jpg", &bytes); let plan = one_rotation(&jpg, true, false);
+    rotation_readonly(&jpg, true); let report = apply_rotation(&plan); rotation_readonly(&jpg, false);
+    assert!(!report.ok); assert_eq!(report.new_base_turns, 0);
+    assert_eq!(std::fs::read(&jpg).unwrap(), bytes);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    assert!(apply_rotation(&plan).ok); assert_eq!(exif_orientation(&jpg), Some(6));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn rotation_readonly_jpeg_can_use_structural_or_cas_sidecar_fallback() {
+    for bytes in [vec![0xff, 0xd8, 0xff, 0xd9], portrait_jpeg(Endian::Little, 3).0] {
+        let dir = tmp_dir(); let jpg = write_tmp(&dir, "fallback.jpg", &bytes);
+        rotation_readonly(&jpg, true); let report = apply_rotation(&one_rotation(&jpg, true, false));
+        rotation_readonly(&jpg, false);
+        assert!(report.ok, "{:?} / {:?}", report.finished_action, report.raw_action); assert!(sidecar_fullname(&jpg).is_file());
+        assert_eq!(std::fs::read(&jpg).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+#[test]
+fn rotation_already_target_needs_no_write_access() {
+    let dir = tmp_dir(); let bytes = portrait_jpeg(Endian::Little, 6).0;
+    let jpg = write_tmp(&dir, "already.jpg", &bytes);
+    rotation_readonly(&jpg, true); let report = apply_rotation(&one_rotation(&jpg, true, false));
+    rotation_readonly(&jpg, false);
+    assert!(report.ok); assert_eq!(report.finished_action, SideAction::AlreadyTarget);
+    assert_eq!(std::fs::read(&jpg).unwrap(), bytes); assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[cfg(unix)]
+#[test]
+fn rotation_in_place_patch_does_not_require_writable_parent_but_sidecar_does() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir(); let bytes = portrait_jpeg(Endian::Little, 1).0;
+    let jpg = write_tmp(&dir, "in-place.jpg", &bytes);
+    let png = write_tmp(&dir, "sidecar.png", &bytes);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let patched = apply_rotation(&one_rotation(&jpg, true, false));
+    let refused = apply_rotation(&one_rotation(&png, false, false));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(patched.ok); assert_eq!(exif_orientation(&jpg), Some(6)); assert!(!refused.ok);
+    assert!(!sidecar_fullname(&png).exists()); assert_eq!(std::fs::read(&png).unwrap(), bytes);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn rotation_preflight_creates_no_probe_and_missing_pair_cannot_patch_jpeg() {
+    let dir = tmp_dir(); let bytes = portrait_jpeg(Endian::Little, 1).0;
+    let jpg = write_tmp(&dir, "pair.jpg", &bytes);
+    let png = write_tmp(&dir, "other.png", &bytes);
+    assert!(permissions::check_rotation_write_access(&one_rotation(&png, false, false)).is_ok());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+    let plan = RotApplyPlan { finished: Some(jpg.clone()), finished_is_jpeg: true,
+        raw: Some(dir.join("missing.CR3")), base_turns: 0, delta: 1 };
+    assert!(!apply_rotation(&plan).ok); assert_eq!(std::fs::read(&jpg).unwrap(), bytes);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Existing XMP is enough: Apply must not open either kind of sidecar-only original.
+/// Windows uses the maintainer's exclusive sharing lock; Unix removes read access.
+#[cfg(any(windows, unix))]
+#[test]
+fn rotation_existing_sidecar_does_not_open_locked_original() {
+    for raw in [true, false] {
+        let dir = tmp_dir();
+        let bytes = b"synthetic original, embedded orientation is unnecessary";
+        let source = write_tmp(&dir, if raw { "locked.CR3" } else { "locked.png" }, bytes);
+        write_xmp_sidecar(&sidecar_path_for(&source, raw), 1).unwrap();
+        #[cfg(windows)]
+        let lock = {
+            use std::os::windows::fs::OpenOptionsExt;
+            let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&source).unwrap();
+            assert_eq!(std::fs::File::open(&source).unwrap_err().raw_os_error(), Some(32));
+            lock
+        };
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert_eq!(std::fs::File::open(&source).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        let report = apply_rotation(&one_rotation(&source, false, raw));
+        #[cfg(windows)] drop(lock);
+        #[cfg(unix)] rotation_readonly(&source, false);
+        assert!(report.ok, "{:?} / {:?}", report.finished_action, report.raw_action);
+        assert_eq!(sidecar_orientation(&source, raw), Some(6));
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

@@ -45,6 +45,8 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+mod permissions;
+
 use crate::exif_orientation; // the bounded (4 MB-capped) kamadak reader — used for the read-back verify
 
 // ───────────────────────────── the orientation ALGEBRA (pure, 32-cell table) ─────────────────────────────
@@ -930,6 +932,43 @@ fn current_for_sidecar(path: &Path, is_raw: bool) -> u8 {
 
 // ───────────────────────────── the per-shot orchestrator ─────────────────────────────
 
+/// Structured Apply failures. The interface translates Falcon-authored reasons; only OS
+/// error details cross this boundary as text. Paths stay separate from explanations.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RotationFailure {
+    pub path: PathBuf,
+    pub reason: RotationFailureReason,
+}
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RotationFailureReason {
+    ReadOnly,
+    NotFile,
+    NotDirectory,
+    InvalidPath,
+    SidecarUnrecognised,
+    SidecarTooLarge,
+    SidecarNotUtf8,
+    Verify { target: u8, found: Option<u32> },
+    Io(String),
+}
+impl RotationFailure {
+    fn new(path: &Path, reason: RotationFailureReason) -> Self {
+        Self { path: path.to_owned(), reason }
+    }
+    fn io(path: &Path, error: std::io::Error) -> Self {
+        Self::new(path, RotationFailureReason::Io(error.to_string()))
+    }
+    fn sidecar(path: &Path, error: SidecarErr) -> Self {
+        let reason = match error {
+            SidecarErr::Unrecognised => RotationFailureReason::SidecarUnrecognised,
+            SidecarErr::TooLarge => RotationFailureReason::SidecarTooLarge,
+            SidecarErr::NotUtf8 => RotationFailureReason::SidecarNotUtf8,
+            SidecarErr::Io(error) => return Self::io(path, error),
+        };
+        Self::new(path, reason)
+    }
+}
+
 /// What one file SIDE (the finished image, or the RAW) did during apply.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SideAction {
@@ -943,8 +982,8 @@ pub enum SideAction {
     SidecarCreated,
     /// An existing XMP sidecar was surgically updated.
     SidecarUpdated,
-    /// This side FAILED (the shot keeps its delta). Carries a short reason for the log.
-    Failed(String),
+    /// This side FAILED (the shot keeps its delta). Carries a reason for localization.
+    Failed(RotationFailure),
 }
 impl SideAction {
     fn ok(&self) -> bool {
@@ -1065,6 +1104,19 @@ pub fn apply_rotation(plan: &RotApplyPlan) -> RotApplyReport {
         (turns_of(target) + 4 - consumed) & 3
     };
 
+    // Preflight only actual output targets, before either side of a pair changes.
+    let jpeg_route = match permissions::check_rotation_write_access(plan) {
+        Ok(route) => route,
+        Err(error) => {
+            let failed = || SideAction::Failed(error.clone());
+            return RotApplyReport {
+                ok: false, new_base_turns,
+                finished_action: if plan.finished.is_some() { failed() } else { SideAction::Skipped },
+                raw_action: if plan.raw.is_some() { failed() } else { SideAction::Skipped },
+            };
+        }
+    };
+
     // ── finished side ─────────────────────────────────────────────────────────────────────
     let finished_action = match &plan.finished {
         None => SideAction::Skipped,
@@ -1086,7 +1138,14 @@ pub fn apply_rotation(plan: &RotApplyPlan) -> RotApplyReport {
             // Structurally: `new_base_turns` is assigned inside the arms, where the CAS outcome is
             // known, instead of before the call on an assumption (v0.8.102 assigned it at the top and
             // the divergence was averted only by the CAS happening to fail).
-            match patch_jpeg_orientation(p, expected, target) {
+            // A read-only JPEG which needs a sidecar must never be opened for write.
+            // The patch route still locates and CAS-checks again on its write handle.
+            let result = match jpeg_route {
+                Some(permissions::JpegRoute::Sidecar(error)) => Err(error),
+                Some(permissions::JpegRoute::AlreadyTarget) => Ok(JpegPatch::AlreadyTarget),
+                _ => patch_jpeg_orientation(p, expected, target),
+            };
+            match result {
                 Ok(JpegPatch::Patched) => {
                     new_base_turns = residual_turns(expected, target);
                     SideAction::Patched
@@ -1117,7 +1176,9 @@ pub fn apply_rotation(plan: &RotApplyPlan) -> RotApplyReport {
                     new_base_turns = residual_turns(cur, target);
                     sidecar_action(&sidecar_fullname(p), target)
                 }
-                Err(e) => SideAction::Failed(format!("{e}")),
+                Err(PatchErr::Io(error)) => SideAction::Failed(RotationFailure::io(p, error)),
+                Err(PatchErr::Verify { target, found }) => SideAction::Failed(
+                    RotationFailure::new(p, RotationFailureReason::Verify { target, found })),
             }
         }
         Some(p) => {
@@ -1172,7 +1233,7 @@ fn sidecar_action(path: &Path, target: u8) -> SideAction {
         Ok(SidecarKind::CreatedFresh) => SideAction::SidecarCreated,
         Ok(SidecarKind::Updated) => SideAction::SidecarUpdated,
         Ok(SidecarKind::AlreadyTarget) => SideAction::AlreadyTarget,
-        Err(e) => SideAction::Failed(format!("{e}")),
+        Err(e) => SideAction::Failed(RotationFailure::sidecar(path, e)),
     }
 }
 

@@ -1249,6 +1249,9 @@
   "drag the logo to position": "⟦drag the logo to position⟧",
   "drop on left half": "⟦drop on left half⟧",
   "drop on right half": "⟦drop on right half⟧",
+  "existing sidecar exceeds the 4 MB read cap — not modified": "⟦existing sidecar exceeds the 4 MB read cap — not modified⟧",
+  "existing sidecar is not valid UTF-8 — not modified": "⟦existing sidecar is not valid UTF-8 — not modified⟧",
+  "existing sidecar structure unrecognised — not modified": "⟦existing sidecar structure unrecognised — not modified⟧",
   "fast, social-first": "⟦fast, social-first⟧",
   "file in ./Rejected → {bin}": "⟦file in ./Rejected → {bin}⟧",
   "files in ./Rejected → {bin}": "⟦files in ./Rejected → {bin}⟧",
@@ -1318,8 +1321,15 @@
     "other": "⟦rejects → move to ./Rejected⟧"
   },
   "right": "⟦right⟧",
+  "rotation I/O failed: {error}": "⟦rotation I/O failed: {error}⟧",
   "rotation apply: {written} written": "⟦rotation apply: {written} written⟧",
   "rotation apply: {written} written, {failed} failed ({names})": "⟦rotation apply: {written} written, {failed} failed ({names})⟧",
+  "rotation parent is not a directory": "⟦rotation parent is not a directory⟧",
+  "rotation path contains NUL": "⟦rotation path contains NUL⟧",
+  "rotation path is not a file": "⟦rotation path is not a file⟧",
+  "rotation target is read-only": "⟦rotation target is read-only⟧",
+  "rotation verification failed: orientation unreadable, expected {target}": "⟦rotation verification failed: orientation unreadable, expected {target}⟧",
+  "rotation verification failed: read {found}, expected {target}": "⟦rotation verification failed: read {found}, expected {target}⟧",
   "rotation → write to photos": {
     "one": "⟦rotation → write to photos⟧",
     "other": "⟦rotations → write to photos⟧"
@@ -1459,6 +1469,7 @@
     "one": "⟦{n}s ago⟧",
     "other": "⟦{n}s ago⟧"
   },
+  "{path}: {reason}": "⟦{path}: {reason}⟧",
   "{photos_and_files}{sidecar_note} Recoverable from there, and Recover restores the whole batch.": "⟦{photos_and_files}{sidecar_note} Recoverable from there, and Recover restores the whole batch.⟧",
   "{photo} RAW + {format} copied to clipboard": "⟦{photo} RAW + {format} copied to clipboard⟧",
   "{photo} RAW copied to clipboard": "⟦{photo} RAW copied to clipboard⟧",
