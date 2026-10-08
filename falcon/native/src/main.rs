@@ -15204,6 +15204,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // gen with the old snapshot (or vice-versa) — see the worker paired read (B1/B2).
             {
                 let mut s = shots.lock().unwrap_or_else(|e| e.into_inner());
+                support::begin_review_visit();
                 *s = new_arc.clone();
                 generation.fetch_add(1, Ordering::Relaxed);
             }
@@ -21202,7 +21203,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let gpu_lost_t = gpu_lost.clone(); // M1 (v0.8.73): device-loss latch — the tick halts the GPU pumps + exits
     // Set once when a selection (ratings/flags) save fails (read-only/locked card, disk full) so the
     // warning banner + log aren't re-spammed every retry; cleared on the next successful save.
-    let save_warned = Cell::new(false);
+    let save_warned = RefCell::new(std::collections::HashSet::<(u64, String)>::new());
     // N9: consecutive tick-panic counter. One caught panic degrades one frame (fine); ~0.5 s of
     // them means a DETERMINISTIC failure that silently kills everything downstream of the panicking
     // step — including the autosave. Past the threshold we surface a banner + rescue-flush the

@@ -10942,7 +10942,7 @@ pub(crate) fn step_persistence(
     ratings: &RefCell<Vec<i32>>,
     marks: &RefCell<Vec<u8>>,
     sel_extra: &RefCell<BTreeMap<String, Sel>>,
-    save_warned: &Cell<bool>,
+    save_warned: &RefCell<std::collections::HashSet<(u64, String)>>,
     sel_gen: &Cell<u64>,
     last_sel_gen: &Cell<u64>,
     quiesce_ctr: &Cell<u32>,
@@ -11021,11 +11021,16 @@ pub(crate) fn step_persistence(
         sel_gen,
     );
 
-    // Selection flush (dirty-checked). Marks the cache clean ONLY on a successful write, so a failed
-    // write (read-only / locked SD card, disk full, folder removed) stays dirty and is RETRIED next
-    // cycle instead of being silently lost; warns the user once (via the events centre). Called from
-    // BOTH the quiescence flush and the periodic cadence — the JSON compare makes a redundant call a no-op.
+    // The JSON cache records the latest ENQUEUED snapshot, not a disk acknowledgement.
+    // The writer's per-folder ticket records Pending/Saved/Failed; Failed forces
+    // the existing backstop to retry even if the edits have not changed. Recovery
+    // feedback is emitted only after a real successful write, never on enqueue.
     let flush_sel = || {
+        // N1: cur_dir intentionally remembers the last folder with photos. Never
+        // serialize an empty displayed folder over that earlier folder's journal.
+        if shots.is_empty() { return; }
+        let visit = crate::support::review_visit();
+        save_warned.borrow_mut().retain(|(seen_visit, _)| *seen_visit == visit);
         // v0.8.69 (E/H2): when XMP sync is ON, enqueue an xmp:Rating sidecar write for every shot whose
         // rating changed since the last sync (per the journal). Runs on the SAME dirty-gated cadence as the
         // JSON flush below (a rating edit trips both), so writes coalesce per shot and never block the UI —
@@ -11061,7 +11066,15 @@ pub(crate) fn step_persistence(
             }
             let attrs = folder_attrs.borrow().clone();
             let j = selection_dirty_json(&sel_map, &rots, &attrs);
-            if *last_ratings_json.borrow() != j {
+            let disk_status = crate::support::review_save_status(Path::new(&dir));
+            let failed = crate::support::review_save_needs_retry(Path::new(&dir), !shots.is_empty());
+            let warning_key = (visit, dir.clone());
+            if failed { save_warned.borrow_mut().insert(warning_key.clone()); }
+            if disk_status == Some(crate::support::ReviewSaveStatus::Saved)
+                && *last_ratings_json.borrow() == j && save_warned.borrow_mut().remove(&warning_key) {
+                notif_pending.borrow_mut().push(NotifEntry::success(i18n::tr("Ratings saved."), now));
+            }
+            if *last_ratings_json.borrow() != j || failed {
                 if dir.is_empty() {
                     *last_ratings_json.borrow_mut() = j; // empty-state: nothing to persist, mark clean
                 } else {
@@ -11077,14 +11090,10 @@ pub(crate) fn step_persistence(
                                 sort_lru.borrow_mut().retain(|(d, _)| d != &dir);
                                 panel_lru.borrow_mut().retain(|(d, _)| d != &dir); // v0.8.89: now a json folder
                             }
-                            if save_warned.replace(false) {
-                                notif_pending.borrow_mut().push(NotifEntry::success(i18n::tr("Ratings saved."), now));
-                            }
                         }
                         Err(e) => {
-                            if !save_warned.replace(true) {
-                                notif_pending.borrow_mut().push(NotifEntry::error(tr_format!("⚠ Ratings not saved — {error}", error = e), now));
-                            }
+                            save_warned.borrow_mut().insert(warning_key.clone());
+                            notif_pending.borrow_mut().push(NotifEntry::error(tr_format!("⚠ Ratings not saved — {error}", error = e), now));
                         }
                     }
                 }

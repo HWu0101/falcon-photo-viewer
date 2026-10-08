@@ -6013,13 +6013,15 @@ The queue is an unbounded `mpsc` channel (`WriteMsg` and `writer_loop` in `suppo
 
 `reap_stale_temps` removes `.falcontmp` files older than 60 seconds when a folder loads, and in the config folder at startup. The age rule protects a temporary file that another running Falcon is still writing. There is **no fsync of the parent folder** after the rename, so the rename itself is not forced to disk; this is a known, accepted gap. Review JSON and XMP sidecars share `falcon_decode::file_io::write_atomic`; JPEG orientation patches use the same synchronization helper.
 
+Review autosave distinguishes a queued snapshot from a disk acknowledgement. Only the latest ticket for the current folder visit controls retry/recovery state. Each photo-list swap (including opening a folder without photos) clears that state after the outgoing flush. An empty displayed photo list never retries or announces a saved journal, because `cur_dir` deliberately remembers the last folder with photos. Failed saves of the loaded folder retry on the existing persistence backstop; a fresh visit starts without the old visit's failure. Every terminal background failure is still reported, including failures after leaving a folder or after Apply rebases its journal. Synchronous review fallback errors propagate to callers; recovery feedback requires a real successful acknowledgement and an unchanged current snapshot.
+
 What the writer guarantees:
 
 - **One FIFO queue**, so writes to the same file land in the order they were queued. The last write wins.
 - Each write runs inside `catch_unwind`. A panic in file code becomes an ordinary error and cannot kill the writer thread, which would silently drop every later write.
 - Each settings, review-data or XMP write is retried once. A second failure is logged and added to a failures list, which the tick shows in the events centre (`writer_take_fails`). A write is never dropped silently. A failed settings or review-data save says "your latest changes may not be on disk". A failed XMP rating says the sidecar may be locked by another app and that "Ratings are safe in Falcon" (`writer_fail_message`).
 - Diagnostic lines (`WriteMsg::Log`) are appended. They are never retried and never raise an events entry, because that entry would itself be logged and loop.
-- If the writer is not running (very early startup, unit tests, or a writer thread that failed to start), or its channel has closed, the `enqueue_*` functions write inline on the calling thread so nothing is lost. **That inline write's error is currently discarded.**
+- If the writer is not running (very early startup, unit tests, or a writer thread that failed to start), or its channel has closed, the `enqueue_*` functions write inline on the calling thread so nothing is lost. Review-data inline failures propagate to the caller; other inline write errors are still discarded.
 
 **Where fsync may run.** No fsync runs on the interface thread on any repeating schedule. Settings, review data and XMP ratings always go through the writer. Two callers still use `write_atomic` directly:
 

@@ -12786,7 +12786,7 @@ pub(crate) enum WriteMsg {
     /// it, or the reverse), and the multi-instance divergence where two Falcons disagree about
     /// which name a folder has. Whatever happened to the folder in between, the bytes land on the
     /// file the folder actually has.
-    ReviewData { dir: PathBuf, data: Vec<u8> },
+    ReviewData { dir: PathBuf, data: Vec<u8>, ticket: u64 },
     /// v0.8.69 (E/H2): a surgical `xmp:Rating` sidecar write — the read-modify-write runs ON the writer
     /// thread (never the UI thread), preserving all foreign sidecar content. Rides the SAME FIFO as the
     /// JSON writes, so the existing durability barriers (Apply / delete / exit) flush pending rating
@@ -12845,9 +12845,9 @@ fn writer_loop(
     mut log_sink: impl FnMut(&Path, &str, u64),
 ) {
     while let Ok(msg) = rx.recv() {
-        let (target, data) = match msg {
-            WriteMsg::Write { target, data } => (target, data),
-            WriteMsg::ReviewData { dir, data } => (resolve_review(&dir), data),
+        let (target, data, review) = match msg {
+            WriteMsg::Write { target, data } => (target, data, None),
+            WriteMsg::ReviewData { dir, data, ticket } => (resolve_review(&dir), data, Some((dir, ticket))),
             WriteMsg::Log { target, line, ticket } => {
                 log_sink(&target, &line, ticket);
                 continue;
@@ -12866,11 +12866,14 @@ fn writer_loop(
                 continue;
             }
         };
-        // A panic/failure of a write must NOT lose the payload silently: retry once, then surface.
-        if let Err(_first) = sink(&target, &data) {
-            if let Err(e) = sink(&target, &data) {
-                on_fail(&target, e, false);
-            }
+        // Complete only the newest ticket for a folder. An old failure must not
+        // overwrite the state of a newer queued/successful save.
+        let result = sink(&target, &data).or_else(|_| sink(&target, &data));
+        if let Some((dir, ticket)) = review { review_save_complete(&dir, ticket, result.is_ok()); }
+        if let Err(e) = result {
+            // Report every terminal failure, even for a stale visit or Apply/exit save.
+            // Suppressing it as "already reported" can hide an unsaved rebased journal.
+            on_fail(&target, e, false);
         }
     }
 }
@@ -12957,19 +12960,60 @@ pub(crate) fn enqueue_write(target: &Path, data: Vec<u8>) {
 /// v0.8.131 (F-P3 rule 6): enqueue a folder's review data WITHOUT naming its file. The writer
 /// resolves the target when it writes; the inline fallbacks (writer gone / never started) resolve
 /// it at the same moment they write, so every route asks the same question at the same time.
-pub(crate) fn enqueue_review_data(dir: &Path, data: Vec<u8>) {
-    match WRITER.get() {
-        Some(h) => {
-            if let Err(std::sync::mpsc::SendError(WriteMsg::ReviewData { dir, data })) =
-                h.tx.send(WriteMsg::ReviewData { dir: dir.to_path_buf(), data })
-            {
-                let _ = write_atomic(&review_write_target(&dir), &data);
-            }
-        }
-        None => {
-            let _ = write_atomic(&review_write_target(dir), &data);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewSaveStatus { Pending, Saved, Failed }
+#[derive(Clone, Copy)]
+struct ReviewSaveRecord { ticket: u64, status: ReviewSaveStatus }
+impl ReviewSaveRecord {
+    fn complete(&mut self, ticket: u64, ok: bool) {
+        if self.ticket == ticket {
+            self.status = if ok { ReviewSaveStatus::Saved } else { ReviewSaveStatus::Failed };
         }
     }
+}
+static REVIEW_SAVES: std::sync::LazyLock<Mutex<HashMap<PathBuf, ReviewSaveRecord>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static REVIEW_TICKET: AtomicU64 = AtomicU64::new(1);
+static REVIEW_VISIT: AtomicU64 = AtomicU64::new(0);
+/// End the outgoing visit after its final flush, before swapping photos. Old
+/// completions still report failures, but cannot drive retries/recovery in the new visit.
+pub(crate) fn begin_review_visit() {
+    let mut saves = REVIEW_SAVES.lock().unwrap_or_else(|e| e.into_inner());
+    saves.clear();
+    REVIEW_VISIT.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn review_visit() -> u64 { REVIEW_VISIT.load(Ordering::Relaxed) }
+fn review_save_complete(dir: &Path, ticket: u64, ok: bool) {
+    if let Some(record) = REVIEW_SAVES.lock().unwrap_or_else(|e| e.into_inner()).get_mut(dir) {
+        record.complete(ticket, ok);
+    }
+}
+pub(crate) fn review_save_status(dir: &Path) -> Option<ReviewSaveStatus> {
+    REVIEW_SAVES.lock().unwrap_or_else(|e| e.into_inner()).get(dir).map(|r| r.status)
+}
+/// cur_dir may name the previous photo folder while the displayed folder is empty.
+/// Such a view can neither retry a save nor announce its recovery.
+pub(crate) fn review_save_needs_retry(dir: &Path, has_photos: bool) -> bool {
+    has_photos && review_save_status(dir) == Some(ReviewSaveStatus::Failed)
+}
+
+pub(crate) fn enqueue_review_data(dir: &Path, data: Vec<u8>) -> std::io::Result<()> {
+    let msg = {
+        // Publish the ticket and send under the same lock: concurrent callers
+        // must agree on which snapshot is last in the writer FIFO.
+        let mut saves = REVIEW_SAVES.lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = REVIEW_TICKET.fetch_add(1, Ordering::Relaxed);
+        saves.insert(dir.to_owned(), ReviewSaveRecord { ticket, status: ReviewSaveStatus::Pending });
+        let msg = WriteMsg::ReviewData { dir: dir.to_path_buf(), data, ticket };
+        match WRITER.get() {
+            Some(h) => match h.tx.send(msg) { Ok(()) => return Ok(()), Err(e) => e.0 },
+            None => msg,
+        }
+    };
+    let WriteMsg::ReviewData { dir, data, ticket } = msg else { unreachable!() };
+    let result = write_atomic(&review_write_target(&dir), &data);
+    review_save_complete(&dir, ticket, result.is_ok());
+    result
 }
 
 // ───────────── XMP rating sync (v0.8.69, E/H2 — the OUTPUT contract) ─────────────
@@ -32705,7 +32749,7 @@ pub(crate) fn save_selection(
     // queued (or, if the writer isn't up — early boot / a unit test — synchronously durably written).
     // v0.8.131 (F-P3 rule 6): addressed by FOLDER — the writer thread picks the file name from
     // on-disk facts at write time (see `WriteMsg::ReviewData`).
-    enqueue_review_data(dir, json.into_bytes());
+    enqueue_review_data(dir, json.into_bytes()).map_err(|e| e.to_string())?;
     Ok(map.len())
 }
 /// v0.8.36 (ITEM 2): a corrupt-settings warning stashed at load (before the events centre exists) and
@@ -44041,7 +44085,7 @@ mod writer_tests {
         let (tx, rx) = channel::<WriteMsg>();
         tx.send(WriteMsg::Log { target: "falcon.log".into(), line: "discard".into(), ticket: 1 }).unwrap();
         tx.send(WriteMsg::Write { target: "settings.json".into(), data: vec![7] }).unwrap();
-        tx.send(WriteMsg::ReviewData { dir: "photos".into(), data: vec![8] }).unwrap();
+        tx.send(WriteMsg::ReviewData { dir: "photos".into(), data: vec![8], ticket: 0 }).unwrap();
         tx.send(WriteMsg::XmpRating { sidecar: "photo.xmp".into(), rating: 5 }).unwrap();
         let (ack, done) = channel();
         tx.send(WriteMsg::Barrier(ack)).unwrap();
@@ -46615,8 +46659,8 @@ mod writer_tests {
         // message, converted by the time the second is written.
         let converted = Rc::new(Cell::new(false));
         let conv = converted.clone();
-        tx.send(WriteMsg::ReviewData { dir: PathBuf::from("/f"), data: vec![1] }).unwrap();
-        tx.send(WriteMsg::ReviewData { dir: PathBuf::from("/f"), data: vec![2] }).unwrap();
+        tx.send(WriteMsg::ReviewData { dir: PathBuf::from("/f"), data: vec![1], ticket: 0 }).unwrap();
+        tx.send(WriteMsg::ReviewData { dir: PathBuf::from("/f"), data: vec![2], ticket: 0 }).unwrap();
         drop(tx);
         writer_loop(
             rx,
@@ -50317,5 +50361,87 @@ mod rotation_failure_message_tests {
             }
             crate::i18n::use_english();
         }
+    }
+}
+
+#[cfg(test)]
+mod review_save_recovery_tests {
+    use super::*;
+    // A visit clears the entire process-wide table, not just this test's path.
+    // Hold a separate test lock for each full scenario (including writer completion)
+    // so parallel test threads cannot clear another scenario's pending save.
+    static SAVE_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    fn pending(dir: &Path) -> u64 {
+        let ticket = REVIEW_TICKET.fetch_add(1, Ordering::Relaxed);
+        REVIEW_SAVES.lock().unwrap().insert(dir.to_owned(), ReviewSaveRecord {
+            ticket, status: ReviewSaveStatus::Pending,
+        });
+        ticket
+    }
+    #[test]
+    fn failed_visit_cannot_retry_empty_folder_or_later_visit() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap();
+        begin_review_visit();
+        let dir = Path::new("/review-visit-test"); let first_visit = review_visit();
+        let first = pending(dir); review_save_complete(dir, first, false);
+        assert!(review_save_needs_retry(dir, true));
+        // An empty photo list can still have this cur_dir; do not serialize it.
+        assert!(!review_save_needs_retry(dir, false));
+        begin_review_visit();
+        assert_ne!(review_visit(), first_visit);
+        assert!(!review_save_needs_retry(dir, true));
+        let later = pending(dir);
+        review_save_complete(dir, first, false); review_save_complete(dir, first, true);
+        assert_eq!(review_save_status(dir), Some(ReviewSaveStatus::Pending));
+        review_save_complete(dir, later, true);
+        assert_eq!(review_save_status(dir), Some(ReviewSaveStatus::Saved));
+        begin_review_visit();
+        assert_eq!(review_save_status(dir), None);
+    }
+    #[test]
+    fn newest_ticket_only_controls_retry_and_disk_acknowledgement() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap();
+        let dir = Path::new("/review-ticket-test");
+        let first = pending(dir); let latest = pending(dir);
+        review_save_complete(dir, first, false); review_save_complete(dir, first, true);
+        assert_eq!(review_save_status(dir), Some(ReviewSaveStatus::Pending));
+        review_save_complete(dir, latest, false); assert!(review_save_needs_retry(dir, true));
+        let retry = pending(dir); review_save_complete(dir, latest, true);
+        assert_eq!(review_save_status(dir), Some(ReviewSaveStatus::Pending));
+        review_save_complete(dir, retry, true); assert!(!review_save_needs_retry(dir, true));
+    }
+    #[test]
+    fn every_final_failure_is_reported_including_old_visit_and_apply_journal() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap();
+        use std::sync::mpsc::channel;
+        let dir = Path::new("/review-final-failure");
+        let old = pending(dir); begin_review_visit(); let new = pending(dir);
+        let (tx, rx) = channel();
+        for (ticket, bytes) in [(old, b"old visit".as_slice()), (new, b"Apply rebased".as_slice()), (new, b"exit".as_slice())] {
+            tx.send(WriteMsg::ReviewData { dir: dir.into(), data: bytes.to_vec(), ticket }).unwrap();
+        }
+        drop(tx);
+        let mut failures = Vec::new(); let mut attempts = 0;
+        writer_loop(rx, |_, _| { attempts += 1; Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "locked")) },
+            |_, _| Ok(()), |path, error, xmp| failures.push((path.to_owned(), error.kind(), xmp)),
+            |dir| dir.join(SELECTION_FILE), |_, _, _| {});
+        assert_eq!(attempts, 6, "each message retains its immediate retry");
+        assert_eq!(failures.len(), 3, "stale/repeated/final failures must never be suppressed");
+        assert!(failures.iter().all(|(path, kind, xmp)| path == &dir.join(SELECTION_FILE)
+            && *kind == std::io::ErrorKind::PermissionDenied && !xmp));
+    }
+    #[test]
+    fn failed_inline_save_propagates_and_can_recover() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("falcon-review-recovery-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join(SELECTION_FILE); std::fs::create_dir(&target).unwrap();
+        assert!(enqueue_review_data(&dir, b"pending".to_vec()).is_err());
+        assert!(review_save_needs_retry(&dir, true)); assert!(target.is_dir());
+        std::fs::remove_dir(&target).unwrap();
+        enqueue_review_data(&dir, b"recovered".to_vec()).unwrap();
+        assert_eq!(review_save_status(&dir), Some(ReviewSaveStatus::Saved));
+        assert_eq!(std::fs::read(&target).unwrap(), b"recovered");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
