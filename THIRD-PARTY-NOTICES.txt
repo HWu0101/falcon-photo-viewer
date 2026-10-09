@@ -843,7 +843,7 @@ Apache License
 
 ==============================================================================
 Apache License 2.0
-Used by: ab_glyph 0.2.32, ab_glyph_rasterizer 0.1.10, falcon-color 0.0.0, falcon-decode 0.0.0, falcon-gpu 0.0.0, falcon-hwdec 0.0.0, falcon-native 1.0.13, falcon-nvjpeg 0.1.0, gl_generator 0.14.0, khronos_api 3.1.0, linked_hash_set 0.1.6, owned_ttf_parser 0.25.1, spirv 0.4.0+sdk-1.4.341.0
+Used by: ab_glyph 0.2.32, ab_glyph_rasterizer 0.1.10, falcon-color 0.0.0, falcon-decode 0.0.0, falcon-gpu 0.0.0, falcon-hwdec 0.0.0, falcon-native 1.0.14, falcon-nvjpeg 0.1.0, gl_generator 0.14.0, khronos_api 3.1.0, linked_hash_set 0.1.6, owned_ttf_parser 0.25.1, spirv 0.4.0+sdk-1.4.341.0
 
 Apache License
 Version 2.0, January 2004

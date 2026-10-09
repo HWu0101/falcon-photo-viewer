@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "tool": "cargo-about 0.9.2",
-  "lock_sha256": "05ac835c5e2dde78fd5c2d4d6c9483915953825c6cd05a31b043dba9280f6402",
+  "lock_sha256": "d8d0ca1024fcb47f9e2c6bc9bed0c25585518d184f6c1be625c2dfc082491536",
   "text_hash_format": "UTF-8, LF line endings",
   "project_inputs": {
     "falcon/Cargo.toml": "eabb77d13a6d28a8c6d6c34d56c0dd8b96bdcd575e8536a4b9546b9b2cc58be9",
@@ -11,7 +11,7 @@
     "falcon/crates/falcon-gpu/Cargo.toml": "6a33547cdbde1dc23360f889c8824b4a5e1a91e17a67d78d19a9ca59cefb9c86",
     "falcon/crates/falcon-hwdec/Cargo.toml": "5518a8095d56abc56a2e2fcff68dbaaf31dbb99c019837a5a4e5a18509e71b3c",
     "falcon/crates/falcon-nvjpeg/Cargo.toml": "6be1c4244b39794f85ef1a5833fc58b96ab3bb501601ec943308d2768f8b24ef",
-    "falcon/native/Cargo.toml": "14c06f1421cde5f33f399c7747e63408bf455d732f40597f1238cbac09f441e8",
+    "falcon/native/Cargo.toml": "62d6ef569dbfa3d2c5c9b6e867cb9a967ed074b6b5561a250ea2f4cc5d48086d",
     "falcon/vendor/femtovg/Cargo.toml": "52ce2ade2f33c14aa023dcc4e26972db738ab598ae4df08906603c655dce49e7",
     "falcon/vendor/winit/Cargo.toml": "4c8b88b4a501155443a893ffbda5f5eb23aa03d5a873554a00a23b8f55a91148",
     "falcon/vendor/zune-jpeg/Cargo.toml": "cc3be1dd6f068b881ddc5445e7ca521920430311c9a134d1dd6b35c8e72d8ff1"
@@ -884,7 +884,7 @@
     },
     {
       "name": "falcon-native",
-      "version": "1.0.13",
+      "version": "1.0.14",
       "declared": "Apache-2.0",
       "selected": [
         "Apache-2.0"
@@ -3525,5 +3525,5 @@
       ]
     }
   ],
-  "notices_sha256": "cd4c34818c0f5d6e73c0d15ca54f718a820d32103d2da53bf63ca4383601a903"
+  "notices_sha256": "f4abe7f540e08abfdf395ffaa003d1153ad2055a13841cd7b2973fc44fb02719"
 }

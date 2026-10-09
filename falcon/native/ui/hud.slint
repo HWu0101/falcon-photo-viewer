@@ -740,8 +740,10 @@ import { FlagGlyph, ArchiveGlyph, GridGlyph, FilmFrameBlock, LeafGlyph } from "g
         property <bool> shown-flag: root.bulk-armed ? root.bulk-flag-on : root.flagged;
         property <bool> shown-reject: root.bulk-armed ? root.bulk-reject-on : root.rejected;
         // ── THE HAND-SPLIT (ledger L3: there is no wrap primitive — rows hug and split by hand) ──
-        // MEASURED, not assumed. The row's budget is its own width — 276px at both mounts (the
-        // 308px panel minus its 2x16px padding). Single-photo it needs 275 and always has. ARMED,
+        // MEASURED, not assumed. The row's budget is its own width — at both mounts (the EXIF panel
+        // and the immersive card) the glass's width minus its 2x16px padding, and both glasses size
+        // themselves to `line1-need` below. Single-photo it needs 291 (since v0.8.137's 123px star
+        // cell; 275 before). ARMED,
         // the two labels grow a verb and a count, and the rig measured the overflow directly: at a
         // 999-photo selection the star cluster ran 12px past the glass even with the widths hugging,
         // and each further digit costs ~14px more. No arrangement of one line survives four digits

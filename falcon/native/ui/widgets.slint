@@ -207,8 +207,9 @@ import { Theme } from "theme.slint";
     //
     // This IS the dock grid's own right-edge band, lifted out of `main_window.slint` unchanged: an
     // 8px band holding a 4px `Theme.block` track and a 6px proportional thumb with a 28px floor;
-    // `Theme.accent` at full opacity while the pointer is on the band or holding it, `Theme.text-mute`
-    // at 55% otherwise, both riding `Theme.anim`; a press or a drag anywhere in the band seeks to the
+    // Only a Theme.block thumb is visible at rest. Hover reveals the track and the text-mute
+    // thumb at 55%; pressing/dragging uses accent at full opacity, even outside the band.
+    // Paint transitions use Theme.anim; a press or drag anywhere in the unchanged band seeks to the
     // cursor-CENTRED fraction of the travel. It is the filmstrip's top seek bar rotated vertical.
     //
     // WHY A COMPONENT AND NOT A SECOND COPY: the Review panel now shows the same bar, and the two
@@ -250,14 +251,16 @@ import { Theme } from "theme.slint";
         }
         track := Rectangle { // track (centred in the 8px band)
             x: 2px; y: root.padt; width: 4px; height: root.trackh;
-            border-radius: 2px; background: Theme.block;
+            border-radius: 2px;
+            background: barta.has-hover || barta.pressed ? Theme.block : transparent;
+            animate background { duration: Theme.anim; easing: ease; }
         }
         thumb := Rectangle { // thumb (proportional height, accent while engaged)
             x: 1px; y: root.padt + (root.trackh - root.thumbh) * max(0.0, min(1.0, root.frac));
             width: 6px; height: root.thumbh;
             border-radius: 3px;
-            background: barta.has-hover || barta.pressed ? Theme.accent : Theme.text-mute;
-            opacity: barta.has-hover || barta.pressed ? 1.0 : 0.55;
+            background: barta.pressed ? Theme.accent : (barta.has-hover ? Theme.text-mute : Theme.block);
+            opacity: barta.has-hover && !barta.pressed ? 0.55 : 1.0;
             animate background, opacity { duration: Theme.anim; easing: ease; }
         }
     }

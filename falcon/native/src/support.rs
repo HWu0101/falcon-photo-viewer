@@ -26771,17 +26771,19 @@ pub(crate) fn bulk_rotate_label(n: usize, cw: bool) -> String {
 /// what it could not turn — *"one Undo for the batch and a note for skipped animated GIFs"*.
 ///
 /// The playback lane has no rotation, so an animated GIF in the set is skipped; and the bounded
-/// probe has a THIRD answer (a truncated file, a sharing violation, a cloud placeholder rule 1
-/// forbids reading), which is not the same news and does not blame the format. Both clauses are
-/// counts, joined after one em-dash, because the sentence lands in a 5 000 ms result row beside
-/// every other bulk sentence this app speaks.
+/// probe has a THIRD answer (a truncated file, a sharing violation), which is not the same news and
+/// does not blame the format. 5 October 2026 (Part 1, F2): a FOURTH — a GIF that is still only in
+/// the cloud, which a batch must not open to probe (opening it downloads it; the amended cloud rule:
+/// batch work never downloads cloud-only files). Its clause says how to fix it: open the photo,
+/// which downloads that one file. The clauses are counts, joined after one em-dash, because the
+/// sentence lands in a 5 000 ms result row beside every other bulk sentence this app speaks.
 ///
 /// `turned == 0` says "Nothing rotated" rather than "Rotated 0 photos": a count of zero is not a
 /// report of work, and the clause after it is the whole of the news.
 ///
 /// Language packs (round 2): the head and each clause are whole counted messages; the clauses are
 /// joined to the head (and to each other) by messages of their own, so a pack can punctuate them.
-pub(crate) fn bulk_rotate_sentence(turned: usize, cw: bool, animated: usize, unreadable: usize) -> String {
+pub(crate) fn bulk_rotate_sentence(turned: usize, cw: bool, animated: usize, unreadable: usize, cloud: usize) -> String {
     let head = if turned == 0 {
         i18n::tr("Nothing rotated").to_string()
     } else if cw {
@@ -26789,20 +26791,29 @@ pub(crate) fn bulk_rotate_sentence(turned: usize, cw: bool, animated: usize, unr
     } else {
         tr_plural!(turned, "Rotated {n} photo left", "Rotated {n} photos left")
     };
-    let animated_clause = (animated > 0).then(|| tr_plural!(animated, "{n} animated GIF skipped", "{n} animated GIFs skipped"));
-    let unreadable_clause =
-        (unreadable > 0).then(|| tr_plural!(unreadable, "{n} GIF couldn't be checked", "{n} GIFs couldn't be checked"));
-    let clauses = match (animated_clause, unreadable_clause) {
-        (None, None) => return head,
-        (Some(a), None) => a,
-        (None, Some(u)) => u,
-        (Some(a), Some(u)) => tr_format!("{skipped}, {unchecked}", skipped = a, unchecked = u),
+    let clauses = [
+        (animated > 0).then(|| tr_plural!(animated, "{n} animated GIF skipped", "{n} animated GIFs skipped")),
+        (unreadable > 0).then(|| tr_plural!(unreadable, "{n} GIF couldn't be checked", "{n} GIFs couldn't be checked")),
+        (cloud > 0).then(|| {
+            tr_plural!(
+                cloud,
+                "{n} cloud-only GIF skipped (open it first to download it from the cloud)",
+                "{n} cloud-only GIFs skipped (open them first to download them from the cloud)"
+            )
+        }),
+    ];
+    let Some(clauses) = clauses
+        .into_iter()
+        .flatten()
+        .reduce(|a, b| tr_format!("{skipped}, {unchecked}", skipped = a, unchecked = b))
+    else {
+        return head;
     };
     tr_format!("{rotated} — {gifs}", rotated = head, gifs = clauses)
 }
 
 /// The English sentence of [`bulk_rotate_sentence`], for the bulk-rotate log line (logs stay English).
-pub(crate) fn bulk_rotate_sentence_english(turned: usize, cw: bool, animated: usize, unreadable: usize) -> String {
+pub(crate) fn bulk_rotate_sentence_english(turned: usize, cw: bool, animated: usize, unreadable: usize, cloud: usize) -> String {
     let head = if turned == 0 {
         "Nothing rotated".to_string()
     } else {
@@ -26821,6 +26832,9 @@ pub(crate) fn bulk_rotate_sentence_english(turned: usize, cw: bool, animated: us
             "{unreadable} GIF{} couldn't be checked",
             if unreadable == 1 { "" } else { "s" }
         ));
+    }
+    if cloud > 0 {
+        clauses.push(format!("{cloud} cloud-only GIF{} skipped", if cloud == 1 { "" } else { "s" }));
     }
     if clauses.is_empty() {
         head
@@ -49498,16 +49512,31 @@ mod multiselect_menu_tests {
     /// noun and rows 5 / 2 redden.
     #[test]
     fn the_bulk_rotate_sentence_names_the_count_and_what_it_skipped() {
-        assert_eq!(bulk_rotate_sentence(5, true, 0, 0), "Rotated 5 photos right");
-        assert_eq!(bulk_rotate_sentence(4, true, 1, 0), "Rotated 4 photos right — 1 animated GIF skipped");
+        assert_eq!(bulk_rotate_sentence(5, true, 0, 0, 0), "Rotated 5 photos right");
+        assert_eq!(bulk_rotate_sentence(4, true, 1, 0, 0), "Rotated 4 photos right — 1 animated GIF skipped");
         assert_eq!(
-            bulk_rotate_sentence(3, false, 2, 1),
+            bulk_rotate_sentence(3, false, 2, 1, 0),
             "Rotated 3 photos left — 2 animated GIFs skipped, 1 GIF couldn't be checked"
         );
-        assert_eq!(bulk_rotate_sentence(0, true, 3, 0), "Nothing rotated — 3 animated GIFs skipped");
-        assert_eq!(bulk_rotate_sentence(1, true, 0, 0), "Rotated 1 photo right");
+        assert_eq!(bulk_rotate_sentence(0, true, 3, 0, 0), "Nothing rotated — 3 animated GIFs skipped");
+        assert_eq!(bulk_rotate_sentence(1, true, 0, 0, 0), "Rotated 1 photo right");
         // …and the unreadable clause alone, which the table above only ever shows beside the other.
-        assert_eq!(bulk_rotate_sentence(2, false, 0, 1), "Rotated 2 photos left — 1 GIF couldn't be checked");
+        assert_eq!(bulk_rotate_sentence(2, false, 0, 1, 0), "Rotated 2 photos left — 1 GIF couldn't be checked");
+        // 5 October 2026 (Part 1, F2): the cloud-only clause, alone and as the third clause, singular
+        // and plural — and the English log twin, which must name the same count.
+        assert_eq!(
+            bulk_rotate_sentence(6, true, 0, 0, 1),
+            "Rotated 6 photos right — 1 cloud-only GIF skipped (open it first to download it from the cloud)"
+        );
+        assert_eq!(
+            bulk_rotate_sentence(0, true, 1, 1, 2),
+            "Nothing rotated — 1 animated GIF skipped, 1 GIF couldn't be checked, \
+             2 cloud-only GIFs skipped (open them first to download them from the cloud)"
+        );
+        assert_eq!(
+            bulk_rotate_sentence_english(6, true, 0, 0, 2),
+            "Rotated 6 photos right — 2 cloud-only GIFs skipped"
+        );
     }
 
     /// v1.0.0-rc (item 27, §2 R5 — the plural rotate ROWS' label). Bare-count grammar, the same

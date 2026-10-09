@@ -4002,11 +4002,30 @@ pub(crate) enum BulkOp {
 ///
 /// A non-GIF returns [`RotVerdict::Turn`] without touching the store: every shot either door can be
 /// handed goes through here, so the format test lives in one place too.
+///
+/// 5 October 2026 (Part 1, F2) — **A BATCH NEVER OPENS A CLOUD-ONLY GIF TO PROBE IT.** Opening an
+/// online-only file downloads it, and the probe runs on the interface thread, so a selection holding
+/// unchecked cloud-only GIFs downloaded every one of them and froze the window while it waited. The
+/// amended cloud rule: batch work never downloads cloud-only files; an explicit action on ONE photo
+/// may download that one file. So the door says which it is ([`RotDoor`]): the selection door skips
+/// an unchecked GIF whose file is still a cloud placeholder ([`RotVerdict::CloudOnly`], counted and
+/// said in its sentence), and the single-photo door probes as before. "Still a placeholder" is read
+/// from the file's attributes at click time (metadata only — never a download), not from the scan's
+/// tag, so a GIF downloaded since the scan is probed normally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RotVerdict {
     Turn,
     Animated,
     Unreadable,
+    /// Selection door only: an unchecked GIF that is still only in the cloud — skipped, never opened.
+    CloudOnly,
+}
+
+/// Which rotate door is asking: one photo (may download that file) or a selection (a batch — must not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RotDoor {
+    One,
+    Selection,
 }
 
 fn gif_rotate_verdict(
@@ -4014,6 +4033,20 @@ fn gif_rotate_verdict(
     idx: usize,
     anim: &RefCell<crate::tick::AnimatedGifs>,
     gen_now: u64,
+    door: RotDoor,
+) -> RotVerdict {
+    gif_rotate_verdict_with(shot, idx, anim, gen_now, door, falcon_decode::file_is_cloud_placeholder)
+}
+
+/// [`gif_rotate_verdict`] with the placeholder check injected, so a test can stand a real file in
+/// for a cloud-only one (no test can mint a real placeholder) and prove the batch never reads it.
+fn gif_rotate_verdict_with(
+    shot: &Shot,
+    idx: usize,
+    anim: &RefCell<crate::tick::AnimatedGifs>,
+    gen_now: u64,
+    door: RotDoor,
+    is_cloud_placeholder: impl Fn(&std::path::Path) -> bool,
 ) -> RotVerdict {
     if shot.kind != falcon_decode::SrcKind::Gif {
         return RotVerdict::Turn;
@@ -4022,6 +4055,7 @@ fn gif_rotate_verdict(
     let (blocked, unreadable) = match verdict {
         Some(v) => (v, false),
         None => match shot.jpg.as_ref() {
+            Some(p) if door == RotDoor::Selection && is_cloud_placeholder(p) => return RotVerdict::CloudOnly,
             // The bounded probe. `shot.jpg` is the GIF's own path (the finished-image slot); a GIF
             // shot without one cannot be read at all, which is the same answer as a failed probe.
             Some(p) => match falcon_decode::gif_is_animated(p) {
@@ -10939,12 +10973,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             // edit away from disagreeing with this one. What stays here is what is single-shot about
             // the refusal: the subject naming, the 1 s de-duplication memo, and the spoken sentence.
             let gen_now = gen_ro.load(Ordering::Relaxed);
-            let verdict = gif_rotate_verdict(shot, idx, &anim_ro, gen_now);
+            let verdict = gif_rotate_verdict(shot, idx, &anim_ro, gen_now, RotDoor::One);
             if verdict != RotVerdict::Turn {
-                let base = if verdict == RotVerdict::Unreadable {
-                    support::ANIMATED_ROTATE_UNREADABLE
-                } else {
-                    support::ANIMATED_ROTATE_REFUSAL
+                // Every answer named, so a new one has to be decided here (5 October 2026, review O3).
+                // `CloudOnly` is the selection door's answer and cannot reach this door; were it ever
+                // to, "couldn't check" is the honest sentence — never "animated".
+                let (base, why) = match verdict {
+                    RotVerdict::Animated => {
+                        (support::ANIMATED_ROTATE_REFUSAL, "is an animated GIF (the playback lane has no rotation)")
+                    }
+                    RotVerdict::Unreadable | RotVerdict::CloudOnly => {
+                        (support::ANIMATED_ROTATE_UNREADABLE, "is a GIF that could not be checked")
+                    }
+                    RotVerdict::Turn => unreachable!("guarded by the `if` above"),
                 };
                 // v0.8.187 (X5): the refusal NAMES ITS SUBJECT when the target is not the photo on
                 // screen — the success path has said so since v0.8.155 (D1b), and a refusal about an
@@ -10959,9 +11000,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap_or_default()
                 });
                 let msg = support::refusal_with_subject(base, subject.as_deref());
-                log_event(&format!(
-                    "rotate: refused — #{idx} is an animated GIF (the playback lane has no rotation)"
-                ));
+                log_event(&format!("rotate: refused — #{idx} {why}"));
                 // v0.8.187 (X5): once per (shot, ~1 s). A held R repeated the identical row.
                 let now = Instant::now();
                 let fresh = support::refusal_is_fresh(
@@ -11034,13 +11073,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             let snap = shots_br.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let gen_now = gen_br.load(Ordering::Relaxed);
             let cw = dir >= 0;
-            let (mut animated, mut unreadable) = (0usize, 0usize);
+            let (mut animated, mut unreadable, mut cloud) = (0usize, 0usize, 0usize);
             let mut turns: Vec<(String, usize, u8)> = Vec::new();
             for &i in &targets {
                 // A stale index (a rescan retired the photograph between the populate and the click) is
                 // dropped rather than aborting the batch — the bulk copy door's own rule.
                 let Some(shot) = snap.get(i) else { continue };
-                match gif_rotate_verdict(shot, i, &anim_br, gen_now) {
+                match gif_rotate_verdict(shot, i, &anim_br, gen_now, RotDoor::Selection) {
                     RotVerdict::Turn => {
                         let name = shot.name.clone();
                         let (old, _new) = rot.rotate(&name, i, if cw { 1 } else { -1 });
@@ -11049,6 +11088,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     RotVerdict::Animated => animated += 1,
                     RotVerdict::Unreadable => unreadable += 1,
+                    RotVerdict::CloudOnly => cloud += 1,
                 }
             }
             let seq = next_act_seq(&aseq_br);
@@ -11057,10 +11097,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 meta_br.exif_built.set(None);
             }
             sel_gen_br.set(sel_gen_br.get().wrapping_add(1));
-            let sentence = support::bulk_rotate_sentence(turns.len(), cw, animated, unreadable);
+            let sentence = support::bulk_rotate_sentence(turns.len(), cw, animated, unreadable, cloud);
             log_event(&format!(
                 "bulk-rotate: {} ({} targets)",
-                support::bulk_rotate_sentence_english(turns.len(), cw, animated, unreadable), // logs stay English
+                support::bulk_rotate_sentence_english(turns.len(), cw, animated, unreadable, cloud), // logs stay English
                 targets.len()
             ));
             // NO ask-first toast: a rotation states its own direction and ONE Ctrl+Z reverts the batch.
@@ -26006,14 +26046,14 @@ mod tests {
         // ── (1) A NON-GIF NEVER ASKS. The function is the whole of both doors' verdict, so it must
         //        answer for every shot they can be handed.
         let jpg = falcon_decode::Shot { kind: SrcKind::Jpeg, ..gif_shot(&still) };
-        assert_eq!(gif_rotate_verdict(&jpg, 9, &store, 1), RotVerdict::Turn);
+        assert_eq!(gif_rotate_verdict(&jpg, 9, &store, 1, RotDoor::One), RotVerdict::Turn);
 
         // ── (2) THE THREE GIF ANSWERS, from an EMPTY store — i.e. through the bounded probe, which
         //        is the state every plural batch starts in for a shot the lane has never decoded.
-        assert_eq!(gif_rotate_verdict(&gif_shot(&still), 0, &store, 1), RotVerdict::Turn, "a STILL GIF turns");
-        assert_eq!(gif_rotate_verdict(&gif_shot(&anim), 1, &store, 1), RotVerdict::Animated, "an ANIMATED one does not");
+        assert_eq!(gif_rotate_verdict(&gif_shot(&still), 0, &store, 1, RotDoor::One), RotVerdict::Turn, "a STILL GIF turns");
+        assert_eq!(gif_rotate_verdict(&gif_shot(&anim), 1, &store, 1, RotDoor::One), RotVerdict::Animated, "an ANIMATED one does not");
         let gone = falcon_decode::Shot { jpg: Some(dir.join("missing.gif")), ..gif_shot(&anim) };
-        assert_eq!(gif_rotate_verdict(&gone, 2, &store, 1), RotVerdict::Unreadable, "a probe that FAILS refuses");
+        assert_eq!(gif_rotate_verdict(&gone, 2, &store, 1, RotDoor::One), RotVerdict::Unreadable, "a probe that FAILS refuses");
         // …and the verdicts were MEMOISED, so a 300-photo batch probes each GIF once.
         assert_eq!(store.borrow().verdict(1, 0), Some(false), "the still verdict is banked");
         assert_eq!(store.borrow().verdict(1, 1), Some(true), "…and the animated one");
@@ -26022,7 +26062,7 @@ mod tests {
         //        used it would turn an unproven animated GIF. Fresh store = "nobody has looked".
         let fresh = RefCell::new(crate::tick::AnimatedGifs::default());
         let greying_says = fresh.borrow().is(1, 1); // what `ctx-rotate-blocked` would answer
-        let door_says = gif_rotate_verdict(&gif_shot(&anim), 1, &fresh, 1);
+        let door_says = gif_rotate_verdict(&gif_shot(&anim), 1, &fresh, 1, RotDoor::One);
         assert!(!greying_says, "premise: the menus' predicate answers 'not blocked' for an unprobed GIF");
         assert_eq!(
             door_says,
@@ -26030,7 +26070,91 @@ mod tests {
             "the rotate doors must PROBE, not read the greying predicate — an unknown GIF that is \
              animated has to be refused, or the batch records a rotation it can never show"
         );
+
+        // ── (4) 5 October 2026 (Part 1, F2): A BATCH NEVER OPENS A CLOUD-ONLY GIF. The placeholder
+        //        check is injected (no test can mint a real placeholder). The selection door is
+        //        handed a path that does not exist: had it probed, the answer would be Unreadable,
+        //        so CloudOnly proves it never opened the file — and nothing was memoised for it.
+        let cloud_store = RefCell::new(crate::tick::AnimatedGifs::default());
+        let all_cloud = |_: &std::path::Path| true;
+        assert_eq!(
+            gif_rotate_verdict_with(&gone, 2, &cloud_store, 1, RotDoor::Selection, all_cloud),
+            RotVerdict::CloudOnly,
+            "a selection must skip an unchecked cloud-only GIF without opening it"
+        );
+        assert_eq!(cloud_store.borrow().verdict(1, 2), None, "…and bank no verdict it never measured");
+        // …while ONE photo may download its own file: the single door still probes a cloud GIF.
+        assert_eq!(
+            gif_rotate_verdict_with(&gif_shot(&anim), 1, &cloud_store, 1, RotDoor::One, all_cloud),
+            RotVerdict::Animated,
+            "the single-photo door probes even a cloud-only GIF (an explicit action on one photo)"
+        );
+        // …a GIF already downloaded is probed by the batch as before…
+        assert_eq!(
+            gif_rotate_verdict_with(&gif_shot(&still), 0, &cloud_store, 1, RotDoor::Selection, |_| false),
+            RotVerdict::Turn
+        );
+        // …and a GIF whose verdict is already banked needs no file at all, cloud or not.
+        assert_eq!(
+            gif_rotate_verdict_with(&gif_shot(&anim), 1, &cloud_store, 1, RotDoor::Selection, all_cloud),
+            RotVerdict::Animated,
+            "a known verdict is answered from the store, so the batch skips nothing it already knows"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 5 October 2026 (Part 1, review O2) — **EACH ROTATE DOOR PASSES ITS OWN `RotDoor`.**
+    ///
+    /// The cloud-GIF fix lives in the label each caller hands `gif_rotate_verdict`: the single-photo
+    /// door says `One` (it may download its one GIF to check it) and the selection door says
+    /// `Selection` (it must skip an unchecked cloud-only GIF). The verdict tests prove the function
+    /// answers each label correctly; only this row proves each DOOR passes the right one. Swap the two
+    /// labels and every other test stays green while a selection quietly downloads cloud GIFs again.
+    ///
+    /// A census over the PRODUCTION source (everything above `mod tests`), comment lines dropped: each
+    /// call site is attributed to the nearest `app.on_…` handler before it, and there are exactly two,
+    /// so a third door has to be added here on purpose.
+    ///
+    /// FALSIFIER (L28): pass `RotDoor::One` from `on_bulk_rotate` (or `Selection` from
+    /// `on_rotate_shot`) and the pairing assert reddens naming the door; add a third production call
+    /// and the count assert reddens.
+    #[test]
+    fn each_rotate_door_passes_its_own_rot_door() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("main.rs is readable from its own test module");
+        let prod = src
+            .split_once("
+mod tests {")
+            .expect("main.rs's own test module ends the production source")
+            .0;
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("
+");
+        let mut doors: Vec<(String, String)> = Vec::new();
+        for (at, _) in code.match_indices("gif_rotate_verdict(shot,") {
+            let handler_at = code[..at].rfind("app.on_").expect("every call sits inside an `app.on_…` handler");
+            let handler: String = code[handler_at + "app.on_".len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            let call_end = code[at..].find(')').expect("the call closes");
+            doors.push((handler, code[at..at + call_end].to_string()));
+        }
+        assert_eq!(doors.len(), 2, "exactly two rotate doors call the GIF check: {doors:?}");
+        for (handler, call) in &doors {
+            let want = match handler.as_str() {
+                "rotate_shot" => "RotDoor::One",
+                "bulk_rotate" => "RotDoor::Selection",
+                other => panic!("an unexpected rotate door `{other}` calls the GIF check: {call}"),
+            };
+            assert!(
+                call.ends_with(want),
+                "`on_{handler}` must pass `{want}` — a swapped label makes a selection download cloud                  GIFs (or skips one photo's own GIF); found `{call}`"
+            );
+        }
     }
 
     /// v1.0.0-rc (queue item 27, §2 R5 b — sheet 2.1 B2 b, OWNER RULING) — **ONE UNDO ENTRY FOR THE

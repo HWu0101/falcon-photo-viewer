@@ -4605,7 +4605,8 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                     // hand-split takes over from there and folds, which is what it is for now.
                     //
                     // NOT ANIMATED, deliberately [VD]. `Theme.anim` on this width would sweep the
-                    // row's width through every value between 276 and the need — and the row's wrap
+                    // row's width through every value between the resting row (291 since v0.8.137;
+                    // 276 when this was written) and the armed need — and the row's wrap
                     // predicate reads its LIVE width, so it would fold, mount a second line, grow
                     // the panel's height, then unfold and shrink it back, on every arm and disarm.
                     // A 120ms two-line blip plus a height jump is a worse artifact than an instant
@@ -4897,13 +4898,15 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 // crossfades both directions (the M8 exit-fade exception); the mount lingers through the
                 // fade-out via chip-reveal-eff, mirroring the chrome-fading mount-linger. ──
                 if root.cull-card-mounted : cullcard := GlassPanel {
-                    // 308px, FIXED — and it stays fixed while its EXIF twin adapts (v0.8.136 / V1),
-                    // because this card provably never arms: the predicate is false in immersive and
-                    // the mount binds none of the bulk inputs (both halves are rig-pinned). Its row
-                    // is therefore always the 275px single-photo one, which 308 - 2x16 = 276 holds
-                    // with the same one pixel of slack it always had. Adapting a width to a need
-                    // that cannot vary would be a binding that never fires, dressed as a rule.
-                    width: 308px;
+                    // The card's width follows its row exactly as the EXIF panel's does (v0.8.136 / V1).
+                    // It never arms (the predicate is false in immersive and the mount binds none of
+                    // the bulk inputs — both halves are rig-pinned), so its need is the single-photo
+                    // row's. That need is NOT a constant to bake in: v0.8.137 grew the star cell to
+                    // 123px and the row to 291px, and the fixed 308px card (276px of row) kept running
+                    // the stars 15px into its right padding — 16px of margin on the left, 1px on the
+                    // right — because nothing re-derived it. Binding to `line1-need` keeps the card
+                    // centred on whatever the row costs (323px today). Right-anchored: x reads width.
+                    width: max(308px, min(parent.width - 36px, cardrow.line1-need + 2 * Theme.space-4));
                     opacity: root.chip-reveal-eff;
                     x: parent.width - self.width - 18px;
                     y: parent.height - self.height - 18px;
@@ -4919,7 +4922,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                     changed anyhot => { root.chip-panel-hot = cullcard.anyhot; }
                     cullswallow := TouchArea { enabled: root.chip-revealed; } // swallow + hover; dies while fading (bool gate)
                     cullcardbox := VerticalLayout {
-                        padding: Theme.space-4;             // = the EXIF panel's infobox padding → 276px content row
+                        padding: Theme.space-4;             // = the EXIF panel's infobox padding; the card's width adds it to the row's need
                         cardrow := CullActionRow {
                             hit: root.chip-revealed; // live only while revealed; non-hittable while fading/hidden
                             rating: root.rating; flagged: root.flagged; rejected: root.rejected;
@@ -5286,14 +5289,16 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                     }
                     Rectangle { // track
                         x: parent.padl; y: 4px; height: 4px; width: parent.trackw;
-                        border-radius: 2px; background: Theme.block;
+                        border-radius: 2px;
+                        background: barta.has-hover || barta.pressed ? Theme.block : transparent;
+                        animate background { duration: Theme.anim; easing: ease; }
                     }
                     Rectangle { // thumb (proportional width, accent while engaged)
                         x: parent.padl + (parent.trackw - parent.thumbw) * max(0.0, min(1.0, root.film-frac));
                         y: 3px; height: 6px; width: parent.thumbw;
                         border-radius: 3px;
-                        background: barta.has-hover || barta.pressed ? Theme.accent : Theme.text-mute;
-                        opacity: barta.has-hover || barta.pressed ? 1.0 : 0.55;
+                        background: barta.pressed ? Theme.accent : (barta.has-hover ? Theme.text-mute : Theme.block);
+                        opacity: barta.has-hover && !barta.pressed ? 0.55 : 1.0;
                         animate background, opacity { duration: Theme.anim; easing: ease; }
                     }
                 }
@@ -7796,6 +7801,20 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                     x: setflick.x; width: setflick.width;
                     y: setflick.y + setflick.height - self.height;
                     more: setflick.viewport-height + setflick.viewport-y > setflick.height + 1px;
+                }
+                // Reuse Review's bar in the existing 20px padding: 6px gap + 8px band + 6px edge.
+                // Settings has a content-top wrapper, so snap the complete window-space origin.
+                if setflick.viewport-height > setflick.height : MiniVBar {
+                    property <float> sfx: max(root.win-sf, 0.5);
+                    property <length> panel-top: root.content-top + parent.y;
+                    property <length> snap-top: Math.round((self.panel-top + setflick.y) / 1px * self.sfx) / self.sfx * 1px;
+                    property <length> snap-bot: Math.round((self.panel-top + setflick.y + setflick.height) / 1px * self.sfx) / self.sfx * 1px;
+                    x: Math.round((parent.x + setflick.x + setflick.width + 6px) / 1px * self.sfx) / self.sfx * 1px - parent.x;
+                    width: 8px;
+                    y: self.snap-top - self.panel-top;
+                    height: self.snap-bot - self.snap-top;
+                    vp-h: setflick.height; content-h: setflick.viewport-height; vp-y: setflick.viewport-y;
+                    seek(y) => { setflick.viewport-y = y; }
                 }
             }
         }

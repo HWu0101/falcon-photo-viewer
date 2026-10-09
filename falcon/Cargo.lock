@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "falcon-native"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "cc",
  "clipboard-win",

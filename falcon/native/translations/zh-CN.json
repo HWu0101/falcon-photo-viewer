@@ -1276,6 +1276,9 @@
   "{n} animated GIF skipped": {
     "other": "已跳过 {n} 个 GIF 动图"
   },
+  "{n} cloud-only GIF skipped (open it first to download it from the cloud)": {
+    "other": "已跳过 {n} 个仅存于云端的 GIF（请先打开，以便从云端下载）"
+  },
   "{n} cloud-only file will be downloaded by this operation.": {
     "other": "此操作将下载 {n} 个仅存于云端的文件。"
   },

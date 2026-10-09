@@ -1401,6 +1401,10 @@
     "one": "⟦{n} animated GIF skipped⟧",
     "other": "⟦{n} animated GIFs skipped⟧"
   },
+  "{n} cloud-only GIF skipped (open it first to download it from the cloud)": {
+    "one": "⟦{n} cloud-only GIF skipped (open it first to download it from the cloud)⟧",
+    "other": "⟦{n} cloud-only GIFs skipped (open them first to download them from the cloud)⟧"
+  },
   "{n} cloud-only file will be downloaded by this operation.": {
     "one": "⟦{n} cloud-only file will be downloaded by this operation.⟧",
     "other": "⟦{n} cloud-only files will be downloaded by this operation.⟧"

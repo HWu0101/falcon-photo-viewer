@@ -134,7 +134,7 @@ How to read the tables:
 | Review panel | **s** (`toggle-sel-panel`), the toolbar's Review button, the Picks and Rejects count chips, the rotation reminder's **Open Review** | Shares the top-left area with Settings and the browse-speed panel: one at a time | Filters: **Reviewed** (rated, flagged or rejected), **Picks**, **Rejects**, **Rated** (with per-star chips) and **Rotated**, plus a hidden **Selected** filter whose chip appears only while something is selected. The generic open lands on Selected when a selection exists, otherwise on Reviewed. It loads and pins its own thumbnails. Its output area holds Copy and Export (for whatever it displays), Move rejected, Empty to Recycle Bin/Trash, the Rotations Apply and Discard buttons, and **XMP sync**. | `sel_open`, `filter-mode`, `out_col1_label` |
 | Hover preview | Rest the pointer on a Review thumbnail | **Hover to preview** (Settings → REVIEW, default On); **Appears**: after a short rest (333 ms, `HOVER_REST_MS`) or at once. Off in compare, in immersive and under any dialog or menu (`hover-preview-live`). No room below about 759 px of window width. **Esc** hides it. | Shows the photo larger beside the panel, using the browsing preview (a preview decode on a miss, never full resolution). The box keeps the photo's shape: a 3:2 photo is half the window wide, other shapes get the same area, capped at 60 % of the window width and 80 % of the height between toolbar and filmstrip. The hovered frame is protected from eviction. | `hover_box`, `hover_preview_step`, `fast_evict_protected` |
 | Undo / redo | **Ctrl+Z**; **Ctrl+Shift+Z** or **Ctrl+Y** (`undo`, `redo`); the events centre's Undo and Redo buttons | Per folder, up to 500 steps. Blocked by any dialog or menu (`popup-open`), because undo jumps `current` to the edited photo. While a photo menu is open, the keys act on that menu's photo. There is no redo of a delete or a move. | One history: the `UndoRedo` stack plus the last delete and the last move, ordered by `Act.seq`, so Ctrl+Z always undoes the most recent of them | `undo_arm`, `UndoRedo`, `UndoEntry` |
-| Rotate | **r** / **Shift+R** (`rotate-shot`), both photo menus. With a selection armed, `bulk-rotate(dir)` makes one undo step for the whole batch and skips animated GIFs, saying so. | Automatic EXIF orientation combines with the manual turn | `RotState` holds turns over unrotated cached pixels: rotation is applied when drawing, so it never throws away decoded pixels | `RotState`, `UndoEntry::BulkRot` |
+| Rotate | **r** / **Shift+R** (`rotate-shot`), both photo menus. With a selection armed, `bulk-rotate(dir)` makes one undo step for the whole batch and skips animated GIFs, GIFs it could not check and unchecked GIFs that are still cloud-only, saying so. | Automatic EXIF orientation combines with the manual turn | `RotState` holds turns over unrotated cached pixels: rotation is applied when drawing, so it never throws away decoded pixels | `RotState`, `UndoEntry::BulkRot` |
 | Apply rotations | Review panel → Rotations → **Apply** or **Discard** (`apply-rotations`, `discard-rotations`), each with a counted confirm. Closing the app with turns pending shows a reminder: **Open Review** or **Close anyway**. | Pending turns exist | Writes the original. A JPEG gets a 2-byte orientation patch at a re-parsed, verified position, checked before and after the write (compare-and-swap). RAW files, finished PNG, TIFF, WebP and HEIC, and JPEGs without a usable EXIF orientation get an XMP sidecar instead. See [Orientation and rotation](#orientation-and-rotation). | `apply_rotation`, `patch_jpeg_orientation`, `write_xmp_sidecar` |
 | XMP rating sync | Review panel → **XMP sync** (`toggle-xmp-sync`); turning it on can offer to write sidecars for existing ratings (`xmp-backfill-confirm`) | `xmp_sync_ratings`, default Off | `<photo>.xmp` `xmp:Rating` through the writer. A name-keyed record, reloaded for each folder, stops existing ratings from being rewritten in bulk. | `write_xmp_rating_sidecar` |
 | Retry a failed photo | Tap the failure card ("Tap to retry — the other photos are unaffected") or the "Full-res unavailable — tap to retry" pill (`retry-detail`) | A failure is latched for this photo | Clears this photo's failure marks in all four tiers: preview (`fast.failed`), full resolution (`detail.failed`), thumbnail, and zoomed region (`roi.failed`) | `on_retry_detail` |
@@ -156,6 +156,8 @@ How to read the tables:
 | Restore an earlier selection | The **Restore** offer (`restore-selection`) after you clear or replace three or more selected photos | `restore_offer_live(stash_dir, scanned_dir)`: the offer names a folder and works only while that folder is on screen | `SelectSet` | `restore_offer_live` |
 
 ### Settings
+
+The Settings body scrolls beneath its header. When it overflows, the same `MiniVBar` used by the grid and Review appears in the existing right padding; it does not narrow the controls. Wheel scrolling and the bar move the same viewport.
 
 | Section | Rows | Notes |
 | --- | --- | --- |
@@ -1745,6 +1747,27 @@ OneDrive Files-On-Demand and iCloud can leave a file on disk as a stub whose pix
 cloud (a *cloud placeholder*; downloading it is called *hydrating*). On these services opening the
 file is itself a download request, so Falcon's folder scan never reads a placeholder.
 
+**The rule (owner, 5 October 2026).** Batch work never downloads cloud-only files without asking
+first. The folder scan, sorting and preparing photos ahead never do. An action over many photos (a
+selection or the whole folder) may, only after the user is told how many cloud-only files it will
+download and agrees; without such a question it skips them and says so. An explicit action on one
+photo (viewing it, rotating it, writing to it) may download that one file.
+
+- **Enforced today:** the scan's type check (below); Date-taken sorting, which uses the file's
+  modified time for placeholders; RAW development at export, which refuses a cloud-only RAW; and
+  rotating a selection, which skips a GIF it has not yet checked for animation while the file is
+  still a placeholder (read from the file's attributes at click time, `RotDoor::Selection` in
+  `gif_rotate_verdict`) and says so. A single-photo rotate still checks that one GIF, which may
+  download it; the window waits while it does (the check runs on the interface thread).
+- **Ask first, then download:** Copy and Move count the cloud-only files and say they will be
+  downloaded (`copy-cloud-notice`, `move-cloud-notice`); if the person goes ahead, they are.
+- **Not yet enforced:** preparing photos ahead and the filmstrip and grid thumbnails open
+  cloud-only files like any other, which downloads them; Apply rotations writes each pending turn
+  into cloud-only finished files (and reads RAWs without a sidecar) with no cloud check; export of
+  cloud-only non-RAW files reads them. Queued as its own round: show Windows' own thumbnail greyed
+  under a cloud icon when Windows can supply it without downloading, otherwise just the cloud icon,
+  and make export ask before downloading cloud-only files.
+
 - **Detection reads metadata only.** The scan already reads each folder entry's metadata. On Windows
   `falcon_decode::is_cloud_placeholder` checks the `RECALL_ON_DATA_ACCESS` attribute. On macOS
   `falcon_decode::is_dataless` checks the `SF_DATALESS` flag in `st_flags`. Other platforms have no
@@ -1840,7 +1863,9 @@ upload and on-screen time separately.
 The interface tick runs every 16 ms while something is happening and every 125 ms when idle
 (`TICK_FULL_MS`, `TICK_IDLE_MS`); see [The tick, threads and workers](#the-tick-threads-and-workers).
 Don't add permanent fast repaint loops, or loops that keep repositioning native windows, to hide
-state bugs. Background folder scanning must never download cloud-only placeholder files.
+state bugs. Batch work (the folder scan, sorting, preparing photos ahead, actions over a selection or
+the whole folder) must never download cloud-only files without asking first; see
+[Cloud-only files](#cloud-only-files-placeholders).
 
 **Words used here.**
 
@@ -5562,10 +5587,14 @@ A sixth, hidden category, Selected, shows its chip only while a selection exists
 
 The panel may queue requests only while fewer than `SEL_FEED_PENDING_MAX` (40) of the 48 thumbnail slots (`THUMB_PENDING_MAX`) are busy. The grid dock's share is 44, and the filmstrip runs first each tick, so the strip always keeps headroom. With the panel closed, or in immersive mode, nothing is pinned or requested. Pins belong to the current folder and are released on a folder swap.
 
-**Mini scroll bar.** `MiniVBar` (`widgets.slint`) is the same component the grid dock uses:
+**Mini scroll bar.** `MiniVBar` (`widgets.slint`) is shared by Review, the grid dock and Settings:
 - an 8 px band with a 4 px track;
 - a 6 px thumb at least 28 px tall;
-- muted at 55 % when idle, accent-coloured while hovered or dragged.
+- idle: only the thumb, using the dark track color (`Theme.block`);
+- hover anywhere in its input band: reveal the track and the gray thumb at 55 %;
+- pressed or dragged: full-opacity accent thumb, retained while held outside until release.
+
+The horizontal filmstrip bar follows the same paint states. The input bands remain active when their tracks are transparent, and paint transitions use the existing 120 ms timing.
 
 It sits in the panel's 20 px right padding, snapped to whole device pixels in window coordinates. The panel itself starts at x = 3, so snapping in panel coordinates would land off the pixel grid at 125 % and 150 % scaling. The bar mounts only while the grid's content is taller than the panel. A press or drag writes the grid's `viewport-y` directly, so the same observer that handles a wheel scroll updates the copied position, clears the hovered tile and records the input time. The fade at the bottom of the panel keeps its own "more below" test.
 
@@ -6994,7 +7023,9 @@ contributor guide is [docs/development/translations.md](docs/development/transla
   without the Simplified forms (found in the 1.0.13 release check). At start-up
   `i18n::apply_han_fallback` sets the Han-script fallback key (`Hani`, no locale) in Slint's shared
   collection to the installed system fonts from `han_fallback_families` (the first installed of
-  Microsoft YaHei UI, … on Windows; PingFang SC, … on macOS). `han_font_code` decides whose fonts:
+  Microsoft YaHei UI, … on Windows; PingFang SC, … on macOS). fontique skips fonts with Apple's
+  newer `hvgl` outlines, which it cannot draw, so on recent macOS PingFang is absent and Hiragino
+  Sans GB is used (the 1.0.13 Mac launch check logged it). `han_font_code` decides whose fonts:
   Simplified Chinese when it runs, and also in other languages (the picker always shows "简体中文"),
   unless the system's languages put Japanese, Korean or Traditional Chinese first, which keeps the
   system's own Han font. Latin text keeps Inter.
@@ -7177,7 +7208,10 @@ The weakest areas are status (1) and recovery (6). The mechanisms exist; the rec
 - A result is shown only if its folder-open counter, photo, source, orientation, output colour and quality still match.
 - What the user asked for comes before preparing ahead; never let speculative work delay the current photo.
 - File type comes from the file's bytes, never its name.
-- Background work never downloads cloud placeholder files.
+- Batch work never downloads cloud-only files without asking first: the folder scan, sorting and
+  preparing photos ahead never do; an action over many photos (a selection or the whole folder)
+  may only after the user is told how many and agrees. An explicit action on one photo (viewing it,
+  rotating it, writing to it) may download that one file.
 - Each rotation or flip is applied exactly once.
 - Saved review data is user data: write atomically, retry once, report failures.
 - No permanent repaint or window-repositioning loops to hide state bugs.

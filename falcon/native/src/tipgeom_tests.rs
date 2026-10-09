@@ -16342,6 +16342,73 @@ fn the_immersive_cull_card_never_arms() {
     app.set_count_selected(0);
 }
 
+/// 5 October 2026 (Part 1, F1) — **THE IMMERSIVE CULL CARD IS AS WIDE AS ITS ROW, SO ITS STARS
+/// ARE CENTRED.**
+///
+/// The card was a fixed 308px (276px of row after its 2x16px padding) on the reasoning that its
+/// single-photo row "always" needed 275. v0.8.137 grew the star cell to 123px and the row to 291px,
+/// and nothing re-derived the card: its stars ran 15px into the right padding — 16px of margin on
+/// the left, 1px on the right — and no row measured the card, so it shipped that way. The card now
+/// binds its width to the row's `line1-need` exactly as the EXIF panel does.
+///
+/// Asserted on the mounted card at a normal window: (1) it is the row's need (re-measured from the
+/// shipped button and star-cell widths) plus 2x16px; (2) the row sits inside it with EQUAL margins,
+/// the property the bug broke; (3) it stays right-anchored 18px from the stage edge.
+///
+/// FALSIFIER (L28): restore `width: 308px` on `cullcard` and blocks 1 and 2 redden (308 vs 323; a
+/// 1px right margin against a 16px left one).
+#[test]
+fn the_immersive_cull_card_is_as_wide_as_its_row() {
+    let app = boot();
+    app.window().set_size(slint::LogicalSize::new(1400.0, 900.0));
+    // Motion off: under the testing backend no animation is driven, so the card's reveal (an
+    // animated property when motion is on) would never mount it. See the backdrop-sampler test.
+    app.set_motion_ui(false);
+    app.set_count_selected(0);
+    app.set_compare(false);
+    app.set_info_open(false);
+    app.set_info_revealed(false);
+    app.set_immersive(true);
+    app.set_chip_revealed(true);
+    let one = |id: &str| {
+        i_slint_backend_testing::ElementHandle::find_by_element_id(&app, id)
+            .find(|e| e.size().width > 1.0)
+            .unwrap_or_else(|| panic!("{id} is mounted"))
+    };
+    let card = one("MainWindow::cullcard");
+    let flag = one("CullActionRow::flagbtn");
+    let rej = one("CullActionRow::rejbtn");
+    let stars = one("CullStarCell::pill");
+    let (cp, cs) = (card.absolute_position(), card.size());
+
+    // (1) The need, re-measured from what shipped, plus the card's own padding.
+    let need = flag.size().width + rej.size().width + stars.size().width + 3.0 * 4.0;
+    assert!(
+        (cs.width - (need + 32.0)).abs() < 0.51,
+        "the card must be its row's need ({need}) plus 2x16px of padding — got {}",
+        cs.width
+    );
+
+    // (2) Equal margins: the row starts 16px in from the card's left edge and the star cell ends
+    // 16px in from its right edge.
+    let left = flag.absolute_position().x - cp.x;
+    let right = cp.x + cs.width - (stars.absolute_position().x + stars.size().width);
+    assert!(
+        (left - 16.0).abs() < 0.51 && (right - 16.0).abs() < 0.51,
+        "the card's row must sit centred inside it — left margin {left}, right margin {right}"
+    );
+
+    // (3) Right-anchored: the card grows leftward from the stage's bottom-right corner.
+    let stage_w = app.window().size().to_logical(app.window().scale_factor()).width;
+    assert!(
+        (cp.x + cs.width - (stage_w - 18.0)).abs() < 0.51,
+        "the card's right edge must stay 18px from the stage edge — right edge {}, stage {stage_w}",
+        cp.x + cs.width
+    );
+    app.set_immersive(false);
+    app.set_chip_revealed(false);
+}
+
 /// v0.8.134 (ORANGE-2) - **ONE MENU, ONE SCOPE - AND THE STAR ROW IS PART OF THE MENU.**
 ///
 /// v0.8.131 (J2) closed "two scopes in one menu" on the three counted bulk rows: right-clicking an
@@ -30794,9 +30861,9 @@ fn the_dock_grids_migrated_bar_seeks_exactly_as_its_inline_copy_did() {
     app.set_grid_open(false);
 }
 
-/// v1.0.0-rc (item 37, R6) — **THE CENSUS: ONE COMPONENT, TWO MOUNTS, NO SURVIVING COPY.**
+/// v1.0.0-rc (item 37, R6) — **THE CENSUS: ONE COMPONENT, THREE MOUNTS, NO SURVIVING COPY.**
 ///
-/// The migration's point was that the two bars cannot drift, and the only evidence for "cannot" is
+/// The migration's point was that the bars cannot drift, and the only evidence for "cannot" is
 /// that there is nothing left to drift FROM. `trackh` / `thumbh` are the vertical bar's own terms —
 /// the filmstrip's surviving seek bar is HORIZONTAL and spells its terms `trackw` / `thumbw` — so a
 /// single occurrence of either in `main_window.slint` is a second copy of this arithmetic.
@@ -30804,7 +30871,7 @@ fn the_dock_grids_migrated_bar_seeks_exactly_as_its_inline_copy_did() {
 /// FALSIFIER (L28), IN the harness and RUN: paste the retired inline block back beside the dock's
 /// mount and the `thumbh` leg reddens with `left: 5 right: 0` — the count this round removed. The
 /// `trackh` leg is NOT reached under that mutation and no claim is made for it, because a row stops
-/// at its first failing assert; mount a third `MiniVBar` anywhere and the mount-count leg reddens.
+/// at its first failing assert; mount a fourth `MiniVBar` anywhere and the mount-count leg reddens.
 #[test]
 fn the_mini_scroll_bars_arithmetic_lives_in_exactly_one_place() {
     let mw = mvb_main_window_source();
@@ -30819,7 +30886,7 @@ fn the_mini_scroll_bars_arithmetic_lives_in_exactly_one_place() {
         0,
         "…and none in the window markup"
     );
-    assert_eq!(mw.matches("MiniVBar {").count(), 2, "exactly two mounts: the dock grid and the Review panel");
+    assert_eq!(mw.matches("MiniVBar {").count(), 3, "exactly three mounts: grid, Review and Settings");
     assert_eq!(
         mw.matches("if root.grid-virtual-h > root.grid-vp-h : MiniVBar {").count(),
         1,
@@ -30829,6 +30896,11 @@ fn the_mini_scroll_bars_arithmetic_lives_in_exactly_one_place() {
         mw.matches("if selflick.viewport-height > selflick.height : MiniVBar {").count(),
         1,
         "the Review panel's mount is `if`-gated on its own Flickable"
+    );
+    assert_eq!(
+        mw.matches("if setflick.viewport-height > setflick.height : MiniVBar {").count(),
+        1,
+        "Settings mounts its shared bar only when its own body overflows"
     );
     assert_eq!(mw.matches("thumbh").count(), 0, "no inline vertical-thumb arithmetic survives in the window markup");
     assert_eq!(mw.matches("trackh").count(), 0, "no inline vertical-track arithmetic survives in the window markup");
@@ -32358,4 +32430,87 @@ fn a_compare_browse_survives_two_steps_after_a_grid_scroll() {
     land(&mut queue);
     assert_eq!(notch(), (2, 502), "its thumbnail lands and the browse goes on");
     app.set_compare(false);
+}
+
+// Settings reuses the existing bar without taking width from controls. Removing its mount
+// fails the first geometry lookup; disconnecting seek fails the footer/top assertions.
+#[test]
+fn settings_scroll_bar_fits_padding_and_seeks_the_body() {
+    use i_slint_backend_testing::ElementHandle as E;
+    use i_slint_core::items::PointerEventButton::Left;
+    let app = boot();
+    app.set_motion_ui(false);
+    app.set_welcome_open(false);
+    app.set_grid_open(false);
+    app.set_sel_open(false);
+    app.set_settings_open(true);
+    let element = |id: &str| E::find_by_element_id(&app, id).next().unwrap_or_else(|| panic!("{id}"));
+    for (width, height, sf) in [(960., 1080., 1.), (768., 864., 1.25), (640., 720., 1.5)] {
+        app.window().set_size(slint::LogicalSize::new(width, height));
+        app.set_win_sf(sf);
+        for inset in [0., 38.25] {
+            app.set_mac_experiment_host(inset > 0.);
+            app.set_native_toolbar_inset(inset);
+            hover(&app, width - 20., 400.);
+            let panel = element("MainWindow::setbox");
+            let flick = element("MainWindow::setflick");
+            let band = element("MiniVBar::barta"); // zero-offset child: actual hit band
+            let (pp, ps) = (panel.absolute_position(), panel.size());
+            let (fp, fs) = (flick.absolute_position(), flick.size());
+            let (bp, bs) = (band.absolute_position(), band.size());
+            assert!((ps.width - 360.).abs() < 0.01 && (fs.width - 320.).abs() < 0.01,
+                "Settings and controls retain their existing widths");
+            assert!((bs.width - 8.).abs() < 0.01);
+            assert!(bp.x - (fp.x + fs.width) >= 5., "bar must not overlap controls");
+            assert!(pp.x + ps.width - (bp.x + bs.width) >= 5., "bar fits existing right padding");
+            assert!((bp.y - fp.y).abs() <= 1. / sf && (bs.height - fs.height).abs() <= 1. / sf);
+            for edge in [bp.x, bp.y, bp.y + bs.height] {
+                assert!((edge * sf - (edge * sf).round()).abs() < 0.002,
+                    "bar edge {edge} must be on device pixels at {sf}, inset {inset}");
+            }
+        }
+    }
+    app.window().set_size(slint::LogicalSize::new(960., 720.));
+    app.set_win_sf(1.);
+    app.set_mac_experiment_host(false);
+    app.set_native_toolbar_inset(0.);
+    hover(&app, 800., 400.);
+    let flick = element("MainWindow::setflick");
+    let body = element("MainWindow::body");
+    let band = element("MiniVBar::barta");
+    let thumb = element("MiniVBar::thumb");
+    let (fp, fs) = (flick.absolute_position(), flick.size());
+    let (bp, bs) = (band.absolute_position(), band.size());
+    let start = body.absolute_position().y;
+    let initial_thumb = thumb.absolute_position().y;
+    assert!(body.size().height > fs.height + 100., "fixture genuinely scrolls");
+    let settle = || {
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(200));
+        hover(&app, 800., 400.);
+    };
+    wheel(&app, fp.x + fs.width / 2., fp.y + 80., -120.);
+    settle();
+    assert!(body.absolute_position().y < start - 1., "wheel still scrolls Settings");
+    assert!(thumb.absolute_position().y > initial_thumb, "thumb follows wheel scrolling");
+    let x = bp.x + bs.width / 2.;
+    drag(&app, &[(x, bp.y + bs.height / 2.), (x, bp.y + bs.height - 1.)]);
+    settle();
+    assert!((body.absolute_position().y + body.size().height - fp.y - fs.height).abs() < 1.,
+        "dragging down reaches the real end of the scroll body");
+    // The footer's actual button centre must remain in the viewport and reachable.
+    let footer = element("MainWindow::about-version-hit");
+    let footer_centre = footer.absolute_position().y + footer.size().height / 2.;
+    assert!(footer_centre >= fp.y && footer_centre <= fp.y + fs.height,
+        "dragging down reaches footer: footer={:?}/{:?}, viewport={fp:?}/{fs:?}, body={:?}/{:?}, band={bp:?}/{bs:?}, thumb={:?}/{:?}",
+        footer.absolute_position(), footer.size(), body.absolute_position(), body.size(),
+        thumb.absolute_position(), thumb.size());
+    assert!(app.get_settings_open() && !app.get_welcome_open(), "bar clicks stay in Settings");
+    click(&app, x, bp.y + 1., Left);
+    settle();
+    assert!((body.absolute_position().y - start).abs() < 1., "top click returns to the first section");
+    app.window().set_size(slint::LogicalSize::new(1200., 9000.));
+    settle();
+    assert!(body.size().height < flick.size().height, "tall fixture fits the complete body");
+    assert_eq!(E::find_by_element_type_name(&app, "MiniVBar").count(), 0,
+        "no bar when Settings needs no scrolling");
 }
