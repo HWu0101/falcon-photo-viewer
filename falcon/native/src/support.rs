@@ -6130,8 +6130,8 @@ pub(crate) struct Settings {
     pub(crate) panel_folders: Vec<(String, String)>,
     // v0.8.50 (G2): the folder-grid dock + filmstrip visibility. `grid_open` — the dock's state
     // (default FALSE: first-ever launch = grid closed, owner rule). `grid_dock_w` — the splitter
-    // width (default 392 = exactly 3 filmstrip columns; re-snapped to whole columns against the
-    // live window each tick — tick::grid_snap_width — so a stale/hand-edited value self-heals).
+    // preferred width (default 392 = exactly 3 filmstrip columns). The existing JSON key is
+    // retained; only deliberate splitter changes replace it, never temporary window fitting.
     // `film_visible` — the filmstrip's shown state (default true; edge-pill-only access). All
     // absent on pre-v0.8.50 files → the container `#[serde(default)]` fills them from Default.
     pub(crate) grid_open: bool,
@@ -6303,6 +6303,13 @@ pub(crate) fn default_panels_on() -> i32 {
     PanelsSegCell::On.index()
 }
 
+/// Restore the saved grid width with the existing corrupt-value guard.
+pub(crate) fn restore_grid_width(app: &MainWindow, saved_width: f32) {
+    let preferred = if (264.0..=4096.0).contains(&saved_width) { saved_width } else { 392.0 };
+    app.set_grid_preferred_w(preferred);
+    app.set_grid_dock_w(preferred); // the first visible grid tick fits the final launch geometry
+}
+
 /// v0.8.65 (C3/H5): the persisted window rect — outer position + inner size in PHYSICAL px (the same
 /// space the immersive save/restore uses) plus the maximized flag. `max: true` restores maximized with
 /// this rect underneath as the un-maximize target (Windows restore semantics). Never records a
@@ -6427,6 +6434,44 @@ pub(crate) fn resolve_accel_migration(
         (true, true) // one-shot: force ON now, stamp migrated so the NEXT boot honors the user's choice
     } else {
         (persisted_use_nvjpeg, accel_migrated)
+    }
+}
+
+/// 1.0.15 (RC1 audit #1): the accelerator's boot state as `(choice, runtime, accel_migrated)`.
+/// `choice` is what the user chose (after the one-shot Mac migration) and is what every save
+/// writes; `runtime` is whether accelerated decoding runs THIS launch — the choice AND
+/// availability. They used to be one value: a launch without nvJPEG (first launch before the CUDA
+/// runtime, Remote Desktop, a driver update) started with the runtime flag Off, saved it as the
+/// choice, and the next launch with the runtime present restored that Off. A deliberate Off stays
+/// Off. Pure, so it unit-tests on either host.
+pub(crate) fn accel_boot_state(
+    persisted_use_nvjpeg: bool,
+    accel_migrated: bool,
+    is_macos: bool,
+    available: bool,
+) -> (bool, bool, bool) {
+    let (choice, migrated) = resolve_accel_migration(persisted_use_nvjpeg, accel_migrated, is_macos);
+    (choice, choice && available, migrated)
+}
+
+#[cfg(test)]
+mod accel_choice_tests {
+    use super::accel_boot_state;
+
+    /// FALSIFIER (L28): return `choice && available` as the FIRST field (the pre-1.0.15 single
+    /// value) and the unavailable-launch row reddens: the saved choice would become Off.
+    #[test]
+    fn an_unavailable_launch_keeps_the_saved_choice() {
+        // Windows, saved On, runtime missing this launch: runs on the CPU, but the choice stays On.
+        assert_eq!(accel_boot_state(true, false, false, false), (true, false, false));
+        // …so the next launch with the runtime present runs accelerated again.
+        assert_eq!(accel_boot_state(true, false, false, true), (true, true, false));
+        // A deliberate Off stays Off, available or not.
+        assert_eq!(accel_boot_state(false, false, false, true), (false, false, false));
+        assert_eq!(accel_boot_state(false, false, false, false), (false, false, false));
+        // The one-shot Mac migration is unchanged (forces On once, then honours the choice).
+        assert_eq!(accel_boot_state(false, false, true, true), (true, true, true));
+        assert_eq!(accel_boot_state(false, true, true, true), (false, false, true));
     }
 }
 
@@ -9654,6 +9699,10 @@ pub(crate) fn set_bench_prov(p: BenchProv) {
 pub(crate) fn bench_prov_snapshot() -> BenchProv {
     BENCH_PROV.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
 }
+/// 1.0.15: back to "no run recorded" (`clear_bench_result`, after a failed run).
+pub(crate) fn clear_bench_prov() {
+    *BENCH_PROV.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
 
 /// v0.9.16 (Round B assoc, Mac): the SINGLE live source of the nine captured per-family incumbent
 /// default handlers (the GPU-memo pattern — a process-global rather than a threaded parameter, so no
@@ -11539,7 +11588,8 @@ pub(crate) fn bench_provenance_note(synthetic: bool, mp: i32) -> slint::SharedSt
 // Two answers here, both macOS-scoped so the Windows trunk's strings and behaviour are untouched
 // (owner decision B3 covers Windows): SAY what was measured (`bench_format_label` +
 // `bench_provenance_tail`), and REFUSE to promise from a run that cannot speak for this folder
-// (`bench_result_governs` + `bench_rec_card`).
+// (`bench_result_governs`). Generated tests can still suggest starting settings when the
+// user explicitly presses Apply; they do not become measurements of an actual folder.
 
 /// The dominant SOURCE FORMAT of a bench run, for the provenance line. `None` = a RAW-only shot
 /// (its finished image is the RAW's embedded preview, which has no standalone extension —
@@ -11668,69 +11718,8 @@ pub(crate) fn bench_result_governs_for(is_mac: bool, synthetic: bool) -> bool {
     !(is_mac && synthetic)
 }
 
-/// The welcome panel's RECOMMENDED card, as (text, placeholder hint) — ONE producer, because the
-/// two must never disagree about whether there is a recommendation. A refused (synthetic-on-macOS)
-/// result yields an EMPTY text, which is the card's existing honest empty state — "—", the Apply
-/// button disabled by its own `bench-rec-text != ""` gate (L21: the enablement reads the same fact
-/// the handler does) — and a hint that says why, instead of "shown after the run" about a run that
-/// has already happened.
-pub(crate) fn bench_rec_card(
-    sub_fps: i32,
-    super_fps: i32,
-    w: u32,
-    screen: u32,
-    synthetic: bool,
-    no_folder: bool,
-) -> (slint::SharedString, slint::SharedString) {
-    let governs = bench_result_governs(synthetic);
-    let text =
-        if governs { bench_rec_text(sub_fps, super_fps, w, screen) } else { "".into() };
-    (text, bench_rec_hint(governs, no_folder).into())
-}
-
-/// v0.9.62 (B3 / audit Q-A minimum): the hint ALONE — the half that depends on LIVE state rather
-/// than on the saved result, so the folder-state refresh can recompose it without re-deriving a
-/// recommendation. One producer for both callers.
-///
-/// The refusal used to say "not yet measured for this folder" in the state the welcome panel exists
-/// for: a FIRST RUN, with no folder open. The user is then told to do the one thing the app has
-/// just refused to let him do — the forced-synthetic welcome run cannot measure a folder, because
-/// there isn't one (L15). Naming the actual next step turns a dead end into an instruction.
-pub(crate) fn bench_rec_hint(governs: bool, no_folder: bool) -> &'static str {
-    // Language packs (round 2): the three constants are marked with `tr_noop!`; shown translated.
-    let hint = if governs {
-        BENCH_REC_HINT_PRE
-    } else if no_folder {
-        BENCH_REC_HINT_OPEN_A_FOLDER
-    } else {
-        BENCH_REC_HINT_NOT_THIS_FOLDER
-    };
-    i18n::tr(hint)
-}
-
-/// Push the hint back onto the UI from the CURRENT state. Called wherever "is a folder open"
-/// changes, because that is an input to the hint and nothing else recomposes it.
-///
-/// WINDOWS-INERT BY CONSTRUCTION, and pinned as such: `bench_result_governs` is `true` there for
-/// every result (owner decision B3), so `governs` always holds and this only ever writes
-/// [`BENCH_REC_HINT_PRE`] — the literal the property already carries in every Windows state.
-pub(crate) fn refresh_bench_rec_hint(app: &MainWindow) {
-    let hint = bench_rec_hint(
-        bench_result_governs(app.get_bench_synthetic()),
-        app.get_empty_state(),
-    );
-    if app.get_bench_rec_hint() != hint {
-        app.set_bench_rec_hint(hint.into());
-    }
-}
-
-/// The card's pre-run hint — the literal the .slint file carried before v0.9.60, so the Windows
-/// rendering is byte-identical in every state.
+/// Shown only before a recommendation exists.
 pub(crate) const BENCH_REC_HINT_PRE: &str = tr_noop!("shown after the run");
-/// …and the macOS-only refusal hint.
-pub(crate) const BENCH_REC_HINT_NOT_THIS_FOLDER: &str = tr_noop!("not yet measured for this folder");
-/// v0.9.62 (B3): …in the state where "this folder" is not a thing that exists yet.
-pub(crate) const BENCH_REC_HINT_OPEN_A_FOLDER: &str = tr_noop!("open a folder and run it again");
 
 /// v0.9.60 (W2-5b): hold a file's data OUT of the unified buffer cache for as long as this guard
 /// lives. `F_GLOBAL_NOCACHE` (fcntl 55) sets the flag on the VNODE, not on our descriptor, so the
@@ -11875,23 +11864,13 @@ pub(crate) fn restore_bench_ui(app: &MainWindow, settings: &Settings, screen: u3
     // v0.8.67 (D): the welcome card's recommendation — rebuilt from the restored bench
     // exactly like the tier labels above (same w, current screen), so an already-benched
     // machine shows a live card the moment the panel opens.
-    // v0.9.66 (the round-7 sync): …through the ONE publisher, which now carries BOTH the trunk's
-    // derived-`Applied` pair (v0.8.160 B4/U11) and this branch's macOS refusal + hint (v0.9.60/62
-    // W2-5d / B3). A restored SYNTHETIC result on macOS shows the card's honest empty state with
-    // "not yet measured for this folder" — the promise is refused across restarts, not just in the
-    // session that made it.
-    //
-    // v0.9.62 (B3): the folder term is the LIVE state, not the saved one. At boot this is the
-    // pre-scan value; `refresh_bench_rec_hint` re-writes the hint the moment a folder actually
-    // lands (main.rs's `set_empty_state` chokepoint), so the card can never sit on a stale answer.
+    // Generated results offer starting settings too; their source label is derived in the UI.
     publish_bench_rec(
         app,
         settings.bench_sub_fps,
         settings.bench_super_fps,
         w,
         screen,
-        settings.bench_synthetic,
-        app.get_empty_state(),
     );
 }
 
@@ -12070,6 +12049,53 @@ pub(crate) fn browse_sustained(mixed: u32, decode: u32, upload: u32) -> u32 {
     if mixed > 0 { mixed.min(iso) } else { iso }
 }
 
+/// 1.0.15 (audit 2026-10-17, finding 2): one of the benchmark's parallel decode runs — `frames`
+/// attempts work-stolen across `workers` threads, `attempt(j)` answering whether attempt `j`
+/// DECODED. Returns `(successes, seconds)`. The preview tiers and the CPU full-size fallback used to
+/// divide the number of ATTEMPTS by the wall time, so a folder whose sampled photos all failed to
+/// decode still reported a positive rate (and a recommendation built on it). A failed decode is not
+/// a measured frame.
+pub(crate) fn bench_pool_run(workers: usize, frames: usize, attempt: impl Fn(usize) -> bool + Sync) -> (usize, f32) {
+    let counter = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let start = Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..workers.max(1) {
+            s.spawn(|| loop {
+                let j = counter.fetch_add(1, Ordering::Relaxed);
+                if j >= frames {
+                    break;
+                }
+                if attempt(j) {
+                    done.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    (done.load(Ordering::Relaxed), start.elapsed().as_secs_f32().max(0.001))
+}
+
+/// The rate of a benchmark run from its SUCCESSFUL decodes: 0 when nothing decoded (not measured),
+/// otherwise the long-standing 1..240 clamp. The one conversion every decode tier uses.
+pub(crate) fn bench_rate(successes: usize, secs: f32) -> u32 {
+    if successes == 0 {
+        return 0;
+    }
+    ((successes as f32 / secs.max(0.001)).round() as u32).clamp(1, 240)
+}
+
+/// May a run's decode rates become a benchmark result? Only when every decode tier it measured
+/// (Faster preview, Sharper preview, Full) decoded at least once. A tier with no successful decode
+/// has no figure; letting the run through would show one anyway (the always-sharp caption floors
+/// the full rate at 1) or recommend from nothing (`bench_recommendation` falls to its lowest stop
+/// for a 0 rate). Full-size decoding reads the same source the zoom does — a RAW-only shot's
+/// embedded preview included — so a folder whose previews decode but whose full size never does is
+/// one Falcon cannot zoom either. A 0 UPLOAD probe is a different condition (unavailable, not
+/// failed) and stays non-binding in `iso_sustained`/`browse_sustained`.
+pub(crate) fn bench_decodes_usable(sub_decode: u32, super_decode: u32, full_decode: u32) -> bool {
+    sub_decode > 0 && super_decode > 0 && full_decode > 0
+}
+
 // ── v0.8.67 (D): the welcome panel's RECOMMENDED card — bench → one-tap settings ────────────
 /// The scrub-speed stops the speed popup's CustomSeg exposes (5 / 12 / 20 / 30 / Max=120). The
 /// recommendation picks from EXACTLY these so "Apply" lands on a named stop, never a custom value.
@@ -12123,30 +12149,92 @@ pub(crate) fn bench_rec_text(sub_fps: i32, super_fps: i32, w: u32, screen: u32) 
 /// `clamp(1, 120)`), because the binding is an equality: a recommendation published unclamped would
 /// read "not applied" the instant it was applied.
 ///
-/// v0.9.66 (the round-7 sync) — AND THE REFUSAL RIDES THE SAME CALL. This branch's `bench_rec_card`
-/// (v0.9.60 W2-5d / v0.9.62 B3) is where a macOS SYNTHETIC run stops being allowed to recommend
-/// anything: it yields an EMPTY text plus the hint that says why. Folding it in here rather than
-/// beside it keeps the trunk's one-producer property intact — the text, the hint AND the two
-/// settings the label compares against are published by one call, so the card cannot show a
-/// sentence its `Applied` label disagrees with. The `bench-rec-fps`/`-super` pair is published
-/// unconditionally, refused text or not: those two feed an EQUALITY the Slint side evaluates, the
-/// Apply button is already disarmed by `bench-rec-text != ""` (L21), and leaving them stale would
-/// make the comparison answer about a previous machine's recommendation.
+/// Generated-image measurements may suggest starting settings on either platform. This does
+/// not change `bench_result_governs`, which still controls Mac runtime pacing and its captions.
 pub(crate) fn publish_bench_rec(
     app: &MainWindow,
     sub_fps: i32,
     super_fps: i32,
     w: u32,
     screen: u32,
-    synthetic: bool,
-    no_folder: bool,
 ) {
-    let (rec_text, rec_hint) = bench_rec_card(sub_fps, super_fps, w, screen, synthetic, no_folder);
-    app.set_bench_rec_text(rec_text);
-    app.set_bench_rec_hint(rec_hint);
+    app.set_bench_rec_text(bench_rec_text(sub_fps, super_fps, w, screen));
+    app.set_bench_rec_hint(i18n::tr(BENCH_REC_HINT_PRE).into());
     let (fps, sup, _res) = bench_recommendation(sub_fps, super_fps, w, screen);
     app.set_bench_rec_fps(bench_rec_scrub_fps(fps));
     app.set_bench_rec_super(sup);
+}
+
+/// 1.0.15 (audit 2026-10-17, finding 3): a run that produced NO usable result clears the previous
+/// one — the drain's `None` arm (an emptied folder, a failed image generation, a caught worker
+/// panic, a sample with no successful decode). It used to clear only the running flags, so the
+/// earlier run's rates, provenance and recommendation stayed live and were saved again, with
+/// `benchmarked` still set: a recommendation from a result the failed rerun no longer stood behind.
+///
+/// Every property a successful drain (`tick::drain_bench`) or a restore (`restore_bench_ui`) writes
+/// returns to its fresh-window default, and both live memos are emptied, so the window is exactly a
+/// never-benchmarked one: the next save writes `bench_ver = 0` with zeroed fields, which
+/// `restore_bench_ui` discards. The user's own choices are NOT result data and stay as they are —
+/// the browsing speed and preview quality (even when set by Apply), "Benchmark with" and the target
+/// size. The readout text is the caller's.
+pub(crate) fn clear_bench_result(app: &MainWindow) {
+    app.set_benchmarked(false);
+    app.set_bench_w(0);
+    app.set_bench_sub_fps(0);
+    app.set_bench_super_fps(0);
+    app.set_bench_fullres_fps(0);
+    app.set_bench_full_gpu(true); // the property's declared default
+    app.set_bench_synthetic(false);
+    app.set_bench_synth_mp(0);
+    app.set_bench_synth_note("".into());
+    app.set_bench_clamp_res(0);
+    app.set_bench_clamp_note("".into());
+    app.set_zoom_sharp_note("".into());
+    app.set_bench_rec_text("".into());
+    app.set_bench_rec_hint(i18n::tr(BENCH_REC_HINT_PRE).into());
+    app.set_bench_rec_fps(0.0);
+    app.set_bench_rec_super(false);
+    set_bench_lat(BenchLat::default());
+    clear_bench_prov();
+}
+
+/// 1.0.15 (review R1): a benchmark that ends with no usable result, by either route — the drain's
+/// `None` arm (the run started and produced nothing) and Run benchmark pressed on Current folder with
+/// no photos open (refused before it starts, in `on_run_benchmark`). Both clear the previous result
+/// ([`clear_bench_result`]) and say why, so neither leaves an older run's rates and recommendation
+/// live and saved.
+pub(crate) fn show_bench_no_result(app: &MainWindow) {
+    clear_bench_result(app);
+    app.set_bench_text(i18n::tr("no photos to benchmark").into());
+}
+
+/// Apply the same recommendation shown by the welcome and Settings cards.
+/// Kept separate from callback registration so the real action can run in headless tests.
+pub(crate) fn apply_bench_rec(a: &MainWindow) {
+    if !a.get_benchmarked() || a.get_bench_rec_text().is_empty() {
+        return; // placeholder state — the Apply button is disabled too; defensive double-gate
+    }
+    // Applying starting settings is an explicit preference change. Synthetic results retain
+    // their provenance and cannot enable the separate Mac runtime benchmark gates.
+    let w = if a.get_bench_w() > 0 {
+        a.get_bench_w() as u32
+    } else {
+        mp_to_long_side(a.get_bench_target_mp())
+    };
+    let (fps, sup, _res) =
+        bench_recommendation(a.get_bench_sub_fps(), a.get_bench_super_fps(), w, screen_long());
+    let f = bench_rec_scrub_fps(fps);
+    a.set_scrub_fps(f);
+    a.set_fps_text(fps_title(f));
+    a.set_quality_super(if sup { 1 } else { 0 });
+    // v0.8.160 (B4/U11): no latch write. `bench-rec-applied` is a binding over the pair this
+    // block just wrote against the pair the card recommends, so it turns true HERE and turns
+    // false again the moment the reader moves either control — in both directions, with no
+    // demotion edge for a future change to forget.
+    log_event(&format!(
+        "welcome: bench recommendation applied (scrub {fps} fps, {})",
+        if sup { "supersample" } else { "subsample" }
+    ));
 }
 
 /// The recommendation's scrub stop as the `scrub-fps` property actually holds it. ONE clamp, two
@@ -12180,9 +12268,8 @@ mod bench_honesty_tests {
         assert_eq!(bench_format_label(&mixed), "mixed (JPG + HEIC)");
     }
 
-    /// v0.9.60 (W2-5d): a SYNTHETIC run may not parameterize a folder's promises on macOS — and
-    /// the refusal is visible, not silent: the card's text goes empty (which disarms Apply through
-    /// its own `bench-rec-text != ""` gate) and the hint says why.
+    /// Synthetic measurements still do not govern Mac runtime pacing.
+    /// Recommendation and Apply are separately covered by the headless generated-result test.
     ///
     /// v0.9.61 (J4): BOTH PLATFORM ARMS RUN ON EVERY HOST. This test used to read `cfg!` itself and
     /// assert whichever half its host compiled, so the Windows byte-identity pin was never executed
@@ -12204,60 +12291,6 @@ mod bench_honesty_tests {
         // …and the shipping wrapper really does hand it the host's own platform.
         let mac = cfg!(target_os = "macos");
         assert_eq!(bench_result_governs(true), !mac, "the wrapper supplies the real platform");
-        // The card, both ways. Folder-sourced: a real recommendation on every platform.
-        let (text, hint) = bench_rec_card(104, 69, 8216, 3840, false, false);
-        assert_eq!(text.as_str(), "Browse at 30 photos/s · Sharper preview 4108 px");
-        assert_eq!(hint.as_str(), BENCH_REC_HINT_PRE);
-        // Synthetic: macOS refuses with the honest hint; Windows is byte-identical to before.
-        let (text, hint) = bench_rec_card(104, 69, 8216, 3840, true, false);
-        if mac {
-            assert_eq!(text.as_str(), "");
-            assert_eq!(hint.as_str(), "not yet measured for this folder");
-        } else {
-            assert_eq!(text.as_str(), "Browse at 30 photos/s · Sharper preview 4108 px");
-            assert_eq!(hint.as_str(), "shown after the run");
-        }
-    }
-
-    /// v0.9.62 (B3 / audit Q-A minimum): the refusal hint is STATE-AWARE. The state the welcome
-    /// panel exists for — a first run, nothing open — is exactly the one where "not yet measured
-    /// for this folder" points at a folder that does not exist, and where the panel's own one-tap
-    /// run is FORCED synthetic (L15), so following the hint could not have changed the answer.
-    /// FALSIFIERS (assert granularity): delete the `no_folder` arm of `bench_rec_hint` -> the
-    /// `"with nothing open, name the step that would help"` assert reddens; make that arm
-    /// unconditional (drop the `governs` test) -> the `"a governing result never explains itself"`
-    /// assert reddens.
-    #[test]
-    fn the_refusal_hint_names_the_step_that_is_actually_available() {
-        assert_eq!(
-            bench_rec_hint(true, true),
-            BENCH_REC_HINT_PRE,
-            "a governing result never explains itself — folder open or not"
-        );
-        assert_eq!(bench_rec_hint(true, false), BENCH_REC_HINT_PRE);
-        assert_eq!(
-            bench_rec_hint(false, true),
-            "open a folder and run it again",
-            "with nothing open, name the step that would help"
-        );
-        assert_eq!(
-            bench_rec_hint(false, false),
-            "not yet measured for this folder",
-            "with a folder open, the run itself is the step"
-        );
-        // THE WINDOWS PIN: `bench_result_governs` is true there for every result, so the refusal
-        // arms are unreachable and the hint is the pre-v0.9.60 literal in every state.
-        if !cfg!(target_os = "macos") {
-            for synthetic in [false, true] {
-                for no_folder in [false, true] {
-                    assert_eq!(
-                        bench_rec_hint(bench_result_governs(synthetic), no_folder),
-                        BENCH_REC_HINT_PRE,
-                        "Windows renders the same hint it always did"
-                    );
-                }
-            }
-        }
     }
 
     // ── v1.0 MERGE [A-4] / owner default L3: A ROW RETIRED WITH ITS SUBJECT. ────────────────
@@ -12854,10 +12887,9 @@ fn writer_loop(
             }
             WriteMsg::XmpRating { sidecar, rating } => {
                 // Same retry-once-then-surface as a JSON write; a rating-sidecar failure NEVER aborts culling.
-                if let Err(_first) = xmp_sink(&sidecar, rating) {
-                    if let Err(e) = xmp_sink(&sidecar, rating) {
-                        on_fail(&sidecar, e, true);
-                    }
+                match xmp_sink(&sidecar, rating).or_else(|_| xmp_sink(&sidecar, rating)) {
+                    Ok(()) => save_failure_ended(&sidecar), // 1.0.15 (review R2): a shown failure is over
+                    Err(e) => on_fail(&sidecar, e, true),
                 }
                 continue;
             }
@@ -12870,6 +12902,9 @@ fn writer_loop(
         // overwrite the state of a newer queued/successful save.
         let result = sink(&target, &data).or_else(|_| sink(&target, &data));
         if let Some((dir, ticket)) = review { review_save_complete(&dir, ticket, result.is_ok()); }
+        if result.is_ok() {
+            save_failure_ended(&target); // 1.0.15 (review R2): this file saved — a later failure shows again
+        }
         if let Err(e) = result {
             // Report every terminal failure, even for a stale visit or Apply/exit save.
             // Suppressing it as "already reported" can hide an unsaved rebased journal.
@@ -12915,15 +12950,7 @@ pub(crate) fn init_writer() {
                 }))
                 .unwrap_or_else(|_| Err(std::io::Error::other("xmp writer panicked mid-write")))
             };
-            let on_fail = |p: &Path, e: std::io::Error, is_xmp: bool| {
-                let m = writer_fail_message(p, &e.to_string(), is_xmp);
-                // The XMP message doesn't embed the io detail (kept clean for the toast) — append it to the
-                // LOG line only, so the failing cause is still greppable. The JSON `m` already carries `{e}`.
-                // Language packs (round 2): the log names the failure in English; `m` is what is shown.
-                let m_log = writer_fail_log_text(p, &e.to_string(), is_xmp);
-                log_event(&format!("writer: {m_log}{}", if is_xmp { format!(" — {e}") } else { String::new() }));
-                fails_w.lock().unwrap_or_else(|x| x.into_inner()).push(m);
-            };
+            let on_fail = |p: &Path, e: std::io::Error, is_xmp: bool| report_writer_failure(p, &e, is_xmp, &fails_w);
             writer_loop(rx, sink, xmp_sink, on_fail, |dir| review_write_target(dir), log_append_inline);
         });
     if spawned.is_err() {
@@ -12981,6 +13008,7 @@ pub(crate) fn begin_review_visit() {
     let mut saves = REVIEW_SAVES.lock().unwrap_or_else(|e| e.into_inner());
     saves.clear();
     REVIEW_VISIT.fetch_add(1, Ordering::Relaxed);
+    forget_shown_save_failures(); // 1.0.15: a new visit may show a still-failing save again
 }
 pub(crate) fn review_visit() -> u64 { REVIEW_VISIT.load(Ordering::Relaxed) }
 fn review_save_complete(dir: &Path, ticket: u64, ok: bool) {
@@ -13011,8 +13039,12 @@ pub(crate) fn enqueue_review_data(dir: &Path, data: Vec<u8>) -> std::io::Result<
         }
     };
     let WriteMsg::ReviewData { dir, data, ticket } = msg else { unreachable!() };
-    let result = write_atomic(&review_write_target(&dir), &data);
+    let target = review_write_target(&dir);
+    let result = write_atomic(&target, &data);
     review_save_complete(&dir, ticket, result.is_ok());
+    if result.is_ok() {
+        save_failure_ended(&target); // 1.0.15 (review R2): the tick's "Ratings not saved" may show again
+    }
     result
 }
 
@@ -13279,6 +13311,52 @@ fn writer_fail_subject(p: &Path, is_xmp: bool) -> WriterFail {
         return WriterFail::Review(folder);
     }
     WriterFail::Other(p.display().to_string())
+}
+
+/// 1.0.15 (PR #4 review SAVE-O2; reworked for review R2): the files whose save failure is SHOWN and
+/// has not recovered. A folder whose saves keep failing is retried on the ~15 s backstop, and every
+/// failed retry used to post a fresh error notice: on a write-protected SD card, a read-only share or
+/// an NTFS drive on a Mac, an error toast every 15 s, crowding the events list. Now a failure shows
+/// when it STARTS and its retries stay quiet; it ends when a write to the same file succeeds, so the
+/// next failure shows again.
+///
+/// Keyed by the file written — the review data, settings.json, an XMP sidecar — never by the
+/// message, which is translated and reads the same for two folders with the same name. The writer
+/// starts and ends failures on its own thread, in queue order ([`report_writer_failure`],
+/// `writer_loop`); the inline review-data route does the same ([`enqueue_review_data`] and the
+/// tick's "Ratings not saved"). A new folder visit forgets them all ([`begin_review_visit`]), so a
+/// folder that still fails warns once more when the user comes back. Only the repeated NOTICE is
+/// dropped: every failure is still logged, still reaches the writer's failure callback and still
+/// drives the retry state.
+static FAILING_SAVES: Mutex<std::collections::BTreeSet<PathBuf>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// A save to `target` failed. True when this starts a failure (show it); false when it is another
+/// failure of one already shown (stay quiet).
+pub(crate) fn save_failure_starts(target: &Path) -> bool {
+    FAILING_SAVES.lock().unwrap_or_else(|e| e.into_inner()).insert(target.to_path_buf())
+}
+
+/// A save to `target` succeeded: its failure, if any, is over, and the next one shows.
+pub(crate) fn save_failure_ended(target: &Path) {
+    FAILING_SAVES.lock().unwrap_or_else(|e| e.into_inner()).remove(target);
+}
+
+/// A new folder visit began: a save that is still failing may warn once more.
+pub(crate) fn forget_shown_save_failures() {
+    FAILING_SAVES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// The real writer's give-up surface (its `on_fail`): log every failure, and queue a notice for the
+/// tick only when the failure starts ([`save_failure_starts`]).
+fn report_writer_failure(p: &Path, e: &std::io::Error, is_xmp: bool, notices: &Mutex<Vec<String>>) {
+    // The XMP message doesn't embed the io detail (kept clean for the toast) — append it to the
+    // LOG line only, so the failing cause is still greppable. The JSON message already carries it.
+    // Language packs (round 2): the log names the failure in English; the notice is translated.
+    let m_log = writer_fail_log_text(p, &e.to_string(), is_xmp);
+    log_event(&format!("writer: {m_log}{}", if is_xmp { format!(" — {e}") } else { String::new() }));
+    if save_failure_starts(p) {
+        notices.lock().unwrap_or_else(|x| x.into_inner()).push(writer_fail_message(p, &e.to_string(), is_xmp));
+    }
 }
 
 /// Drain the writer's failure messages (the tick pushes each into the events centre). Empty if none or
@@ -28773,7 +28851,9 @@ impl ReviewIo for RealReviewIo {
         let written = (|| -> std::io::Result<()> {
             let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&part)?;
             f.write_all(data)?;
-            f.sync_all()?; // the bytes are on the platter BEFORE the name flips
+            // 1.0.15: through the shared durable flush, which on macOS falls back to an ordinary
+            // fsync only where a network share (SMB) refuses the full one (errno 45, issue #6).
+            falcon_decode::file_io::sync_file(&f)?; // the bytes are on the platter BEFORE the name flips
             Ok(())
         })();
         if let Err(e) = written {
@@ -29440,7 +29520,10 @@ fn copy_via_part(src: &Path, to: &Path) -> std::io::Result<()> {
     let mut inp = std::fs::File::open(src)?;
     // Errors before this exclusive claim succeeds own no marker to clean up.
     let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&part)?;
-    let copied = std::io::copy(&mut inp, &mut out).and_then(|_| out.sync_all());
+    // 1.0.15: the shared durable flush (`falcon_decode::file_io::sync_file`), so Copy picks, the
+    // cross-drive Move and Undo of a move work on a Mac network share, which refuses the full
+    // sync (errno 45) — the failure #7 fixed for the review file. Windows is unchanged.
+    let copied = std::io::copy(&mut inp, &mut out).and_then(|_| falcon_decode::file_io::sync_file(&out));
     drop(out);
     let result = copied.and_then(|_| rename_retry(&part, to));
     if result.is_err() { let _ = std::fs::remove_file(&part); }
@@ -35407,11 +35490,10 @@ pub(crate) fn build_settings(
         // while the toggle is ON, so an OFF install serializes NO geometry keys (skip_serializing_if).
         remember_geometry: app.get_remember_geometry(),
         win_geom: if app.get_remember_geometry() { win_geom_snapshot() } else { None },
-        // v0.8.50 (G2): the grid dock + filmstrip visibility — persisted straight off the Slint
-        // properties like motion_ui/dev_hud (the pills/splitter/path-pill write them; the tick's
-        // grid_snap_width keeps grid_dock_w on a whole-column value before it ever lands here).
+        // Persist the user's splitter choice, not a temporary narrow-window fit. Retaining
+        // the JSON key preserves existing explicit two-, three- and wider-column preferences.
         grid_open: app.get_grid_open(),
-        grid_dock_w: app.get_grid_dock_w(),
+        grid_dock_w: app.get_grid_preferred_w(),
         film_visible: app.get_film_visible(),
         // v0.8.67 (D): the welcome panel's shown-once latch — straight off its Slint property (the
         // motion_ui pattern). v0.8.76: the property goes TRUE at BOOT (persist-at-show via
@@ -50406,6 +50488,80 @@ mod review_save_recovery_tests {
             ticket, status: ReviewSaveStatus::Pending,
         });
         ticket
+    }
+    /// 1.0.15 (SAVE-O2, review R2): through the real `writer_loop` and the real writer failure
+    /// surface (`report_writer_failure`), a failing save shows ONCE however often it is retried; a
+    /// write to the same file that succeeds ends the failure, and the next failure shows again — for
+    /// review data, settings and an XMP sidecar alike. Two folders with the same name are two
+    /// failures (the messages read the same), and a new folder visit lets a save that is still
+    /// failing show once more. Nothing here resets the shown failures by hand except the visit.
+    ///
+    /// FALSIFIER (L28): drop `save_failure_ended` from the writer's JSON or XMP arm and that kind's
+    /// count drops to 1; make `save_failure_starts` always true and the retries show; key it by the
+    /// file NAME and the same-name folders row drops to 1; drop the reset from `begin_review_visit`
+    /// and the visit row reddens.
+    #[test]
+    fn a_failing_save_shows_once_until_that_file_saves_again() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        begin_review_visit();
+        let notices: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        // One message through the real writer loop; both tries fail or both succeed.
+        let write = |msg: WriteMsg, fail: bool| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(msg).unwrap();
+            drop(tx);
+            let outcome = || if fail { Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)) } else { Ok(()) };
+            writer_loop(rx, |_, _| outcome(), |_, _| outcome(),
+                |p, e, xmp| report_writer_failure(p, &e, xmp, &notices),
+                |d| d.join(SELECTION_FILE), |_, _, _| {});
+        };
+        let shown = || std::mem::take(&mut *notices.lock().unwrap());
+        let root = Path::new("/falcon-save-failure-test");
+        let (shoot_a, shoot_b) = (root.join("a").join("shoot"), root.join("b").join("shoot"));
+        let review = |dir: &Path| WriteMsg::ReviewData { dir: dir.to_path_buf(), data: b"{}".to_vec(), ticket: 0 };
+        let settings = || WriteMsg::Write { target: root.join("settings.json"), data: b"{}".to_vec() };
+        let xmp = || WriteMsg::XmpRating { sidecar: root.join("a").join("IMG_1.xmp"), rating: 3 };
+        let kinds: [(&str, &dyn Fn() -> WriteMsg); 3] =
+            [("review data", &|| review(&shoot_a)), ("settings", &settings), ("XMP sidecar", &xmp)];
+        for (kind, msg) in kinds {
+            for fail in [true, true, false, true] {
+                write(msg(), fail);
+            }
+            assert_eq!(shown().len(), 2, "{kind}: failed, retried quietly, saved, failed again");
+        }
+        write(review(&shoot_b), true); // a different folder that happens to share the name
+        assert_eq!(shown().len(), 1, "two folders with the same name are two failures");
+        write(review(&shoot_a), true);
+        assert!(shown().is_empty(), "a save that is still failing stays quiet…");
+        begin_review_visit(); // the user opens the folder again
+        write(review(&shoot_a), true);
+        assert_eq!(shown().len(), 1, "…until a new visit");
+        begin_review_visit(); // hygiene
+    }
+    /// …and the same on the inline route (no background writer: its start-up failed). The tick asks
+    /// `save_failure_starts` for the folder's review file when `save_selection` fails (a census in
+    /// main.rs pins that line); `enqueue_review_data`'s successful inline write ends the failure.
+    /// FALSIFIER (L28): drop `save_failure_ended` from `enqueue_review_data` and the last row reddens.
+    #[test]
+    fn an_inline_review_save_failure_shows_once_until_it_saves() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        begin_review_visit();
+        let dir = std::env::temp_dir().join(format!("falcon-review-fail-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join(SELECTION_FILE);
+        // What the tick does with a save's result.
+        let tick_shows = |r: std::io::Result<()>| r.is_err() && save_failure_starts(&review_write_target(&dir));
+        std::fs::create_dir(&target).unwrap(); // a folder where the file must go: every write fails
+        assert!(tick_shows(enqueue_review_data(&dir, b"one".to_vec())), "the first failure shows");
+        assert!(!tick_shows(enqueue_review_data(&dir, b"two".to_vec())), "its retry stays quiet");
+        std::fs::remove_dir(&target).unwrap();
+        assert!(enqueue_review_data(&dir, b"three".to_vec()).is_ok(), "the save succeeds");
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        assert!(tick_shows(enqueue_review_data(&dir, b"four".to_vec())), "the next failure shows again");
+        std::fs::remove_dir_all(&dir).unwrap();
+        begin_review_visit(); // hygiene
     }
     #[test]
     fn failed_visit_cannot_retry_empty_folder_or_later_visit() {

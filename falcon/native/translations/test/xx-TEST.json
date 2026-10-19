@@ -1057,6 +1057,7 @@
   "Speed": "⟦Speed⟧",
   "Speed limits aren't measured for this folder yet — the last benchmark used generated test images. Run it again with this folder open (Settings → Fast View).": "⟦Speed limits aren't measured for this folder yet — the last benchmark used generated test images. Run it again with this folder open (Settings → Fast View).⟧",
   "Standard": "⟦Standard⟧",
+  "Starting settings from generated test images": "⟦Starting settings from generated test images⟧",
   "Still loading — press again when the photo appears": "⟦Still loading — press again when the photo appears⟧",
   "Still loading — press again when this half appears": "⟦Still loading — press again when this half appears⟧",
   "Still loading — scroll again when the next photo appears": "⟦Still loading — scroll again when the next photo appears⟧",
@@ -1283,7 +1284,6 @@
   "no previous default to restore": "⟦no previous default to restore⟧",
   "no system font found": "⟦no system font found⟧",
   "not used for PNG — larger files, no loss": "⟦not used for PNG — larger files, no loss⟧",
-  "not yet measured for this folder": "⟦not yet measured for this folder⟧",
   "of {n} file this export would write already exist in ./export": {
     "one": "⟦of {n} file this export would write already exist in ./export⟧",
     "other": "⟦of {n} files this export would write already exist in ./export⟧"
@@ -1294,7 +1294,6 @@
   },
   "off — every folder opens sorted by name": "⟦off — every folder opens sorted by name⟧",
   "off — no resume prompt": "⟦off — no resume prompt⟧",
-  "open a folder and run it again": "⟦open a folder and run it again⟧",
   "or pick the gamut yourself:": "⟦or pick the gamut yourself:⟧",
   "original resolution, no downscale": "⟦original resolution, no downscale⟧",
   "pick → copy to ./Picks": "⟦pick → copy to ./Picks⟧",

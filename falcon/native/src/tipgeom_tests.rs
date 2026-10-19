@@ -2819,8 +2819,19 @@ fn grid_splitter_drags_snap_to_whole_columns() {
     // the splitter lane = stage x 0..5 = window x 392..397 while the dock is 392
     drag((394.0, 400.0), (300.0, 400.0));
     assert_eq!(app.get_grid_dock_w(), 264.0, "drag left snaps to exactly 2 columns");
+    assert_eq!(crate::tick::sync_grid_width(&app), 2, "a deliberate two-column choice survives fitting");
+    assert_eq!(app.get_grid_preferred_w(), 264.0);
     drag((266.0, 400.0), (900.0, 400.0));
     assert_eq!(app.get_grid_dock_w(), 392.0, "drag right caps at 3 columns (the 1200/3 cap)");
+    app.window().set_size(slint::LogicalSize::new(1100.0, 800.0));
+    hover(&app, 0.0, 0.0);
+    drag((394.0, 400.0), (300.0, 400.0));
+    assert_eq!(app.get_grid_dock_w(), 264.0);
+    drag((266.0, 400.0), (900.0, 400.0));
+    assert_eq!(app.get_grid_dock_w(), 392.0, "drag can select three at 1100px too");
+    assert_eq!(crate::tick::sync_grid_width(&app), 3, "the tick and splitter use the same cap");
+    assert_eq!(app.get_grid_preferred_w(), 392.0);
+
     app.set_grid_open(false);
 }
 
@@ -3916,6 +3927,147 @@ fn bench_clamp_caption_roundtrip() {
     // …and a pre-v0.8.174 settings.json has no key at all → 0 → silent, exactly as before.
     let legacy: crate::support::Settings = serde_json::from_str("{}").expect("legacy load");
     assert_eq!(legacy.bench_full_probe_res, 0);
+}
+
+/// 1.0.15 (audit 2026-10-17, finding 3): a FAILED benchmark run clears the previous result — on
+/// screen, in the saved settings and after a restart — and leaves the user's own settings alone,
+/// even the ones its recommendation set; a later good run brings everything back. Driven through
+/// the real `tick::drain_bench`, `build_settings` (+ the serde hop), `restore_bench_ui` and Apply.
+///
+/// Block 5 is the other way a run ends with no result (review R1): the empty-folder start.
+///
+/// FALSIFIER (L28): drop `clear_bench_result(app)` from `support::show_bench_no_result` (the
+/// pre-1.0.15 behaviour of both routes) and blocks 2 and 5 redden with the old run's properties;
+/// drop any one reset from `clear_bench_result` and block 2's fresh-window comparison names that
+/// property; drop the memo resets and block 2's latency/provenance rows redden and block 3 saves
+/// the stale latencies.
+#[test]
+fn a_failed_benchmark_run_clears_the_previous_result_and_a_good_run_brings_it_back() {
+    let _g = bench_roundtrip_guard();
+    use crate::support::{BenchLat, BenchProv, BenchResult};
+    let result = |sub: u32, sup: u32, full: u32| BenchResult {
+        sub_res: 2054,
+        super_res: 4108,
+        full_res: 8216,
+        sub_fps: sub,
+        super_fps: sup,
+        full_fps: full,
+        sub_decode: sub + 10,
+        super_decode: sup + 5,
+        full_decode: full + 1,
+        sub_upload: 300,
+        super_upload: 120,
+        full_upload: 20,
+        full_gpu: false,
+        sub_lat_ms: 40.0,
+        super_lat_ms: 90.0,
+        synthetic: true,
+        synth_mp: 61,
+        src_fmt: "JPG".into(),
+        pool_w: 12,
+        full_probe_res: 2560,
+    };
+    // Every property a successful drain or a restore writes, as one comparable snapshot.
+    let state = |w: &ui::MainWindow| -> Vec<(&'static str, String)> {
+        vec![
+            ("benchmarked", w.get_benchmarked().to_string()),
+            ("bench-w", w.get_bench_w().to_string()),
+            ("bench-sub-fps", w.get_bench_sub_fps().to_string()),
+            ("bench-super-fps", w.get_bench_super_fps().to_string()),
+            ("bench-fullres-fps", w.get_bench_fullres_fps().to_string()),
+            ("bench-full-gpu", w.get_bench_full_gpu().to_string()),
+            ("bench-synthetic", w.get_bench_synthetic().to_string()),
+            ("bench-synth-mp", w.get_bench_synth_mp().to_string()),
+            ("bench-synth-note", w.get_bench_synth_note().to_string()),
+            ("bench-clamp-res", w.get_bench_clamp_res().to_string()),
+            ("bench-clamp-note", w.get_bench_clamp_note().to_string()),
+            ("zoom-sharp-note", w.get_zoom_sharp_note().to_string()),
+            ("bench-rec-text", w.get_bench_rec_text().to_string()),
+            ("bench-rec-hint", w.get_bench_rec_hint().to_string()),
+            ("bench-rec-fps", w.get_bench_rec_fps().to_string()),
+            ("bench-rec-super", w.get_bench_rec_super().to_string()),
+        ]
+    };
+    let km: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let save = |w: &ui::MainWindow| -> crate::support::Settings {
+        let s = crate::support::build_settings(
+            w, true, true, &km, "", "", &[], &[], "name.asc", &[], &[],
+            &std::collections::BTreeMap::new(),
+            false,
+            crate::support::INFO_VIEW_STANDARD,
+        );
+        serde_json::from_str(&serde_json::to_string(&s).expect("settings serialize")).expect("settings reload")
+    };
+    crate::support::set_bench_lat(BenchLat::default());
+    crate::support::clear_bench_prov();
+    let fresh = state(&boot());
+
+    let a = boot();
+    a.set_bench_use_synthetic(true); // the user's own "Benchmark with" choice
+    a.set_bench_target_mp(61); // …and target size
+    let (tx, rx) = std::sync::mpsc::channel::<Option<BenchResult>>();
+    let running = std::cell::Cell::new(true);
+
+    // 1) A good run lands, and the user applies its recommendation.
+    tx.send(Some(result(47, 30, 9))).expect("send");
+    crate::tick::drain_bench(&rx, &running, &a);
+    assert!(a.get_benchmarked() && !a.get_bench_rec_text().is_empty(), "the good run is live");
+    crate::support::apply_bench_rec(&a);
+    assert!(a.get_bench_rec_applied(), "its recommendation is applied");
+    let (scrub, quality) = (a.get_scrub_fps(), a.get_quality_super());
+
+    // 2) A rerun fails: the previous result goes, the user's settings stay.
+    running.set(true);
+    a.set_bench_running(true);
+    tx.send(None).expect("send");
+    crate::tick::drain_bench(&rx, &running, &a);
+    assert!(!running.get() && !a.get_bench_running(), "the running flags clear");
+    assert_eq!(state(&a), fresh, "every result property is back to a never-benchmarked window's");
+    assert_eq!(crate::support::bench_lat_snapshot(), BenchLat::default(), "the latency memo is cleared");
+    assert_eq!(crate::support::bench_prov_snapshot(), BenchProv::default(), "the provenance memo is cleared");
+    assert_eq!(a.get_bench_text().as_str(), "no photos to benchmark");
+    assert!(!a.get_bench_rec_applied() && !a.get_bench_governs(), "nothing left to apply or to pace by");
+    assert_eq!((a.get_scrub_fps(), a.get_quality_super()), (scrub, quality), "browsing speed and quality stay");
+    assert!(a.get_bench_use_synthetic() && a.get_bench_target_mp() == 61, "the benchmark choices stay");
+
+    // 3) Saved and restored, the failure is still "never benchmarked" — not the older run.
+    let s = save(&a);
+    assert_eq!(s.bench_ver, 0, "no result to stamp");
+    assert_eq!((s.bench_sub_fps, s.bench_super_fps, s.bench_fullres_fps, s.bench_w), (0, 0, 0, 0));
+    assert_eq!((s.bench_sub_lat_ms, s.bench_super_lat_ms, s.bench_src_fmt.as_str(), s.bench_pool_w), (0.0, 0.0, "", 0));
+    assert_eq!((s.scrub_fps, s.quality_super), (scrub, quality == 1), "the saved user settings stay");
+    let b = boot();
+    crate::support::restore_bench_ui(&b, &s, 3840);
+    assert_eq!(state(&b), fresh, "a restart restores no benchmark");
+
+    // 4) A later good run brings it all back, live and through a restart.
+    tx.send(Some(result(60, 24, 12))).expect("send");
+    crate::tick::drain_bench(&rx, &running, &a);
+    assert!(a.get_benchmarked() && !a.get_bench_rec_text().is_empty(), "usable again");
+    assert_eq!((a.get_bench_sub_fps(), a.get_bench_super_fps(), a.get_bench_fullres_fps()), (60, 24, 12));
+    assert_eq!(crate::support::bench_lat_snapshot(), BenchLat { sub_ms: 40.0, super_ms: 90.0 });
+    assert_eq!(crate::support::bench_prov_snapshot(), BenchProv { src_fmt: "JPG".into(), pool_w: 12 });
+    let s2 = save(&a);
+    assert_eq!(s2.bench_ver, crate::BENCH_SCHEMA_VER, "the new result is stamped");
+    let c = boot();
+    crate::support::restore_bench_ui(&c, &s2, 3840);
+    assert!(c.get_benchmarked() && !c.get_bench_rec_text().is_empty(), "and restores after a restart");
+
+    // 5) Review R1: Run benchmark on Current folder with no photos open is refused before it starts
+    //    (`on_run_benchmark` calls the same `show_bench_no_result`; a census in main.rs pins that) —
+    //    and clears the good result exactly like a failed run, keeping the user's choices.
+    a.set_bench_use_synthetic(false); // Settings → "Benchmark with": Current folder
+    crate::support::show_bench_no_result(&a);
+    assert_eq!(state(&a), fresh, "a refused start leaves a never-benchmarked window too");
+    assert_eq!(crate::support::bench_lat_snapshot(), BenchLat::default(), "the latency memo is cleared");
+    assert_eq!(crate::support::bench_prov_snapshot(), BenchProv::default(), "the provenance memo is cleared");
+    assert_eq!(a.get_bench_text().as_str(), "no photos to benchmark");
+    assert_eq!((a.get_scrub_fps(), a.get_quality_super()), (scrub, quality), "browsing speed and quality stay");
+    assert!(!a.get_bench_use_synthetic() && a.get_bench_target_mp() == 61, "the benchmark choices stay");
+    assert_eq!(save(&a).bench_ver, 0, "and the older result is not saved again");
+
+    crate::support::set_bench_lat(BenchLat::default()); // hygiene (parallel tests)
+    crate::support::clear_bench_prov();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -19822,11 +19974,7 @@ fn the_bench_recommendation_card_says_applied_only_while_it_is() {
     app.set_benchmarked(true);
     // The dev box's own numbers: sub 104 / super 69 on an 8216px source, 4K screen ⇒ 30 fps +
     // Supersample (`recommendation_picks_tier_and_stop`'s first row).
-    // v0.9.66: the publisher carries this branch's macOS refusal terms too. A FOLDER-sourced result
-    // (`synthetic = false`) governs on every platform, so this row asserts the trunk's derived
-    // `Applied` binding on both lines rather than the refusal — which has its own rows in
-    // `support::bench_rec_card`'s tests.
-    crate::support::publish_bench_rec(&app, 104, 69, 8216, 3840, false, false);
+    crate::support::publish_bench_rec(&app, 104, 69, 8216, 3840);
     i_slint_core::properties::ChangeTracker::run_change_handlers();
 
     // ── (1) NOT APPLIED: the live settings are the defaults, not the recommendation.
@@ -32513,4 +32661,128 @@ fn settings_scroll_bar_fits_padding_and_seeks_the_body() {
     assert!(body.size().height < flick.size().height, "tall fixture fits the complete body");
     assert_eq!(E::find_by_element_type_name(&app, "MiniVBar").count(), 0,
         "no bar when Settings needs no scrolling");
+}
+
+
+/// Reported M5 result: a generated 45 MP test measured 36/25 fps but offered no settings.
+/// Falsifier: restore the synthetic recommendation refusal or hide its source label; the
+/// live/restore card checks fail. Restore the Apply refusal and the Mac action check fails.
+#[test]
+fn generated_benchmark_offers_labelled_starting_settings() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let _g = bench_roundtrip_guard();
+    for is_mac in [false, true] {
+        for restored in [false, true] {
+            let app = boot();
+            app.set_is_mac(is_mac);
+            app.set_empty_state(true);
+            app.set_scrub_fps(60.0);
+            app.set_quality_super(0);
+            if restored {
+                let saved = crate::support::Settings {
+                    bench_ver: crate::BENCH_SCHEMA_VER,
+                    bench_w: 8216,
+                    bench_sub_fps: 36,
+                    bench_super_fps: 25,
+                    bench_fullres_fps: 5,
+                    bench_synthetic: true,
+                    bench_synth_mp: 45,
+                    ..Default::default()
+                };
+                crate::support::restore_bench_ui(&app, &saved, 3840);
+            } else {
+                app.set_benchmarked(true);
+                app.set_bench_w(8216);
+                app.set_bench_sub_fps(36);
+                app.set_bench_super_fps(25);
+                app.set_bench_fullres_fps(5);
+                app.set_bench_synthetic(true);
+                crate::support::publish_bench_rec(&app, 36, 25, 8216, 3840);
+            }
+            assert_eq!(app.get_bench_rec_text().as_str(),
+                "Browse at 20 photos/s · Sharper preview 4108 px");
+            let weak = app.as_weak();
+            app.on_apply_bench_rec(move || {
+                if let Some(a) = weak.upgrade() { crate::support::apply_bench_rec(&a); }
+            });
+            // Both actual hosts show the same source label and use the same Apply action.
+            for welcome in [true, false] {
+                app.window().set_size(slint::LogicalSize::new(1200.0, 9000.0));
+                app.set_welcome_open(welcome);
+                app.set_settings_open(!welcome);
+                hover(&app, 0.0, 0.0);
+                assert_eq!(E::find_by_accessible_label(&app,
+                    "Starting settings from generated test images").count(), 1);
+                let button = E::find_by_element_id(&app, "BenchRecCard::apply-btn")
+                    .next().expect("the card's Apply button");
+                assert_ne!(button.accessible_enabled(), Some(false));
+                let p = button.absolute_position();
+                let sz = button.size();
+                click(&app, p.x + sz.width / 2.0, p.y + sz.height / 2.0,
+                    i_slint_core::items::PointerEventButton::Left);
+                assert_eq!(app.get_scrub_fps(), 20.0);
+                assert_eq!(app.get_quality_super(), 1);
+                assert!(app.get_bench_rec_applied());
+                assert_eq!(app.get_bench_governs(), !is_mac,
+                    "applying starting settings must not bless synthetic runtime measurements");
+                app.set_scrub_fps(60.0);
+                app.set_quality_super(0);
+                assert!(!app.get_bench_rec_applied(), "changing a setting re-enables Apply");
+            }
+        }
+    }
+}
+
+
+/// A temporary narrow window must not replace the user's splitter preference on disk.
+/// Falsifiers: save the fitted width instead of the preference, or fit the previous live
+/// width on resize; the saved-value or grow-back assertion fails respectively.
+#[test]
+fn grid_preference_survives_resize_and_restart() {
+    let save = |app: &ui::MainWindow| {
+        crate::support::build_settings(
+            app, true, true, &std::collections::HashMap::new(), "", "", &[], &[],
+            "name.asc", &[], &[], &std::collections::BTreeMap::new(), false,
+            crate::support::INFO_VIEW_STANDARD,
+        )
+    };
+    let fit = |app: &ui::MainWindow, width| {
+        app.window().set_size(slint::LogicalSize::new(width, 800.0));
+        hover(app, 0.0, 0.0);
+        crate::tick::sync_grid_width(app)
+    };
+    // Existing settings keep their meaning, including a deliberately selected two-column dock.
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        for preferred in [264.0, 392.0, 648.0] {
+            let app = boot();
+            app.window().dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged { scale_factor: scale });
+            app.set_grid_open(true);
+            let legacy: crate::support::Settings = serde_json::from_str(
+                &format!("{{\"grid_dock_w\":{preferred}}}")
+            ).unwrap();
+            crate::support::restore_grid_width(&app, legacy.grid_dock_w);
+            fit(&app, 2560.0);
+            assert_eq!(app.get_grid_dock_w(), preferred);
+            let usual_cols = if preferred == 264.0 { 2 } else { 3 };
+            assert_eq!(fit(&app, 1100.0), usual_cols);
+            assert_eq!(fit(&app, 980.0), usual_cols, "logical 40% boundary is independent of display scaling");
+            assert_eq!(fit(&app, 979.0), 2);
+            assert_eq!(fit(&app, 960.0), 2);
+            assert_eq!(app.get_grid_dock_w(), 264.0);
+            let saved = save(&app);
+            assert_eq!(saved.grid_dock_w, preferred, "narrow-window fit must not become the saved choice");
+            let restored: crate::support::Settings = serde_json::from_str(
+                &serde_json::to_string(&saved).unwrap()
+            ).unwrap();
+            let restarted = boot();
+            restarted.window().dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged { scale_factor: scale });
+            restarted.set_grid_open(true);
+            crate::support::restore_grid_width(&restarted, restored.grid_dock_w);
+            assert_eq!(fit(&restarted, 768.0), 2, "restart narrow still fits the window");
+            fit(&restarted, 2560.0);
+            assert_eq!(restarted.get_grid_dock_w(), preferred, "restart retains the chosen width");
+            fit(&app, 2560.0);
+            assert_eq!(app.get_grid_dock_w(), preferred, "same-session enlargement restores the choice");
+        }
+    }
 }

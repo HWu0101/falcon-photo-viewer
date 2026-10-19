@@ -154,14 +154,16 @@ pub(crate) const MAX_FAST_INFLIGHT: usize = 2;
 
 /// 0) benchmark results (worker thread) → bench UI fields. §43: three timings — the sub/super
 /// DCT tiers bracketing the screen (the scrub pick) + native full res (the zoomed always-sharp
-/// rate). `None` means the folder emptied under the worker — clear the running flag but DON'T
-/// mark benchmarked (B3), so the always-sharp cap stays on its honest default.
+/// rate). `None` means the run produced no usable result (the folder emptied, image generation
+/// failed, the worker panicked, or no sampled photo decoded) — clear the running flag, DON'T mark
+/// benchmarked (B3), and since 1.0.15 clear the PREVIOUS result too (`clear_bench_result`), so a
+/// failed rerun can't leave an older run's rates and recommendation live and saved.
 pub(crate) fn drain_bench(rx: &Receiver<Option<BenchResult>>, running: &Cell<bool>, app: &MainWindow) {
     while let Ok(r) = rx.try_recv() {
         running.set(false);
         app.set_bench_running(false);
         let Some(r) = r else {
-            app.set_bench_text(i18n::tr("no photos to benchmark").into());
+            support::show_bench_no_result(app);
             continue;
         };
         app.set_benchmarked(true);
@@ -208,18 +210,13 @@ pub(crate) fn drain_bench(rx: &Receiver<Option<BenchResult>>, running: &Cell<boo
         // can't interpolate).
         // v0.8.160 (B4/U11): the card's "Applied" state needs no un-latching here — publishing a
         // NEW recommendation re-evaluates the binding by itself, which is what deriving buys.
-        // v0.9.66 (the round-7 sync): …and the SAME call carries this branch's macOS refusal +
-        // hint (v0.9.60 W2-5d / v0.9.62 B3), so one producer still writes every part of the card.
+        // Generated runs provide labelled starting settings without governing Mac runtime limits.
         support::publish_bench_rec(
             app,
             r.sub_fps as i32,
             r.super_fps as i32,
             r.full_res,
             screen_long(),
-            r.synthetic,
-            // v0.9.62 (B3): with no folder open the refusal names the next step ("open a folder and
-            // run it again") instead of pointing at a folder that does not exist.
-            app.get_empty_state(),
         );
         // v0.8.82 (tester issue 9): provenance lands with the SAME drain that writes the result —
         // the properties build_settings persists and restore_bench_ui round-trips. The note is
@@ -10284,6 +10281,8 @@ pub(crate) fn step_notifs(
     // v0.8.36 (ITEMs 1–3): surface background-writer save FAILURES + a corrupt-settings warning (once)
     // into the events centre, and keep this instance's open-folders heartbeat fresh. Co-located here
     // because step_notifs already owns `pending` (the events queue), `cur_dir`, and `app`.
+    // 1.0.15 (SAVE-O2, review R2): the writer queues a failure's notice once, when it starts, and its
+    // retries stay quiet until that file saves again (support::report_writer_failure).
     for m in writer_take_fails() {
         pending.borrow_mut().push(NotifEntry::error(m, now));
     }
@@ -10930,7 +10929,7 @@ pub(crate) fn step_persistence(
     app: &MainWindow,
     shots: &[Shot],
     save_ctr: &Cell<u32>,
-    use_nvjpeg: &AtomicBool,
+    nvjpeg_choice: &AtomicBool, // 1.0.15: the saved GPU-decoding CHOICE (not the runtime flag)
     auto_orient: &AtomicBool, // v0.8.0: persisted like use_nvjpeg/raw_mode
     rot: &RotState,           // v0.8.0: the manual rotation deltas ride the selection flush
     keymap: &RefCell<HashMap<String, String>>,
@@ -11093,7 +11092,14 @@ pub(crate) fn step_persistence(
                         }
                         Err(e) => {
                             save_warned.borrow_mut().insert(warning_key.clone());
-                            notif_pending.borrow_mut().push(NotifEntry::error(tr_format!("⚠ Ratings not saved — {error}", error = e), now));
+                            // 1.0.15 (SAVE-O2, review R2): once per failure of this folder's review file,
+                            // like the writer's — quiet until a save to it succeeds (enqueue_review_data).
+                            if crate::support::save_failure_starts(&crate::support::review_write_target(Path::new(&dir))) {
+                                notif_pending.borrow_mut().push(NotifEntry::error(
+                                    tr_format!("⚠ Ratings not saved — {error}", error = e),
+                                    now,
+                                ));
+                            }
                         }
                     }
                 }
@@ -11124,7 +11130,7 @@ pub(crate) fn step_persistence(
         save_ctr.set(0);
         let s = build_settings(
             app,
-            use_nvjpeg.load(Ordering::Relaxed),
+            nvjpeg_choice.load(Ordering::Relaxed),
             auto_orient.load(Ordering::Relaxed),
             &keymap.borrow(),
             &cur_dir.borrow(),
@@ -13508,17 +13514,30 @@ pub(crate) fn grid_cols_for_width(dock_w: f32) -> usize {
     ((((dock_w - 2.0 * GRID_PAD + GRID_GAP) / GRID_COL_PITCH).floor() as i64).max(1)) as usize
 }
 
-/// v0.8.50 (G2): the splitter's snap/clamp rule, the RUST authority (the .slint drag handler
-/// carries the same formula for live feel; this re-validation runs every tick so a window
-/// RESIZE — or a stale persisted width — re-snaps automatically). Whole columns only:
-/// width-for-cols(n) = n·col-pitch + pad (128n + 8 — the 2·pad sides minus the absent last gap),
-/// clamped [2 .. ⌊(window/3 − pad)/col-pitch⌋] with the 2-column floor WINNING on windows too
-/// narrow for a 2-column third (min-width 560 ⇒ ⅓ = 186 < 264 — the grid stays usable; the
-/// owner's ⅓ cap is an upper bound, not a promise on tiny windows).
+/// Whole columns, at least two. Three may use up to 40% of the logical window;
+/// wider grids retain the one-third cap. A fit never changes the user's preferred width.
+/// The splitter's Slint expression mirrors this rule for immediate drag feedback.
 pub(crate) fn grid_snap_width(desired_w: f32, win_w: f32) -> f32 {
-    let cap = (((win_w / 3.0 - GRID_PAD) / GRID_COL_PITCH).floor() as i64).max(2);
+    let three_col_min_window = (3.0 * GRID_COL_PITCH + GRID_PAD) / 0.4;
+    let cap = (((win_w / 3.0 - GRID_PAD) / GRID_COL_PITCH).floor() as i64)
+        .max(if win_w >= three_col_min_window { 3 } else { 2 });
     let cols = (((desired_w - GRID_PAD) / GRID_COL_PITCH).round() as i64).clamp(2, cap);
     cols as f32 * GRID_COL_PITCH + GRID_PAD
+}
+
+/// Fit the dock and publish its column count before laying out the rows.
+pub(crate) fn sync_grid_width(app: &MainWindow) -> usize {
+    // Read root.width, like the splitter: dock + stage can disagree while mounting or resizing.
+    // Re-fit from the preference every time, so a temporary reduction is reversible.
+    let win_w = app.get_grid_window_w();
+    let dock_w = app.get_grid_dock_w();
+    let snapped = grid_snap_width(app.get_grid_preferred_w(), win_w);
+    if (snapped - dock_w).abs() > 0.5 {
+        app.set_grid_dock_w(snapped);
+    }
+    let cols = grid_cols_for_width(snapped);
+    app.set_grid_cols(cols as i32);
+    cols
 }
 
 /// The live-row window for a scroll position: (base row, live row count). `live` covers the
@@ -13598,16 +13617,7 @@ pub(crate) fn step_folder_grid(
         film.grid_anchor.set(None);
         return;
     }
-    // v0.8.50 (G2): re-validate the splitter width every tick against the LIVE window (the dock +
-    // stage span the whole row, so their sum IS the window width) — a resize or a stale persisted
-    // value re-snaps to a whole-column width; a no-op when already snapped.
-    let dock_w = app.get_grid_dock_w();
-    let snapped = grid_snap_width(dock_w, app.get_stage_w() + dock_w);
-    if (snapped - dock_w).abs() > 0.5 {
-        app.set_grid_dock_w(snapped);
-    }
-    let cols = grid_cols_for_width(snapped);
-    app.set_grid_cols(cols as i32);
+    let cols = sync_grid_width(app);
     let edges = photo_open::pending_edges(app);
     let leading = if edges.0 { cols } else { 0 };
     let vrows = len.div_ceil(cols) as i64 + i64::from(edges.0) + i64::from(edges.1);
@@ -17872,10 +17882,15 @@ mod grid_window_tests {
         assert!(grid_visible_rows(0.0, 0.0, 100, GRID_MARGIN_ROWS).is_none());
     }
 
-    /// v0.8.50 (G2): the splitter snap — whole columns only (128n + 8), clamped to the ⌊window/3⌋
-    /// column cap, with the 2-column floor WINNING on windows too narrow for a 2-column third.
+    /// Whole-column fit, the three-column 40% exception, and unchanged wider-grid limits.
+    /// Falsifier: restore the one-third-only cap; the 1100px and 980px assertions fail.
     #[test]
     fn grid_snap_width_whole_columns_and_caps() {
+        assert_eq!(grid_snap_width(392.0, 1100.0), 392.0, "three columns may use up to 40% of the window");
+        assert_eq!(grid_snap_width(392.0, 980.0), 392.0, "the exact 40% boundary fits");
+        assert_eq!(grid_snap_width(392.0, 979.0), 264.0, "below the boundary, temporarily fit two");
+        assert_eq!(grid_snap_width(520.0, 1300.0), 392.0, "four columns retain the one-third cap");
+        assert_eq!(grid_snap_width(520.0, 1560.0), 520.0, "four columns fit at their original threshold");
         assert_eq!(grid_snap_width(392.0, 1200.0), 392.0, "an already-snapped 3-col width holds");
         assert_eq!(grid_snap_width(400.0, 1200.0), 392.0, "mid-drag widths snap to the nearest column");
         assert_eq!(grid_snap_width(1000.0, 1200.0), 392.0, "1200/3 = 400 caps at 3 columns");

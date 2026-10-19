@@ -7322,6 +7322,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // v0.9.9 (P6): the runtime accel toggle. Seeded from accel_avail so it defaults ON on Mac (Image I/O
     // slot), and turning it off routes decodes to the CPU. Windows: accel_avail == nvjpeg_avail.
     let use_nvjpeg = Arc::new(AtomicBool::new(accel_avail));
+    // 1.0.15 (RC1 audit #1): the user's CHOICE, kept apart from the runtime flag above. Only the
+    // choice is saved; `use_nvjpeg` = choice AND available-this-launch. Saving the runtime flag
+    // turned a launch without nvJPEG (first launch before CUDA, Remote Desktop, a driver update)
+    // into a saved Off that the next launch obeyed. Default On, like `Settings::use_nvjpeg`.
+    let nvjpeg_choice = Arc::new(AtomicBool::new(true));
     let cur_atomic = Arc::new(AtomicUsize::new(start0));
     // G2: compare-mode mirror for the detail worker's jump-away abandon (compare halves sit at
     // arbitrary distances from `current`, so the distance rule must be suspended there). Stored
@@ -9379,14 +9384,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             ));
         }
         // v0.8.50 (G2): the grid dock + filmstrip visibility — persisted state applied at boot.
-        // grid_dock_w gets a coarse sanity clamp here (a hand-edited/corrupt value); the tick's
-        // grid_snap_width then snaps it to a whole-column width against the LIVE window.
+        // Restore the preferred width; the visible grid tick fits it to the final window
+        // without replacing the preference when the window is temporarily narrow.
         app.set_grid_open(settings.grid_open);
-        app.set_grid_dock_w(if (264.0..=4096.0).contains(&settings.grid_dock_w) {
-            settings.grid_dock_w
-        } else {
-            392.0
-        });
+        support::restore_grid_width(&app, settings.grid_dock_w);
         app.set_film_visible(settings.film_visible);
 
         support::apply_input_settings(&app, &settings);
@@ -9704,17 +9705,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         log_event("RAW view startup: JPG/Preview (session default)");
         // v0.9.9 (P6): accel_avail (not nvjpeg_avail) — so the persisted toggle is restored on Mac too
         // (where the accel slot is Image I/O). Windows: accel_avail == nvjpeg_avail, so bit-identical.
+        // 1.0.15 (RC1 audit #1): the saved choice is restored whether or not the accelerator is
+        // available this launch, so the next save writes it back unchanged; only the runtime flag
+        // waits for availability (`support::accel_boot_state`).
+        let (accel_choice, accel_effective, accel_migrated_now) = support::accel_boot_state(
+            settings.use_nvjpeg,
+            settings.accel_migrated,
+            cfg!(target_os = "macos"),
+            accel_avail,
+        );
+        nvjpeg_choice.store(accel_choice, Ordering::Relaxed);
         if accel_avail {
             // v0.9.10 (Mac fix 2): a pre-v0.9.9 macOS build persisted `use_nvjpeg=false` unconditionally
             // while the value was STRUCTURALLY false (never user-chosen), and v0.9.9's restore honored that
             // stale false — the tester booted to `engine=cpu`. resolve_accel_migration repairs it ONCE on
             // macOS (force ON + stamp `accel_migrated`), then the user's choice round-trips. On Windows
             // is_macos=false → the persisted toggle passes through unchanged (bit-identical to v0.9.9).
-            let (accel_on, migrated) = support::resolve_accel_migration(
-                settings.use_nvjpeg,
-                settings.accel_migrated,
-                cfg!(target_os = "macos"),
-            );
+            let (accel_on, migrated) = (accel_effective, accel_migrated_now);
             use_nvjpeg.store(accel_on, Ordering::Relaxed);
             app.set_use_nvjpeg(accel_on);
             app.set_accel_migrated(migrated); // persisted by build_settings so the one-shot happens once
@@ -9745,7 +9752,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // seed the dedup snapshots so the first periodic tick doesn't rewrite unchanged files
         let s0 = build_settings(
             &app,
-            use_nvjpeg.load(Ordering::Relaxed),
+            nvjpeg_choice.load(Ordering::Relaxed), // 1.0.15: the choice, not the runtime flag
             auto_orient.load(Ordering::Relaxed),
             &keymap.borrow(),
             &cur_dir.borrow(),
@@ -10030,7 +10037,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     });
     let un = use_nvjpeg.clone();
-    app.on_set_nvjpeg(move |on| un.store(on, Ordering::Relaxed));
+    let uc = nvjpeg_choice.clone();
+    // The toggle is enabled only while the accelerator is available, so a flip is both the new
+    // choice and the new runtime state (1.0.15: the choice is what gets saved).
+    app.on_set_nvjpeg(move |on| {
+        un.store(on, Ordering::Relaxed);
+        uc.store(on, Ordering::Relaxed);
+    });
     // v0.8.171 (OWNER RULING): HEIC speed priority. One store, like  beside it — the
     // router reads the atomic per decode, so there is nothing to invalidate and nothing to un-set
     // (L43). Persisted off the Slint property by `build_settings` on the ~1 s dirty compare.
@@ -11894,9 +11907,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Current-folder mode: guard the empty folder BEFORE flipping any flags (with no shots the
         // worker would index snap[j % 0] and panic, and the button would hang on "Benchmarking…" —
         // B3). Synthetic mode makes its OWN images, so it needs no open folder.
+        // 1.0.15 (review R1): a refused run is a run with no usable result — it clears the previous
+        // one exactly as the drain's `None` arm does, so the old recommendation can't stay live.
         if !synthetic && shots_bench.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
             if let Some(a) = awz.upgrade() {
-                a.set_bench_text(i18n::tr("no photos to benchmark").into());
+                support::show_bench_no_result(&a);
             }
             return;
         }
@@ -12007,41 +12022,35 @@ fn main() -> Result<(), Box<dyn Error>> {
             // `use_blur` (the async_blur flag) is on, each worker ALSO builds the 160 px frosted-
             // glass mip — the identical `downscale_rgba` the live pool now runs per frame — so the
             // decode number reflects the real per-frame pool cost, not a blur-free lower bound.
-            let run = |res: u32| -> f32 {
-                let counter = AtomicUsize::new(0);
-                let start = Instant::now();
-                std::thread::scope(|s| {
-                    for _ in 0..nworkers {
-                        let snap = &snap;
-                        let counter = &counter;
-                        s.spawn(move || loop {
-                            let j = counter.fetch_add(1, Ordering::Relaxed);
-                            if j >= bench_frames {
-                                break;
+            // 1.0.15: returns (SUCCESSFUL decodes, seconds) — `support::bench_pool_run` — and the
+            // rate counts only those (`support::bench_rate`, 0 when nothing decoded).
+            let run = |res: u32| -> (usize, f32) {
+                support::bench_pool_run(nworkers, bench_frames, |j| {
+                    let Some(shot) = snap.get(j % n) else { return false };
+                    // super=true pins the decode to the DCT stop ≥ res — and the §43 tiers ARE
+                    // stops of the target-MP image, so each run times its own tier exactly (on a
+                    // folder of that size; other folders time their nearest stop, which is still
+                    // the honest scrub cost).
+                    match fast_frame_rgba(shot, res, true) {
+                        Ok((rgba, dw, dh)) => {
+                            if use_blur {
+                                std::hint::black_box(falcon_decode::downscale_frost_rgba(&rgba, dw, dh, BLUR_DIM));
                             }
-                            if let Some(shot) = snap.get(j % n) {
-                                // super=true pins the decode to the DCT stop ≥ res — and the §43
-                                // tiers ARE stops of the target-MP image, so each run times its
-                                // own tier exactly (on a folder of that size; other folders time
-                                // their nearest stop, which is still the honest scrub cost).
-                                if let Ok((rgba, dw, dh)) = fast_frame_rgba(shot, res, true) {
-                                    if use_blur {
-                                        std::hint::black_box(falcon_decode::downscale_frost_rgba(&rgba, dw, dh, BLUR_DIM));
-                                    }
-                                }
-                            }
-                        });
+                            true
+                        }
+                        Err(_) => false,
                     }
-                });
-                start.elapsed().as_secs_f32().max(0.001)
+                })
             };
-            let fps = |frames: usize, secs: f32| ((frames as f32 / secs).round() as u32).clamp(1, 240);
+            let fps = support::bench_rate;
             // Warm the OS file cache once so the first tier isn't penalised by cold disk
             // reads (keeps the tiers comparable and the result repeatable). These are the DECODE
             // POOL rates; the SUSTAINED rate below is min(decode, upload).
             let _ = run(sub_res);
-            let sub_decode = fps(bench_frames, run(sub_res));
-            let super_decode = fps(bench_frames, run(super_res));
+            let (sub_ok, sub_secs) = run(sub_res);
+            let sub_decode = fps(sub_ok, sub_secs);
+            let (super_ok, super_secs) = run(super_res);
+            let super_decode = fps(super_ok, super_secs);
             // ── v0.9.23 (one-pool): SERIAL per-decode latency at each scrub tier ──────────────
             // Single-thread, 1 warmup + median of 6 — the L in the macOS elastic pool's
             // smoothness floor (floor = ceil(r × L), pool_gov::derive_floor). Measured INSIDE the
@@ -12212,26 +12221,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             let (full_decode, full_gpu) = full.unwrap_or_else(|| {
                 // Parallel CPU full decodes are ~1 s each at 45 MP — a small pool-scaled count
                 // keeps the whole bench bounded while still spanning several work-steal rounds.
+                // 1.0.15: counts the decodes that SUCCEEDED, like the hardware loops above.
                 let frames = (nworkers * 2).max(8);
-                let counter = AtomicUsize::new(0);
-                let start = Instant::now();
-                std::thread::scope(|s| {
-                    for _ in 0..nworkers {
-                        let snap = &snap;
-                        let counter = &counter;
-                        s.spawn(move || loop {
-                            let j = counter.fetch_add(1, Ordering::Relaxed);
-                            if j >= frames {
-                                break;
-                            }
-                            if let Some(shot) = snap.get(j % n) {
-                                let _ = decode_full_rgb(shot);
-                            }
-                        });
-                    }
+                let (ok, secs) = support::bench_pool_run(nworkers, frames, |j| {
+                    snap.get(j % n).is_some_and(|shot| decode_full_rgb(shot).is_ok())
                 });
-                (fps(frames, start.elapsed().as_secs_f32().max(0.001)), false)
+                (fps(ok, secs), false)
             });
+            // 1.0.15: a tier that decoded nothing has no figure, so the run has no usable result —
+            // it ends here as a failed run (the drain's `None` arm clears any earlier result),
+            // before the upload and mixed stages spend time and memory on frames that never decode.
+            if !support::bench_decodes_usable(sub_decode, super_decode, full_decode) {
+                log_event(&format!(
+                    "benchmark: no usable result — successful decodes {sub_ok}/{bench_frames} at {sub_res} px, \
+                     {super_ok}/{bench_frames} at {super_res} px, full rate {full_decode} (nothing is marked benchmarked)"
+                ));
+                let _ = bench_tx_cb.send(None);
+                return;
+            }
             // ── B4: measure the SERIAL UPLOAD STAGE through the REAL upload thread ──
             // A BenchProbe job round-trips through the actual upload thread (it waits its turn
             // behind any live upload — idle during a bench — so the number includes the real
@@ -12497,41 +12504,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let awz = app.as_weak();
     app.on_apply_bench_rec(move || {
         let Some(a) = awz.upgrade() else { return };
-        if !a.get_benchmarked() {
-            return; // placeholder state — the Apply button is disabled too; defensive double-gate
-        }
-        // v0.9.60 (W2-5d / L21): the SAME refusal the card's text carries, at the handler. The
-        // button's `enabled` reads `bench-rec-text != ""`, which `bench_rec_card` empties for a
-        // refused result — so this can't be reached today. It is here because L21's rule is that a
-        // remote invoker's enablement mirrors the handler's OWN guard: if a later surface ever
-        // dispatches this callback, it must not be able to apply a recommendation the app has
-        // publicly refused to make.
-        if !support::bench_result_governs(a.get_bench_synthetic()) {
-            log_event(
-                "welcome: bench recommendation refused — the displayed result is from generated \
-                 test images, not this folder",
-            );
-            return;
-        }
-        let w = if a.get_bench_w() > 0 {
-            a.get_bench_w() as u32
-        } else {
-            mp_to_long_side(a.get_bench_target_mp())
-        };
-        let (fps, sup, _res) =
-            bench_recommendation(a.get_bench_sub_fps(), a.get_bench_super_fps(), w, screen_long());
-        let f = support::bench_rec_scrub_fps(fps);
-        a.set_scrub_fps(f);
-        a.set_fps_text(support::fps_title(f));
-        a.set_quality_super(if sup { 1 } else { 0 });
-        // v0.8.160 (B4/U11): no latch write. `bench-rec-applied` is a binding over the pair this
-        // block just wrote against the pair the card recommends, so it turns true HERE and turns
-        // false again the moment the reader moves either control — in both directions, with no
-        // demotion edge for a future change to forget.
-        log_event(&format!(
-            "welcome: bench recommendation applied (scrub {fps} fps, {})",
-            if sup { "supersample" } else { "subsample" }
-        ));
+        support::apply_bench_rec(&a);
     });
 
     // adaptive hi-res toggle: set the full-res decode cap (8192 on, manual limit off) and
@@ -15675,12 +15648,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // reads `cur` at dispatch time, so there is nothing left to invalidate at the swap.)
                 a.set_open_menu_open(false); // v0.8.65 (C3/M6): the Open… menu closes at the swap too
                 a.set_empty_state(new_len == 0);
-                // v0.9.62 (B3): "is a folder open" is an INPUT to the welcome card's refusal hint,
-                // and this is the one chokepoint where it changes. Without this the hint composed at
-                // boot (or at the last run) would still be telling a user who has since opened a
-                // folder to open one. Windows-inert by construction and pinned as such — see
-                // `support::refresh_bench_rec_hint`.
-                support::refresh_bench_rec_hint(&a);
                 if new_len == 0 {
                     // M2: distinguish "folder unreadable" (scan IO error) from "folder genuinely has no
                     // photos" — the honest empty-state, not the misleading "No photos" one.
@@ -21077,7 +21044,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let last_oom_t = last_oom.clone();
     let prefetch_ahead_t = prefetch_ahead.clone();
     let prefetch_behind_t = prefetch_behind.clone();
-    let use_nvjpeg_t = use_nvjpeg.clone();
+    let nvjpeg_choice_t = nvjpeg_choice.clone(); // 1.0.15: the periodic save persists the choice
     let raw_t = raw_mode.clone();
     let output_gamut_t = output_gamut.clone();
     let gen_t = generation.clone();
@@ -24696,7 +24663,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         // 11) periodic persistence (~1 s; write only when changed — see fn doc above).
         step_persistence(
-            &app, &shots_now, &save_ctr_t, &use_nvjpeg_t, &auto_orient_t, &rot_t, &keymap_t,
+            &app, &shots_now, &save_ctr_t, &nvjpeg_choice_t, &auto_orient_t, &rot_t, &keymap_t,
             &cur_dir_t, &export_image_path_t, &export_presets_t, &lsj_t, &lrj_t, &ratings_t,
             &marks_t, &sel_extra_t, &save_warned, &sel_gen_t, &last_sel_gen_t, &quiesce_ctr_t,
             &last_flush_gen, &flush_backstop, &notif_pending_t, &viewed_lru_t,
@@ -25852,7 +25819,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // best-effort final flush on graceful close
             save_settings(&build_settings(
                 &app,
-                use_nvjpeg.load(Ordering::Relaxed),
+                nvjpeg_choice.load(Ordering::Relaxed), // 1.0.15: the choice, not the runtime flag
                 auto_orient.load(Ordering::Relaxed),
                 &keymap.borrow(),
                 &cur_dir.borrow(),
@@ -26498,6 +26465,250 @@ mod tests {")
             assert!(w > 0 && h > 0 && rgba.len() == (w as usize * h as usize * 4));
         } // guard drops here
         assert!(!dir_path.exists(), "the drop-guard removed the temp dir");
+    }
+
+    /// 1.0.15 (audit 2026-10-17, finding 2): the benchmark counts DECODES, not attempts — through
+    /// the real preview and full-size decoders on real files. The good frame is a real JPEG made
+    /// with the encoder the "Target size" generator uses (not `synth_bench_dir` itself: its folder is
+    /// named per PROCESS, so a second test calling it would delete the first one's frames); the bad
+    /// ones are JPEG-named files whose bytes are not a JPEG, the shape of a folder whose photos fail
+    /// to decode.
+    ///
+    /// FALSIFIER (L28): count every attempt in `support::bench_pool_run` (the pre-1.0.15 `run` and
+    /// CPU fallback) and the mixed rows read 8 for 2 and the all-bad row reads 8 for 0; return the
+    /// old clamp for 0 in `support::bench_rate` and the all-bad rate reads 1; drop a tier from
+    /// `support::bench_decodes_usable` and its row reddens.
+    #[test]
+    fn the_benchmark_counts_successful_decodes_not_attempts() {
+        let root = std::env::temp_dir().join(format!("falcon-bench-decode-count-{}", std::process::id()));
+        let (good_dir, bad_dir) = (root.join("good"), root.join("bad"));
+        std::fs::create_dir_all(&good_dir).expect("scratch dir");
+        std::fs::create_dir_all(&bad_dir).expect("scratch dir");
+        let (w, h) = (512u32, 342u32);
+        let rgb: Vec<u8> = (0..w * h).flat_map(|i| [(i % w) as u8, (i / w) as u8, (i % 7 * 31) as u8]).collect();
+        let jpeg = falcon_decode::encode_jpeg_rgb(&rgb, w, h, 90).expect("encode a real JPEG");
+        std::fs::write(good_dir.join("good.jpg"), jpeg).expect("write the good file");
+        let good = scan_folder(&good_dir).expect("scan the good file").remove(0);
+        let bad: Vec<Shot> = (1..=3)
+            .map(|k| {
+                let p = bad_dir.join(format!("broken-{k}.jpg"));
+                std::fs::write(&p, b"this is not a jpeg ".repeat(64)).expect("write the broken file");
+                Shot { id: k, name: format!("broken-{k}"), jpg: Some(p), ..good.clone() }
+            })
+            .collect();
+        let preview = |s: &Shot| fast_frame_rgba(s, 256, true).is_ok();
+        let full = |s: &Shot| decode_full_rgb(s).is_ok();
+        assert!(preview(&good) && full(&good), "the generated frame decodes on both paths");
+        assert!(bad.iter().all(|s| !preview(s) && !full(s)), "the broken files decode on neither");
+
+        // One good photo in four, eight attempts: two decodes, on the preview path and the CPU fallback.
+        let mixed: Vec<&Shot> = std::iter::once(&good).chain(bad.iter()).collect();
+        let (ok, _) = support::bench_pool_run(4, 8, |j| preview(mixed[j % mixed.len()]));
+        assert_eq!(ok, 2, "preview tier: successful decodes, not the 8 attempts");
+        let (ok, _) = support::bench_pool_run(4, 8, |j| full(mixed[j % mixed.len()]));
+        assert_eq!(ok, 2, "CPU full-size fallback: successful decodes, not the 8 attempts");
+
+        // Nothing decodes: no rate, and the run is not a usable result.
+        let (ok, secs) = support::bench_pool_run(4, 8, |j| preview(&bad[j % bad.len()]));
+        assert_eq!((ok, support::bench_rate(ok, secs)), (0, 0), "an undecodable sample has no rate");
+        let (ok, secs) = support::bench_pool_run(4, 8, |j| full(&bad[j % bad.len()]));
+        assert_eq!(support::bench_rate(ok, secs), 0, "nor does its CPU full-size fallback");
+
+        // The rate itself: successes over time, the long-standing 1..240 clamp once anything decoded.
+        assert_eq!(support::bench_rate(2, 1.0), 2);
+        assert_eq!(support::bench_rate(1, 10.0), 1, "a real but slow decode still reads 1");
+        assert_eq!(support::bench_rate(5000, 1.0), 240);
+
+        // Usable only when every decode tier measured something.
+        assert!(support::bench_decodes_usable(47, 30, 9));
+        assert!(!support::bench_decodes_usable(0, 30, 9), "no Faster-preview decode");
+        assert!(!support::bench_decodes_usable(47, 0, 9), "no Sharper-preview decode");
+        assert!(!support::bench_decodes_usable(47, 30, 0), "no full-size decode");
+        assert!(!support::bench_decodes_usable(0, 0, 0), "nothing decoded");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 1.0.15: the benchmark WORKER itself uses the success-counting run for both preview tiers and
+    /// the CPU full-size fallback, and ends a run with an unusable tier as a failed run BEFORE the
+    /// upload stages. The helpers are exercised above; this pins that the worker still calls them —
+    /// a census over the production source, like `each_rotate_door_passes_its_own_rot_door`.
+    ///
+    /// FALSIFIER (L28): put back the pre-1.0.15 `fps(bench_frames, run(sub_res))` or the CPU
+    /// fallback's own attempt-counting loop and the call-count or old-pattern assert reddens; move
+    /// the usable check after the upload probes (or drop its `send(None)`) and the order assert does.
+    #[test]
+    fn the_benchmark_worker_counts_successes_and_stops_an_unusable_run() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("main.rs is readable from its own test module");
+        let prod = src
+            .split_once("\nmod tests {")
+            .expect("main.rs's own test module ends the production source")
+            .0;
+        let code: String = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let start = code.find("app.on_run_benchmark(").expect("the benchmark handler");
+        let end = start + code[start..].find("bench_tx_cb.send(Some(BenchResult").expect("the result send");
+        let worker = &code[start..end];
+        assert_eq!(
+            worker.matches("support::bench_pool_run(").count(),
+            2,
+            "the preview-tier run and the CPU full-size fallback both count successful decodes"
+        );
+        assert!(
+            !worker.contains("fps(bench_frames,") && !worker.contains("fps(frames,"),
+            "no rate is computed from the number of attempts"
+        );
+        let usable = worker.find("support::bench_decodes_usable(").expect("the worker checks the run is usable");
+        let uploads = worker.find("upload_fps(sub_res)").expect("the upload probes");
+        assert!(usable < uploads, "an unusable run ends before the upload stages");
+        assert!(worker[usable..uploads].contains("bench_tx_cb.send(None)"), "…as a failed run");
+    }
+
+    /// 1.0.15 (review R1): both ways a benchmark ends with no usable result go through
+    /// `support::show_bench_no_result`, which clears the previous result (blocks 2 and 5 of
+    /// `a_failed_benchmark_run_clears_the_previous_result_and_a_good_run_brings_it_back` test it):
+    /// Run benchmark on Current folder with no photos open (refused in `on_run_benchmark`) and the
+    /// drain's `None` arm. Neither may set the readout on its own. A census over main.rs and tick.rs.
+    ///
+    /// FALSIFIER (L28): put the reviewed `a.set_bench_text(i18n::tr("no photos to benchmark")…)`
+    /// back in the handler's empty-folder guard and the guard and readout asserts redden.
+    #[test]
+    fn both_ways_a_benchmark_ends_without_a_result_clear_the_previous_one() {
+        let read = |f: &str| {
+            let src = std::fs::read_to_string(format!("{}/src/{f}", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+            let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p).to_string();
+            prod.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let main = read("main.rs");
+        let handler = main.find("app.on_run_benchmark(").expect("the benchmark handler");
+        let guard = handler + main[handler..].find("if !synthetic && shots_bench").expect("the empty-folder guard");
+        let guard_end = guard + main[guard..].find("return;").expect("the guard returns");
+        assert!(
+            main[guard..guard_end].contains("support::show_bench_no_result(&a)"),
+            "the empty-folder start clears the previous result"
+        );
+        let tick = read("tick.rs");
+        let drain = tick.find("fn drain_bench(").expect("the drain");
+        let none_arm = drain + tick[drain..].find("let Some(r) = r else {").expect("the drain's None arm");
+        assert!(
+            tick[none_arm..].lines().nth(1).unwrap_or_default().contains("support::show_bench_no_result(app)"),
+            "a run with no usable result clears the previous one"
+        );
+        for (f, code) in [("main.rs", &main), ("tick.rs", &tick)] {
+            assert!(
+                !code.contains("tr(\"no photos to benchmark\")"),
+                "{f} shows the no-result readout without clearing the previous result"
+            );
+        }
+    }
+
+    /// 1.0.15 (RC1 audit #1): every settings save persists the GPU-decoding CHOICE, never the
+    /// runtime flag that is Off on a launch without the accelerator (`support::accel_boot_state`
+    /// keeps the two apart and is tested beside it). A census over main.rs and tick.rs: the three
+    /// `build_settings` calls (boot seed, periodic save, quit) and the periodic save's argument.
+    ///
+    /// FALSIFIER (L28): pass `use_nvjpeg.load(…)` to any `build_settings` call, or `&use_nvjpeg_t`
+    /// to `step_persistence`, and the matching assert reddens.
+    #[test]
+    fn every_settings_save_persists_the_gpu_choice_not_the_runtime_flag() {
+        let read = |f: &str| {
+            let src = std::fs::read_to_string(format!("{}/src/{f}", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+            // main.rs's own test module (this census included) is not production source.
+            let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p).to_string();
+            prod.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut calls = Vec::new();
+        for f in ["main.rs", "tick.rs"] {
+            let code = read(f);
+            for (at, _) in code.match_indices("build_settings(") {
+                let args: Vec<&str> = code[at + "build_settings(".len()..].splitn(3, ',').collect();
+                calls.push((f, args.get(1).map(|a| a.trim().to_string()).unwrap_or_default()));
+            }
+        }
+        assert_eq!(calls.len(), 3, "boot seed, periodic save and quit: {calls:?}");
+        for (f, nv) in &calls {
+            assert!(nv.starts_with("nvjpeg_choice.load("), "{f}: a settings save passes `{nv}`, not the choice");
+        }
+        let main = read("main.rs");
+        let at = main.find("step_persistence(").expect("the periodic save");
+        assert!(main[at..at + 200].contains("&nvjpeg_choice_t"), "the periodic save is handed the choice");
+    }
+
+    /// 1.0.15 (PR #4 review SAVE-O3): the app flushes files only through the shared durable flush
+    /// `falcon_decode::file_io::sync_file`, which on macOS falls back to an ordinary fsync where a
+    /// network share (SMB) refuses the full one (errno 45, issue #6). Copy picks, the cross-drive
+    /// Move, Undo of a move and the review file's move-aside copy all used a plain flush, so on a Mac
+    /// network share they failed every time. The one plain flush left is the Windows-only icon
+    /// helper's cache file. (The needles are built at run time so this census can't match itself.)
+    ///
+    /// FALSIFIER (L28): put `out.sync_all()` back in `support::copy_via_part` (or `f.sync_all()` in
+    /// `RealReviewIo::copy_via_part`) and the census names that line.
+    #[test]
+    fn the_app_flushes_files_only_through_the_network_share_safe_sync() {
+        let needles = [format!(".{}()", "sync_all"), format!(".{}()", "sync_data")];
+        let mut plain = Vec::new();
+        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).expect("src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            let src = std::fs::read_to_string(&path).expect("source readable");
+            for (i, line) in src.lines().enumerate() {
+                if !line.trim_start().starts_with("//") && needles.iter().any(|n| line.contains(n.as_str())) {
+                    plain.push(format!("{name}:{}", i + 1));
+                }
+            }
+        }
+        assert!(
+            plain.iter().all(|p| p.starts_with("windows_icon_bridge.rs:")),
+            "only the Windows icon helper may flush with the plain call; found {plain:?}"
+        );
+        let support = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/support.rs")).expect("support.rs");
+        assert!(
+            support.matches("falcon_decode::file_io::sync_file(&").count() >= 2,
+            "both copy-through-a-marker paths flush through the shared helper"
+        );
+    }
+
+    /// 1.0.15 (SAVE-O2, review R2): both routes by which a failed save becomes an error notice show
+    /// a failure once, when it starts, and stay quiet on its ~15 s retries until a save to that file
+    /// succeeds: the real writer's failure callback is `support::report_writer_failure`
+    /// (`a_failing_save_shows_once_until_that_file_saves_again` drives it through the writer), and
+    /// the tick's inline "Ratings not saved" asks `support::save_failure_starts` for the folder's
+    /// review file. A census over support.rs and tick.rs, comment lines dropped.
+    ///
+    /// FALSIFIER (L28): give `init_writer` its own pushing closure again, or push the inline message
+    /// without asking, and the matching assert reddens.
+    #[test]
+    fn repeated_save_failures_reach_the_notices_once_per_failure() {
+        let read = |f: &str| -> String {
+            std::fs::read_to_string(format!("{}/src/{f}", env!("CARGO_MANIFEST_DIR")))
+                .expect("source readable")
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let support = read("support.rs");
+        let init = support.find("pub(crate) fn init_writer(").expect("the writer's start-up");
+        let init_end = init + support[init..].find("writer_loop(rx, sink, xmp_sink, on_fail,").expect("the real writer loop");
+        assert!(
+            support[init..init_end].contains("report_writer_failure(p, &e, is_xmp, &fails_w)"),
+            "the real writer reports failures through the once-per-failure surface"
+        );
+        let tick = read("tick.rs");
+        let inline = tick.find("tr_format!(\"⚠ Ratings not saved — {error}\"").expect("the inline failure notice");
+        let asked = tick[..inline].rfind("if crate::support::save_failure_starts(").expect("the inline failure asks first");
+        assert!(
+            !tick[asked..inline].contains('}') && tick[asked..inline].contains("review_write_target(Path::new(&dir))"),
+            "the inline failure shows only when this folder's review file starts failing"
+        );
     }
 
     // ── v0.9.12 (C2/M11): pinch-accumulator → zoom-step mapping (drives the macOS PinchGesture arm) ──

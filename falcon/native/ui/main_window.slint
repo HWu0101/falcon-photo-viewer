@@ -94,11 +94,8 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
     component BenchRecCard inherits Rectangle {
         in property <string> rec-text;
         in property <bool> applied;
-        // v0.9.60 (W2-5d) / v0.9.66 (the round-7 sync): the placeholder line is COMPOSED IN RUST
-        // (`support::bench_rec_card`), by the same producer as `rec-text`, so the card cannot show
-        // an empty recommendation beside a sentence that explains a different reason for it. The
-        // default is the literal this row carried before the hint existed, so the Windows
-        // rendering is byte-identical in every state; on macOS a synthetic run replaces it.
+        // A generated test is useful for starting preferences, not a measurement of this folder.
+        in property <bool> generated;
         in property <string> hint: @tr("falcon" => "shown after the run");
         callback apply();
         // one surface step back DOWN (base-on-block) + the hairline rim — 262:80, verbatim
@@ -118,6 +115,10 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 color: root.rec-text == "" ? Theme.text-mute : Theme.text;
                 font-size: Theme.font-body; font-weight: 600; wrap: word-wrap;
             }
+            if root.generated && root.rec-text != "" : Text {
+                text: @tr("falcon" => "Starting settings from generated test images");
+                color: Theme.text-mute; font-size: Theme.font-sm; wrap: word-wrap;
+            }
             HorizontalLayout {
                 spacing: Theme.space-2;
                 // L5, widest state: the card's inner width is 272px in BOTH hosts (a 320px
@@ -125,7 +126,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 // card at 296 → its own 12px sides), against 88 + 8 + ~90 ("shown after the
                 // run" at font-sm) ≈ 186px, and the two strings are literals — the trailing
                 // spacer absorbs the rest.
-                ActionBtn {
+                apply-btn := ActionBtn {
                     width: 88px;
                     label: root.applied ? @tr("falcon" => "Applied") : @tr("falcon" => "Apply");
                     variant: 0;
@@ -2212,12 +2213,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         out property <bool> bench-rec-applied:
             root.benchmarked && root.scrub-fps == root.bench-rec-fps
             && root.quality-super == (root.bench-rec-super ? 1 : 0);
-        // v0.9.60 (W2-5d): the card's placeholder line, composed by the SAME Rust producer as the
-        // text above (`support::bench_rec_card`) so the two can never disagree about why there is
-        // no recommendation. Default = the literal this row carried before, so Windows renders
-        // byte-identically in every state; on macOS a synthetic run replaces it with "not yet
-        // measured for this folder" — a run HAS happened, and "shown after the run" would be a lie
-        // about it.
+        // The first-run placeholder; generated-result labelling belongs to BenchRecCard.
         in property <string> bench-rec-hint: @tr("falcon" => "shown after the run");
         // v0.9.60 (W2-5d): may the displayed benchmark PARAMETERIZE this folder's promises?
         // Derived, never set from Rust, so it cannot drift from the two facts it reads. On Windows
@@ -2291,7 +2287,11 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // drag-to-compare). Immersive/empty-state mount-cull the dock (the title-bar-slot
         // rule) — grid-open is untouched, so the state restores on exit.
         in-out property <bool> grid-open: false;
-        in-out property <length> grid-dock-w: 392px; // 8 pad + 3×120 tiles + 2×8 gaps + 8 pad (fixed this stage; the G2 splitter varies it)
+        // Only settings restoration and an explicit splitter drag write the preference.
+        // The fitted width can shrink with the window without replacing that choice.
+        in-out property <length> grid-preferred-w: 392px;
+        in-out property <length> grid-dock-w: 392px; // live fit: 128px per column + 8px padding
+        out property <length> grid-window-w: root.width; // same logical width the splitter reads
         in property <length> grid-virtual-h: 0px;    // Rust: pad + virtual-rows × row-pitch
         in-out property <length> grid-vp-y: 0px;     // Flickable viewport-y mirror (negative when scrolled; the sel-vp-y idiom)
         in-out property <length> grid-vp-h: 0px;     // live dock viewport height (Rust reads for the window math)
@@ -5028,13 +5028,10 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                     }
                 }
 
-                // ── v0.8.50 (G2): the grid splitter — a 5px ew-resize lane on the stage's left
-                // edge (the dock boundary). Dragging writes grid-dock-w SNAPPED to whole columns
-                // (width-for-cols = 128·n + 8 — never a clipped part-column), clamped [2 columns ..
-                // ⌊window/3⌋ columns, 2-col floor wins on small windows]. Rust (step_folder_grid /
-                // grid_snap_width) re-validates the same formula every tick, so a window resize
-                // re-snaps automatically. Declared LAST in the stage so it wins the edge's hits
-                // (a 5px sliver of the photo's left edge — panels sit at x≥18 and stay clear).
+                // The splitter chooses a preferred whole-column width. Three columns may use
+                // up to 40% (392 / 0.4 = 980px); wider grids retain the one-third cap.
+                // Keep this snap formula aligned with tick::grid_snap_width. Only this explicit
+                // drag writes the preference; automatic fitting writes grid-dock-w alone.
                 if root.grid-open && !root.immersive && !root.empty-state : TouchArea {
                     x: 0; width: 5px; height: 100%;
                     mouse-cursor: ew-resize;
@@ -5043,8 +5040,10 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                             root.grid-dock-w = clamp(
                                 Math.round(((self.absolute-position.x + self.mouse-x) - 8px) / 128px),
                                 2.0,
-                                max(2.0, Math.floor((root.width / 3 - 8px) / 128px))
+                                max(root.width >= 980px ? 3.0 : 2.0,
+                                    Math.floor((root.width / 3 - 8px) / 128px))
                             ) * 128px + 8px;
+                            root.grid-preferred-w = root.grid-dock-w;
                         }
                     }
                 }
@@ -6079,10 +6078,9 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                     padding-left: 12px; padding-right: 12px;
                                     BenchRecCard {
                                         rec-text: root.bench-rec-text;
+                                        generated: root.bench-synthetic;
                                         applied: root.bench-rec-applied;
-                                        // v0.9.66: both hosts read the SAME Rust-composed hint —
-                                        // a card that refuses a recommendation must say why on
-                                        // whichever surface the reader is looking at.
+                                        // Both hosts share the first-run hint and generated-source label.
                                         hint: root.bench-rec-hint;
                                         // LIVE-COMMIT, like every other control on this sheet: the
                                         // SAME callback the welcome's Apply invokes, which writes
@@ -11257,10 +11255,10 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                 // it always did; the second host is what is new.
                                 VerticalLayout {
                                     padding-left: 12px; padding-right: 12px;
-                                    // v0.9.66: `hint` carries this branch's Rust-composed
-                                    // placeholder line (`support::bench_rec_card`).
+                                    // The same recommendation and source label as Settings.
                                     BenchRecCard {
                                         rec-text: root.bench-rec-text;
+                                        generated: root.bench-synthetic;
                                         applied: root.bench-rec-applied;
                                         hint: root.bench-rec-hint;
                                         apply => { root.apply-bench-rec(); }

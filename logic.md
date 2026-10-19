@@ -2489,6 +2489,14 @@ sustained browsing rate for each tier. Saved results carry `BENCH_SCHEMA_VER` = 
 an older schema measured something different and cannot be compared, so they are discarded on load,
 and the row reads "device not yet tested" until the user runs the benchmark again.
 
+The welcome and Settings cards offer the same preview-quality and browsing-speed recommendation.
+Generated-image tests also offer it on Mac, labelled **Starting settings from generated test
+images**. Apply changes those two preferences only; saved generated results retain the label on
+restart. This does not turn them into measurements of the current folder: Mac's runtime pacing
+and its speed-limit captions keep their existing source checks, and pool/memory policies are
+unchanged. The screenshot reported on 17 October (36/25 preview fps) therefore recommends
+20 photos/s with Sharper preview instead of an empty card.
+
 - **Faster and Sharper preview** report `browse_sustained(mixed, decode, upload) = min(mixed,
   iso_sustained)`. That is the rate measured while full-size uploads compete through the real two-lane
   upload thread, clamped to the contention-free ceiling (`iso_sustained = min(decode pool, upload
@@ -2508,6 +2516,19 @@ and the row reads "device not yet tested" until the user runs the benchmark agai
   the mixed stage uses (for example 8216 → 2560 px on a small laptop), and the per-loop target is
   `min(800 MB, detail budget)`. When the probe is clamped, `bench_clamp_note` writes a caption naming
   both sizes, and `bench_full_probe_res` saves the probe size so the caption survives a restart.
+- **Rates count successful decodes (1.0.15).** Each tier's rate is the number of photos that actually
+  decoded over the time taken (`bench_pool_run`, `bench_rate`), for both preview tiers and the CPU
+  full-size fallback. A run in which any of the three tiers decoded nothing (`bench_decodes_usable`)
+  ends before the upload stages as a run with no usable result. An unavailable upload measurement is
+  a different condition and keeps its existing non-binding 0.
+- **A run with no usable result clears the previous one (1.0.15).** It ends this way by two routes:
+  the worker sends `None` (no photo decoded, the folder emptied, image generation failed or the worker
+  panicked), or Run benchmark is pressed on Current folder with no photos open, which is refused before
+  anything starts. Both go through `show_bench_no_result`: `clear_bench_result` returns every result
+  property and both live memos (latencies, provenance) to a never-benchmarked window's, and the readout
+  says "no photos to benchmark". The next save writes `bench_ver = 0`, which `restore_bench_ui`
+  discards, so a restart does not bring the older result back. The user's own settings stay, including
+  ones set by Apply: browsing speed, preview quality, "Benchmark with" and the target size.
 
 `FALCON_BENCH_ON_BOOT=1` runs the Quick benchmark about 2.5 s after start-up, through the same
 `invoke_run_benchmark(true)` call the button uses. It is the only way to reach this code path without
@@ -5556,6 +5577,21 @@ Falcon's review tools are star ratings (0–5), flags, reject marks, rotations, 
 
 While the folder is still being scanned, thumbnails offer no edit actions (they show the normal disabled colours and ignore clicks), and the Review panel's hover preview and the filmstrip's drag-to-compare are not guaranteed to work.
 
+### Grid width and remembered layout
+
+The grid keeps the user's preferred width (`grid-preferred-w`) separate from its fitted width
+(`grid-dock-w`). Only restoring settings or dragging the splitter changes the preference. The
+existing `settings.json` key `grid_dock_w` stores that preference, so shrinking a window cannot
+silently turn three columns into a permanently remembered two. Enlarging the window restores the
+chosen width; saving or restarting while narrow preserves the choice too.
+
+Three columns occupy 392 logical pixels and may use up to 40% of the window, so they fit from
+980 logical pixels wide. Below that, the dock temporarily uses two columns. Wider grids retain
+the one-third cap, and an explicitly selected two-column grid stays two columns. The fit reads
+the window's logical width, independent of display scaling. Existing saved widths are retained;
+a two-column value left by an older build cannot be distinguished from a deliberate choice, so
+Falcon does not automatically replace it with three.
+
 ### Culling data
 
 Each folder's culling state is `ratings: Vec<i32>` plus `marks: Vec<u8>` bit flags (`MARK_FLAG`, `MARK_REJECT`; flag and reject exclude each other). Undo and redo are per folder, capped at 500 entries.
@@ -6049,6 +6085,7 @@ What the writer guarantees:
 - **One FIFO queue**, so writes to the same file land in the order they were queued. The last write wins.
 - Each write runs inside `catch_unwind`. A panic in file code becomes an ordinary error and cannot kill the writer thread, which would silently drop every later write.
 - Each settings, review-data or XMP write is retried once. A second failure is logged and added to a failures list, which the tick shows in the events centre (`writer_take_fails`). A write is never dropped silently. A failed settings or review-data save says "your latest changes may not be on disk". A failed XMP rating says the sidecar may be locked by another app and that "Ratings are safe in Falcon" (`writer_fail_message`).
+- **A failure is shown once, when it starts (1.0.15).** A folder whose saves keep failing (a write-protected card, a read-only share, an NTFS drive on a Mac) is retried on the persistence backstop, about every 15 s, and each failed retry used to add another error notice. Now `report_writer_failure` logs every failure but queues a notice only when `save_failure_starts` says the failure is new. The failure ends when a write to the same file succeeds (`save_failure_ended`, called by `writer_loop`), so the next failure is shown again. Failures are keyed by the file written, never by the message text, which is translated and reads the same for two folders with the same name. The inline review-data route does the same: the tick asks `save_failure_starts` for the folder's review file before showing "Ratings not saved", and `enqueue_review_data`'s successful inline write ends the failure. A new folder visit forgets every shown failure (`begin_review_visit`), so a folder that still fails warns once more. Only the repeated notice is dropped: every failure still reaches the writer's failure callback and the retry state, as the paragraph above requires. Tests: `a_failing_save_shows_once_until_that_file_saves_again` (review data, settings and XMP through the real writer loop) and `an_inline_review_save_failure_shows_once_until_it_saves`.
 - Diagnostic lines (`WriteMsg::Log`) are appended. They are never retried and never raise an events entry, because that entry would itself be logged and loop.
 - If the writer is not running (very early startup, unit tests, or a writer thread that failed to start), or its channel has closed, the `enqueue_*` functions write inline on the calling thread so nothing is lost. Review-data inline failures propagate to the caller; other inline write errors are still discarded.
 
