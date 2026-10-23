@@ -84,3 +84,15 @@ jobs:
             dist/source-revision.txt
             dist/SHA256SUMS.txt
           if-no-files-found: error
+      # 1.0.16 (Mac log-out fix): runs after the upload, so a sender problem on the runner cannot cost
+      # the package; a failure still fails the run, and a failed run's package is not for testers.
+      - name: System log-out and ordinary quit requests to the actual app (isolated profiles)
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/test-mac-system-quit.py "dist/Falcon.app/Contents/MacOS/falcon" "${{ runner.temp }}/falcon-system-quit-check"
+      - name: Upload quit-check logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: falcon-system-quit-check-${{ github.run_number }}
+          path: ${{ runner.temp }}/falcon-system-quit-check/
+          if-no-files-found: ignore

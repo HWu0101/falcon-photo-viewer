@@ -21,3 +21,16 @@ this exact package, and existing settings and review data still load correctly.
 Diagnostic logging is under Developer settings and defaults Off. Enable it only when investigating;
 review logs for personal paths or image metadata before sharing. Report the source revision,
 macOS version and exact steps alongside any screenshot or recording.
+
+**Log out, restart and shut down** (builds with the log-out fix, after 1.0.15). Turn on
+Diagnostic logging, use copies of photos and save work in other apps first. Rate or flag a few
+photos, then log out straight away. macOS should not say that Falcon interrupted log out, and
+one attempt should be enough. Log back in, reopen the folder and check the last ratings and
+flags. Repeat with Restart and with Shut Down; do one of them with XMP sync on and check the
+sidecar too. Then check that ⌘Q and Dock → Quit still close promptly with no new prompt and keep
+changes, and that closing the window with unapplied rotations still shows the reminder. Last,
+start Copy picks on copied photos and log out during it: finished copies open, originals are
+unchanged and ratings survive. The log should show `terminate: system reason=` and later
+`terminate: reply=now`. A line with `STILL running at the boundary deadline`,
+`FLUSH BARRIER exceeded` or `final ratings flush failed` means that run proved nothing about
+saving; check the files after logging back in either way.

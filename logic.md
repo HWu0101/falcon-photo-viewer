@@ -324,7 +324,7 @@ These are current design facts, not unfinished work:
 - **Two Falcon windows on one folder.** Falcon keeps `open_folders.json` in its configuration folder, so that a second running copy can warn that a folder is already open ("review edits … are last-writer-wins"). Each copy refreshes its entry every 25 s (`heartbeat_open_folder`); an entry older than 90 s (`OPEN_FOLDER_STALE_MS`), or one from a process that has exited, is ignored. The heartbeat and folder-open writes go through the durable writer; only the removal at exit writes inline, because it runs after the writer has been drained. The update is a read-modify-write with no lock between processes. If two copies write at the same moment, one entry can be lost. It corrects itself at the next heartbeat, and the only cost is a missed or spurious warning.
 - **No directory flush after an atomic write.** `write_atomic` writes a uniquely named temporary file, synchronizes it and renames it over the target. On macOS only, when the full-sync operation returns `ENOTSUP` (as on some writable SMB shares), it requires ordinary `fsync` to succeed instead. Other errors still fail; the fallback cannot promise the stronger physical-device flush guarantee. Review JSON, XMP sidecars and JPEG orientation patches share this synchronization helper. A failed temporary-file write, sync or rename removes only its own temporary file and preserves the previous target. Nothing flushes the parent directory after the rename, so on some file systems a power cut just after the rename can still lose it.
 - **Interrupted copy and export recovery is a timeout rule.** A leftover `.part` claim is recovered only when it is at least 60 seconds old. That is a heuristic, not proof that the writer stopped: a live writer stalled for longer can still race the recovery, and there is no lock between processes. See [File operations, delete and recovery](#file-operations-delete-and-recovery).
-- **A Mac logout may report that Falcon interrupted it,** because the quit handler cancels the system's quit and Falcon then exits by itself after saving. See [Shutdown order](#shutdown-order).
+- **A Mac log-out, restart or shut-down waits for Falcon's save.** The quit handler recognises them from macOS's quit request and saves before it agrees. The save is not time-bounded: its waits add up to about 22 seconds, and a hung drive can hold log-out up for longer, as it held up quitting before. A quit request without a recognised reason keeps the old route. See [Shutdown order](#shutdown-order).
 
 #### Export limits
 
@@ -965,13 +965,15 @@ Boot log lines such as `boot: settings loaded in … ms`, `boot: wgpu backend se
 
 ### Shutdown order
 
-Every way out of the event loop (closing the window, a device loss, ⌘Q on Mac) ends in the same tail after `app.run()` returns. First, unfinished export work is told to stop. Then `support::graceful_shutdown` emits a fixed list of steps that `main` carries out:
+Every way out of Falcon runs one save sequence, built once in `main()` before the event loop (`support::SaveSequence`). Every way out of the event loop (closing the window, a device loss, ⌘Q on Mac) runs it after `app.run()` returns. On a Mac, a system log-out, restart or shut-down runs it inside the quit handler instead (below). First, unfinished export work is told to stop. Then `support::graceful_shutdown` emits a fixed list of steps that `main` carries out:
 
 `AwaitFileOpBoundary` (Mac immediate quit only: a bounded wait for a copy, move or export to reach a safe point; never emitted on Windows) → `DrainAppliedRotations` → `DrainPickerResults` → `RevertStagedEdits` → `SaveSettings` → `FlushSelection` → `WriterBarrier` → `UnregisterFolder`.
 
 The order matters. Staged (unconfirmed) key and preset edits must be reverted before settings are saved. The two worker hand-offs must be drained before review data is written. The writer barrier must come after both writes, or they may never reach disk. The test `the_shutdown_tail_runs_its_steps_in_the_one_correct_order` pins this order. `SHUTDOWN_ONCE` makes a second arrival do nothing (on Mac, the quit handler and the ⌘Q key are two doors into the same exit). From the start of the tail every log line is written directly (`log_inline_from_now`), after a 2 s barrier that drains already-queued lines so the log stays in order.
 
-Known Mac limitation: the quit handler answers `NSTerminateCancel` (it cancels the system's quit) and Falcon then exits by itself after the flush, so a system logout may report that Falcon interrupted it. The fix would be `NSTerminateLater` plus `replyToApplicationShouldTerminate:` (see the note in `macos_open.rs`).
+After the steps, completed export records are flushed (`stop_and_flush_completed`). Whichever route runs the save sequence first takes it, so it cannot run twice.
+
+**Mac log-out, restart and shut-down.** macOS first asks `applicationShouldTerminate:`. The handler reads the reason on the current quit Apple event (`kAEQuitReason`; `support::classify_quit_request`). Log out (`rlgo`, `logo`), restart (`rest`, `rrst`), shut down (`shut`, `rsdn`) and a coordinated quit-all (`quia`) are system quits. Anything else, including a quit with no reason (Dock → Quit), is an ordinary quit. For a system quit the handler raises the cancels, stops the tick, hides the window and runs the save sequence as an immediate quit. Only then does it answer `NSTerminateNow`, and AppKit ends the process without returning from `app.run()`. An ordinary quit still answers `NSTerminateCancel` and leaves the loop, and the save runs after the loop as before. The save is synchronous: there is no `NSTerminateLater`. Its waits are the existing 2 s, 10 s and 10 s, and other steps can still block on a hung drive. A failure while hiding the window or restoring the Mac title bar is logged and does not stop the save (`support::guard_teardown`). If the save itself is missing or panics, the handler refuses termination and leaves the loop. A partly run save is not retried, and Falcon then exits with an error status and without the `clean shutdown` line, so it never reports a save that did not finish (`support::answer_terminate_request`). A system request that arrives while the save runs gets Cancel. Log lines: `terminate: system reason=…`, `shutdown: save sequence begin route=system`, `shutdown: save sequence complete …`, `terminate: reply=now …`.
 
 ### The diagnostic log
 
@@ -1020,22 +1022,24 @@ bidirectional-override characters). Profile names on the panel are limited to 32
 
 ### Quitting and shutdown
 
-Every way out of Falcon ends the event loop, then runs one shutdown sequence in `main()`. `support::graceful_shutdown` decides which steps run and in what order, and `main.rs` carries out each `ShutdownStep`. A process-wide `Once` makes sure the sequence runs only once, even if two quit routes arrive (for example ⌘Q and macOS's own quit request). Because the order is a function, a test checks it.
+Every way out of Falcon runs one save sequence, built once in `main()`. Most routes end the event loop first and run it after `app.run()` returns. A Mac system log-out, restart or shut-down runs it inside the quit handler, before answering macOS. `support::graceful_shutdown` decides which steps run and in what order, and `main.rs` carries out each `ShutdownStep`. A process-wide `Once` makes sure the sequence runs only once, even if two quit routes arrive (for example ⌘Q and macOS's own quit request). Because the order is a function, a test checks it.
 
-The diagram shows the quit routes and the fixed shutdown sequence they all reach.
+The diagram shows the quit routes and the fixed shutdown sequence they all reach. On the system-quit route the sequence runs before macOS is answered; on every other route it runs after the event loop returns.
 
 ```mermaid
 flowchart TB
   CMDQ["⌘Q, or macOS asks Falcon to quit<br/>(applicationShouldTerminate:)"]
+  SYS["Mac log out, restart or shut down<br/>(applicationShouldTerminate: with a system reason)"]
   CLOSE["Close button (both platforms)"]
   BUSY{"Copy, move, export or<br/>rotation apply running?"}
   IDLEQ["Finish it, then quit<br/>(a second press forces)"]
   ROT{"Unapplied rotations?"}
   REMIND["Rotation reminder"]
   CANCEL["Stop export between photos,<br/>stop copy/move after the current file"]
+  HIDE["Stop the tick, hide the window<br/>(the event loop is still running)"]
   LOOP["Event loop returns"]
   ONCE["support::graceful_shutdown (once per process)"]
-  S0["AwaitFileOpBoundary<br/>⌘Q route only, at most 10 s"]
+  S0["AwaitFileOpBoundary<br/>⌘Q and quit-handler routes only, at most 10 s"]
   S1["DrainAppliedRotations"]
   S2["DrainPickerResults"]
   S3["RevertStagedEdits"]
@@ -1043,13 +1047,19 @@ flowchart TB
   S5["FlushSelection"]
   S6["WriterBarrier"]
   S7["UnregisterFolder"]
-  CMDQ --> CANCEL --> LOOP
+  EXPORT["Flush completed export records"]
+  NOW["Answer NSTerminateNow<br/>(AppKit ends the process)"]
+  CMDQ --> CANCEL
+  SYS --> CANCEL
+  CANCEL -->|ordinary quit| LOOP
+  CANCEL -->|system quit| HIDE --> ONCE
   CLOSE --> BUSY
   BUSY -->|yes| IDLEQ --> LOOP
   BUSY -->|no| ROT
   ROT -->|yes| REMIND -->|Close anyway| LOOP
   ROT -->|no| LOOP
-  LOOP --> ONCE --> S0 --> S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7
+  LOOP --> ONCE --> S0 --> S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> EXPORT
+  EXPORT -->|system quit| NOW
 ```
 
 The order matters:
@@ -6847,7 +6857,7 @@ The startup and shutdown order is the same on both platforms (see [Startup order
 1. Before `app.run()`, the settings-apply block sets `native-window-controls`, an 80 px `titlebar-leading-inset` and `is-mac`. This must happen before the window exists, because winit creates it at first show and `no-frame: !native-window-controls` must already hold its final value.
 2. The GPU adapter preference is chosen once, from the IOKit battery probe. On battery, Falcon asks for `LowPower` for its own adapter and, through `falcon_gpu::set_low_power`, for the separate RAW-development device, so a Mac with two GPUs keeps automatic graphics switching. This is the only power fact fixed at startup. The title bar shows the live Efficiency mode state, which the power watcher updates every 2 s.
 3. The native menu bar is not built at startup. Each tick calls `mac_menu::tick_pump`, which installs Falcon's menus once the menu library's bar exists, checks every tick that the bar AppKit shows is still Falcon's, refreshes titles and check marks when state changes, and returns clicked commands for the tick to run.
-4. The Apple Events open-documents handler (`macos_open::install_odoc_handler`) lets Finder's "Open With → Falcon" and file double-clicks reach `begin_reload`, the same path as a command-line argument. The quit handler (`install_terminate_handler`) sends Dock Quit and other system quits into the graceful shutdown tail, after stopping file operations and export at a safe point (`register_quit_cancel`).
+4. The Apple Events open-documents handler (`macos_open::install_odoc_handler`) lets Finder's "Open With → Falcon" and file double-clicks reach `begin_reload`, the same path as a command-line argument. The quit handler (`install_terminate_handler`) sends Dock Quit and other ordinary quit requests into the graceful shutdown tail after the loop, after stopping file operations and export at a safe point (`register_quit_cancel`). For a system log-out, restart or shut-down it runs the save sequence registered before the loop (`register_save_sequence`) itself, then lets macOS end Falcon; see [Shutdown order](#shutdown-order).
 
 ### Mac-specific code
 

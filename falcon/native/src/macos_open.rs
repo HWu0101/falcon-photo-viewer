@@ -45,17 +45,18 @@
 //! app continues (associations simply won't open — never a crash). The callback body is wrapped in
 //! `catch_unwind` because a Rust panic must not unwind across the ObjC frame (UB).
 
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ProtocolObject, Sel};
-use objc2::sel;
+use objc2::{class, msg_send, sel};
 use objc2_app_kit::{NSApplication, NSApplicationDelegate};
 use objc2_foundation::{MainThreadMarker, NSArray, NSURL};
 
-use crate::support::log_event;
+use crate::support::{self, log_event, QuitRequest, SaveSequence, SystemQuitState, TerminateHooks, TerminateReply};
 
 /// File paths delivered by `application:openURLs:` — pushed by the objc callback (on the AppKit main
 /// thread) and drained on the UI thread by the §tick, which forwards each into `begin_reload` (the
@@ -178,22 +179,23 @@ pub(crate) fn install_odoc_handler() {
 // same is true of every OTHER route into `terminate:`: the Dock's Quit item, `killall -TERM`-style
 // polite quits, Apple-events quit, a restart/shut-down request. They all arrive HERE first.
 //
-// WHAT IT DOES: nothing but ask for the loop to end. It sets the latch the shutdown tail reads,
-// raises the workers' cancel flags so an in-flight batch stops at its next file boundary, asks
-// Slint to leave the loop, and answers `NSTerminateCancel` — "do not tear the process down; I am
-// leaving under my own power". `app.run()` then returns into `main()`'s tail, which is the ONE
-// tested exit; the tail's `Once` is what stops this door and the ⌘Q door from both running it.
+// WHAT IT DOES FOR AN ORDINARY QUIT: nothing but ask for the loop to end. It sets the latch the
+// shutdown tail reads, raises the workers' cancel flags so an in-flight batch stops at its next
+// file boundary, asks Slint to leave the loop, and answers `NSTerminateCancel` — "do not tear the
+// process down; I am leaving under my own power". `app.run()` then returns into `main()`, which
+// runs the shared save sequence; the tail's `Once` is what stops this door and the ⌘Q door from
+// both running it. No explicit hide: Slint's generated `run()` hides the window before it returns.
 //
-// KNOWN LIMITATION (recorded here and in the round report; owner question Q-C'): a system LOGOUT or
-// restart also arrives through this selector, and it receives our Cancel. macOS may therefore
-// report Falcon as having interrupted the logout, even though the process exits a moment later of
-// its own accord. The sanctioned shape for that case is `NSTerminateLater` + a
-// `replyToApplicationShouldTerminate:` once the flush is done, which requires pumping a run loop
-// from inside the callback — deliberately DEFERRED rather than half-built here.
-//
-// NO explicit hide-before-wait: Slint's generated `run()` hides the window before it returns (and
-// `set_visibility` early-returns on a second call), so by the time the tail's bounded wait runs
-// there is nothing on screen to look frozen.
+// 1.0.16 — A SYSTEM LOG-OUT, RESTART OR SHUT-DOWN (owner-approved 22 Oct; round
+// `2026-10-22_mac_logout`). Answering those with Cancel made macOS report that Falcon interrupted
+// log out, even though it exited a moment later. The quit Apple event's `kAEQuitReason` now
+// identifies them (`support::classify_quit_request`), and for those the hook runs the SAME save
+// sequence `main()` registered, right here, then answers `NSTerminateNow`. After Now, AppKit ends
+// the process from inside `terminate:` (winit's `applicationWillTerminate:` closes the windows on
+// the way), so nothing after `app.run()` runs — which is why the save cannot stay there. The save
+// is synchronous: no `NSTerminateLater`, no nested loop. Its waits are the tail's existing ones
+// (2 s + 10 s + 10 s); a hung disk can still hold log-out up, as it held up exit before. The
+// decisions (once-only, re-entry, a missing or panicking save) are `support::answer_terminate_request`.
 
 /// Raised by the hook; read by the shutdown tail via [`terminate_was_requested`]. A plain static
 /// because the callback is a bare `extern "C" fn` with no place to keep a handle.
@@ -217,27 +219,155 @@ pub(crate) fn terminate_was_requested() -> bool {
     TERMINATE_REQUESTED.load(Ordering::SeqCst)
 }
 
+thread_local! {
+    /// 1.0.16: the save sequence `main()` registered before the loop. Main-thread storage, because
+    /// it holds Slint and `Rc` handles (not `Send`), and owned, so no borrow of `main()`'s locals is
+    /// stretched. Taken out (the borrow ends) before it runs; whichever exit takes it runs it.
+    static SAVE_SEQUENCE: RefCell<Option<SaveSequence>> = const { RefCell::new(None) };
+    /// 1.0.16: where the system-quit save stands ([`SystemQuitState`]).
+    static SYSTEM_QUIT: Cell<SystemQuitState> = const { Cell::new(SystemQuitState::Idle) };
+}
+
+/// Hand the hook the save sequence. Called at boot, before [`install_terminate_handler`].
+pub(crate) fn register_save_sequence(save: SaveSequence) {
+    SAVE_SEQUENCE.with(|s| *s.borrow_mut() = Some(save));
+}
+
+/// Take the save sequence back after the loop. `Err(state)` = a system quit already took it; since
+/// the process is still here that is `Failed` (logged at the time; not retried), and `main()` then
+/// exits without reporting a clean shutdown (review R2).
+pub(crate) fn take_save_sequence() -> Result<SaveSequence, SystemQuitState> {
+    SAVE_SEQUENCE.with(|s| s.borrow_mut().take()).ok_or_else(|| SYSTEM_QUIT.with(Cell::get))
+}
+
+/// The after-loop route finished the save. A system quit arriving later (a modal dialog after the
+/// loop, such as the device-lost prompt, still receives Apple events) may then say yes at once.
+pub(crate) fn note_saved_after_loop() {
+    SYSTEM_QUIT.with(|s| s.set(SystemQuitState::Complete));
+}
+
 /// NSApplicationTerminateReply::Cancel — "I will quit myself; do not kill me."
 const NS_TERMINATE_CANCEL: usize = 0;
+/// NSApplicationTerminateReply::Now — "saved; you may end the process" (1.0.16, system quits only).
+const NS_TERMINATE_NOW: usize = 1;
+
+/// What the current Apple event says, read inside `applicationShouldTerminate:` (the manager only
+/// holds it while AppKit's quit handler runs). Raw codes, for [`support::classify_quit_request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuitEvent {
+    /// (event class, event id); `None` when there is no current Apple event (⌘Q, `terminate:`).
+    event: Option<(u32, u32)>,
+    /// The `kAEQuitReason` code; `None` when the attribute is absent or reads as zero.
+    reason: Option<u32>,
+    /// The reason's descriptor type, for the log only (Apple does not document it).
+    reason_type: Option<u32>,
+}
+
+fn current_quit_event() -> QuitEvent {
+    let manager: *mut AnyObject = unsafe { msg_send![class!(NSAppleEventManager), sharedAppleEventManager] };
+    if manager.is_null() {
+        return QuitEvent { event: None, reason: None, reason_type: None };
+    }
+    let event: *mut AnyObject = unsafe { msg_send![manager, currentAppleEvent] };
+    unsafe { read_quit_event(event) }
+}
+
+/// Read one `NSAppleEventDescriptor`. Typed messages: `objc2-foundation` 0.2 generates neither the
+/// event class/id readers nor `attributeDescriptorForKeyword:`, and every return is checked.
+///
+/// SAFETY: `event` is null or a live `NSAppleEventDescriptor`.
+unsafe fn read_quit_event(event: *mut AnyObject) -> QuitEvent {
+    if event.is_null() {
+        return QuitEvent { event: None, reason: None, reason_type: None };
+    }
+    let class: u32 = unsafe { msg_send![event, eventClass] };
+    let id: u32 = unsafe { msg_send![event, eventID] };
+    let why: *mut AnyObject =
+        unsafe { msg_send![event, attributeDescriptorForKeyword: support::AE_QUIT_REASON] };
+    if why.is_null() {
+        return QuitEvent { event: Some((class, id)), reason: None, reason_type: None };
+    }
+    // Each reader coerces and answers 0 when it cannot, so the first nonzero reading wins:
+    // enumerated, then type code, then the 32-bit integer Wine's Mac driver reads.
+    let kind: u32 = unsafe { msg_send![why, descriptorType] };
+    let as_enum: u32 = unsafe { msg_send![why, enumCodeValue] };
+    let as_type: u32 = unsafe { msg_send![why, typeCodeValue] };
+    let as_int: i32 = unsafe { msg_send![why, int32Value] };
+    let reason = [as_enum, as_type, as_int as u32].into_iter().find(|c| *c != 0);
+    QuitEvent { event: Some((class, id)), reason, reason_type: Some(kind) }
+}
+
+fn quit_event_text(q: &QuitEvent) -> String {
+    let code = |c: Option<u32>| c.map_or_else(|| "none".to_string(), support::four_char_code_text);
+    let event = q.event.map_or_else(
+        || "none".to_string(),
+        |(class, id)| format!("{}/{}", support::four_char_code_text(class), support::four_char_code_text(id)),
+    );
+    format!("event={event} reason={} reason_type={}", code(q.reason), code(q.reason_type))
+}
 
 /// The grafted `applicationShouldTerminate:`. Runs on the AppKit main thread; `catch_unwind` guards
 /// the ObjC boundary (a Rust panic must not unwind an ObjC frame — UB). Returns NSUInteger.
 extern "C" fn should_terminate(_this: &AnyObject, _cmd: Sel, _app: &NSApplication) -> usize {
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Idempotent: a second terminate request while we are already unwinding must not re-log or
-        // re-ask; `swap` makes the first arrival the only one that does anything.
-        if TERMINATE_REQUESTED.swap(true, Ordering::SeqCst) {
-            return;
+    let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let event = current_quit_event();
+        let request = support::classify_quit_request(event.event, event.reason);
+        // The first request of either kind raises the cancels; `swap` makes it the only one.
+        let first_arrival = !TERMINATE_REQUESTED.swap(true, Ordering::SeqCst);
+        let mut raise_cancels = || {
+            for raise in QUIT_CANCELS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                raise();
+            }
+        };
+        let mut leave_loop = || {
+            let _ = slint::quit_event_loop();
+        };
+        // The storage borrow ends inside this closure, before the sequence runs.
+        let mut take_save = || SAVE_SEQUENCE.with(|s| s.borrow_mut().take());
+        let mut hooks = TerminateHooks {
+            raise_cancels: &mut raise_cancels,
+            leave_loop: &mut leave_loop,
+            take_save: &mut take_save,
+        };
+        match request {
+            QuitRequest::Ordinary => {
+                if first_arrival {
+                    log_event(&format!(
+                        "terminate: applicationShouldTerminate ({}) — ordinary quit: leaving the event loop for the graceful flush tail (answering NSTerminateCancel)",
+                        quit_event_text(&event)
+                    ));
+                }
+                SYSTEM_QUIT.with(|state| support::answer_terminate_request(request, first_arrival, state, &mut hooks))
+            }
+            QuitRequest::System { reason, name } => {
+                log_event(&format!(
+                    "terminate: system reason={} ({name}) — {}; saving before the reply",
+                    support::four_char_code_text(reason),
+                    quit_event_text(&event)
+                ));
+                let started = std::time::Instant::now();
+                let reply =
+                    SYSTEM_QUIT.with(|state| support::answer_terminate_request(request, first_arrival, state, &mut hooks));
+                log_event(&format!(
+                    "terminate: reply={} elapsed_ms={}",
+                    if reply == TerminateReply::Now { "now" } else { "cancel" },
+                    started.elapsed().as_millis()
+                ));
+                reply
+            }
         }
-        for raise in QUIT_CANCELS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-            raise();
-        }
-        log_event(
-            "terminate: applicationShouldTerminate — leaving the event loop for the graceful flush tail (answering NSTerminateCancel; a system logout may report this as an interruption — known limitation, see macos_open.rs)",
-        );
-        let _ = slint::quit_event_loop();
     }));
-    NS_TERMINATE_CANCEL
+    match reply {
+        Ok(TerminateReply::Now) => NS_TERMINATE_NOW,
+        Ok(TerminateReply::Cancel) => NS_TERMINATE_CANCEL,
+        Err(_) => {
+            // Outside the save itself (that has its own guard): fall back to the pre-1.0.16 route,
+            // so the save sequence — still registered — runs after the loop.
+            log_event("terminate: the terminate hook panicked (recovered) — answering NSTerminateCancel and leaving the loop");
+            let _ = slint::quit_event_loop();
+            NS_TERMINATE_CANCEL
+        }
+    }
 }
 
 /// Graft `applicationShouldTerminate:` onto winit's live application delegate — the same
@@ -297,4 +427,100 @@ pub(crate) fn install_terminate_handler() {
     app.setDelegate(Some(del_ref));
     log_event("terminate: applicationShouldTerminate handler installed on the winit app delegate");
     let _keep: Retained<ProtocolObject<dyn NSApplicationDelegate>> = delegate;
+}
+
+// 1.0.16: native rows. They run in the Mac Actions test step (`cargo test` on the runner), which is
+// the only place the real Foundation selectors and the installed SDK headers exist.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn code(c: &[u8; 4]) -> u32 {
+        u32::from_be_bytes(*c)
+    }
+
+    /// A real `quit` (or other) Apple event, optionally with a `kAEQuitReason` attribute.
+    unsafe fn apple_event(id: u32, why: Option<*mut AnyObject>) -> *mut AnyObject {
+        let event: *mut AnyObject = unsafe {
+            msg_send![class!(NSAppleEventDescriptor), appleEventWithEventClass: support::AE_CORE_EVENT_CLASS eventID: id targetDescriptor: std::ptr::null::<AnyObject>() returnID: -1i16 transactionID: 0i32]
+        };
+        assert!(!event.is_null(), "NSAppleEventDescriptor built a quit event");
+        if let Some(why) = why {
+            let _: () = unsafe { msg_send![event, setAttributeDescriptor: why forKeyword: support::AE_QUIT_REASON] };
+        }
+        event
+    }
+
+    /// FALSIFIERS: misspell a selector or give a reader the wrong return type → this row panics in
+    /// objc2's checked send; read only `enumCodeValue` → the type-code / integer rows read `None`.
+    #[test]
+    fn a_real_quit_event_reads_back_its_class_id_and_reason() {
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let quit = support::AE_QUIT_APPLICATION;
+            let enumerated: *mut AnyObject = msg_send![class!(NSAppleEventDescriptor), descriptorWithEnumCode: code(b"rlgo")];
+            let type_code: *mut AnyObject = msg_send![class!(NSAppleEventDescriptor), descriptorWithTypeCode: code(b"rest")];
+            let integer: *mut AnyObject = msg_send![class!(NSAppleEventDescriptor), descriptorWithInt32: code(b"shut") as i32];
+            for (why, expect, name) in [(enumerated, b"rlgo", "log out"), (type_code, b"rest", "restart"), (integer, b"shut", "shut down")] {
+                let read = read_quit_event(apple_event(quit, Some(why)));
+                assert_eq!(read.event, Some((support::AE_CORE_EVENT_CLASS, quit)), "class and id read back");
+                assert_eq!(read.reason, Some(code(expect)), "{name}: reason read back ({})", quit_event_text(&read));
+                assert_eq!(
+                    support::classify_quit_request(read.event, read.reason),
+                    QuitRequest::System { reason: code(expect), name }
+                );
+            }
+            let dock = read_quit_event(apple_event(quit, None));
+            assert_eq!((dock.reason, dock.reason_type), (None, None), "a quit without a reason");
+            assert_eq!(support::classify_quit_request(dock.event, dock.reason), QuitRequest::Ordinary);
+            let odoc = read_quit_event(apple_event(code(b"odoc"), Some(enumerated)));
+            assert_eq!(support::classify_quit_request(odoc.event, odoc.reason), QuitRequest::Ordinary);
+            assert_eq!(read_quit_event(std::ptr::null_mut()).event, None, "no current event (⌘Q)");
+        });
+    }
+
+    /// The four-character codes in `support` are the installed SDK's, not a remembered copy.
+    /// FALSIFIER: change any code in `support::SYSTEM_QUIT_REASONS` → its name's row reddens.
+    #[test]
+    fn the_quit_codes_match_the_installed_sdk_headers() {
+        let sdk = std::process::Command::new("xcrun").arg("--show-sdk-path").output().expect("xcrun runs");
+        let sdk = String::from_utf8(sdk.stdout).expect("utf-8 SDK path");
+        let core = std::path::Path::new(sdk.trim()).join("System/Library/Frameworks/CoreServices.framework");
+        let headers = [
+            core.join("Frameworks/AE.framework/Headers"),
+            core.join("Versions/A/Frameworks/AE.framework/Versions/A/Headers"),
+        ]
+        .into_iter()
+        .find(|p| p.is_dir())
+        .unwrap_or_else(|| panic!("no AE.framework headers under {}", core.display()));
+        let mut text = String::new();
+        for entry in std::fs::read_dir(&headers).unwrap_or_else(|e| panic!("{}: {e}", headers.display())) {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|x| x == "h") {
+                text.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+        let fourcc = |c: u32| String::from_utf8_lossy(&c.to_be_bytes()).into_owned();
+        let declares = |name: &str, c: u32| {
+            text.lines().any(|line| {
+                let line = line.trim_start();
+                line.strip_prefix(name)
+                    .is_some_and(|rest| rest.trim_start().starts_with('=') && rest.contains(&format!("'{}'", fourcc(c))))
+            })
+        };
+        let names = [
+            ("kCoreEventClass", support::AE_CORE_EVENT_CLASS),
+            ("kAEQuitApplication", support::AE_QUIT_APPLICATION),
+            ("kAEQuitReason", support::AE_QUIT_REASON),
+            ("kAEQuitAll", support::SYSTEM_QUIT_REASONS[0].0),
+            ("kAEShutDown", support::SYSTEM_QUIT_REASONS[1].0),
+            ("kAERestart", support::SYSTEM_QUIT_REASONS[2].0),
+            ("kAEReallyLogOut", support::SYSTEM_QUIT_REASONS[3].0),
+            ("kAELogOut", support::SYSTEM_QUIT_REASONS[4].0),
+            ("kAEShowRestartDialog", support::SYSTEM_QUIT_REASONS[5].0),
+            ("kAEShowShutdownDialog", support::SYSTEM_QUIT_REASONS[6].0),
+        ];
+        for (name, c) in names {
+            assert!(declares(name, c), "{name} = '{}' in {}", fourcc(c), headers.display());
+        }
+    }
 }

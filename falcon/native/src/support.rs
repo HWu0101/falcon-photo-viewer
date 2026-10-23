@@ -12779,6 +12779,399 @@ pub(crate) fn graceful_shutdown(immediate: bool, step: &mut dyn FnMut(ShutdownSt
     ran
 }
 
+// ─── 1.0.16 (Mac log-out): a SYSTEM quit saves first, then says yes ────────────────────────────
+// macOS asks every app `applicationShouldTerminate:` before it logs out, restarts or shuts down.
+// Up to 1.0.15 Falcon answered Cancel to every such request and saved after its own event loop
+// ended: the save was safe, but macOS read the Cancel as "Falcon interrupted log out". Now a
+// RECOGNISED system request runs the same save sequence inside the callback and answers Now only
+// once it has returned. Every other request (⌘Q before the menu graft, Dock → Quit, a script's
+// quit) keeps the old Cancel + leave-the-loop route, and Windows never reaches any of this. The
+// Apple-event reading lives in `macos_open.rs`; the decisions live here, platform-free, so the
+// Windows suite drives them.
+
+/// A four-character code as the Apple Event Manager stores it (`'quit'` → 0x7175_6974).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the caller is the Mac terminate hook; pinned by tests on every host
+const fn four_char_code(code: &[u8; 4]) -> u32 {
+    u32::from_be_bytes(*code)
+}
+
+/// `kCoreEventClass` / `kAEQuitApplication` (AppleEvents.h): the event a polite quit arrives as.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the caller is the Mac terminate hook; pinned by tests on every host
+pub(crate) const AE_CORE_EVENT_CLASS: u32 = four_char_code(b"aevt");
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the caller is the Mac terminate hook; pinned by tests on every host
+pub(crate) const AE_QUIT_APPLICATION: u32 = four_char_code(b"quit");
+/// `kAEQuitReason` (AERegistry.h): the quit event's attribute that says why.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the caller is the Mac terminate hook; pinned by tests on every host
+pub(crate) const AE_QUIT_REASON: u32 = four_char_code(b"why?");
+
+/// The quit reasons that mean the system is ending the session, each with the name the log uses.
+/// The first four are the reasons AERegistry.h documents for `kAEQuitReason`; the last three are
+/// the older log-out / restart-dialog / shut-down-dialog codes, which Wine's Mac driver also reads
+/// as quit reasons. Anything else, including no reason at all, is an ordinary quit.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the caller is the Mac terminate hook; pinned by tests on every host
+pub(crate) const SYSTEM_QUIT_REASONS: [(u32, &str); 7] = [
+    (four_char_code(b"quia"), "quit all"),  // kAEQuitAll
+    (four_char_code(b"shut"), "shut down"), // kAEShutDown
+    (four_char_code(b"rest"), "restart"),   // kAERestart
+    (four_char_code(b"rlgo"), "log out"),   // kAEReallyLogOut
+    (four_char_code(b"logo"), "log out"),   // kAELogOut
+    (four_char_code(b"rrst"), "restart"),   // kAEShowRestartDialog
+    (four_char_code(b"rsdn"), "shut down"), // kAEShowShutdownDialog
+];
+
+/// What one terminate request turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the caller is the Mac terminate hook; pinned by tests on every host
+pub(crate) enum QuitRequest {
+    /// ⌘Q before the menu graft, Dock → Quit, a script's quit, or a reason not listed above.
+    Ordinary,
+    /// Log out, restart, shut down or a coordinated quit-all: `reason` is the code, `name` its
+    /// log name.
+    System { reason: u32, name: &'static str },
+}
+
+/// Classify one `applicationShouldTerminate:` call. `event` is the current Apple event's
+/// (class, id), `None` when there is none (⌘Q, `terminate:` from code); `reason` is its
+/// `kAEQuitReason` attribute, `None` when absent or unreadable. Only a `quit` event carrying a
+/// listed reason is a system request: an Apple event alone proves nothing (Dock → Quit sends one).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the caller is the Mac terminate hook; pinned by tests on every host
+pub(crate) fn classify_quit_request(event: Option<(u32, u32)>, reason: Option<u32>) -> QuitRequest {
+    if event != Some((AE_CORE_EVENT_CLASS, AE_QUIT_APPLICATION)) {
+        return QuitRequest::Ordinary;
+    }
+    let Some(code) = reason else { return QuitRequest::Ordinary };
+    SYSTEM_QUIT_REASONS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map_or(QuitRequest::Ordinary, |&(reason, name)| QuitRequest::System { reason, name })
+}
+
+/// A four-character code for the log: `'rlgo'` when all four bytes are printable ASCII, hex
+/// otherwise, so an unexpected reason on a tester's Mac is still readable.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the caller is the Mac terminate hook; pinned by tests on every host
+pub(crate) fn four_char_code_text(code: u32) -> String {
+    let bytes = code.to_be_bytes();
+    if bytes.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        format!("'{}'", String::from_utf8_lossy(&bytes))
+    } else {
+        format!("0x{code:08x}")
+    }
+}
+
+/// The answer `applicationShouldTerminate:` gives AppKit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the caller is the Mac terminate hook; pinned by tests on every host
+pub(crate) enum TerminateReply {
+    /// `NSTerminateNow`: the save sequence has run; AppKit may end the process.
+    Now,
+    /// `NSTerminateCancel`: not now. Falcon leaves under its own power, or is already saving.
+    Cancel,
+}
+
+/// Where the system-quit save stands. One per process, kept on the main thread by `macos_open`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the caller is the Mac terminate hook; pinned by tests on every host
+pub(crate) enum SystemQuitState {
+    Idle,
+    /// The save sequence is running inside the callback. A request arriving now (from a nested
+    /// event loop) must neither approve termination early nor start the save again.
+    Running,
+    /// The save sequence has returned (inside the callback, or after the loop). Saying yes is safe.
+    Complete,
+    /// The save sequence was missing or panicked. Never claim it ran; Falcon leaves the old way.
+    Failed,
+}
+
+/// Which exit is running the shared save sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveRoute {
+    /// The event loop has ended (window ×, ⌘Q through the menu, Dock → Quit, a device-lost exit…).
+    /// `immediate` is the ⌘Q / terminate latch: wait for an in-flight file operation's boundary.
+    AfterLoop { immediate: bool },
+    /// macOS is ending the session: runs inside `applicationShouldTerminate:`, before the reply,
+    /// with the event loop still alive underneath — so it stops the tick and hides the window first.
+    System,
+}
+
+/// The save sequence both exits share. `main()` builds it once; whichever exit runs first takes it,
+/// so it cannot run twice (the process `Once` inside [`graceful_shutdown`] is the second guard).
+pub(crate) type SaveSequence = Box<dyn FnOnce(SaveRoute)>;
+
+/// 1.0.16 (review R2): run one PRESENTATION step of the save sequence — hiding the window, the Mac
+/// title-bar cleanup — so that a panic in it is logged and the durable save that follows still
+/// runs. Only for steps that write nothing; the saving steps stay unguarded, so a failure there is
+/// never mistaken for a save. Returns whether the step finished.
+pub(crate) fn guard_teardown(what: &str, step: impl FnOnce()) -> bool {
+    let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)).is_ok();
+    if !finished {
+        log_event(&format!("shutdown: {what} failed (recovered) — the save continues"));
+    }
+    finished
+}
+
+/// What the terminate decision may ask the Mac side to do. Closures, so a test can record them.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the caller is the Mac terminate hook; pinned by tests on every host
+pub(crate) struct TerminateHooks<'a> {
+    /// Raise the copy/move and export cancel latches so in-flight batches stop at a file boundary.
+    pub(crate) raise_cancels: &'a mut dyn FnMut(),
+    /// Ask Slint to leave the event loop; `main()` then saves after the loop, as before 1.0.16.
+    pub(crate) leave_loop: &'a mut dyn FnMut(),
+    /// Take the registered save sequence out of its storage (`None` if none is there). The
+    /// storage's borrow must end before the sequence runs.
+    pub(crate) take_save: &'a mut dyn FnMut() -> Option<SaveSequence>,
+}
+
+/// Decide one `applicationShouldTerminate:` call. `first_arrival` is true for the first request of
+/// either kind (the cancels are raised once). An ORDINARY request keeps the pre-1.0.16 behaviour
+/// exactly: the first one leaves the loop, every one answers Cancel. A SYSTEM request runs the save
+/// sequence right here and answers Now only after it returns. If the sequence is missing or panics,
+/// it refuses (Cancel) and leaves the loop the old way rather than report a save that did not
+/// finish; a partly run sequence is not retried (its `Once` may be poisoned).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the caller is the Mac terminate hook; pinned by tests on every host
+pub(crate) fn answer_terminate_request(
+    request: QuitRequest,
+    first_arrival: bool,
+    state: &std::cell::Cell<SystemQuitState>,
+    hooks: &mut TerminateHooks<'_>,
+) -> TerminateReply {
+    if first_arrival {
+        (hooks.raise_cancels)();
+    }
+    if request == QuitRequest::Ordinary {
+        if first_arrival {
+            (hooks.leave_loop)();
+        }
+        return TerminateReply::Cancel;
+    }
+    match state.get() {
+        SystemQuitState::Idle => {}
+        SystemQuitState::Complete => return TerminateReply::Now,
+        SystemQuitState::Running => {
+            log_event("terminate: a system quit arrived while the save sequence is running — not yet (Cancel)");
+            return TerminateReply::Cancel;
+        }
+        SystemQuitState::Failed => return TerminateReply::Cancel,
+    }
+    state.set(SystemQuitState::Running);
+    let Some(save) = (hooks.take_save)() else {
+        state.set(SystemQuitState::Failed);
+        log_event("terminate: no save sequence is registered — refusing termination; leaving the loop instead");
+        (hooks.leave_loop)();
+        return TerminateReply::Cancel;
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| save(SaveRoute::System))).is_err() {
+        state.set(SystemQuitState::Failed);
+        log_event("terminate: the save sequence panicked — refusing termination (not reported as saved); leaving the loop");
+        (hooks.leave_loop)();
+        return TerminateReply::Cancel;
+    }
+    state.set(SystemQuitState::Complete);
+    TerminateReply::Now
+}
+
+#[cfg(test)]
+mod system_quit_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    fn code(c: &[u8; 4]) -> u32 {
+        u32::from_be_bytes(*c)
+    }
+    const QUIT_EVENT: Option<(u32, u32)> = Some((AE_CORE_EVENT_CLASS, AE_QUIT_APPLICATION));
+
+    /// 1.0.16: each listed reason is recognised on its own; nothing else is a system quit.
+    /// FALSIFIERS: drop the event-class check → the `"a reason on another event"` rows redden;
+    /// treat every nonzero reason as system → the `"unknown reason"` row reddens; byte-swap
+    /// `four_char_code` (`from_le_bytes`) → the literal-value rows redden; delete a row from
+    /// `SYSTEM_QUIT_REASONS` → its row below reddens.
+    #[test]
+    fn only_a_quit_event_with_a_listed_reason_is_a_system_quit() {
+        assert_eq!(AE_CORE_EVENT_CLASS, 0x6165_7674, "'aevt' in the Apple Event Manager's byte order");
+        assert_eq!(AE_QUIT_APPLICATION, 0x7175_6974, "'quit'");
+        assert_eq!(AE_QUIT_REASON, 0x7768_793F, "'why?'");
+        for (bytes, name) in [
+            (b"quia", "quit all"),
+            (b"shut", "shut down"),
+            (b"rest", "restart"),
+            (b"rlgo", "log out"),
+            (b"logo", "log out"),
+            (b"rrst", "restart"),
+            (b"rsdn", "shut down"),
+        ] {
+            assert_eq!(
+                classify_quit_request(QUIT_EVENT, Some(code(bytes))),
+                QuitRequest::System { reason: code(bytes), name },
+                "{} is a system quit",
+                four_char_code_text(code(bytes))
+            );
+        }
+        assert_eq!(SYSTEM_QUIT_REASONS[3].0, 0x726C_676F, "kAEReallyLogOut = 'rlgo'");
+        assert_eq!(classify_quit_request(None, None), QuitRequest::Ordinary, "⌘Q / terminate: from code: no event");
+        assert_eq!(classify_quit_request(QUIT_EVENT, None), QuitRequest::Ordinary, "Dock → Quit: a quit event, no reason");
+        assert_eq!(classify_quit_request(QUIT_EVENT, Some(0)), QuitRequest::Ordinary, "a zero reason");
+        assert_eq!(classify_quit_request(QUIT_EVENT, Some(code(b"stat"))), QuitRequest::Ordinary, "unknown reason");
+        assert_eq!(
+            classify_quit_request(Some((AE_CORE_EVENT_CLASS, code(b"odoc"))), Some(code(b"rlgo"))),
+            QuitRequest::Ordinary,
+            "a reason on another event (open documents) is not a quit"
+        );
+        assert_eq!(
+            classify_quit_request(Some((code(b"misc"), AE_QUIT_APPLICATION)), Some(code(b"rlgo"))),
+            QuitRequest::Ordinary,
+            "a reason on another event class is not a quit"
+        );
+    }
+
+    #[test]
+    fn a_quit_reason_is_logged_readably() {
+        assert_eq!(four_char_code_text(code(b"rlgo")), "'rlgo'");
+        assert_eq!(four_char_code_text(AE_QUIT_REASON), "'why?'");
+        assert_eq!(four_char_code_text(0), "0x00000000");
+        assert_eq!(four_char_code_text(0x0102_0304), "0x01020304");
+    }
+
+    /// One recorder for every hook, so a row can assert the ORDER things happened in.
+    #[derive(Default)]
+    struct Record {
+        seen: RefCell<Vec<&'static str>>,
+        save: RefCell<Option<SaveSequence>>,
+    }
+
+    fn answer(request: QuitRequest, first: bool, state: &Cell<SystemQuitState>, rec: &Rc<Record>) -> TerminateReply {
+        let (r1, r2, r3) = (rec.clone(), rec.clone(), rec.clone());
+        let mut raise = move || r1.seen.borrow_mut().push("cancels");
+        let mut leave = move || r2.seen.borrow_mut().push("leave loop");
+        let mut take = move || {
+            r3.seen.borrow_mut().push("take");
+            r3.save.borrow_mut().take()
+        };
+        answer_terminate_request(
+            request,
+            first,
+            state,
+            &mut TerminateHooks { raise_cancels: &mut raise, leave_loop: &mut leave, take_save: &mut take },
+        )
+    }
+
+    fn recording_save(rec: &Rc<Record>) -> SaveSequence {
+        let r = rec.clone();
+        Box::new(move |route| {
+            assert_eq!(route, SaveRoute::System, "the callback runs the system route");
+            r.seen.borrow_mut().push("save");
+        })
+    }
+
+    const LOG_OUT: QuitRequest = QuitRequest::System { reason: 0x726C_676F, name: "log out" };
+
+    /// 1.0.16: a system quit raises the cancels, runs the WHOLE save sequence, and only then says
+    /// Now; an ordinary quit is exactly the pre-1.0.16 Cancel + leave-the-loop.
+    /// FALSIFIERS: answer Now before running the save (or without it) → the `"saved before Now"`
+    /// row reddens; leave the loop on the system route → its sequence row reddens; take the save
+    /// again on a second request → the `"not taken twice"` row reddens; skip raising cancels → the
+    /// sequence rows redden.
+    #[test]
+    fn a_system_quit_saves_before_it_says_now_and_an_ordinary_quit_is_unchanged() {
+        let rec = Rc::new(Record::default());
+        let state = Cell::new(SystemQuitState::Idle);
+        assert_eq!(answer(QuitRequest::Ordinary, true, &state, &rec), TerminateReply::Cancel);
+        assert_eq!(*rec.seen.borrow(), ["cancels", "leave loop"], "ordinary first request: unchanged");
+        assert_eq!(state.get(), SystemQuitState::Idle, "an ordinary quit does not touch the system state");
+        rec.seen.borrow_mut().clear();
+        assert_eq!(answer(QuitRequest::Ordinary, false, &state, &rec), TerminateReply::Cancel);
+        assert!(rec.seen.borrow().is_empty(), "a repeated ordinary request does nothing");
+
+        let rec = Rc::new(Record::default());
+        *rec.save.borrow_mut() = Some(recording_save(&rec));
+        let state = Cell::new(SystemQuitState::Idle);
+        assert_eq!(answer(LOG_OUT, true, &state, &rec), TerminateReply::Now);
+        assert_eq!(*rec.seen.borrow(), ["cancels", "take", "save"], "saved before Now, without leaving the loop");
+        assert_eq!(state.get(), SystemQuitState::Complete);
+        rec.seen.borrow_mut().clear();
+        assert_eq!(answer(LOG_OUT, false, &state, &rec), TerminateReply::Now, "complete: yes again is safe");
+        assert!(rec.seen.borrow().is_empty(), "the save is not taken twice");
+
+        // A system quit after an ordinary one (the loop has not ended yet): the cancels are already
+        // up, so it goes straight to the save.
+        let rec = Rc::new(Record::default());
+        *rec.save.borrow_mut() = Some(recording_save(&rec));
+        let state = Cell::new(SystemQuitState::Idle);
+        assert_eq!(answer(LOG_OUT, false, &state, &rec), TerminateReply::Now);
+        assert_eq!(*rec.seen.borrow(), ["take", "save"]);
+
+        // The after-loop route already saved (main marks the state Complete): a later system
+        // request, e.g. during the device-lost dialog, says yes without a second save.
+        let rec = Rc::new(Record::default());
+        let state = Cell::new(SystemQuitState::Complete);
+        assert_eq!(answer(LOG_OUT, false, &state, &rec), TerminateReply::Now);
+        assert!(rec.seen.borrow().is_empty());
+    }
+
+    /// 1.0.16: the exceptional branches never claim a save. FALSIFIERS: answer Now when nothing is
+    /// registered → the `"missing"` row reddens; drop the `catch_unwind` → the test itself panics;
+    /// let `Running` fall through to the save → the nested row records a second `take`; let
+    /// `Failed` answer Now → the `"after a failure"` row reddens.
+    #[test]
+    fn a_missing_panicking_or_nested_save_never_says_now_early() {
+        let rec = Rc::new(Record::default());
+        let state = Cell::new(SystemQuitState::Idle);
+        assert_eq!(answer(LOG_OUT, true, &state, &rec), TerminateReply::Cancel, "missing: refuse");
+        assert_eq!(*rec.seen.borrow(), ["cancels", "take", "leave loop"], "missing: leave the old way");
+        assert_eq!(state.get(), SystemQuitState::Failed);
+        rec.seen.borrow_mut().clear();
+        assert_eq!(answer(LOG_OUT, false, &state, &rec), TerminateReply::Cancel, "after a failure: still no");
+        assert!(rec.seen.borrow().is_empty(), "after a failure: nothing re-run");
+
+        let rec = Rc::new(Record::default());
+        let r = rec.clone();
+        *rec.save.borrow_mut() = Some(Box::new(move |_| {
+            r.seen.borrow_mut().push("save");
+            panic!("simulated failure inside the save sequence");
+        }));
+        let state = Cell::new(SystemQuitState::Idle);
+        assert_eq!(answer(LOG_OUT, true, &state, &rec), TerminateReply::Cancel, "panicked: refuse");
+        assert_eq!(*rec.seen.borrow(), ["cancels", "take", "save", "leave loop"]);
+        assert_eq!(state.get(), SystemQuitState::Failed);
+
+        // A second system request arrives from a nested loop WHILE the save runs: it must say no
+        // and must not take or start the save; the outer request then says Now.
+        let rec = Rc::new(Record::default());
+        let state = Rc::new(Cell::new(SystemQuitState::Idle));
+        let nested_reply = Rc::new(Cell::new(None));
+        let (r, s, n) = (rec.clone(), state.clone(), nested_reply.clone());
+        *rec.save.borrow_mut() = Some(Box::new(move |_| {
+            r.seen.borrow_mut().push("save begins");
+            n.set(Some(answer(LOG_OUT, false, &s, &r)));
+            r.seen.borrow_mut().push("save ends");
+        }));
+        assert_eq!(answer(LOG_OUT, true, &state, &rec), TerminateReply::Now);
+        assert_eq!(nested_reply.get(), Some(TerminateReply::Cancel), "nested while running: not yet");
+        assert_eq!(*rec.seen.borrow(), ["cancels", "take", "save begins", "save ends"], "no second take");
+        assert_eq!(state.get(), SystemQuitState::Complete);
+    }
+
+    /// 1.0.16 (review R2): a failure while hiding the window or restoring the Mac title bar is
+    /// logged and the durable save still runs — the shape `main()`'s save sequence has (guarded
+    /// presentation steps, then the unguarded save). FALSIFIER: make `guard_teardown` call the step
+    /// without `catch_unwind` → the hide panic escapes the sequence, the reply is Cancel and the
+    /// `"the save still runs"` assert reddens.
+    #[test]
+    fn a_failed_presentation_step_does_not_skip_the_save() {
+        let rec = Rc::new(Record::default());
+        let r = rec.clone();
+        *rec.save.borrow_mut() = Some(Box::new(move |_| {
+            let hid = guard_teardown("hiding the window", || panic!("simulated failure while hiding"));
+            let r2 = r.clone();
+            let cleaned = guard_teardown("restoring the Mac title bar", move || r2.seen.borrow_mut().push("cleanup"));
+            r.seen.borrow_mut().push(if hid || !cleaned { "wrong guard result" } else { "durable save" });
+        }));
+        let state = Cell::new(SystemQuitState::Idle);
+        assert_eq!(answer(LOG_OUT, true, &state, &rec), TerminateReply::Now, "saved, so yes");
+        assert_eq!(*rec.seen.borrow(), ["cancels", "take", "cleanup", "durable save"], "the save still runs");
+        assert_eq!(state.get(), SystemQuitState::Complete);
+    }
+}
+
 /// Best-effort sweep of our own crashed-run temp files (`*.falcontmp`) in `dir`. A completed write
 /// renames its temp away in milliseconds, so any `.falcontmp` still present AND older than 60 s is a
 /// leftover from a crash/power-loss mid-write — safe to remove. The age gate means a CONCURRENT second

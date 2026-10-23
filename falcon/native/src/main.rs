@@ -25667,6 +25667,254 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // ── THE SAVE SEQUENCE (1.0.16, Mac log-out) ───────────────────────────────────────────────────
+    // Everything an exit must do before the process ends — the Mac title-bar cleanup, stopping
+    // unfinished export work, the ordered shutdown tail, and the completed export records — built
+    // ONCE as a callable over owned handles, so the two exits share it instead of copying it:
+    // * after the event loop ends (every route on Windows; window ×, ⌘Q, Dock → Quit and any other
+    //   ordinary quit on the Mac), with the same steps, arguments and order as before 1.0.16;
+    // * on the Mac, inside `applicationShouldTerminate:` when macOS is logging out, restarting or
+    //   shutting down. That save must finish BEFORE Falcon answers yes, because after a yes AppKit
+    //   ends the process without returning from `app.run()` (`macos_open.rs`).
+    // Whichever exit runs first takes it; the process `Once` inside `graceful_shutdown` is the second
+    // guard. Owned clones, not borrows: the Mac keeps it in main-thread storage during the loop.
+    let save_sequence: support::SaveSequence = {
+        let app = app.clone_strong();
+        #[cfg(target_os = "macos")]
+        let sel_busy = sel_busy.clone();
+        let tick = tick.clone();
+        let export_progress = export_progress.clone();
+        let rot = rot.clone();
+        let generation = generation.clone();
+        let undo_stack = undo_stack.clone();
+        let pick_rx = pick_rx.clone();
+        let icc_pick_key = icc_pick_key.clone();
+        let display_colors = display_colors.clone();
+        let display_active = display_active.clone();
+        let display_live = display_live.clone();
+        let display_open = display_open.clone();
+        let display_failed = display_failed.clone();
+        let notif_pending = notif_pending.clone();
+        let wm_cache = wm_cache.clone();
+        let export_image_path = export_image_path.clone();
+        let keymap = keymap.clone();
+        let basics_snap = basics_snap.clone();
+        let capturing = capturing.clone();
+        let bind_conflict = bind_conflict.clone();
+        let keybind_model = keybind_model.clone();
+        let basic_model = basic_model.clone();
+        let nvjpeg_choice = nvjpeg_choice.clone();
+        let auto_orient = auto_orient.clone();
+        let cur_dir = cur_dir.clone();
+        let export_presets = export_presets.clone();
+        let viewed_lru = viewed_lru.clone();
+        let sort_last_used = sort_last_used.clone();
+        let sort_lru = sort_lru.clone();
+        let panel_lru = panel_lru.clone();
+        let display_migrated = display_migrated.clone();
+        let info_view_pref = info_view_pref.clone();
+        let shots = shots.clone();
+        let ratings = ratings.clone();
+        let xmp_journal = xmp_journal.clone();
+        let marks = marks.clone();
+        let sel_extra = sel_extra.clone();
+        let folder_attrs = folder_attrs.clone();
+        Box::new(move |route: support::SaveRoute| {
+            let started = std::time::Instant::now();
+            let (route_name, immediate) = match route {
+                support::SaveRoute::AfterLoop { immediate } => ("after-loop", immediate),
+                // A system quit is an immediate quit: a copy may be mid-file, so wait for its boundary.
+                support::SaveRoute::System => ("system", true),
+            };
+            log_event(&format!("shutdown: save sequence begin route={route_name}"));
+            if route == support::SaveRoute::System {
+                // The event loop is still alive underneath this callback, so stop the tick and hide
+                // the window first — the hide `app.run()` does before every other route's save (the
+                // owner approved the same look here, 22 Oct). Hidden, not destroyed: the snapshots
+                // below still read the window's state.
+                support::guard_teardown("hiding the window", || {
+                    tick.stop();
+                    let _ = app.hide();
+                });
+            }
+            // Review R2: the presentation steps write nothing, so a failure in one is logged and
+            // the durable save below still runs (`support::guard_teardown`).
+            #[cfg(target_os = "macos")]
+            support::guard_teardown("restoring the Mac title bar", mac_experiment::shutdown);
+            // Any loop-exit route (including device loss) stops unfinished export work. UI Cancel remains
+            // nonblocking; completed output provenance is flushed below after the existing shutdown tail.
+            export_progress.cancel.store(true, Ordering::Relaxed);
+
+            // ── THE SHUTDOWN TAIL (v0.8.128, J10 + A1.2) ──────────────────────────────────────────────────
+            // Every route out of the event loop lands here (1.0.16: and a Mac system log-out, restart or
+            // shut-down, from inside the terminate hook), and the ORDER of what follows is load-bearing:
+            // the staged-edit revert must precede the settings snapshot it protects, the two worker hand-offs
+            // must be drained before the selection flush that persists them, and the writer barrier must be
+            // last or the flushes it exists to make durable are not. That order is now
+            // `support::graceful_shutdown` — what follows is only its dispatcher, so the sequence has a test
+            // (`the_shutdown_tail_runs_its_steps_in_the_one_correct_order`) instead of being a run of
+            // statements nothing could assert. The `Once` inside it is what stops a second arrival — the
+            // `applicationShouldTerminate:` hook and the ⌘Q key equivalent are two doors into this one exit —
+            // from re-running the whole flush over state a first pass already wrote.
+            let mut final_shots: Arc<Vec<Shot>> = Arc::new(Vec::new());
+            support::graceful_shutdown(immediate, &mut |st| match st {
+                support::ShutdownStep::AwaitFileOpBoundary => {
+                    // v0.9.59 (OWNER RULING 08-02 — ⌘Q): the immediate-quit path exits the loop the instant
+                    // the key is pressed, so a copy/move/export worker can still be mid-write here. The
+                    // WINDOW is already gone (nothing is being deferred in front of the user); this bounded
+                    // wait exists so the process does not tear a worker off mid-file. v0.9.61 (A1.3): the
+                    // copy/move worker polls a cancel flag between FILES now, so this converges after one
+                    // file rather than being bounded only by the stopwatch. Every other route (window ×,
+                    // quit-when-idle, the reminder's "Close anyway", a device-lost exit) already guarantees
+                    // idleness, so their behaviour is unchanged — and on Windows the step is never emitted.
+                    #[cfg(target_os = "macos")]
+                    support::await_file_op_boundary(&sel_busy, std::time::Duration::from_secs(10));
+                }
+                support::ShutdownStep::DrainAppliedRotations => {
+                    // v0.9.61 (A1.2): the apply-rotations worker publishes each written shot into
+                    // `rot.apply_slot` and the TICK drains it — but ⌘Q exits the loop BETWEEN ticks, so the
+                    // last shots the worker wrote stayed listed as pending in this folder's journal, and the
+                    // next Apply here would rotate those files a second time. `lock()`, not `try_lock`:
+                    // there is no UI left to protect, and the worker holds this mutex only long enough to
+                    // push a four-field tuple. `rebase_only`, not the tick's closure: that closure would
+                    // also drop GPU/EXIF caches nothing will read again, run its OWN `save_selection` and
+                    // take a SECOND 10 s writer barrier — up to 30 s of exit to produce state the flush two
+                    // steps below writes anyway.
+                    //
+                    // v0.9.62 (WAVE B ADDENDUM B4-a): UN-GATED. Wave A scoped this to macOS because ⌘Q is
+                    // the mac door, but the hole is not the door — it is the loop exiting between ticks with
+                    // written shots still listed as pending, and Windows reaches that state too (a second
+                    // click on the title-bar ×, a device-lost loop exit, any route that leaves the loop while
+                    // the apply worker has published). Deliberately certified as an INTENDED shared change,
+                    // the same class as A1.1's per-shot publishing: it can only ever REMOVE entries the
+                    // worker has proven are already on disk.
+                    if let Some((batch_gen, applied)) = rot.take_apply_batch() {
+                        if batch_gen == generation.load(Ordering::Relaxed) && !applied.is_empty() {
+                            log_event(&format!(
+                                "shutdown: rebasing {} applied rotation(s) the tick never got to drain",
+                                applied.len()
+                            ));
+                            support::rebase_only(&rot, &undo_stack, &applied);
+                        }
+                    }
+                }
+                support::ShutdownStep::DrainPickerResults => {
+                    // v0.8.128 (A1.2): a colour profile or a watermark chosen in the last frame is still
+                    // sitting in the picker channel, and BOTH feed `build_settings` one step below — so
+                    // quitting used to discard a choice the user had just made in a native dialog.
+                    // `OpenFolder` is deliberately NOT acted on: starting a folder swap inside the shutdown
+                    // tail is the one drain that would be actively harmful.
+                    //
+                    // v0.9.62 (WAVE B ADDENDUM B4-a): UN-GATED, for the same reason. A colour profile or a
+                    // watermark chosen in the last frame is a real user choice sitting in a channel, and
+                    // Windows discards it on exit exactly as macOS did. Intended shared change.
+                    while let Ok((kind, picked)) = pick_rx.try_recv() {
+                        let Some(path) = picked else { continue };
+                        match kind {
+                            PickKind::OpenFolder => {
+                                log_event("shutdown: a folder pick arrived as we were quitting — not opened");
+                            }
+                            PickKind::Icc => {
+                                let key = icc_pick_key.borrow().clone();
+                                log_event(&format!(
+                                    "shutdown: applying the colour profile picked in the last frame ({})",
+                                    path.display()
+                                ));
+                                apply_picked_icc(
+                                    &app, &key, &path, &display_colors, &display_active, &display_live,
+                                    &display_open, &display_failed, &notif_pending,
+                                );
+                            }
+                            PickKind::Watermark => {
+                                if let Ok((rgba, w, h)) = load_wm_logo(&path) {
+                                    *wm_cache.borrow_mut() = Some((rgba, w, h));
+                                    *export_image_path.borrow_mut() = path.display().to_string();
+                                    app.set_wm_type(1);
+                                    log_event(&format!(
+                                        "shutdown: keeping the watermark picked in the last frame ({})",
+                                        path.display()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                support::ShutdownStep::RevertStagedEdits => {
+                    revert_staged_edits(
+                        &app,
+                        &keymap,
+                        &basics_snap,
+                        &capturing,
+                        &bind_conflict,
+                        &keybind_model,
+                        &basic_model,
+                    );
+                }
+                support::ShutdownStep::SaveSettings => {
+                    // best-effort final flush on graceful close
+                    save_settings(&build_settings(
+                        &app,
+                        nvjpeg_choice.load(Ordering::Relaxed), // 1.0.15: the choice, not the runtime flag
+                        auto_orient.load(Ordering::Relaxed),
+                        &keymap.borrow(),
+                        &cur_dir.borrow(),
+                        &export_image_path.borrow(),
+                        &export_presets.borrow(),
+                        &viewed_lru.borrow(),
+                        &sort_last_used.borrow(), // v0.8.49
+                        &sort_lru.borrow(),
+                        &panel_lru.borrow(), // v0.8.89
+                        &display_colors.borrow(), // v0.8.107
+                        display_migrated.get(), // v0.8.108
+                        info_view_pref.get(), // v1.0.0-rc (item 33): the FLOOR, not the live view
+                    ));
+                }
+                support::ShutdownStep::FlushSelection => {
+                    final_shots = shots.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let dir = cur_dir.borrow().clone();
+                    // N1: skip when nothing is loaded (empty/photo-less current folder). `cur_dir` can be
+                    // stale — it's kept on the last photo'd folder for next-launch memory — so an empty-map
+                    // write here would wipe THAT folder's ratings. The last real folder was already saved by
+                    // its own swap-away flush.
+                    if !dir.is_empty() && !final_shots.is_empty() {
+                        // v0.8.69 (E/H2): flush any pending rating deltas to their XMP sidecars on shutdown
+                        // (when sync is ON) so the barrier below makes them durable before the writer thread
+                        // is torn down.
+                        support::sync_xmp_ratings(app.get_xmp_sync(), &final_shots, &ratings.borrow(), &xmp_journal);
+                        let mut m = selection_map(&final_shots, &ratings.borrow(), &marks.borrow());
+                        merge_selection_extra(&mut m, &sel_extra.borrow()); // N8: keep moved-out entries
+                        if let Err(e) = save_selection(Path::new(&dir), &m, &rot.rotations_snapshot(), &folder_attrs.borrow()) {
+                            log_event(&format!("final ratings flush failed on shutdown: {e}"));
+                        }
+                    }
+                }
+                support::ShutdownStep::WriterBarrier => {
+                    // v0.8.36 (ITEM 1, barrier c): DRAIN the writer so the final settings + selection saves
+                    // above are durable before the process exits (the writer thread would otherwise be torn
+                    // down mid-write). Log+proceed on timeout — a hung network drive must never wedge exit.
+                    support::writer_barrier(std::time::Duration::from_secs(10));
+                }
+                support::ShutdownStep::UnregisterFolder => {
+                    support::unregister_open_folder(); // v0.8.36 (ITEM 3): drop our open-folders registry entry
+                }
+            });
+
+            // RAW decode can outlive the Mac's bounded file-operation wait. This snapshot is synchronized
+            // with the final rename, and the cancel flag prevents any later unfinished output publishing.
+            export_progress.stop_and_flush_completed();
+
+            // NOTE (v0.8.122 / M1, preserved from the pre-extraction tail): `RevertStagedEdits` is
+            // deliberately the step BEFORE `SaveSettings`. `build_settings` reads `&keymap.borrow()`, so an
+            // abandoned rebind still live at that point is an abandoned rebind written to settings.json —
+            // which is precisely why the order above is a tested object now and not a run of statements.
+            let _ = &final_shots; // the FlushSelection step owns it; kept named for the reader
+            log_event(&format!(
+                "shutdown: save sequence complete route={route_name} elapsed_ms={}",
+                started.elapsed().as_millis()
+            ));
+        })
+    };
+
     // v0.9.15 (B-spike): graft `application:openURLs:` onto winit's live app delegate so Finder
     // "Open With → Falcon" / associated-file double-clicks reach `begin_reload`. Called on the main
     // thread AFTER the backend/delegate exist (built at boot's `select()`) and BEFORE `app.run()`
@@ -25687,6 +25935,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         macos_open::register_quit_cancel(Box::new(move || oc.store(true, Ordering::Relaxed)));
         let ep = export_progress.clone();
         macos_open::register_quit_cancel(Box::new(move || ep.cancel.store(true, Ordering::Relaxed)));
+        // 1.0.16: the save sequence goes in BEFORE the hook, so no request can find it missing.
+        macos_open::register_save_sequence(save_sequence);
         macos_open::install_terminate_handler();
     }
 
@@ -25701,178 +25951,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "macos")]
     mac_experiment::start(&app);
     let run_outcome = app.run();
-    #[cfg(target_os = "macos")]
-    mac_experiment::shutdown();
-    // Any loop-exit route (including device loss) stops unfinished export work. UI Cancel remains
-    // nonblocking; completed output provenance is flushed below after the existing shutdown tail.
-    export_progress.cancel.store(true, Ordering::Relaxed);
 
-    // ── THE SHUTDOWN TAIL (v0.8.128, J10 + A1.2) ──────────────────────────────────────────────────
-    // Every route out of the event loop lands here, and the ORDER of what follows is load-bearing:
-    // the staged-edit revert must precede the settings snapshot it protects, the two worker hand-offs
-    // must be drained before the selection flush that persists them, and the writer barrier must be
-    // last or the flushes it exists to make durable are not. That order is now
-    // `support::graceful_shutdown` — what follows is only its dispatcher, so the sequence has a test
-    // (`the_shutdown_tail_runs_its_steps_in_the_one_correct_order`) instead of being a run of
-    // statements nothing could assert. The `Once` inside it is what stops a second arrival — the
-    // `applicationShouldTerminate:` hook and the ⌘Q key equivalent are two doors into this one exit —
-    // from re-running the whole flush over state a first pass already wrote.
+    // The loop has ended: run the save sequence. On the Mac, take it back from the terminate hook's
+    // storage first. A system quit that ran it successfully ended the process inside AppKit, so this
+    // line is never reached after one. `Err(state)` means a system quit already took it: `Failed`
+    // (logged then) — a partly run sequence is not retried, its `Once` may be poisoned.
+    #[cfg(target_os = "macos")]
+    let save_sequence = macos_open::take_save_sequence();
+    #[cfg(not(target_os = "macos"))]
+    let save_sequence: Result<support::SaveSequence, support::SystemQuitState> = Ok(save_sequence);
     #[cfg(target_os = "macos")]
     let immediate = immediate_quit.get() || macos_open::terminate_was_requested();
     #[cfg(not(target_os = "macos"))]
     let immediate = false; // no ⌘Q, no terminate hook — the step is never emitted on this trunk
-    let mut final_shots: Arc<Vec<Shot>> = Arc::new(Vec::new());
-    support::graceful_shutdown(immediate, &mut |st| match st {
-        support::ShutdownStep::AwaitFileOpBoundary => {
-            // v0.9.59 (OWNER RULING 08-02 — ⌘Q): the immediate-quit path exits the loop the instant
-            // the key is pressed, so a copy/move/export worker can still be mid-write here. The
-            // WINDOW is already gone (nothing is being deferred in front of the user); this bounded
-            // wait exists so the process does not tear a worker off mid-file. v0.9.61 (A1.3): the
-            // copy/move worker polls a cancel flag between FILES now, so this converges after one
-            // file rather than being bounded only by the stopwatch. Every other route (window ×,
-            // quit-when-idle, the reminder's "Close anyway", a device-lost exit) already guarantees
-            // idleness, so their behaviour is unchanged — and on Windows the step is never emitted.
+    let saved = match save_sequence {
+        Ok(save) => {
+            save(support::SaveRoute::AfterLoop { immediate });
             #[cfg(target_os = "macos")]
-            support::await_file_op_boundary(&sel_busy, std::time::Duration::from_secs(10));
+            macos_open::note_saved_after_loop();
+            true
         }
-        support::ShutdownStep::DrainAppliedRotations => {
-            // v0.9.61 (A1.2): the apply-rotations worker publishes each written shot into
-            // `rot.apply_slot` and the TICK drains it — but ⌘Q exits the loop BETWEEN ticks, so the
-            // last shots the worker wrote stayed listed as pending in this folder's journal, and the
-            // next Apply here would rotate those files a second time. `lock()`, not `try_lock`:
-            // there is no UI left to protect, and the worker holds this mutex only long enough to
-            // push a four-field tuple. `rebase_only`, not the tick's closure: that closure would
-            // also drop GPU/EXIF caches nothing will read again, run its OWN `save_selection` and
-            // take a SECOND 10 s writer barrier — up to 30 s of exit to produce state the flush two
-            // steps below writes anyway.
-            //
-            // v0.9.62 (WAVE B ADDENDUM B4-a): UN-GATED. Wave A scoped this to macOS because ⌘Q is
-            // the mac door, but the hole is not the door — it is the loop exiting between ticks with
-            // written shots still listed as pending, and Windows reaches that state too (a second
-            // click on the title-bar ×, a device-lost loop exit, any route that leaves the loop while
-            // the apply worker has published). Deliberately certified as an INTENDED shared change,
-            // the same class as A1.1's per-shot publishing: it can only ever REMOVE entries the
-            // worker has proven are already on disk.
-            if let Some((batch_gen, applied)) = rot.take_apply_batch() {
-                if batch_gen == generation.load(Ordering::Relaxed) && !applied.is_empty() {
-                    log_event(&format!(
-                        "shutdown: rebasing {} applied rotation(s) the tick never got to drain",
-                        applied.len()
-                    ));
-                    support::rebase_only(&rot, &undo_stack, &applied);
-                }
-            }
+        Err(state) => {
+            log_event(&format!("shutdown: the save sequence was already taken by a system quit ({state:?}) — not run again"));
+            state == support::SystemQuitState::Complete
         }
-        support::ShutdownStep::DrainPickerResults => {
-            // v0.8.128 (A1.2): a colour profile or a watermark chosen in the last frame is still
-            // sitting in the picker channel, and BOTH feed `build_settings` one step below — so
-            // quitting used to discard a choice the user had just made in a native dialog.
-            // `OpenFolder` is deliberately NOT acted on: starting a folder swap inside the shutdown
-            // tail is the one drain that would be actively harmful.
-            //
-            // v0.9.62 (WAVE B ADDENDUM B4-a): UN-GATED, for the same reason. A colour profile or a
-            // watermark chosen in the last frame is a real user choice sitting in a channel, and
-            // Windows discards it on exit exactly as macOS did. Intended shared change.
-            while let Ok((kind, picked)) = pick_rx.try_recv() {
-                let Some(path) = picked else { continue };
-                match kind {
-                    PickKind::OpenFolder => {
-                        log_event("shutdown: a folder pick arrived as we were quitting — not opened");
-                    }
-                    PickKind::Icc => {
-                        let key = icc_pick_key.borrow().clone();
-                        log_event(&format!(
-                            "shutdown: applying the colour profile picked in the last frame ({})",
-                            path.display()
-                        ));
-                        apply_picked_icc(
-                            &app, &key, &path, &display_colors, &display_active, &display_live,
-                            &display_open, &display_failed, &notif_pending,
-                        );
-                    }
-                    PickKind::Watermark => {
-                        if let Ok((rgba, w, h)) = load_wm_logo(&path) {
-                            *wm_cache.borrow_mut() = Some((rgba, w, h));
-                            *export_image_path.borrow_mut() = path.display().to_string();
-                            app.set_wm_type(1);
-                            log_event(&format!(
-                                "shutdown: keeping the watermark picked in the last frame ({})",
-                                path.display()
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        support::ShutdownStep::RevertStagedEdits => {
-            revert_staged_edits(
-                &app,
-                &keymap,
-                &basics_snap,
-                &capturing,
-                &bind_conflict,
-                &keybind_model,
-                &basic_model,
-            );
-        }
-        support::ShutdownStep::SaveSettings => {
-            // best-effort final flush on graceful close
-            save_settings(&build_settings(
-                &app,
-                nvjpeg_choice.load(Ordering::Relaxed), // 1.0.15: the choice, not the runtime flag
-                auto_orient.load(Ordering::Relaxed),
-                &keymap.borrow(),
-                &cur_dir.borrow(),
-                &export_image_path.borrow(),
-                &export_presets.borrow(),
-                &viewed_lru.borrow(),
-                &sort_last_used.borrow(), // v0.8.49
-                &sort_lru.borrow(),
-                &panel_lru.borrow(), // v0.8.89
-                &display_colors.borrow(), // v0.8.107
-                display_migrated.get(), // v0.8.108
-                info_view_pref.get(), // v1.0.0-rc (item 33): the FLOOR, not the live view
-            ));
-        }
-        support::ShutdownStep::FlushSelection => {
-            final_shots = shots.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let dir = cur_dir.borrow().clone();
-            // N1: skip when nothing is loaded (empty/photo-less current folder). `cur_dir` can be
-            // stale — it's kept on the last photo'd folder for next-launch memory — so an empty-map
-            // write here would wipe THAT folder's ratings. The last real folder was already saved by
-            // its own swap-away flush.
-            if !dir.is_empty() && !final_shots.is_empty() {
-                // v0.8.69 (E/H2): flush any pending rating deltas to their XMP sidecars on shutdown
-                // (when sync is ON) so the barrier below makes them durable before the writer thread
-                // is torn down.
-                support::sync_xmp_ratings(app.get_xmp_sync(), &final_shots, &ratings.borrow(), &xmp_journal);
-                let mut m = selection_map(&final_shots, &ratings.borrow(), &marks.borrow());
-                merge_selection_extra(&mut m, &sel_extra.borrow()); // N8: keep moved-out entries
-                if let Err(e) = save_selection(Path::new(&dir), &m, &rot.rotations_snapshot(), &folder_attrs.borrow()) {
-                    log_event(&format!("final ratings flush failed on shutdown: {e}"));
-                }
-            }
-        }
-        support::ShutdownStep::WriterBarrier => {
-            // v0.8.36 (ITEM 1, barrier c): DRAIN the writer so the final settings + selection saves
-            // above are durable before the process exits (the writer thread would otherwise be torn
-            // down mid-write). Log+proceed on timeout — a hung network drive must never wedge exit.
-            support::writer_barrier(std::time::Duration::from_secs(10));
-        }
-        support::ShutdownStep::UnregisterFolder => {
-            support::unregister_open_folder(); // v0.8.36 (ITEM 3): drop our open-folders registry entry
-        }
-    });
+    };
+    // Review R2: an incomplete save is never reported as a clean exit (no `clean shutdown` line, no
+    // "state flushed" device-loss message). The process ends with an error status; there is no
+    // dialog, and nothing more can be saved safely from here.
+    if !saved {
+        log_event("shutdown: exiting WITHOUT a complete save (the system-quit save stopped with an error, logged above) — not a clean shutdown");
+        return Err("the quit-time save did not complete".into());
+    }
 
-    // RAW decode can outlive the Mac's bounded file-operation wait. This snapshot is synchronized
-    // with the final rename, and the cancel flag prevents any later unfinished output publishing.
-    export_progress.stop_and_flush_completed();
-
-    // NOTE (v0.8.122 / M1, preserved from the pre-extraction tail): `RevertStagedEdits` is
-    // deliberately the step BEFORE `SaveSettings`. `build_settings` reads `&keymap.borrow()`, so an
-    // abandoned rebind still live at that point is an abandoned rebind written to settings.json —
-    // which is precisely why the order above is a tested object now and not a run of statements.
-    let _ = &final_shots; // the FlushSelection step owns it; kept named for the reader
     // M1 (v0.8.73): a fast redraw can trip Slint's loop-exit (a Validation surface error) a hair before
     // the device-lost callback fires on the upload thread's next poll. If the loop errored and we haven't
     // latched yet, poll the shared device once so the (maintain-driven) callback runs, then re-check —
@@ -26602,6 +26713,59 @@ mod tests {")
                 "{f} shows the no-result readout without clearing the previous result"
             );
         }
+    }
+
+    /// 1.0.16 (Mac log-out): the save sequence exists ONCE. The system-quit hook and the after-loop
+    /// path run the same callable, built before the loop and registered before the hook goes in; the
+    /// system route stops the tick and hides the window first, and nothing saves after `app.run()`
+    /// except that callable. A census over main.rs (the ordering inside the tail is
+    /// `the_shutdown_tail_runs_its_steps_in_the_one_correct_order`'s).
+    ///
+    /// FALSIFIERS (L28): paste a second `support::graceful_shutdown(` after `app.run()` → the
+    /// `"one tail"` assert reddens; register the save after `install_terminate_handler()` → the
+    /// `"registered before"` assert reddens; move `export_progress.stop_and_flush_completed()` back
+    /// after the loop → the `"inside the sequence"` assert reddens; drop `tick.stop()` → the
+    /// system-route assert reddens. Review R2: call `mac_experiment::shutdown()` or the hide
+    /// unguarded → the `"guarded"` asserts redden; drop the `if !saved` early return → the
+    /// `"never a clean exit"` assert reddens.
+    #[test]
+    fn the_save_sequence_is_built_once_and_shared_by_both_exits() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let once = |needle: &str| {
+            assert_eq!(main.matches(needle).count(), 1, "exactly one `{needle}`");
+            main.find(needle).unwrap()
+        };
+        for call in ["support::graceful_shutdown(", "stop_and_flush_completed(", "mac_experiment::shutdown"] {
+            assert_eq!(main.matches(call).count(), 1, "one tail: a single `{call}` in main.rs");
+        }
+        let built = once("let save_sequence: support::SaveSequence = {");
+        let system = once("if route == support::SaveRoute::System {");
+        let guarded_hide = once("support::guard_teardown(\"hiding the window\", || {");
+        let stop = once("tick.stop();");
+        let hide = once("let _ = app.hide();");
+        let mac_cleanup = once("support::guard_teardown(\"restoring the Mac title bar\", mac_experiment::shutdown);");
+        assert!(system < guarded_hide && guarded_hide < stop, "the hide is guarded");
+        let tail = once("support::graceful_shutdown(immediate, &mut |st| match st {");
+        let flush = once("export_progress.stop_and_flush_completed();");
+        let registered = once("macos_open::register_save_sequence(save_sequence);");
+        let hook = once("macos_open::install_terminate_handler();");
+        let run = once("let run_outcome = app.run();");
+        let after = once("save(support::SaveRoute::AfterLoop { immediate });");
+        assert!(built < system && system < stop && stop < hide && hide < mac_cleanup, "system route: tick, hide, then cleanup");
+        assert!(mac_cleanup < tail && tail < flush && flush < registered, "one tail, with the export flush inside the sequence");
+        assert!(registered < hook, "the save is registered before the terminate hook is installed");
+        assert!(hook < run && run < after, "after the loop, the same sequence runs");
+        assert!(!main[run..].contains("save_settings(") && !main[run..].contains("save_selection("), "nothing else saves after the loop");
+        let not_saved = once("if !saved {");
+        let early = not_saved + main[not_saved..].find("return Err(").expect("an incomplete save returns an error");
+        let clean = main[run..].find("log_event(\"clean shutdown\")").map(|i| run + i).expect("the clean line");
+        assert!(after < not_saved && early < clean, "an incomplete save is never a clean exit");
     }
 
     /// 1.0.15 (RC1 audit #1): every settings save persists the GPU-decoding CHOICE, never the
