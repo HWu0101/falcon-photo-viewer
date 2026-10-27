@@ -99,7 +99,7 @@ const CMP_BOTHPIN_HINT_FRAMES: i32 = 360; // ~6 s at 60 Hz
 // scrubbing runs forward. Total window = AHEAD + BEHIND + current ≈ 99.
 // Prefetch window — how many frames to keep hot ahead/behind. Scaled UP at startup from the
 // VRAM budget (a bigger card prefetches deeper → smoother scrub), clamped to ≥ these minimums.
-// v0.8.196: `pub(crate)` because `support::efficiency_limits` clamps the posture's rate-derived
+// v0.8.196: `pub(crate)` because `support::mode_limits` (Efficiency's limits then) clamps the rate-derived
 // runway to them — the depth may follow the browse rate, but never past the shipped window.
 pub(crate) const PREFETCH_AHEAD: usize = 22; // minimum window in front of current
 pub(crate) const PREFETCH_BEHIND: usize = 8; // minimum window behind current
@@ -1896,6 +1896,7 @@ fn revert_staged_edits(
 // glob-imported so every existing unqualified name resolves exactly as before.
 mod backdrop;
 mod glass_blur;
+mod gpu_memory; // 2026-10-25 (graphics-memory sharing, round 1): Falcon's own and the whole card's graphics-memory use, measured on Windows
 mod menu_probe;
 mod detail; // v0.8.30 (§64): the detail (full-res) decode-tier subsystem (owns the swap-cleared detail state) — unit-tested
 mod fast; // v0.8.26 (§64): the fast-decode-tier subsystem (owns the swap-cleared fast state) — unit-tested
@@ -1913,7 +1914,9 @@ mod mac_menu; // v0.9.22: the native NSMenu menu bar (graft onto muda's default 
 mod macos_open; // v0.9.15 (B-spike): the Apple-Events "odoc" (open-documents) delegate arm — Finder "Open With → Falcon"
 mod menubar_model; // v0.9.22: the menu-bar MODEL (tree/titles/enablement/fingerprint) — pure, Windows-unit-tested
 mod meta; // v0.9.4 (§66/P4a): the per-shot-metadata subsystem (owns the swap-cleared/reseeded metadata) — unit-tested
+mod background_memory; // 2026-10-25 (graphics-memory sharing, round 1): release graphics memory while Falcon is in the background — pure, unit-tested
 mod memory_pressure;
+mod prep_priority; // 2026-10-25 (round 3 step a): work done ahead of the user runs below normal Windows priority
 #[cfg(test)]
 #[path = "../../vendor/femtovg/src/renderer/wgpu/pipeline_cache.rs"]
 mod renderer_pipeline_cache_tests;
@@ -4875,29 +4878,42 @@ fn spawn_fixed_fast_pool(nworkers: usize, pool18: bool, ctx: &FastWorkerCtx) {
     ));
     for _ in 0..nworkers {
         let ctx = ctx.clone();
-        std::thread::spawn(move || loop {
-            let (idx, regime_at_pop) = {
-                let (m, cv) = &*ctx.pump;
-                let mut p = m.lock().unwrap_or_else(|e| e.into_inner());
-                loop {
-                    // v0.8.114 (V9): THE shared hand-off — the tick marked what the cap counts
-                    // when it built this queue and `support::pump_pop` moves the mark from
-                    // "queued" to "in flight". No format lookup here, so nothing can go stale
-                    // against a swapped shot list; and being ONE function, the fixed pool, the
-                    // elastic worker's `try_fast` and the test rig's `pop_all` all drive the same
-                    // code — which is what makes the suite's stated falsifier bite on every shape.
-                    if let Some(hit) = support::pump_pop(&mut p) {
-                        break hit;
+        std::thread::spawn(move || {
+            // 2026-10-25 (round 3 step a): this worker's place in the priority registry, with a
+            // pool of one thread only it uses (`prep_priority`; one is enough: a preview-size JPEG
+            // decode gains little from more, measured in the round's `fix/lane_bench`).
+            let mut prep = prep_priority::PREP.worker(1);
+            loop {
+                let (idx, regime_at_pop) = {
+                    let (m, cv) = &*ctx.pump;
+                    let mut p = m.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        // v0.8.114 (V9): THE shared hand-off — the tick marked what the cap counts
+                        // when it built this queue and `support::pump_pop` moves the mark from
+                        // "queued" to "in flight". No format lookup here, so nothing can go stale
+                        // against a swapped shot list; and being ONE function, the fixed pool, the
+                        // elastic worker's `try_fast` and the test rig's `pop_all` all drive the same
+                        // code — which is what makes the suite's stated falsifier bite on every shape.
+                        if let Some(hit) = support::pump_pop(&mut p) {
+                            break hit;
+                        }
+                        // Poison-tolerant like every lock: if another pool worker panicked while holding the
+                        // Pump, a bare unwrap() here would abort THIS worker too, cascading the pool to death
+                        // — the exact failure the per-worker catch_unwind + poison recovery exist to prevent.
+                        p = cv.wait(p).unwrap_or_else(|e| e.into_inner());
                     }
-                    // Poison-tolerant like every lock: if another pool worker panicked while holding the
-                    // Pump, a bare unwrap() here would abort THIS worker too, cascading the pool to death
-                    // — the exact failure the per-worker catch_unwind + poison recovery exist to prevent.
-                    p = cv.wait(p).unwrap_or_else(|e| e.into_inner());
-                }
-            };
-            run_fast_job(&ctx, idx, regime_at_pop);
+                };
+                // 2026-10-25 (round 3 step a): a preview nobody asked for decodes below normal
+                // priority, its decoder's parallel work with it (`prep_priority`).
+                prep.run(prep_priority::Job::Frame(idx), || run_fast_job(&ctx, idx, regime_at_pop));
+            }
         });
     }
+}
+
+/// The fixed thumbnail pool's width (G6): a quarter of the cores, 2–4.
+fn thumb_pool_workers() -> usize {
+    std::thread::available_parallelism().map(|n| n.get() / 4).unwrap_or(2).clamp(2, 4)
 }
 
 /// Everything a thumbnail job needs — one clone per worker (the old thumb spawn's clone set).
@@ -4913,12 +4929,19 @@ struct ThumbWorkerCtx {
     frost_map: tick::FrostMap, // v0.8.32 (§64): park the 160 px frost mip via Film
     auto_orient: Arc<AtomicBool>, // v0.8.0: gates the per-thumb orientation read
     orient_cache: Arc<Mutex<OrientCache>>, // F2b: shared JPG-side base cache
+    cloud_skipped: Arc<Mutex<HashSet<(u64, usize)>>>, // round 2b: the whole folder's online-only finds, via Film
 }
 
 /// ONE thumbnail job, panic-guarded — the pre-v0.9.23 thumb-worker body verbatim (including the
 /// always-answer rule on both the failure and panic paths).
 fn run_thumb_job(ctx: &ThumbWorkerCtx, req: support::ThumbReq) {
-    let support::ThumbReq { idx, gen: req_gen, delta, .. } = req;
+    run_thumb_job_with(ctx, req, falcon_decode::file_is_cloud_placeholder);
+}
+
+/// [`run_thumb_job`] with the cloud probe passed in, so a test can stand in for a placeholder (no test
+/// can make a real one — the `gif_rotate_verdict_with` precedent).
+fn run_thumb_job_with(ctx: &ThumbWorkerCtx, req: support::ThumbReq, is_cloud: impl Fn(&std::path::Path) -> bool) {
+    let support::ThumbReq { idx, gen: req_gen, delta, local_only, .. } = req;
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let (snap, g) = {
             let s = ctx.shots.lock().unwrap_or_else(|e| e.into_inner());
@@ -4928,6 +4951,33 @@ fn run_thumb_job(ctx: &ThumbWorkerCtx, req: support::ThumbReq) {
             return; // folder swapped since the request — apply_scan cleared thumb_pending
         }
         if let Some(shot) = snap.get(idx) {
+            // 2026-10-27 (round 2b, owner: "do the check") — THE WHOLE FOLDER READS ONLY WHAT IS STILL
+            // ON THIS DEVICE. The scan's cloud tags miss a file made online-only since (Free up space,
+            // Storage Sense, Optimise Mac Storage), and reading one downloads it: batch work never
+            // does. So a whole-folder job asks the file's metadata just before the read and, for an
+            // online-only file, answers with an empty marker (the pending slot frees) WITHOUT the
+            // failure latch — a tile on screen still asks for its thumbnail as before — and notes it
+            // for the feeder (`Film::cloud_skipped`), which asks for it no more this folder. Here on
+            // the worker, not in the tick, so a stalled network share can never hold up the window.
+            //
+            // FALSIFIER (L28): drop this check and `a_whole_folder_job_skips_a_file_only_in_the_cloud`
+            // reddens with the decode attempted and the failure latched.
+            if local_only && support::shot_is_cloud_only(shot, &is_cloud) {
+                let first = {
+                    let mut s = ctx.cloud_skipped.lock().unwrap_or_else(|e| e.into_inner());
+                    // Only for the folder still open, asked under the lock: a swap moves the generation
+                    // before `Film::on_folder_swap` clears this set under the same lock, so an old
+                    // folder's find never lands in the new folder's set or takes its one log line.
+                    ctx.generation.load(Ordering::Relaxed) == g && s.insert((g, idx)) && s.len() == 1
+                };
+                if first {
+                    log_event(&format!(
+                        "whole-folder thumbnails: #{idx} is only in the cloud now — skipped, not downloaded (any more this folder are skipped without a line)"
+                    ));
+                }
+                let _ = ctx.thumb_res_tx.send((idx, g, Vec::new(), 0, 0, 0, 0, 0));
+                return;
+            }
             // v0.8.99 (H2a): the thumb tier's per-format cost. On JPEG a thumb is a near-free 1/8
             // DCT stop; on HEIC it is a FULL 48 MP decode, and the frost feeder asks for one per
             // shot across the whole prefetch window. That ratio is the number the HEIC round needs.
@@ -5078,27 +5128,36 @@ fn run_thumb_job(ctx: &ThumbWorkerCtx, req: support::ThumbReq) {
 /// count, same log line, blocking shared-receiver dequeue). Windows/Linux always; macOS only
 /// under the classic hatch.
 fn spawn_fixed_thumb_pool(thumb_rx_shared: &Arc<Mutex<support::ThumbQueue>>, ctx: &ThumbWorkerCtx) {
-    let thumb_workers = std::thread::available_parallelism()
-        .map(|n| n.get() / 4)
-        .unwrap_or(2)
-        .clamp(2, 4);
+    let thumb_workers = thumb_pool_workers();
     log_event(&format!("thumbnail pool: {thumb_workers} workers"));
     for _ in 0..thumb_workers {
         let ctx = ctx.clone();
         let thumb_rx = thumb_rx_shared.clone();
         std::thread::spawn(move || {
+            // 2026-10-25 (round 3 step a): this worker's place in the priority registry, with a pool
+            // of one thread only it uses (`prep_priority`).
+            let mut prep = prep_priority::PREP.worker(1);
             loop {
                 // Dequeue under the shared lock; a worker blocked in recv() holds it only until a
                 // job arrives (its siblings then contend for the NEXT job) — the decode below runs
                 // lock-free. Err = channel closed (app shutdown) → exit.
                 //
                 // v1.0.0-rc (FIX 2026-09-07, round X1 / F3): the same blocking `recv`, reached
-                // through `support::ThumbQueue::take`, which sorts what has already arrived into an
+                // through `support::ThumbQueue::take_via`, which sorts what has already arrived into an
                 // EXPLICIT and a SPECULATIVE lane and hands back the explicit one first. No poll,
                 // no timeout, no extra thread — see that type's wake-up note.
-                let job = { thumb_rx.lock().unwrap_or_else(|e| e.into_inner()).take() };
+                //
+                // 2026-10-26 (round 3 step a, the re-checks): each look goes through the priority
+                // registry's hand-over, so a tile that comes on screen as this worker takes its job
+                // still has it start at normal (`prep_priority::Worker::hand_over`).
+                let job = {
+                    thumb_rx.lock().unwrap_or_else(|e| e.into_inner()).take_via(|q| prep.hand_over(|| q.try_take()))
+                };
                 let Ok(job) = job else { break };
-                run_thumb_job(&ctx, job);
+                // 2026-10-25 (round 3 step a): only a thumbnail not on screen decodes below normal,
+                // until its tile comes on screen (`tick::feed_visible_thumb`).
+                let ask = prep_priority::Job::Thumb { idx: job.idx, gen: job.gen, delta: job.delta, on_screen: job.explicit };
+                prep.run(ask, || run_thumb_job(&ctx, job));
             }
         });
     }
@@ -5289,7 +5348,14 @@ fn fast_holds(gesture: bool, memory: bool) -> FastHolds {
 #[cfg(target_os = "macos")]
 struct MacPoolGov {
     gate: Arc<pool_gov::ElasticGate>,
-    params: pool_gov::GovParams,
+    /// 2026-10-26 (round 2a): a `Cell`, because the floor is re-derived when the mode in effect
+    /// changes (`set_floor_rate`); the ceiling never moves.
+    params: Cell<pool_gov::GovParams>,
+    /// …from the boot's bench record and core count, kept for that re-derivation.
+    bench: Option<pool_gov::FloorBench>,
+    cores: usize,
+    /// The rate the floor was last derived for, so the re-derivation runs once per change.
+    floor_rate: Cell<f32>,
     state: RefCell<pool_gov::GovState>,
     /// Fast frames SENT since the last sample (the elastic workers bump it) → delivered fps.
     delivered: Arc<AtomicUsize>,
@@ -5312,7 +5378,7 @@ impl MacPoolGov {
     /// steps and the L2 pressure controller take — evaluated once per tick at the call site, read a
     /// fourth time here. It is a SAMPLE input, not a gate on this fn: a held window still updates the
     /// clock, still measures, still grows if it is starved; what it may not do is be counted as idle.
-    fn step(&self, now: Instant, app: &MainWindow, fast_hold: bool) {
+    fn step(&self, now: Instant, fast_hold: bool, target_fps: f32) {
         let dt = now.duration_since(self.last_sample.get());
         if dt < Duration::from_secs(1) {
             return;
@@ -5347,7 +5413,9 @@ impl MacPoolGov {
             let p = self.pump.0.lock().unwrap_or_else(|e| e.into_inner());
             (p.queue.len(), p.inflight.len())
         };
-        let target_fps = app.get_scrub_fps().max(1.0); // the LIVE applied target (speed popup)
+        // The LIVE applied target: the speed popup's rate, after the mode's limit (round 2a — a
+        // Balanced browse held at 20 fps must not read as starved against the user's 30).
+        let target_fps = target_fps.max(1.0);
         let sample = pool_gov::GovSample {
             delivered_fps,
             target_fps,
@@ -5359,7 +5427,7 @@ impl MacPoolGov {
         };
         // Release the GovState borrow before the match arms so the Grow rollback (Fix A) can
         // re-borrow it (GovDecision is Copy, so the RefMut is dropped at this statement's end).
-        let decision = pool_gov::govern(&mut self.state.borrow_mut(), &self.params, &sample);
+        let decision = pool_gov::govern(&mut self.state.borrow_mut(), &self.params.get(), &sample);
         match decision {
             pool_gov::GovDecision::Hold => {}
             pool_gov::GovDecision::Grow { from, to } => {
@@ -5424,6 +5492,40 @@ impl MacPoolGov {
                     )),
                 }
             }
+        }
+    }
+
+    /// 2026-10-26 (round 2a): the smoothness floor follows the rate the mode in effect allows. The
+    /// boot derived it from the saved speed (`FloorBench::from_settings`); a mode that lowers the
+    /// speed lowers the floor, and returning restores it. A floor above the current width grows the
+    /// pool to it at once, through the same fallible spawn the governor's grow uses. Called every
+    /// tick; acts only when the rate changes.
+    fn set_floor_rate(&self, rate_fps: f32) {
+        if (rate_fps - self.floor_rate.get()).abs() < 0.01 {
+            return;
+        }
+        self.floor_rate.set(rate_fps);
+        let bench = self.bench.map(|b| pool_gov::FloorBench { applied_fps: rate_fps, ..b });
+        let mut p = self.params.get();
+        let floor = pool_gov::derive_floor(bench, self.cores).floor().min(p.ceiling);
+        if floor == p.floor {
+            return;
+        }
+        log_event(&format!("pool: elastic floor {}→{floor} (the mode allows {rate_fps:.0} fps)", p.floor));
+        p.floor = floor;
+        self.params.set(p);
+        let from = self.state.borrow().width;
+        if from < floor {
+            let mut grown = from;
+            for slot in self.gate.resize(floor) {
+                if (self.spawn)(slot) {
+                    grown += 1;
+                } else {
+                    self.gate.mark_dead(slot);
+                }
+            }
+            self.state.borrow_mut().width = grown.max(from);
+            log_event(&format!("pool: width {from}→{grown} (grow — to the new floor)"));
         }
     }
 }
@@ -5514,7 +5616,10 @@ fn spawn_elastic_pool(
     }
     Rc::new(MacPoolGov {
         gate,
-        params: pool_gov::GovParams { floor, ceiling },
+        params: Cell::new(pool_gov::GovParams { floor, ceiling }),
+        bench,
+        cores,
+        floor_rate: Cell::new(boot.scrub_fps),
         state: RefCell::new(pool_gov::GovState::new(floor)),
         delivered,
         thumb_done,
@@ -5662,13 +5767,14 @@ fn auto_tune_backend(pref: wgpu::PowerPreference) -> (Option<String>, String) {
                 continue;
             }
         };
-        // DeviceDescriptor mirrors WGPUSettings::default() incl. the swapchain-resolution limit bump.
+        // DeviceDescriptor mirrors WGPUSettings::default() incl. the swapchain-resolution limit bump,
+        // with the memory hints `falcon_backend_selector` gives the real device (2026-10-25).
         let dev = poll_once_ready(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            memory_hints: device_memory_hints(),
             trace: wgpu::Trace::default(),
         }));
         match dev {
@@ -5734,14 +5840,35 @@ fn mac_titlebar_window_attributes(
 
 /// v0.9.11: the ONE constructor for the app's BackendSelector — BOTH select sites (the organic
 /// auto-tune and the constrained memo/pin path) must carry the macOS window-attributes hook, so
-/// building a selector anywhere else is a bug. On Windows this is exactly the pre-v0.9.11
-/// selector (the hook line compiles out; behavior byte-identical).
+/// building a selector anywhere else is a bug. On Windows this is the pre-v0.9.11 selector (the hook
+/// line compiles out) plus, since 2026-10-25, [`device_memory_hints`].
 fn falcon_backend_selector(ws: slint::wgpu_29::WGPUSettings) -> slint::BackendSelector {
+    let mut ws = ws;
+    ws.device_memory_hints = device_memory_hints();
     let selector = slint::BackendSelector::new()
         .require_wgpu_29(slint::wgpu_29::WGPUConfiguration::Automatic(ws));
     #[cfg(target_os = "macos")]
     let selector = selector.with_winit_window_attributes_hook(mac_titlebar_window_attributes);
     selector
+}
+
+/// 2026-10-25 (graphics-memory sharing, round 1): the device's memory-block sizes. ONE value, read by
+/// the app's device ([`falcon_backend_selector`]) and by the auto-tune probe that mirrors it.
+///
+/// Slint's default (`MemoryUsage`) lets gpu-allocator grow its general blocks to 64 MB. A 46 MB
+/// browsing preview fits one block but two do not, so every preview took its own 64 MB block and left
+/// 18 MB unused: about 2.5 GB across 140 previews on the owner's card (wgpu's allocator report,
+/// 25 October). Capping general blocks at 16 MB gives every larger texture an exact-size block.
+/// Measured on the same 300-photo run: 14.45 → 11.42 GB (DirectX 12) and 15.88 → 13.14 GB (Vulkan),
+/// median upload time unchanged, Vulkan's slowest eighth of full-resolution uploads about 30 ms
+/// longer. macOS keeps Slint's default: Metal does not use these blocks, and nothing changes there
+/// without a native run.
+pub(crate) fn device_memory_hints() -> wgpu::MemoryHints {
+    if cfg!(target_os = "macos") {
+        wgpu::MemoryHints::MemoryUsage
+    } else {
+        wgpu::MemoryHints::Manual { suballocated_device_memory_block_size: (4 << 20)..(16 << 20) }
+    }
 }
 
 /// v0.8.43: run one AUTO-TUNE + constrain Slint's `Automatic` select to the winning backend (all-backends if
@@ -5966,11 +6093,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     // v1.0.0-rc TAIL (OWNER RULING, CMYK): the lever lives in falcon-decode (the decode that reads
     // it is there), seeded from settings.json exactly as its neighbour above is.
     falcon_decode::set_cmyk_os_route(boot.cmyk_os_route);
-    // v0.8.195 (EFFICIENCY MODE): the posture's mode, seeded from the same early read and for the
-    // same reason — the first tick consults it, and a session must never spend its opening seconds
-    // in a posture the settings file does not describe. `set_efficiency_mode` owns the range clamp,
-    // so a hand-edited file cannot mount a fourth state (see `efficiency_mode_from_settings`).
-    support::set_efficiency_mode(boot.efficiency_mode as i32);
+    // 2026-10-26 (round 2a): the saved mode and the battery switch, seeded from the same early read
+    // and for the same reason — the first tick consults them, and a session must never spend its
+    // opening seconds in a mode the settings file does not describe. `set_saved_mode` owns the range
+    // clamp, so a hand-edited file cannot mount a fifth state (see `mode_from_settings`). The early
+    // read has already run the Efficiency migration (`normalize_loaded_settings`).
+    support::set_saved_mode(i32::from(boot.mode));
+    support::set_battery_power_saver(boot.battery_power_saver);
 
     // Prefer the high-performance (discrete) GPU. On a hybrid NVIDIA + Intel-iGPU
     // machine Slint's default adapter pick (no power preference) can land on the
@@ -7159,6 +7288,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // window of re-decodes, so it waits `EFFICIENCY_BIAS_DEBOUNCE_MS` for the posture to mean it;
     // `user_super_applied` is what tells a POSTURE flip from a USER flip at the apply site.
     let bias_engaged_seen = Rc::new(Cell::new(None::<bool>));
+    // 2026-10-26 (round 2a): the ask toast's battery pill asks the tick to hold the saved mode until
+    // the power source changes; the tick takes the ask (see `mode_hold` at the tick's state).
+    let mode_hold_ask = Rc::new(Cell::new(false));
     let bias_since = Rc::new(RefCell::new(Instant::now()));
     let bias_applied = Rc::new(Cell::new(false));
     let user_super_applied = Rc::new(Cell::new(true));
@@ -7739,6 +7871,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         det_epoch: det_epoch.clone(),
         derive_tx: derive_tx.clone(),
     };
+    // 2026-10-25 (round 3 step a): before the first worker starts; each takes its own place and
+    // low-priority pool as it starts (Windows only).
+    let prep_on = prep_priority::enabled_from_env(std::env::var("FALCON_LOW_PRIORITY_PREP").ok().as_deref());
+    prep_priority::PREP.configure(prep_on);
+    log_event(&format!(
+        "work prepared ahead: {}",
+        if prep_on { "below normal priority" } else { "normal priority (FALCON_LOW_PRIORITY_PREP=0, or not Windows)" }
+    ));
     #[cfg(not(target_os = "macos"))]
     spawn_fixed_fast_pool(nworkers, boot.pool18, &fast_ctx);
     #[cfg(target_os = "macos")]
@@ -7932,6 +8072,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             // falls through det_nv's None arm to THIS decoder for JPEG/HEIC (else Unsupported → CPU).
             #[cfg(target_os = "macos")]
             let mut det_imageio = ImageIODecoder::new();
+            // 2026-10-25 (round 3 step a): this worker's place in the priority registry. Its pool is
+            // as wide as the machine, like the global pool its CPU decode and colour conversion
+            // would otherwise use (`prep_priority`).
+            let mut prep_worker = prep_priority::PREP.worker(cores);
             // One request per job (the tick only sends when idle, so no chase-drain).
             // v0.8.115: `derive` = the tick suppressed this shot's fast decode, so this master is
             // the ONLY source its scrub-tier frame will have.
@@ -7944,8 +8088,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // "Jumped away" = the id fell outside the ±window of the live current (mirrors the
                 // fast pool's DROP_DIST chase-latest). The radius is the LIVE (possibly
                 // zoom-widened, v0.3.51) window — it must never be narrower than the prefetch
-                // window or the outer prefetched frames would abandon-loop forever. Never in
-                // compare: its halves sit at arbitrary distances from `current`.
+                // window or the outer prefetched frames would abandon-loop forever (since round 2b
+                // its wider side, `support::detail_jump_radius`: Custom may keep more behind than
+                // ahead). Never in compare: its halves sit at arbitrary distances from `current`.
                 let jumped_away = |at: &str| {
                     if compare_atomic.load(Ordering::Relaxed) {
                         return false;
@@ -7983,6 +8128,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     det_cpu_busy.store(false, Ordering::Relaxed); // v0.8.99 (H4): nothing in flight → no collapse
                     continue;
                 }
+                // 2026-10-25 (round 3 step a): a neighbour nobody asked for decodes with this thread
+                // below normal priority, and its CPU decode and colour conversion run on this
+                // worker's low pool. It owns thread-bound state (the GPU RAW developer, nvJPEG, the
+                // HEIC supersession watch), so the thread itself never moves. Restored when the job
+                // ends, a panic included.
+                let prep = prep_worker.enter(prep_priority::Job::Frame(idx));
                 // Decode under catch_unwind: a panic in a third-party RAW/JPEG codec on a crafted or
                 // corrupt file must NOT kill this SOLE full-res worker (that would permanently freeze
                 // all full-res / RAW-develop for the session — det_busy would stay true forever). On a
@@ -8213,8 +8364,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                         Some((rgba, w, h))
                     } else if raw {
                         // GPU develop for RGGB Bayer (~0.7 ms); fall back to CPU develop.
+                        // 2026-10-25 (round 3 step a): rawler's parallel work, the read and the CPU
+                        // develop, on the low pool; the GPU develop stays on this thread.
                         let mut out = None;
-                        if let Ok(cfa) = extract_cfa(shot) {
+                        if let Ok(cfa) = prep.on_low_pool(|| extract_cfa(shot)) {
                             if cfa.rggb {
                                 if gpu_dev.is_none() {
                                     gpu_dev = GpuDeveloper::new().ok();
@@ -8230,7 +8383,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                         }
-                        out.or_else(|| develop_raw_rgba(shot, ddim).ok())
+                        out.or_else(|| prep.on_low_pool(|| develop_raw_rgba(shot, ddim)).ok())
                     } else {
                         // ── v0.9.66 (the round-7 sync): TWO HALVES, TWO OWNERS ──────────────
                         //
@@ -8315,7 +8468,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                             // failure arm below — `det_failed` is a latch that stops this shot ever
                             // being asked for again in this folder, and nothing is wrong with this
                             // file. It is recorded here and answered where the skip marker is sent.
-                            got = match browse_frame_or_superseded(shot, ddim, true, Lane::Native) {
+                            // 2026-10-25 (round 3 step a): a non-HEIC file never reaches the hardware
+                            // lane or this thread's supersession watch, so its decode (`jpeg-decoder`
+                            // and jxl-oxide split theirs across rayon) runs on the low pool; a HEIC
+                            // stays here with the watch.
+                            let cpu = || browse_frame_or_superseded(shot, ddim, true, Lane::Native);
+                            let cpu = if shot.kind == SrcKind::Heic { cpu() } else { prep.on_low_pool(cpu) };
+                            got = match cpu {
                                 Ok(Some(f)) => {
                                     cpu_split = (f.dec_ms, f.exp_ms);
                                     cpu_route = f.route;
@@ -8498,7 +8657,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         // the work went, not a missing measurement.
                         let t_xf = Instant::now();
                         if yuv_frame.is_none() && !heic_gpu_color {
-                            falcon_color::transform_rgba(&mut rgba, src, dst);
+                            prep.on_low_pool(|| falcon_color::transform_rgba(&mut rgba, src, dst));
                         }
                         let xform_ms = t_xf.elapsed().as_millis() as u32;
                         let ms = t.elapsed().as_millis() as u32;
@@ -8984,6 +9143,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         auto_orient: auto_orient.clone(), // v0.8.0: gates the per-thumb orientation read
         orient_cache: meta.orient_cache.clone(), // F2b: shared JPG-side base cache
         output_gamut: output_gamut.clone(), // v0.8.104 (Round-A C2): the thumb tier's CM destination
+        cloud_skipped: film.cloud_skipped.clone(), // round 2b: the whole folder's online-only finds, via Film
     };
     #[cfg(not(target_os = "macos"))]
     spawn_fixed_thumb_pool(&thumb_rx_shared, &thumb_ctx);
@@ -9206,10 +9366,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         // routed side. The merge routed this dialog’s BUTTONS and left its body typing the other
         // OS’s bin three lines above them.
         app.set_overwrite_confirm_body(platform::overwrite_confirm_body().into());
-        // v1.0 MERGE TAIL [B-R1, L17]: the Efficiency card’s Auto clause. `saver` is structurally
-        // false on macOS (Low Power Mode is not read at v1.0), so the Windows half of the predicate
-        // is not named there. Windows keeps the pre-tail literal, byte for byte.
-        app.set_efficiency_auto_clause(platform::efficiency_auto_clause().into());
+        // v1.0 MERGE TAIL [B-R1, L17]: the battery switch's Battery saver clause (round 2a; it was
+        // the Efficiency card's Auto clause). `saver` is structurally false on macOS (Low Power Mode
+        // is not read), so the Windows half of the rule is not named there.
+        app.set_battery_switch_clause(platform::battery_switch_clause().into());
+        app.set_mode_performance_line(platform::mode_performance_line().into());
         app.set_delete_confirm_label(i18n::tr(platform::PLATFORM.move_to_trash).into());
         // v0.8.71 (Round B assoc): the HEIC row's conditional availability — a boot-time READ-ONLY
         // WIC codec-registry probe (no decode, session-cached; a codec installed mid-session enables
@@ -9293,9 +9454,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         // below, so even a hard kill right after boot can't resurrect the panel. The `.slint`
         // `changed welcome-open` close observer stays as a redundant latch (its keys.focus() is
         // load-bearing on close).
-        let (welcome_open_at_boot, onboarding_latch_now) =
-            support::onboarding_boot(settings.onboarding_shown);
+        let (_, onboarding_latch_now) = support::onboarding_boot(settings.onboarding_shown);
         app.set_onboarding_shown(settings.onboarding_shown || onboarding_latch_now);
+        // 2026-10-26 (round 2a): …and once more after a FEATURE update (1.0 → 1.1, never a patch),
+        // with the wording for people who already use Falcon. The feature version that showed it is
+        // recorded the moment it shows (the persist-at-show contract above), and the nudge below
+        // saves it at once.
+        let (welcome_open_at_boot, guide_updating) = support::guide_boot(
+            settings.onboarding_shown,
+            &settings.guide_seen_feature,
+            env!("CARGO_PKG_VERSION"),
+        );
+        app.set_welcome_updating(guide_updating);
+        app.set_guide_seen_feature(if welcome_open_at_boot {
+            support::feature_version_text(env!("CARGO_PKG_VERSION")).into()
+        } else {
+            settings.guide_seen_feature.as_str().into()
+        });
+        app.set_welcome_feature(support::feature_version_text(env!("CARGO_PKG_VERSION")).into());
         app.set_welcome_open(welcome_open_at_boot);
         // v0.9.16 (Round B assoc): the popup latch + captured incumbents round-trip on EVERY OS (a
         // loaded value must never be dropped by a save), but the popup itself is Mac-only below.
@@ -9434,19 +9610,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         app.set_hover_appears_seg_opts(slint::ModelRc::new(slint::VecModel::from(
             support::hover_appears_opts(),
         )));
-        // v0.8.195 (EFFICIENCY MODE): the atomic and the control's property, from the ONE setter, so
-        // the number the tick spends and the cell the Seg lights are the same number — including
-        // when the file held something out of range and the setter clamped it to Auto.
-        app.set_efficiency_mode(i32::from(support::set_efficiency_mode(
-            settings.efficiency_mode as i32,
-        )));
-        // v0.8.195 fix tail (skeptic B, O1): `FALCON_EFFICIENCY=0` UNMOUNTS the Seg and the card
-        // shows only its note — the `heic-lane-cap-env` precedent in this same sheet, whose own
-        // comment is "Dev levers win; the UI says so rather than pretending otherwise". §1B's ruling
-        // that the setting still PERSISTS is untouched: what the lever takes away is the ability to
-        // act this session, and the note is what says that. Read once (the env cannot change under a
-        // running process in any way this app initiates).
-        app.set_efficiency_env(!support::efficiency_enabled());
+        // 2026-10-26 (round 2a): the saved mode, the battery switch and the background wait — the
+        // atomics and the controls' properties from the ONE setter each, so the number the tick
+        // spends and the cell the control lights are the same number, including when the file held
+        // something out of range. `FALCON_EFFICIENCY=0` turns the battery switch off for the session
+        // only; the status line says so and the switch still persists.
+        app.set_mode(i32::from(support::set_saved_mode(i32::from(settings.mode))));
+        support::set_battery_power_saver(settings.battery_power_saver);
+        app.set_battery_power_saver(settings.battery_power_saver);
+        app.set_bg_wait_s(settings.bg_wait_s as i32);
+        // 2026-10-27 (round 2b): Custom's numbers onto its card, in range — the tick reads them back
+        // off the card every pass, as it does the wait.
+        support::set_custom_limits_on(&app, settings.custom_limits());
         // v0.8.172 (G10): the WITNESS is mirrored back into the property FIRST, so `build_settings`
         // re-persists an install's existing "the control has been used" fact instead of clearing it
         // on the next periodic save — which would re-arm the migration against a deliberate Uncapped
@@ -9783,10 +9958,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         // than its predecessor did — s0 already carries the derived `panels_default` + its marker,
         // so without this the dedup would keep BOTH in memory only and the next launch would
         // re-derive, overwriting a preference the user might have changed in between.
+        // 2026-10-26 (round 2a): …and the guide's return after a feature update, and the mode
+        // migration, for the same reasons (the guide must not return twice; the migrated mode and its
+        // marker go to disk on the launch that earned them).
         if onboarding_latch_now
             || assoc_latch_now
             || settings.info_min_boot
             || settings.panels_migrated_boot
+            || guide_updating
+            || settings.modes_migrated_boot
         {
             save_settings(&s0);
         }
@@ -10047,43 +10227,149 @@ fn main() -> Result<(), Box<dyn Error>> {
     // v0.8.171 (OWNER RULING): HEIC speed priority. One store, like  beside it — the
     // router reads the atomic per decode, so there is nothing to invalidate and nothing to un-set
     // (L43). Persisted off the Slint property by `build_settings` on the ~1 s dirty compare.
-    // v0.8.195 (EFFICIENCY MODE, OWNER RULING option c): the three-state control. One store, like
-    // the row below it — the tick re-reads the atomic every pass, so there is nothing to invalidate,
-    // no folder to reopen and no latch to un-set (L43). The posture's own ENGAGED / RELEASED line is
-    // logged by the tick off the composed verdict, so this line reports only what the user chose;
-    // saying "engaged" here would claim a posture that a desktop on Auto will not enter.
-    //
-    // v1.0 MERGE MICRO-TAIL [D-V1]: THE AUTO ARM ROUTES, exactly like the card it echoes. This line
-    // is keyed on the MODE the user picked, not on a snapshot, so it was unconditional — and owner
-    // default L4 makes the control live on macOS, which makes this merge the first commit to write
-    // "Windows' Battery saver" into a Mac user's falcon.log. Same class, same first-exposure
-    // argument and the same routed fix as B-R1's caption; the fix-tail's own sweep sentence ("the
-    // caption was the only unconditional one") was spelled for the card and missed the log. It is a
-    // LOG line, so nothing the app DOES changes — but the tester's log is the traceability record
-    // this project asks him to send back, and a record that names the wrong operating system is the
-    // class the routing exists to end. `platform::efficiency_auto_clause` is the one source, so the
-    // card and the log can never drift apart again.
-    app.on_set_efficiency_mode(|m| {
-        let live = support::set_efficiency_mode(m);
-        log_event(&format!(
-            "efficiency mode: {}",
-            match live {
-                support::EFFICIENCY_ON =>
-                    "On — background work is reduced on every power source, including mains".to_string(),
-                support::EFFICIENCY_OFF =>
-                    "Off — the posture never engages; speculation runs exactly as it did before v0.8.195"
-                        .to_string(),
-                _ => format!(
-                    "Auto — the posture follows {}",
-                    // "Auto follows your power source[ and Windows' Battery saver]." → the clause
-                    // this line has always spoken in the third person, minus the trailing stop.
-                    platform::efficiency_auto_clause_english()
-                        .trim_start_matches("Auto follows ")
-                        .trim_end_matches('.')
-                ),
-            }
-        ));
+    // 2026-10-26 (round 2a, owner rulings): THE MODE ROW. One store, like the rows beside it — the
+    // tick re-reads the atomic every pass, so there is nothing to invalidate, no folder to reopen and
+    // no latch to un-set (L43). The tick logs the mode IN EFFECT off its own decision, so this line
+    // reports only what the user chose (on battery the mode in effect may still be Power saver).
+    app.on_set_mode(|m| {
+        let live = support::set_saved_mode(m);
+        log_event(&format!("mode: {} chosen", support::mode_log_name(live)));
     });
+    app.on_set_battery_power_saver(|on| {
+        support::set_battery_power_saver(on);
+        log_event(&format!("mode: Eco on battery {}", if on { "on" } else { "off" }));
+    });
+    // The background wait: a stop sends its seconds; the typed value is parsed and brought into the
+    // 5 s – 5 min range (the CustomSeg contract: the caller validates and restores keyboard focus).
+    app.on_set_bg_wait_custom({
+        let awz = app.as_weak();
+        move |t| {
+            if let (Ok(v), Some(a)) = (t.trim().parse::<f32>(), awz.upgrade()) {
+                if v.is_finite() {
+                    let s = (v.round().max(0.0) as u32).clamp(support::BG_WAIT_MIN_S, support::BG_WAIT_MAX_S);
+                    a.set_bg_wait_s(s as i32);
+                }
+            }
+        }
+    });
+    // 2026-10-27 (round 2b): Custom's typed numbers. One callback for the card's rows — the row and
+    // the text — parsed and brought into the row's range (the CustomSeg contract: the caller
+    // validates; the markup restores keyboard focus). The speed is held to this machine's best when a
+    // benchmark speaks for the folder (`support::custom_ceiling`), so the card never shows a limit the
+    // tick would not spend. A stop writes its property directly in the markup.
+    app.on_set_custom_number({
+        let awz = app.as_weak();
+        move |row, t| {
+            let Some(a) = awz.upgrade() else { return };
+            let bench = support::mode_bench_fps(
+                a.get_bench_governs(),
+                a.get_bench_sub_fps(),
+                a.get_bench_super_fps(),
+                a.get_quality_super() != 0,
+            );
+            if let Some(c) = support::custom_typed(support::custom_limits_of(&a), row, &t, bench) {
+                support::set_custom_limits_on(&a, c);
+            }
+        }
+    });
+    // ── THE SPEED PANEL'S PICK, AND THE ASK BEFORE A MODE CHANGE ─────────────────────────────────
+    //
+    // A stop above the mode's limit is greyed. Picking one (or typing a custom rate above it) does
+    // not change the speed: a toast asks, with two pills (owner's wording, 26 October). When Power
+    // saver is in effect only because of the power state, the toast says so and offers the saved
+    // mode until the power source changes instead. The ask's subject rides on three toast properties
+    // (`toast-mode-ask`, `-target`, `-fps`), cleared by every raise and every dismissal with the
+    // rating question's flag (`support::clear_bulk_ask`), so a stale pill can never act.
+    {
+        let awz = app.as_weak();
+        let tcu = toast_counts_unread.clone();
+        let tleft = toast_left.clone();
+        app.on_pick_fps(move |fps| {
+            let Some(a) = awz.upgrade() else { return };
+            let f = fps.clamp(1.0, 120.0);
+            let limit = a.get_mode_limit_fps();
+            let in_effect = support::mode_from_settings(a.get_mode_in_effect());
+            let forced = a.get_mode_forced();
+            // Balanced's own limit at the user's preview tier, for a pick made in Power saver.
+            let bench = support::mode_bench_fps(
+                a.get_bench_governs(),
+                a.get_bench_sub_fps(),
+                a.get_bench_super_fps(),
+                a.get_quality_super() != 0,
+            );
+            let balanced_limit = support::mode_ceiling(support::MODE_BALANCED, bench).0;
+            let ask = support::mode_ask(f, limit, in_effect, forced != 0, support::saved_mode(), balanced_limit);
+            let (text, kind, target, yes, no) = match ask {
+                None => {
+                    a.invoke_set_fps(f);
+                    return;
+                }
+                Some(support::ModeAsk::Hold { saved }) => {
+                    let text = if forced == 2 {
+                        tr_format!("{mode} is on because Battery saver is on.", mode = support::mode_name(support::MODE_POWER_SAVER))
+                    } else {
+                        tr_format!(
+                            "{mode} is on because Falcon is running on battery.",
+                            mode = support::mode_name(support::MODE_POWER_SAVER)
+                        )
+                    };
+                    let yes = tr_format!("Use {mode} until the power source changes", mode = support::mode_name(saved));
+                    (text, 2, saved, yes, tr_format!("Keep {mode}", mode = support::mode_name(support::MODE_POWER_SAVER)))
+                }
+                Some(support::ModeAsk::Switch { target }) => {
+                    let text = tr_format!(
+                        "{fps} photos/s needs {mode}.",
+                        fps = f.round() as i32,
+                        mode = support::mode_name(target)
+                    );
+                    let yes = tr_format!("Switch to {mode}", mode = support::mode_name(target));
+                    (text, 1, target, yes, tr_format!("Keep {mode}", mode = support::mode_name(in_effect)))
+                }
+            };
+            // Raise FIRST (every raise clears every other raiser's pills, this one's included),
+            // then arm the ask's subject on the card.
+            show_transient_toast(&a, &tcu, &tleft, &text, 10_000);
+            a.set_toast_mode_yes(yes.into());
+            a.set_toast_mode_no(no.into());
+            a.set_toast_mode_target(i32::from(target));
+            a.set_toast_mode_fps(f);
+            a.set_toast_mode_ask(kind);
+            log_event(&format!(
+                "mode: {} fps is above {}'s limit of {} — asked before changing anything",
+                f.round() as i32,
+                support::mode_log_name(in_effect),
+                limit.round() as i32
+            ));
+        });
+    }
+    {
+        // [Switch to …] / [Use … until the power source changes]: ONE call. The handler takes the
+        // ask's subject, dismisses the card (which clears it), and only then acts — the
+        // `bulk-rate-yes` order (F-P1 rule 4), so the act cannot be undone by its own dismissal.
+        let awz = app.as_weak();
+        let hold = mode_hold_ask.clone();
+        app.on_mode_ask_yes(move || {
+            let Some(a) = awz.upgrade() else { return };
+            let (kind, target, fps) = (a.get_toast_mode_ask(), a.get_toast_mode_target(), a.get_toast_mode_fps());
+            a.invoke_dismiss_toast();
+            match kind {
+                1 => {
+                    let live = support::set_saved_mode(target);
+                    a.set_mode(i32::from(live));
+                    log_event(&format!("mode: {} chosen from the speed panel", support::mode_log_name(live)));
+                }
+                2 => {
+                    hold.set(true);
+                    log_event(&format!(
+                        "mode: {} until the power source changes, from the speed panel",
+                        support::mode_log_name(support::mode_from_settings(target))
+                    ));
+                }
+                _ => return, // no question is armed: nothing to answer
+            }
+            a.invoke_set_fps(fps);
+        });
+    }
     app.on_set_cmyk_os_route(|on| {
         // v1.0.0-rc TAIL (OWNER RULING, CMYK): live, per decode, never memoised — the
         // `heic_speed_priority` discipline immediately below.
@@ -10143,7 +10429,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             rot.auto.set(on);
             rotate_invalidate_all(
                 &fast.cache, &detail.cache, &detail.order, &roi.tiles, &roi.region,
-                &film.thumbs, &film.pending, &thumb_gen, &shown, &blur_key,
+                &film, &thumb_gen, &shown, &blur_key,
             );
             // The flip re-orients EVERY shot, so every cached EXIF row (oriented Dimensions) is now
             // stale. Clear the caches + request latches wholesale so the settled shot re-requests
@@ -10898,7 +11184,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Rc::new(move |idx: usize| {
             rotate_invalidate(
                 idx, &fast.cache, &detail.cache, &detail.order, &roi.tiles, &roi.region,
-                &film.thumbs, &shown, &blur_key,
+                &film, &shown, &blur_key,
             );
             // item b: oriented dims re-request for this shot. N21: the re-request gate is
             // `!exif_cache.contains_key(&idx) && exif_requested.insert(idx)` — dropping only the
@@ -16239,6 +16525,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     // governor must hear from both.
     #[cfg(target_os = "macos")]
     arm_menu_activity_snap(&posture);
+    // 2026-10-25 (graphics-memory sharing, round 1): when USER INPUT last reached the main window —
+    // pointer, wheel, keys, touch, gestures — as opposed to `posture.last_activity`, which every
+    // window event moves (focus changes, moves, resizes). Windows and macOS both deliver wheel
+    // scrolling to a window that is not active, so a photographer can browse Falcon with the wheel
+    // while Photoshop has focus; the background release must read that as Falcon in use.
+    let user_input_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
 
     #[cfg(target_os = "macos")]
     mac_experiment::set_open_handler(begin_reload.clone());
@@ -16276,6 +16568,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let ime_starve = std::cell::RefCell::new(support::ImeStarveThrottle::new());
         let dmove_ev = display_move_at.clone(); // v0.8.107: the active-display move debounce
         let posture_ev = posture.clone(); // v0.8.142 (POSTURE T1): the snap-back
+        let input_ev = user_input_at.clone(); // 2026-10-25: the background release's input clock
         // v0.9.62 (B1.3 / N1): the LAST PHYSICAL SIZE this window reported, taken from Resized's own
         // payload. The hook runs BEFORE Slint updates its window state, so `win.size()` inside a
         // Resized handler answers the PRE-resize size — the read that made "achieved" lines quote the
@@ -16301,6 +16594,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             // rate forever on exactly the platform this round exists for.
             if support::winit_event_is_activity(matches!(ev, WindowEvent::RedrawRequested)) {
                 posture_ev.note_activity(Instant::now(), "window event");
+            }
+            if matches!(ev, WindowEvent::MouseWheel { .. } | WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseInput { .. } | WindowEvent::KeyboardInput { .. }
+                | WindowEvent::Touch(_) | WindowEvent::PinchGesture { .. } | WindowEvent::PanGesture { .. }
+                | WindowEvent::RotationGesture { .. } | WindowEvent::DoubleTapGesture { .. })
+            {
+                input_ev.set(Some(Instant::now()));
             }
             // v0.9.62 (B1.3): ONE geometry handler, fed the half the event actually carries. `pos`
             // is `None` on a Resized (the origin is live and correct there — N1's finding was
@@ -17621,7 +17921,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             for idx in moved {
                 rotate_invalidate(
                     idx, &fast.cache, &detail.cache, &detail.order, &roi.tiles, &roi.region,
-                    &film.thumbs, &shown, &blur_key,
+                    &film, &shown, &blur_key,
                 );
             }
             meta.exif_built.set(None);
@@ -19788,13 +20088,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         });
     }
     {
-        // Speed popup custom SCRUB fps — parse-rejecting front-end for the existing set-fps
-        // (which clamps 1..120 and drives the scrub clock).
+        // Speed popup custom SCRUB fps — parse-rejecting front-end for the panel's pick (round 2a:
+        // `pick-fps`, which asks before a rate above the mode's limit and otherwise commits through
+        // the existing set-fps, which clamps 1..120 and drives the scrub clock).
         let awz = app.as_weak();
         app.on_set_fps_custom(move |t| {
             if let (Ok(v), Some(a)) = (t.trim().parse::<f32>(), awz.upgrade()) {
                 if v.is_finite() && v > 0.0 {
-                    a.invoke_set_fps(v);
+                    a.invoke_pick_fps(v);
                 }
             }
         });
@@ -20348,6 +20649,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let frame_prof_on = support::frame_prof_armed();
     let last_before: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
     let this_before: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
+    // 2026-10-25 (graphics-memory sharing, round 1): Falcon's own and the whole card's memory use,
+    // sampled from the moment the rendering device exists (`gpu_memory`). The tick reads the clone.
+    let gpu_memory = gpu_memory::GpuMemory::default();
+    let gpu_memory_setup = gpu_memory.clone();
     app.window().set_rendering_notifier(move |state, api| {
         if matches!(state, slint::RenderingState::AfterRendering) {
             film_frames.note_presented();
@@ -20457,6 +20762,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ) = (state, api)
         {
             log_event("wgpu device captured (RenderingSetup)");
+            gpu_memory_setup.start(device);
             // v0.8.148 (E5): THE DEVICE-TOPOLOGY MEASUREMENT. Slint builds this device from
             // `WGPUSettings::default()` — wgpu's DEFAULT limits — and the HEIC assembly needs a
             // storage binding big enough for a whole mosaic (a 48 MP photo's is 198180864 B).
@@ -20677,8 +20983,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // (see tick::step_folder_grid — the filmstrip window pattern rotated 90°).
     let grid_model = Rc::new(slint::VecModel::<FilmItem>::default());
     app.set_grid_items(grid_model.clone().into());
-    let last_grid_key: Cell<(i64, usize, usize, u64, u64, u64, u64, u64)> = // v0.8.129: + select_gen; v0.8.187 (Y1): slot 3 = fast_gen
-        Cell::new((i64::MIN, usize::MAX, 0, 0, u64::MAX, u64::MAX, u64::MAX, u64::MAX));
+    let last_grid_key: Cell<(i64, usize, usize, u64, u64, u64, u64, u64, (i64, i64))> = // v0.8.129: + select_gen; v0.8.187 (Y1): slot 3 = fast_gen; round 2b: + the rows on screen
+        Cell::new(background_memory::GRID_KEY_UNBUILT);
     // (v0.8.52: last_grid_view is declared up at the on_film_recenter registration — fix 2 shares it.)
     let last_grid_c: Cell<usize> = Cell::new(usize::MAX); // v0.8.52 (owner fix 3): follow-recenter memo
 
@@ -21110,6 +21416,43 @@ fn main() -> Result<(), Box<dyn Error>> {
     // v0.7.7 stage 2: ~1/s throttle for the L2 RAM-pressure sample (GlobalMemoryStatusEx is cheap,
     // but the controller is DESIGNED around a ~1 Hz cadence — its calm-streak counts are seconds).
     let l2_pressure_at = RefCell::new(Instant::now());
+    // 2026-10-25 (graphics-memory sharing, round 1): the background release (`background_memory`).
+    // Since round 2a its policy follows the mode in effect and the user's wait, every tick (see the
+    // release's evaluation in the tick); FALCON_BACKGROUND_TIER=performance|balanced forces a target
+    // for verification, read once.
+    let background_t = RefCell::new(background_memory::Background::new());
+    let bg_forced = background_memory::Policy::forced_from_env(
+        std::env::var("FALCON_BACKGROUND_TIER").ok().as_deref(),
+    );
+    let bg_enabled =
+        background_memory::Policy::release_enabled(std::env::var("FALCON_BACKGROUND_RELEASE").ok().as_deref());
+    // What this absence has released so far (for the log), and the memory line's clock.
+    let bg_released = Cell::new(background_memory::Released::default());
+    let bg_mem_log_at = Cell::new(Instant::now());
+    log_event(&if bg_enabled {
+        format!(
+            "background: graphics memory is released after the wait in another application ({} s now, \
+             the Settings value; at once when minimised), over {} s; target {}",
+            app.get_bg_wait_s(),
+            background_memory::RAMP.as_secs(),
+            match bg_forced {
+                Some(t) => format!(
+                    "forced to {} (FALCON_BACKGROUND_TIER)",
+                    background_memory::Policy::for_mode(support::MODE_BALANCED, &support::CustomLimits::BALANCED_COPY, Some(t), 0)
+                        .name()
+                ),
+                None if cfg!(target_os = "macos") => "follows the mode in effect (Turbo: a quarter of Apple's \
+                    recommended graphics budget while macOS reports normal memory pressure and nothing is \
+                    swapped; Balanced and Eco: the requested photos; Custom: its own choice and release time)"
+                    .to_string(),
+                None => "follows the mode in effect (Turbo: a quarter of the card; Balanced and Eco: the \
+                         requested photos; Custom: its own choice and release time)"
+                    .to_string(),
+            }
+        )
+    } else {
+        "background: release OFF (FALCON_BACKGROUND_RELEASE=0, a comparison switch)".to_string()
+    });
     let worst_tick_ms = Cell::new(0u32);
     // v0.8.128 (SEL-LAG P3): …and WHICH STEP made that worst tick worst. Tracked unconditionally
     // (not behind FALCON_TICK_PROF) precisely because the reports that matter come from the field,
@@ -21396,35 +21739,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     // never engages Auto, so a session's opening ticks can never spend an unmeasured power state as
     // if it were a measurement.
     let power_now: Cell<support::PowerSnapshot> = Cell::new(support::PowerSnapshot::UNKNOWN);
-    // The posture's EDGE, so the log says engaged/released exactly once each instead of 62.5 times a
-    // second (the `settings_throttle_on` grammar). `None` until the first snapshot has landed: the
-    // BOOT line states the baseline verdict, and a transition line about that same baseline would be
-    // a change that never happened — the v0.8.178 (W4 tail) seeding lesson, applied on arrival
-    // rather than on the first tick.
-    let efficiency_on: Cell<Option<bool>> = Cell::new(None);
-    // v0.8.195 fix tail (skeptic B, R2/O1 and R1c): the two state-derived sentences the SHEET needs,
-    // published on their own edges rather than every tick. Both compose a `String`, so an
-    // unconditional per-tick write would allocate 62.5 times a second to say the same thing; the
-    // memo keys are the exact inputs their composers read, so a change of state is a change of key
-    // and nothing else is.
-    // v0.8.196 (WAVE 2, §E): the keys carry the derived CEILING as well, because that is what the
-    // two sentences quote now — a memo keyed only on the posture bit would leave a stale number on
-    // the sheet for as long as the posture held (L45: a dedup record keyed on less than what
-    // produced the output is not a cache).
-    // v0.8.196 tail 2 (verifier DEFECT): NAMED, because the tail widened these two from 3-tuples
-    // (under clippy's `type_complexity` threshold) to 6-tuples (over it) and introduced the round's
-    // only two new warnings. The alias is also the better documentation: each field is what one
-    // composed sentence reads, and the memo exists so the sentence is not recomposed per tick.
-    /// (mode, power snapshot, ceiling ×10, the user's browse stop, floored, the bias is masking a
-    /// Supersample stop) — everything `support::efficiency_note` reads.
-    type EffNoteKey = (u8, support::PowerSnapshot, i32, i32, bool, bool);
-    /// (engaged, the user's browse stop, ceiling ×10, mode, power snapshot, floored) — everything
-    /// `support::scrub_fps_efficiency_note` reads.
-    type FpsNoteKey = (bool, i32, i32, u8, support::PowerSnapshot, bool);
-    let eff_note_seen: Cell<Option<EffNoteKey>> = Cell::new(None);
+    // 2026-10-26 (round 2a): the mode in effect's EDGE and the power reading it was decided under,
+    // so the log says each change once and a POWER change can be told from a click (only the first
+    // toasts — `support::mode_edge`). `None` until the first snapshot has landed: the BOOT line states
+    // the baseline, and a transition about that same baseline would be a change that never happened —
+    // the v0.8.178 (W4 tail) seeding lesson.
+    let mode_seen: Cell<Option<(support::ModeInEffect, support::PowerSnapshot)>> = Cell::new(None);
+    // The ask toast's "Use Balanced until the power source changes": the power reading it was chosen
+    // under, cleared the first tick that reading changes (`support::mode_override_step`, L43). The
+    // pill only asks (`mode_hold_ask`); the tick stores the reading it is deciding under.
+    let mode_hold: Cell<Option<support::PowerSnapshot>> = Cell::new(None);
+    let mode_hold_ask_t = mode_hold_ask.clone();
+    // v0.8.195 fix tail (skeptic B, R2/O1 and R1c): the state-derived sentences the SHEET needs,
+    // published on their own edges rather than every tick. Each composes a `String`, so an
+    // unconditional per-tick write would allocate 62.5 times a second to say the same thing; the memo
+    // keys are the exact inputs their composers read, so a change of state is a change of key and
+    // nothing else is (L45: a dedup record keyed on less than what produced the output is not a cache).
+    /// (mode in effect, saved mode, battery switch, the override, power snapshot, ceiling ×10, the
+    /// user's browse stop, bound, the bias is masking a Sharper preview stop) — everything
+    /// `support::mode_note` reads.
+    type ModeNoteKey = (support::ModeInEffect, u8, bool, bool, support::PowerSnapshot, i32, i32, support::LimitBound, bool);
+    /// (mode in effect, the user's browse stop, ceiling ×10, limit ×10, bound) — everything
+    /// `support::scrub_fps_mode_note` and the speed panel's greying read.
+    type FpsNoteKey = (u8, i32, i32, i32, support::LimitBound);
+    let mode_note_seen: Cell<Option<ModeNoteKey>> = Cell::new(None);
     let fps_note_seen: Cell<Option<FpsNoteKey>> = Cell::new(None);
     // …and the leaf's own mount bit, written on change only.
     let eff_leaf_seen: Cell<Option<bool>> = Cell::new(None);
+    // 2026-10-27 (round 2b): Custom's numbers as last logged (`None` until the first tick adopts them,
+    // which the boot line already states), the thumbnails the tile feeds last asked under, and where
+    // the whole-folder feeder's last scan stopped (`tick::step_whole_folder_thumbs`).
+    let custom_seen: Cell<Option<support::CustomLimits>> = Cell::new(None);
+    let thumb_scope_seen = Cell::new(support::ThumbScope::Nearby);
+    let whole_folder_cursor: Cell<(u64, usize, usize, u64, usize)> = Cell::new((u64::MAX, 0, 0, 0, 0));
     // §D: the posture log's quiet window — when it last printed, and how many arm changes it has
     // swallowed since. Both live beside `interact_gate_on`, which they only ever qualify.
     let pg_last_print: Cell<Option<Instant>> = Cell::new(None);
@@ -21740,33 +22087,38 @@ fn main() -> Result<(), Box<dyn Error>> {
             show_transient_toast(&app, &toast_counts_unread_t, &toast_left_t, &msg, 10_000);
         }
         mk!("colour_watch");
-        // ── v0.8.196 (EFFICIENCY WAVE 2, §A): THE ADAPTIVE LIMITS, DERIVED IN ONE PLACE ──────────
+        // ── 2026-10-26 (round 2a): THE MODE IN EFFECT AND ITS LIMITS, DERIVED IN ONE PLACE ──────────
         //
-        // ONE expression, TWO callers — the boot line inside the drain below (which runs before the
-        // posture bit exists, and is the only moment at which a MEASURED snapshot exists to state a
-        // verdict about) and the posture block under it. Written as a closure rather than evaluated
-        // twice by hand for the v0.8.178 reason: two hand-written evaluations are how a log comes to
-        // describe a state the app is not in.
+        // ONE expression, TWO callers — the boot line inside the drain below (the only moment at
+        // which a MEASURED snapshot exists to state a verdict about) and the mode block under it.
+        // Written as a closure rather than evaluated twice by hand for the v0.8.178 reason: two
+        // hand-written evaluations are how a log comes to describe a state the app is not in.
         //
         // Every input is LIVE and none is memoised (L43): the folder's own smoothed fast-decode
         // latency, this box's worker count, the user's own browse setting, the persisted benchmark
-        // as a first-run seed, and the dev lever. Releasing the posture drops all of it in the same
-        // tick, because `efficiency_limits` returns `RELEASED` on a false bit and every term in that
-        // value is inert by construction.
+        // (the mode's share of its best, and a first-run latency seed), and the dev lever. Performance
+        // drops all of it in the same tick: `mode_limits` returns `RELEASED`, inert by construction.
         // v0.8.196 fix tail (skeptic A, O5): the latency the derivation reads is the one for the
         // format the browse is about to spend its next decode on — the DISPLAYED shot's — with the
-        // folder's most-decoded format as the fallback. A single process-wide blend described no
-        // format on a mixed folder: one 48 MP HEIC among 20 ms JPEGs cost a ~40 % rate drop for a
-        // couple of seconds every time it passed through the window.
+        // folder's most-decoded format as the fallback.
         // The list is snapshotted lower down (`shots_now`); this is the one read that has to
         // happen before it, so it takes the same lock for one index and nothing else.
         let c_kind = {
             let sl = shots_t.lock().unwrap_or_else(|e| e.into_inner());
             sl.get(*cur_t.borrow()).map(|sh| sh.kind)
         };
-        let derive_limits = |engaged: bool| {
-            support::efficiency_limits(
-                engaged,
+        // 2026-10-27 (round 2b): Custom's numbers, off its card every tick (the wait's discipline, L43);
+        // `mode_limits` reads them only while Custom is in effect.
+        let custom_now = support::custom_limits_of(&app);
+        let derive_limits = |mode: u8| {
+            // The preview tier the mode browses at: Power saver's is Faster preview.
+            let tier_super = support::efficiency_quality_super(
+                app.get_quality_super() != 0,
+                mode == support::MODE_POWER_SAVER,
+            );
+            support::mode_limits(
+                mode,
+                custom_now,
                 support::fast_latency_ewma(c_kind),
                 nworkers,
                 app.get_scrub_fps().max(1.0),
@@ -21774,218 +22126,216 @@ fn main() -> Result<(), Box<dyn Error>> {
                     app.get_benchmarked(),
                     app.get_bench_sub_fps(),
                     app.get_bench_super_fps(),
-                    app.get_quality_super() != 0,
+                    tier_super,
                     nworkers,
                 ),
                 support::efficiency_sim_latency(),
+                support::mode_bench_fps(
+                    app.get_bench_governs(),
+                    app.get_bench_sub_fps(),
+                    app.get_bench_super_fps(),
+                    tier_super,
+                ),
             )
         };
-        // ── v0.8.195 (EFFICIENCY MODE): DRAIN THE POWER WATCHER, THEN DECIDE THE POSTURE ONCE ────
+        // The ask toast's battery pill, taken here so the override stores the reading this tick
+        // decides under; then any power change since clears it (L43).
+        let decide_mode = |snap: support::PowerSnapshot| {
+            support::mode_in_effect(
+                support::saved_mode(),
+                support::battery_power_saver(),
+                snap,
+                !support::efficiency_enabled(),
+                mode_hold.get().is_some(),
+            )
+        };
+        // ── v0.8.195: DRAIN THE POWER WATCHER, THEN DECIDE THE MODE ONCE ──────────────────────────
         //
-        // The drain is one line beside the colour drain above and answers empty on essentially every
-        // tick. The FIRST event carries the boot line: it is the only moment at which a MEASURED
-        // snapshot exists to state a verdict about, so this is where L30 is paid — the line names
-        // the posture the app is in, never merely that a watcher started.
+        // The drain answers empty on essentially every tick. The FIRST event carries the boot line:
+        // it is the only moment at which a MEASURED snapshot exists, so this is where L30 is paid —
+        // the line names the mode in effect, never merely that a watcher started.
         for ev in power_watch_rx.try_iter() {
             power_now.set(ev.now);
             if ev.prev.is_none() {
                 // v0.8.195 fix tail (skeptic B, O3): the probe clause comes from the EVENT's own
-                // `Option`, so a simulated read — which never called Windows — cannot print a
-                // microsecond figure it did not measure.
-                // v0.8.196 (WAVE 2, §E): …and the limits this session opens with, so a field log
-                // states the three numbers the posture is actually running on rather than leaving a
-                // reader to assume the shipped constants. At this moment nothing has been decoded
-                // yet, so the source is honestly `Seed` or `Default` — which is the point.
+                // `Option`, so a simulated read cannot print a microsecond figure it did not measure.
+                let eff = decide_mode(ev.now);
                 log_event(&format!(
                     "{}{}{}",
-                    support::efficiency_boot_line(
-                        support::efficiency_mode(),
+                    support::mode_boot_line(
+                        support::saved_mode(),
+                        support::battery_power_saver(),
+                        eff,
                         ev.now,
                         support::power_sim(),
                         !support::efficiency_enabled(),
                     ),
-                    support::efficiency_limits_clause(derive_limits(support::efficiency_engaged(
-                        ev.now,
-                        support::efficiency_mode(),
-                        !support::efficiency_enabled(),
-                    ))),
+                    support::efficiency_limits_clause(derive_limits(eff.mode)),
                     support::efficiency_boot_suffix(ev.probe_us)
                 ));
-                // The baseline is ADOPTED, not announced twice: the boot line above has already
-                // said which posture this session opens in. (v0.8.195 fix tail, skeptic A, O4: the
-                // decision itself is `support::efficiency_edge`'s `Adopt` row now — see the edge
-                // block below. This site only has to make sure a baseline EXISTS by the time the
-                // edge is consulted on this same tick.)
-                efficiency_on.set(Some(support::efficiency_engaged(
-                    ev.now,
-                    support::efficiency_mode(),
-                    !support::efficiency_enabled(),
-                )));
+                // The baseline is ADOPTED, not announced twice (`support::mode_edge`'s `Adopt` row).
+                mode_seen.set(Some((eff, ev.now)));
             }
         }
         mk!("power_watch");
-        // ── THE POSTURE BIT, COMPUTED ONCE PER TICK ───────────────────────────────────
+        // ── THE MODE IN EFFECT, COMPUTED ONCE PER TICK ─────────────────────────────────────────────
         //
-        // HOISTED ABOVE THE v0.8.157 POSTURE BLOCK, deliberately, and this is the only reason: the
-        // compare wheel's applier (`step_compare_browse_advance`, ~120 lines below) is one of the
-        // three browse-rate sites and it runs BEFORE that block. One evaluation per tick is the
-        // discipline that block exists to enforce; where the evaluation SITS is free, and it has to
-        // sit above its earliest consumer or the compare wheel would read last tick's answer.
+        // HOISTED ABOVE THE v0.8.157 POSTURE BLOCK, deliberately: the compare wheel's applier
+        // (`step_compare_browse_advance`, below) is one of the three browse-rate sites and it runs
+        // BEFORE that block, and the background release's evaluation further down reads it too.
         //
-        // Three live inputs, no state: the drained snapshot, the setting's atomic (read fresh, never
-        // memoised — L43), and the session's env revert. Every consumer below reads THIS local.
-        let efficiency = support::efficiency_engaged(
-            power_now.get(),
-            support::efficiency_mode(),
-            !support::efficiency_enabled(),
-        );
-        // v0.8.196 (WAVE 2, §A): …and the three numbers that bit now decides, derived from the same
-        // live inputs on the same tick. EVERY consumer below reads THIS value — the concurrency cap,
-        // the decode runway, all three browse-rate executors, the Subsample bias, the meter's leaf
-        // and every sentence — so the app cannot be running one posture and describing another.
-        let limits = derive_limits(efficiency);
-        // …and the SAMPLING BIAS, which is the same posture through a 2 s quiet window (skeptic B,
-        // R6). Smoothing, not a latch (L43): it is a pure function of how long the LIVE bit has held
-        // its current answer, so a genuine engage reaches the tier 2 s later and a genuine release 2 s
-        // later, and there is no state that can survive the input. The other four consumers still
-        // follow the posture on the very next tick.
-        if bias_engaged_seen_t.get() != Some(efficiency) {
-            bias_engaged_seen_t.set(Some(efficiency));
+        // Live inputs, no state but the override: the drained snapshot, the saved mode and the
+        // battery switch (atomics read fresh — L43), the session switch, and the override, which any
+        // power change clears. Every consumer below reads THESE locals.
+        if mode_hold_ask_t.take() {
+            mode_hold.set(Some(power_now.get()));
+        }
+        mode_hold.set(support::mode_override_step(mode_hold.get(), power_now.get()));
+        let mode_eff = decide_mode(power_now.get());
+        // …and the numbers that mode decides, derived from the same live inputs on the same tick.
+        // EVERY consumer below reads THIS value — the concurrency cap, the decode runway, the kept
+        // window, all three browse-rate executors, the sharp-photo caps, Power saver's cuts, the
+        // meter's leaf and every sentence — so the app cannot be running one mode and describing
+        // another.
+        let limits = derive_limits(mode_eff.mode);
+        // Power saver's own cuts (Efficiency mode's): the settled sharp fill withheld, speculative
+        // publishes paced, the stale-upgrade sweep held, Faster preview.
+        let power_saver = limits.quiet;
+        // …and the SAMPLING BIAS, which is Power saver through a 2 s quiet window (skeptic B, R6).
+        // Smoothing, not a latch (L43): a pure function of how long the LIVE bit has held its
+        // current answer, so a genuine change reaches the tier 2 s later each way.
+        if bias_engaged_seen_t.get() != Some(power_saver) {
+            bias_engaged_seen_t.set(Some(power_saver));
             *bias_since_t.borrow_mut() = now;
         }
         let bias_held_ms = now.duration_since(*bias_since_t.borrow()).as_millis() as u64;
         bias_applied_t.set(support::efficiency_bias_step(
             bias_held_ms,
-            efficiency,
+            power_saver,
             bias_applied_t.get(),
         ));
         let quality_bias = bias_applied_t.get();
-        // ONE line per transition, both directions, change-only — and it covers BOTH ways the verdict
-        // can move, a power change and a setting change, because it is keyed on the verdict rather
-        // than on either input. The toast rides an AUTO ENGAGE only: On is something the user just
-        // did (the control's own log line says so), a release needs no announcement, and the boot
-        // baseline is already stated by the `efficiency:` line above.
-        //
-        // v0.8.195 fix tail (skeptic A, O4 — CONFIRMED): the DECISION is
-        // `support::efficiency_edge`, a pure verdict on the `colour_watch_verdict` pattern, and it
-        // is where deviation D4 lives. It shipped as four inline conditions no test could reach, so
-        // the one deviation the round asked the architect to accept was the one thing with no
-        // falsifier: an edit that dropped the first-pass suppression, moved the adoption, or fired
-        // the toast on a release would have reddened nothing. This site now only PERFORMS what the
-        // table decides.
-        let eff_mode = support::efficiency_mode();
-        match support::efficiency_edge(efficiency_on.get(), efficiency, eff_mode) {
-            support::EfficiencyEdge::Nothing => {}
-            support::EfficiencyEdge::Adopt => efficiency_on.set(Some(efficiency)),
-            support::EfficiencyEdge::Log => {
-                efficiency_on.set(Some(efficiency));
+        // ONE line per change of the mode in effect, and a toast only when a POWER change moved
+        // Power saver in or out (the switch on): the user's own clicks need no announcement, and the
+        // boot baseline is already stated by the `mode:` line above. `support::mode_edge` decides;
+        // this site only performs what the table says.
+        let saved_now = support::saved_mode();
+        match support::mode_edge(mode_seen.get(), mode_eff, power_now.get()) {
+            support::ModeEdge::Nothing | support::ModeEdge::Adopt => {}
+            support::ModeEdge::Log => {
                 log_event(&format!(
                     "{}{}",
-                    support::efficiency_transition_line(
-                        efficiency,
-                        eff_mode,
-                        power_now.get(),
-                        support::power_sim(),
-                    ),
+                    support::mode_transition_line(mode_eff, saved_now, power_now.get(), support::power_sim()),
                     support::efficiency_limits_clause(limits)
                 ));
             }
-            support::EfficiencyEdge::LogAndToast => {
-                efficiency_on.set(Some(efficiency));
+            support::ModeEdge::LogAndToast => {
                 log_event(&format!(
                     "{}{}",
-                    support::efficiency_transition_line(
-                        efficiency,
-                        eff_mode,
-                        power_now.get(),
-                        support::power_sim(),
-                    ),
+                    support::mode_transition_line(mode_eff, saved_now, power_now.get(), support::power_sim()),
                     support::efficiency_limits_clause(limits)
                 ));
-                show_transient_toast(
-                    &app,
-                    &toast_counts_unread_t,
-                    &toast_left_t,
-                    &support::efficiency_auto_toast(power_now.get()),
-                    6_000,
-                );
+                if let Some((prev, _)) = mode_seen.get() {
+                    show_transient_toast(
+                        &app,
+                        &toast_counts_unread_t,
+                        &toast_left_t,
+                        &support::mode_power_toast(prev, mode_eff, saved_now),
+                        6_000,
+                    );
+                }
             }
         }
-        // ── v0.8.195 fix tail (skeptic B, R2/O1 + R1c): THE TWO SENTENCES THE SHEET SHOWS. ───────
+        mode_seen.set(Some((mode_eff, power_now.get())));
+        // ── THE SENTENCES THE SHEET SHOWS, on their own edges ──────────────────────────────────────
         //
-        // The control's own live-state line — without it a desktop's permanent no-op, a laptop
-        // engaged right now, a laptop released and a session vetoed by `FALCON_EFFICIENCY=0` all
-        // rendered as the identical lit "Auto" pill under a caption about a battery, and the verdict
-        // existed only in `falcon.log` and a six-second toast. Keyed on exactly what the composer
-        // reads (the env arm is constant for the process, so it is not part of the key).
+        // The mode row's status line: what is in effect and why, then what it is doing to the browse.
+        // Keyed on exactly what the composer reads (the session switch is constant for the process).
         {
-            // v0.8.196 fix tail: the key carries everything the composer reads — the user's own
-            // browse stop and his Fast View tier joined it, because the card now goes SILENT about a
-            // rate the posture is not taking away (skeptic B, R5) and names his tier by its own word.
             let key = (
-                eff_mode,
+                mode_eff,
+                saved_now,
+                support::battery_power_saver(),
+                mode_hold.get().is_some(),
                 power_now.get(),
                 (limits.ceiling_fps.min(1000.0) * 10.0) as i32,
                 app.get_scrub_fps().round() as i32,
-                limits.floored,
-                app.get_quality_super() != 0 && limits.engaged,
+                limits.bound,
+                app.get_quality_super() != 0 && limits.quiet,
             );
-            if eff_note_seen.get() != Some(key) {
-                eff_note_seen.set(Some(key));
-                app.set_efficiency_note(
-                    support::efficiency_note(
-                        eff_mode,
+            if mode_note_seen.get() != Some(key) {
+                mode_note_seen.set(Some(key));
+                app.set_mode_note(
+                    support::mode_note(
+                        saved_now,
+                        support::battery_power_saver(),
+                        mode_eff,
                         power_now.get(),
                         support::power_sim(),
                         !support::efficiency_enabled(),
+                        mode_hold.get().is_some(),
                         limits,
                         app.get_scrub_fps().max(1.0),
                         app.get_quality_super() != 0,
                     )
                     .into(),
                 );
+                // The mode in effect and whether the power state imposed it (0 chosen, 1 battery, 2
+                // Battery saver): the speed panel's ask reads both to choose its wording.
+                app.set_mode_in_effect(i32::from(mode_eff.mode));
+                app.set_mode_forced(match mode_eff.reason {
+                    support::ModeReason::Chosen => 0,
+                    support::ModeReason::Battery => 1,
+                    support::ModeReason::BatterySaver => 2,
+                });
             }
-            // …and the FAST VIEW card's own note (skeptic B, R4 — CONFIRMED): while the posture holds
-            // the tier, the Seg forty lines below sat on **Supersample** with the app decoding
-            // **Subsample** and nothing anywhere connecting the two — the v0.8.195 R1c defect, on the
-            // card next door, in the round that quotes it. Same mount-on-emptiness grammar.
+            // …and the FAST VIEW card's own note (skeptic B, R4): while Power saver holds the tier,
+            // the Seg below sits on the user's own choice. Same mount-on-emptiness grammar.
             app.set_fastview_eff_note(
                 support::efficiency_sampling_sentence(limits, app.get_quality_super() != 0).into(),
             );
         }
-        // v0.8.196 (WAVE 2, §C): the leaf's MOUNT BIT — the one property the title-bar glyph's `if`
-        // reads. Published from the same local every other consumer reads, and written on change
-        // only. The glyph lives INSIDE the cache meter's existing 62 px footprint (owner ruling), so
-        // its own tip is composed with the meter's in `tick::step_cache_meter`.
-        if eff_leaf_seen.get() != Some(limits.engaged) {
-            eff_leaf_seen.set(Some(limits.engaged));
-            app.set_efficiency_leaf(limits.engaged);
+        // v0.8.196 (WAVE 2, §C): the leaf's MOUNT BIT — while Power saver is in effect, whatever the
+        // reason. Written on change only; the glyph lives inside the cache meter's 62 px footprint,
+        // so its tip is composed with the meter's in `tick::step_cache_meter`.
+        if eff_leaf_seen.get() != Some(limits.quiet) {
+            eff_leaf_seen.set(Some(limits.quiet));
+            app.set_efficiency_leaf(limits.quiet);
         }
-        // …and the browse-speed popup's own note, because that popup's TITLE is the fps number and
-        // its segmented control's pill sits on the user's stop — so engaged, all of it said 30 while
-        // the browse stepped at 20. Empty unless the posture is actually binding; the markup mounts
-        // on the emptiness (L4).
+        // …and the browse-speed popup: its note (empty unless the mode is binding; the markup mounts
+        // on the emptiness, L4) and the limit its stops are greyed above.
         {
             let key = (
-                efficiency,
+                mode_eff.mode,
                 app.get_scrub_fps().round() as i32,
                 (limits.ceiling_fps.min(1000.0) * 10.0) as i32,
-                eff_mode,
-                power_now.get(),
-                limits.floored,
+                (limits.limit_fps.min(1000.0) * 10.0) as i32,
+                limits.bound,
             );
             if fps_note_seen.get() != Some(key) {
                 fps_note_seen.set(Some(key));
-                app.set_fps_eff_note(
-                    support::scrub_fps_efficiency_note(
-                        limits,
-                        app.get_scrub_fps(),
-                        eff_mode,
-                        power_now.get(),
-                        support::power_sim(),
-                    )
-                    .into(),
-                );
+                app.set_fps_eff_note(support::scrub_fps_mode_note(limits, app.get_scrub_fps()).into());
+                app.set_mode_limit_fps(if limits.limit_fps.is_finite() { limits.limit_fps } else { -1.0 });
+            }
+        }
+        // 2026-10-27 (round 2b): Balanced's own limit, which Custom's speed row shows until the user
+        // picks a speed (Custom starts as a copy of Balanced) — and ONE log line per change of Custom's
+        // numbers, after the first tick adopts them, naming the limit Custom actually spends.
+        {
+            let bench = support::mode_bench_fps(
+                app.get_bench_governs(),
+                app.get_bench_sub_fps(),
+                app.get_bench_super_fps(),
+                app.get_quality_super() != 0,
+            );
+            let balanced = support::mode_ceiling(support::MODE_BALANCED, bench).0.round() as i32;
+            if app.get_custom_fps_balanced() != balanced {
+                app.set_custom_fps_balanced(balanced);
+            }
+            if custom_seen.replace(Some(custom_now)).is_some_and(|was| was != custom_now) {
+                let limit = support::custom_ceiling(custom_now.fps, bench).0;
+                let shown = if limit.is_finite() { limit.round() as i32 } else { 0 };
+                log_event(&support::custom_log_line(custom_now, shown));
             }
         }
         // N5/N6/N7) A completed file-op (move / undo-move / empty-bin) posts the folder to re-scan.
@@ -23050,6 +23400,56 @@ fn main() -> Result<(), Box<dyn Error>> {
             &app, now, &cur_t, &seen_t, &lm_t, &roi_t.region, &roi_t.tiles, &shots_now,
             &ratings_t, &marks_t, &compare_t, &pan_carry_t,
         );
+        // 2026-10-25 (round 3 step a): the photos the user asked for, published to the decode workers
+        // as soon as the current photo is known and before any step dispatches work. A running job
+        // that just became one of them is raised to normal priority here. `det_awaited_t` is written
+        // further down, so this reads last tick's, one tick stale like every other reader of it.
+        if prep_priority::PREP.enabled() {
+            prep_priority::PREP.publish(support::ExplicitSet::new(c, compare_t.get(), cmp_a_idx_t.get(),
+                cmp_b_idx_t.get(), len, fast_t.hover_pin.get(), det_awaited_t.load(Ordering::Relaxed)));
+        }
+        // 2026-10-25 (graphics-memory sharing, round 1): THE BACKGROUND RELEASE'S ONE EVALUATION PER
+        // TICK, above its first consumer (the full-detail fill just below). The fast holds, the
+        // publish gate and the release step further down all read `bg_hold` from here.
+        let bg_cache_bytes = background_memory::cache_bytes(&fast_t, &detail_t);
+        let bg_measured = gpu_memory.latest(now);
+        // Round 2a: the policy of the mode in effect, with the user's wait, read every tick.
+        let bg_policy = background_memory::Policy::for_mode(
+            mode_eff.mode,
+            &custom_now,
+            bg_forced,
+            (app.get_bg_wait_s().max(0) as u32).clamp(support::BG_WAIT_MIN_S, support::BG_WAIT_MAX_S),
+        );
+        let bg_final = background_memory::final_cache_target(bg_policy.target, bg_measured, bg_cache_bytes);
+        let bg_obs = background_memory::observe(
+            background_memory::falcon_is_active(),
+            user_input_at.get().map(|at| now.saturating_duration_since(at)),
+            app.window().is_minimized(),
+        );
+        let bg_change = if bg_enabled {
+            background_t.borrow_mut().step(now, bg_obs, &bg_policy, bg_cache_bytes, bg_final)
+        } else {
+            None
+        };
+        if let Some(change) = bg_change {
+            background_memory::log_change(change, &bg_policy, &background_t.borrow(), &bg_released,
+                bg_cache_bytes, bg_measured);
+        }
+        // Round 2c, the Mac rule: memory pressure or swapping during a release that keeps a share
+        // (Turbo's, Custom's) drops it to the requested photos at once, until Falcon is back in
+        // front. Asked on every held tick, the release's first included; never on Windows.
+        let bg_guard = if bg_enabled {
+            background_t.borrow_mut().guard(background_memory::mac_guard_trips(cfg!(target_os = "macos"), bg_measured))
+        } else {
+            None
+        };
+        if let Some(change) = bg_guard {
+            background_memory::log_change(change, &bg_policy, &background_t.borrow(), &bg_released,
+                bg_cache_bytes, bg_measured);
+        }
+        let bg_hold = background_t.borrow().holds();
+        background_memory::log_memory(now, &bg_mem_log_at, background_t.borrow().phase(), bg_cache_bytes,
+            fast_t.cache.borrow().len(), detail_t.cache.borrow().len(), bg_measured);
         // v0.3.51 ZOOMED DETAIL-WINDOW (PLAN §39.0): while zoomed in single view, widen the
         // full-res window to what the VRAM detail budget actually HOLDS, so stepping through a
         // burst at zoom runs on pre-decoded sharp frames (§38.2: the serial nvJPEG refill
@@ -23081,21 +23481,42 @@ fn main() -> Result<(), Box<dyn Error>> {
         // window collided with compare's three uncounted pins. The stillness bool is computed here,
         // off `last_motion`, exactly as it was.
         //
-        // v0.8.195 (EFFICIENCY MODE, consumer 1): …AND NOT WHILE THE POSTURE IS ENGAGED. The widened
+        // v0.8.195 (EFFICIENCY MODE, consumer 1; Power saver's since round 2a): …AND NOT IN POWER SAVER. The widened
         // window is pure speculation — it fires precisely when the user has STOPPED, which is when a
         // battery has the least to gain from decoding photographs nobody has asked for — and the
         // ordinary (3, 1) window below is untouched. Nothing banked is torn down either: the KEEP cap
         // three lines down follows the budget CAPACITY, not this window.
+        //
+        // 2026-10-25 (graphics-memory sharing, round 1): …AND NOT WHILE THE BACKGROUND RELEASE HOLDS,
+        // and after a return the stillness interval counts from the return too, so the fill waits
+        // its usual pause instead of re-banking the whole window the moment the user is back.
+        let still = Duration::from_millis(IDLE_DEEPEN_MS);
         let idle_deepen = support::idle_deepen_allowed(
             zoomed,
             compare_t.get(),
             *scr_t.borrow(),
             film_dragging_t.get(),
-            now.duration_since(*lm_t.borrow()) >= Duration::from_millis(IDLE_DEEPEN_MS),
-            efficiency,
+            now.duration_since(*lm_t.borrow()) >= still
+                && background_t.borrow().since_return(now).is_none_or(|d| d >= still),
+            // Round 2b: withheld in Power saver, and in Custom, whose "Sharp photos kept ready" is
+            // already the most it prepares (`EfficiencyLimits::settled_fill`).
+            !limits.settled_fill(),
+            bg_hold,
         );
-        let (det_ahead, det_behind) = if zoomed || idle_deepen {
-            (capacity, if capacity >= 4 { 2 } else { DETAIL_BEHIND })
+        // 2026-10-26 (round 2a): the zoomed and settled windows stay within the mode's allowance for
+        // sharp photos (about 2 GB in Balanced; about 1 GB and 3 + 1 in Power saver). The ladder's
+        // budget still applies — the smaller of the two wins — and in Performance `wide` IS
+        // `capacity`. The ordinary 3 + 1 window below keeps the budget's own capacity in every mode.
+        let wide = zoomed_detail_ahead(detail_budget_t.get().min(limits.detail_bytes_max), est_frame);
+        // 2026-10-27 (round 2b): Custom's own numbers — kept ready, or while zoomed — fitted to what the
+        // ladder's budget holds at this folder's frame size (`support::custom_detail_window`). The
+        // other modes keep the windows below.
+        let det_frames = (detail_budget_t.get() / est_frame.max(1)) as usize;
+        let custom_detail = limits.mode == support::MODE_CUSTOM;
+        let (det_ahead, det_behind) = if custom_detail {
+            support::custom_detail_window(if zoomed { limits.detail_zoom_max } else { limits.detail_keep }, det_frames)
+        } else if zoomed || idle_deepen {
+            support::mode_detail_window(wide, if wide >= 4 { 2 } else { DETAIL_BEHIND }, limits)
         } else {
             // A1 (PLAN §39.1): the UNZOOMED window is capacity-clamped too — a floor-budget card
             // (iGPU / 8 GB post-OOM) otherwise decodes neighbours straight into eviction and
@@ -23104,17 +23525,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         // E3: the KEEP cap follows the budget capacity (stable across idle↔motion), so a deepened
         // cache isn't torn down when the window narrows on the next step; byte budget is the guard.
-        let det_cache_cap = DETAIL_CACHE_MAX.max(capacity + DETAIL_BEHIND + 2);
+        let det_cache_cap = if custom_detail {
+            // …and in Custom it holds BOTH of its windows, for the same reason.
+            support::custom_detail_cache_cap(limits, det_frames)
+        } else {
+            DETAIL_CACHE_MAX.max(wide + DETAIL_BEHIND + 2)
+        };
         // v0.8.182 (2026-08-13 owner report): the WANT-LIST CEILING, from the same two numbers the
         // window above is sized from — the byte budget's frame count minus one slack, under the
         // count cap, floored at the on-screen set. `step_prefetch_detail` truncates its list to it.
         // See `support::detail_wanted_cap`: the tier may want more than the cache can retire for
         // exactly as long as it takes the LRU to evict a still-wanted frame, and then it is a
         // livelock, not a slow tier.
+        // 2026-10-26 (round 2a review R2): …and what the full-resolution cache may RETAIN agrees with
+        // what those windows ask for. While the mode's sharp-photo allowance sizes the window (zoomed,
+        // or settled and widening) it is also the byte budget the eviction keeps to and the want
+        // list's ceiling, so a strict allowance never decodes a neighbour it cannot keep. The ordinary
+        // 3 + 1 keeps the card's own budget, as before; in Performance the two are the same.
+        let det_retain_bytes = if zoomed || idle_deepen {
+            detail_budget_t.get().min(limits.detail_bytes_max)
+        } else {
+            detail_budget_t.get()
+        };
         let wanted_cap = support::detail_wanted_cap(
-            detail_budget_t.get(), est_frame, det_cache_cap, compare_t.get(),
+            det_retain_bytes, est_frame, det_cache_cap, compare_t.get(),
         );
-        detail_ahead_atomic_t.store(det_ahead, Ordering::Relaxed);
+        // Round 2b (review A1): the jump-away radius is the window's wider side — Custom may keep more
+        // behind than ahead — so nothing the window asks for is given up as "jumped away" and asked
+        // for again on the next tick. The worker, the HEIC watch and both upload checks read it.
+        let det_reach = support::detail_jump_radius(det_ahead, det_behind);
+        detail_ahead_atomic_t.store(det_reach, Ordering::Relaxed);
         // G2: mirror compare-mode for the detail worker's jump-away abandon (see the worker).
         compare_atomic_t.store(compare_t.get(), Ordering::Relaxed);
 
@@ -23282,7 +23722,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Some(since_input),
                 interact_arm,
             ),
-            efficiency,
+            power_saver,
         );
         let publish_gate = publish_arm.gate();
         // v0.8.179 (W4 wave-2 tail): …and the FAST tier's own term, which is not the gate. Wave 2
@@ -23300,7 +23740,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         // count. Gesture parking alone retains the very frames we need to release.
         #[cfg(target_os = "macos")]
         let memory_hold = if let Some(g) = &mac_pool_gov_t {
-            g.step(now, &app, fast_hold);
+            // Round 2a: the pool works to the rate the mode in effect allows, and its floor follows.
+            let rate = support::efficiency_scrub_cap(app.get_scrub_fps().max(1.0), limits);
+            g.set_floor_rate(rate);
+            g.step(now, fast_hold, rate);
             g.memory.borrow().active
         } else { false };
         #[cfg(target_os = "macos")]
@@ -23316,7 +23759,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         #[cfg(not(target_os = "macos"))]
         let memory_hold = false;
-        let holds = fast_holds(fast_hold, memory_hold);
+        // 2026-10-25 (graphics-memory sharing, round 1): the background release holds speculation
+        // exactly as the Mac pressure hold does — the frames, never the gesture term (so the RAM
+        // cache's pressure controller may still shrink) — and parks speculative publishes. Then,
+        // every held tick, queued speculative work is shed and the caches fall toward the ramp's
+        // allowance, farthest first; the photos the user asked for always stay. A panel that is not
+        // refreshing lets go of its rows on every held tick, whichever release evicted the preview
+        // a row still holds (Codex review R1).
+        let publish_gate = if bg_hold { support::PublishGate::Park } else { publish_gate };
+        if bg_hold {
+            let explicit = support::ExplicitSet::new(c, compare_t.get(), cmp_a_idx_t.get(),
+                cmp_b_idx_t.get(), len, fast_t.hover_pin.get(), det_awaited_t.load(Ordering::Relaxed));
+            memory_pressure::shed_work(&explicit, &fast_t, &detail_t, &drain_buf, &parked_full,
+                &det_sent, &parked_done_t);
+            if let Some(allowed) = background_t.borrow().allowed_bytes(now) {
+                let r = background_memory::release_to(allowed, c, &explicit, &fast_t, &detail_t, &fast_gen_t);
+                let mut sum = bg_released.get();
+                sum.bytes += r.bytes;
+                sum.previews += r.previews;
+                sum.full += r.full;
+                bg_released.set(sum);
+            }
+            background_memory::release_unrefreshed_models(app.get_sel_open(), &sel_model, &last_sel_key,
+                tick::grid_refills(&app, len), &grid_model, &last_grid_key);
+        }
+        let holds = fast_holds(fast_hold, memory_hold || bg_hold);
         // v0.8.160 (P1/U3): the cap in force is NO LONGER COMPOSED HERE. `admission_cap(costly_cap,
         // lane_cap)` was one number with no idea whether this folder is lane-served, and the ONE
         // budget counter spent it on every format — so the lever tightened folders and formats it
@@ -23341,7 +23808,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // v0.8.178 (W4 tail): `len` + the two half indices, for the one thing — the publish
             // gate's exemption is `support::displayed_shot` now, so an on-screen COMPARE half is
             // exempt here exactly as it already was at the dispatch hold and the drain bound.
-            c, len, gen_now, det_ahead, &det_rx, &det_epoch_t, gpu_ready, &detail_t,
+            c, len, gen_now, det_reach, &det_rx, &det_epoch_t, gpu_ready, &detail_t,
             &compare_t, &cmp_a_idx_t, &cmp_b_idx_t, &det_sent, &upload_job_tx, &rot_t,
             // v0.8.157 (§4): the throttle term + the publish clock (see the step's own note).
             // v0.8.160 (P4): …and the one-frame park the pace uses instead of a `return`.
@@ -23370,7 +23837,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         mk!("up_roi"); // v0.8.151 (ORANGE-1): its OWN label — this bracket used to cover the drain too
 
         // 3d) drain the upload thread's finished textures → wrap + cache-insert + evict (U1).
-        step_upload_drain(
+        let previews_trimmed = step_upload_drain(
             // v0.8.178 (W4 tail): `len` — the bound's exemption clamps the compare halves with it.
             c, len, gen_now, &det_epoch_t, Gamut::from_i32(output_gamut_t.load(Ordering::Relaxed) as i32),
             // §57 fix: the live fast tier, read here beside `cur_gamut` — an old-tier lander after a
@@ -23383,6 +23850,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             // v0.8.183 (W6): the two failure latches a FATAL upload failure records into.
             &fast_t.failed, &detail_t.failed,
             &eff_win,
+            // 2026-10-26 (round 2a): the previews the mode keeps — Balanced and Power saver evict
+            // beyond their kept window, Performance keeps today's count limit.
+            limits.keep_count().map_or(FAST_CACHE_MAX, |n| n.min(FAST_CACHE_MAX)),
+            // 2026-10-26 (round 2a re-check R3): …and whether that limit is a mode's, so every preview
+            // it releases reaches the panels below, the arrival's included.
+            limits.keep_count().is_some(),
             // v1.0.0-rc (queue item 31): the hovered Review tile, exempt from the fast eviction for
             // as long as its card is on screen — the frame was fetched BECAUSE it sits outside the
             // window, so without this it is the first thing the next over-budget insert takes.
@@ -23391,7 +23864,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // UploadDone::Fast), so the drain no longer reads the live scrub bucket at all.
             &l2_t, ram_l2_t.load(Ordering::Relaxed),
             det_ahead, det_behind, det_cache_cap, &detail_t.cache, &detail_t.order,
-            &detail_budget_t, &dms_t, &dgpu_t, &detail_t.uploading, &detail_pace_t,
+            det_retain_bytes, &dms_t, &dgpu_t, &detail_t.uploading, &detail_pace_t,
             now, &compare_t, &cmp_a_idx_t, &cmp_b_idx_t, &roi_t.tiles, &roi_t.region, &rot_t,
             // v0.8.122 (M7): the film tier — a successful full-res landing clears that shot's
             // thumb-failure latch (see `heal_thumb_failure`).
@@ -23410,6 +23883,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             // step's evictions ask it.
             &det_awaited_t,
         );
+        // 2026-10-26 (round 2a re-check R3): …and when the drain's retention released previews (a mode
+        // narrowed its kept window over a warm cache), the panels that are not refreshing let go of
+        // their rows, as the background release does. The refreshing feeds heard it through
+        // `fast_gen`, inside the drain.
+        background_memory::release_after_trim(previews_trimmed, app.get_sel_open(), &sel_model,
+            &last_sel_key, tick::grid_refills(&app, len), &grid_model, &last_grid_key);
 
         // 3z) GPU memory reclaim MOVED to the upload thread (E2, v0.3.56). The per-tick
         // device.poll here was measured at 26–52 ms (spikes to 98 ms) under heavy upload traffic
@@ -23434,6 +23913,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             support::cm_bake_key(app.get_output_gamut()),
             c,
             strip_anchor,
+            limits.thumbs_max, // round 2b: 400, or the whole folder's cap
         ); // v0.8.32 (§64): &Film
         mk!("thumbs");
 
@@ -23608,7 +24088,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             quality_bias,
             // …while the OBSERVABILITY half keeps the live bit, because the log must name what is
             // true right now and consumer 5's own hold is keyed on exactly this term.
-            efficiency
+            power_saver
         );
         mk!("adapt_res");
 
@@ -23922,6 +24402,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Model signatures must revisit unmet requests when this hold releases.
             thumb_gen_t.set(thumb_gen_t.get().wrapping_add(1));
         }
+        // Round 2b: …and so must a change of the thumbnails the mode prepares (Visible only ↔ nearby).
+        if thumb_scope_seen.replace(limits.thumbs) != limits.thumbs {
+            thumb_gen_t.set(thumb_gen_t.get().wrapping_add(1));
+        }
         let thumbnail_startup_hold = film_t.startup_hold(now);
         step_prefetch_fast(
             c, len, &shots_now, &cur_atomic_t, &drain_buf, &fast_t,
@@ -24082,11 +24566,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         // budget partition keeps it from starving the visible strip; runs here, before the strip's own
         // request loop, so a feeder thumb for a visible cell also fills that strip cell via the shared
         // thumb_cache. Requests carry the shot's manual delta (rot) exactly like the strip path.
-        if frost_thumb_t.load(Ordering::Relaxed) && !thumbnail_startup_hold && !defer_thumbs {
+        // Round 2b: part of "Visible and nearby" — off under Custom's "Visible only".
+        let frost_feeding =
+            frost_thumb_t.load(Ordering::Relaxed) && limits.thumbs != support::ThumbScope::VisibleOnly;
+        if frost_feeding && !thumbnail_startup_hold && !defer_thumbs {
             step_frost_feed(
                 c, len, &shots_now, &eff_win, &film_t, // v0.8.32 (§64): &Film (thumbs/pending/frost/failed)
                 &thumb_req_t, gen_now, &rot_t,
             );
+        } else if !frost_feeding {
+            // Round 2b review R1: the thumbnail and frost evictions spare the feeder's window, so with
+            // no feeder there is none to spare (a held or deferred feeder keeps its last one).
+            film_t.frost_window.set((1, 0));
         }
         mk!("frost_feed");
 
@@ -24323,7 +24814,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // v0.8.179 (W4 wave-2 tail 2): the clamp bounds, out — the strip's input handlers ask
             // `support::film_scroll_target` with them so an end-stop gesture stamps nothing.
             &film_clamp_t, &fk_t,
-            &film_model, &rot_t,
+            &film_model, &rot_t, limits.thumbs,
         );
         let film_glide = support::film_glided(film_pos_before, film_pos_t.get());
         mk!("film");
@@ -24441,7 +24932,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // v0.8.178 (W4 tail): where this step declares the scroll it wrote itself, so the
             // panel-scroll detector at the head of the tick does not read it as the user's.
             &grid_vp_prog,
-            &grid_model, &rot_t,
+            &grid_model, &rot_t, limits.thumbs,
         );
         film_t.observe_models(&film_model, &grid_model, app.get_grid_open());
         mk!("grid");
@@ -24453,6 +24944,34 @@ fn main() -> Result<(), Box<dyn Error>> {
             c, compare_t.get().then(|| (cmp_a_idx_t.get(), cmp_b_idx_t.get())));
         tick::step_retire_thumbs(&thumb_req_t, &film_t, strip_window, &thumb_keep, gen_now, &thumb_gen_t);
         mk!("thumb_retire");
+
+        // 8c-iii) 2026-10-27 (round 2b, owner answer 5): THE WHOLE FOLDER'S THUMBNAILS, where the mode
+        // prepares it — after every visible producer, and only while nothing else is asked for: still
+        // for the settled fill's interval (no browse, scrub or strip drag), the photo on screen ready,
+        // no sharp frame awaited, no folder-open hold, not released in the background, and no Mac
+        // memory pressure (the hold that pauses every other background preparation there; always off
+        // on Windows). Out to the radius the cache can keep at the mode's cap, so feeding never
+        // churns; never a cloud-only file (see the step).
+        if limits.thumbs == support::ThumbScope::WholeFolder
+            && !thumbnail_startup_hold
+            && !defer_thumbs
+            && !bg_hold
+            && !memory_hold
+            && app.get_photo_ready()
+            && det_awaited_t.load(Ordering::Relaxed) < 0
+            && !*scr_t.borrow()
+            && !film_dragging_t.get()
+            && now.saturating_duration_since(*lm_t.borrow()) >= Duration::from_millis(IDLE_DEEPEN_MS)
+        {
+            let anchors: Vec<usize> =
+                [Some(c), Some(strip_anchor), film_t.grid_anchor.get()].into_iter().flatten().collect();
+            let radius = tick::whole_folder_radius(len, &anchors, limits.thumbs_max);
+            tick::step_whole_folder_thumbs(
+                c, len, &shots_now, &meta_t.cloud_tagged.borrow(), &film_t, &thumb_req_t, gen_now, &rot_t,
+                radius, &whole_folder_cursor,
+            );
+        }
+        mk!("whole_folder");
 
         // 8b) v0.8.24 (D3): cloud-placeholder retry sweep (~30 s; free on local folders via the is_empty
         // gate — see step_cloud_retry). Clears the per-session failure latches of tagged shots so an
@@ -24501,13 +25020,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // v0.8.196 fix tail: the leaf's sentence is composed HERE, where all four of its inputs are
         // in hand (the posture, the user's own browse stop, the mode and the power snapshot), and the
         // meter is handed the finished string. See `support::efficiency_leaf_tip`.
-        let leaf_tip = support::efficiency_leaf_tip(
-            limits,
-            app.get_scrub_fps().max(1.0),
-            eff_mode,
-            power_now.get(),
-            support::power_sim(),
-        );
+        let leaf_tip = support::efficiency_leaf_tip(limits, app.get_scrub_fps().max(1.0));
         step_cache_meter(&app, c, len, zoomed, &fast_t.cache, &detail_t.cache, &eff_win, &meter_win,
             det_ahead, det_behind, &leaf_tip, &cache_meter_last);
         mk!("cache_meter");
@@ -26715,6 +27228,146 @@ mod tests {")
         }
     }
 
+    /// 2026-10-25 (graphics-memory sharing, round 1): the background release is ONE evaluation per
+    /// tick, above every consumer, and each consumer reads it. A census over main.rs.
+    ///
+    /// FALSIFIERS (L28): move the controller step below the full-detail fill, drop `bg_hold` from
+    /// `idle_deepen_allowed`, from `fast_holds` or from the publish gate, drop the release or the
+    /// panel step, gate the panel step on this call's evictions again or pass it the grid's open
+    /// setting instead of `tick::grid_refills` (Codex review R1), or route the release after
+    /// `step_upload_fast` → the matching assert reddens. Drop the measurement's start, either
+    /// memory-hints site, or the input clock's writer or reader → its assert reddens. Round 2a
+    /// re-check R3: drop the mode trim's panel step after the drain, or hand it anything but the
+    /// drain's count → its assert reddens.
+    #[test]
+    fn the_background_release_is_one_evaluation_that_every_consumer_reads() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+        let prod = src.split_once("
+mod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("
+");
+        let once = |needle: &str| {
+            assert_eq!(main.matches(needle).count(), 1, "exactly one `{needle}`");
+            main.find(needle).unwrap()
+        };
+        let step = once("background_t.borrow_mut().step(now, bg_obs, &bg_policy, bg_cache_bytes, bg_final)");
+        // Round 2c: the Mac's guard asks the same tick's reading, between the step and the hold.
+        let guard = once("background_t.borrow_mut().guard(background_memory::mac_guard_trips(cfg!(target_os = \"macos\"), bg_measured))");
+        let hold = once("let bg_hold = background_t.borrow().holds();");
+        assert!(step < guard && guard < hold, "the guard acts on this tick's step, before anything reads the hold");
+        let deepen = once("let idle_deepen = support::idle_deepen_allowed(");
+        let deepen_term = once("            !limits.settled_fill(),
+            bg_hold,
+        );");
+        let gate = once("let publish_gate = if bg_hold { support::PublishGate::Park } else { publish_gate };");
+        let shed = once("memory_pressure::shed_work(&explicit, &fast_t, &detail_t, &drain_buf, &parked_full,");
+        let release = once("background_memory::release_to(allowed, c, &explicit, &fast_t, &detail_t, &fast_gen_t)");
+        let closed = once("background_memory::release_unrefreshed_models(app.get_sel_open(), &sel_model, &last_sel_key,");
+        let grid = once("&last_sel_key,\n                tick::grid_refills(&app, len), &grid_model, &last_grid_key);");
+        let holds = once("let holds = fast_holds(fast_hold, memory_hold || bg_hold);");
+        let upload = main.find("        step_upload_fast(").expect("the fast upload step");
+        assert!(step < hold && hold < deepen && deepen < deepen_term, "one evaluation, above the full-detail fill");
+        assert!(gate < shed && shed < release && release < closed && closed < grid && grid < holds && holds < upload,
+            "the hold parks, sheds and releases before the first upload step of the tick");
+        assert!(!main[release..closed].contains("if r."),
+            "the panels let go on every held tick, not only when this call evicted a preview");
+        let final_target = once("background_memory::final_cache_target(bg_policy.target, bg_measured, bg_cache_bytes);");
+        // Round 2a: the policy is the mode in effect's, built on the tick above the release step.
+        let policy = once("let bg_policy = background_memory::Policy::for_mode(
+            mode_eff.mode,");
+        let mode = once("let mode_eff = decide_mode(power_now.get());");
+        assert!(mode < policy && policy < final_target && final_target < step,
+            "the mode is decided, then its policy built, then the release steps with it");
+        // Round 2a re-check R3: a mode's preview trim (the drain's count) reaches the same panel step,
+        // with the same refresh conditions, right after the drain that counted it.
+        let drain = once("let previews_trimmed = step_upload_drain(");
+        let trim_panels = once("background_memory::release_after_trim(previews_trimmed, app.get_sel_open(), &sel_model,\n            &last_sel_key, tick::grid_refills(&app, len), &grid_model, &last_grid_key);");
+        assert!(upload < drain && drain < trim_panels, "the trim's panels let go after the drain");
+        once("input_ev.set(Some(Instant::now()));");
+        once("user_input_at.get().map(|at| now.saturating_duration_since(at)),");
+        let captured = once("log_event(\"wgpu device captured (RenderingSetup)\");");
+        let started = once("gpu_memory_setup.start(device);");
+        assert!(captured < started, "the measurement starts on the rendering device");
+        once("ws.device_memory_hints = device_memory_hints();");
+        once("memory_hints: device_memory_hints(),");
+    }
+
+    /// 2026-10-25 (round 3 step a): the requested set reaches the decode workers once per tick,
+    /// after the current photo is known and before any step dispatches work; a thumbnail tile that
+    /// comes on screen promotes its running job; and every worker that prepares photos ahead goes
+    /// through the one registry, each with its own place. A census over the production source.
+    ///
+    /// FALSIFIERS (L28): move the publish below `step_upload_fast`, drop the thumbnail promotion,
+    /// run a preview or thumbnail job outside its worker's `run`, drop the full-resolution guard or
+    /// take its CPU decode, RAW work or colour conversion off the low pool, configure after the
+    /// first worker starts, or call `SetThreadPriority` anywhere new → the matching assert reddens.
+    #[test]
+    fn work_prepared_ahead_goes_through_one_priority_registry() {
+        let dir = format!("{}/src", env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(format!("{dir}/main.rs")).expect("source readable");
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let once = |needle: &str| {
+            assert_eq!(main.matches(needle).count(), 1, "exactly one `{needle}`");
+            main.find(needle).unwrap()
+        };
+        let book = once("let c = step_bookkeeping(");
+        let publish = once("prep_priority::PREP.publish(support::ExplicitSet::new(c, compare_t.get(), cmp_a_idx_t.get(),");
+        let upload = main.find("        step_upload_fast(").expect("the fast upload step");
+        let prefetch = main.find("        step_prefetch_fast(").expect("the fast prefetch step");
+        assert!(book < publish && publish < upload && upload < prefetch, "published before any dispatch");
+        let tick = std::fs::read_to_string(format!("{dir}/tick.rs")).expect("source readable");
+        let feed = tick.find("pub(crate) fn feed_visible_thumb(").expect("the visible-tile feed");
+        let feed = &tick[feed..feed + tick[feed..].find("\n}").unwrap()];
+        let queued = feed.find("support::ThumbReq::promote(idx, gen, delta)").expect("the queue's promotion");
+        let running = feed.find("prep_priority::PREP.promote_thumb(idx, gen, delta);").expect("the running job's promotion");
+        assert!(running > queued && !feed[queued..running].contains("} else"), "both in the pending-tile branch");
+        assert_eq!(main.matches("prep_priority::PREP.worker(1);").count(), 2, "one place per preview and per thumbnail worker");
+        once("prep.run(prep_priority::Job::Frame(idx), || run_fast_job(&ctx, idx, regime_at_pop));");
+        let hand = once("take_via(|q| prep.hand_over(|| q.try_take()))");
+        let ask = once("let ask = prep_priority::Job::Thumb { idx: job.idx, gen: job.gen, delta: job.delta, on_screen: job.explicit };");
+        assert!(hand < ask, "the thumbnail worker takes its job through the hand-over");
+        once("prep.run(ask, || run_thumb_job(&ctx, job));");
+        let place = once("let mut prep_worker = prep_priority::PREP.worker(cores);");
+        let guard = once("let prep = prep_worker.enter(prep_priority::Job::Frame(idx));");
+        let cfa = once("prep.on_low_pool(|| extract_cfa(shot))");
+        let develop = once("prep.on_low_pool(|| develop_raw_rgba(shot, ddim))");
+        let cpu = once("let cpu = if shot.kind == SrcKind::Heic { cpu() } else { prep.on_low_pool(cpu) };");
+        let xform = once("prep.on_low_pool(|| falcon_color::transform_rgba(&mut rgba, src, dst));");
+        assert!(place < guard && guard < cfa && cfa < develop && develop < cpu && cpu < xform,
+            "the full-resolution job holds its guard across its decode and its conversion");
+        let configure = once("prep_priority::PREP.configure(prep_on);");
+        let first_pool = main.find("spawn_fixed_fast_pool(nworkers, boot.pool18, &fast_ctx);").expect("the fast pool");
+        assert!(configure < first_pool && configure < place, "configured before the first worker starts");
+        // The one place priorities change, beside the two existing watchers' own LOWEST calls.
+        let mut setters = Vec::new();
+        for e in std::fs::read_dir(&dir).expect("src listable").flatten() {
+            let path = e.path();
+            if path.extension().is_some_and(|x| x == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let code = text.split_once("\nmod tests {").map_or(text.as_str(), |(p, _)| p);
+                let n = code.lines().filter(|l| !l.trim_start().starts_with("//") && l.contains("SetThreadPriority(")).count();
+                if n > 0 {
+                    setters.push((path.file_name().unwrap().to_string_lossy().into_owned(), n));
+                }
+            }
+        }
+        setters.sort();
+        assert_eq!(setters, vec![("prep_priority.rs".to_string(), 2), ("support.rs".to_string(), 2)]);
+    }
+
+    /// 2026-10-25: smaller memory blocks everywhere but macOS. FALSIFIER: return Slint's default.
+    #[test]
+    fn the_device_gives_large_textures_exact_size_memory_blocks() {
+        let hints = device_memory_hints();
+        if cfg!(target_os = "macos") {
+            assert!(matches!(hints, wgpu::MemoryHints::MemoryUsage));
+        } else {
+            assert!(matches!(hints, wgpu::MemoryHints::Manual { ref suballocated_device_memory_block_size }
+                if *suballocated_device_memory_block_size == ((4 << 20)..(16 << 20))));
+        }
+    }
+
     /// 1.0.16 (Mac log-out): the save sequence exists ONCE. The system-quit hook and the after-loop
     /// path run the same callable, built before the loop and registered before the hook goes in; the
     /// system route stops the tick and hides the window first, and nothing saves after `app.run()`
@@ -28912,13 +29565,9 @@ mod tests {")
             platform::overwrite_confirm_body(),
             "Overwrite re-renders those files and replaces them in place — the old versions are gone for good, not moved to the Recycle Bin (each replacement is atomic, so a file is never left half-written). Skip existing leaves them untouched and exports the rest. To keep both versions, cancel and turn on “Append the preset name to filenames”."
         );
-        // [B-R1, L17] the Efficiency card's Auto clause. `Dc || saver` is the whole Auto predicate
-        // on Windows and both halves are named; the macOS arm drops the half its own `power_probe`
-        // documents it does not read.
-        assert_eq!(
-            platform::efficiency_auto_clause(),
-            "Auto follows your power source and Windows' Battery saver."
-        );
+        // [B-R1, L17] the battery switch's Battery saver clause (round 2a). `Dc || saver` is the
+        // whole battery rule on Windows; macOS's arm is empty because `saver` is never read there.
+        assert_eq!(platform::battery_switch_clause(), "Also while Windows' Battery saver is on.");
         // v0.9.9 (P6): the accel-toggle label — the Windows value byte-equals the pre-refactor .slint
         // literal (the `accel-toggle-label` property default also carries it as the byte-identity fallback).
         assert_eq!(
@@ -29667,6 +30316,69 @@ mod tests {")
             "…and self-clears `inflight`, because no frame will arrive to clear it"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-27 (round 2b, owner: "do the check") — **A WHOLE-FOLDER JOB NEVER READS A FILE THAT IS
+    /// ONLY IN THE CLOUD NOW.** The worker asks the file's metadata just before the read; an
+    /// online-only file (either file of a pair, the scan's rule) is answered empty, is no failure, and
+    /// is noted for the feeder. A tile on screen, and a whole-folder job for a file on this device,
+    /// read as before. The probe stands in for a placeholder (no test can make one); the photo's path
+    /// does not exist, so a read that is tried fails and latches, which is what tells them apart.
+    ///
+    /// FALSIFIER (L28): drop the check in `run_thumb_job_with` and the first row reddens with the read
+    /// tried and the failure latched; probe only the JPEG and the pair row reddens.
+    #[test]
+    fn a_whole_folder_job_skips_a_file_only_in_the_cloud() {
+        let dir = std::env::temp_dir().join(format!("falcon-2b-cloud-skip-{}", std::process::id()));
+        let shot = falcon_decode::Shot {
+            id: 0,
+            name: "IMG_0001".into(),
+            has_raw: true,
+            has_jpg: true,
+            raw: Some(dir.join("IMG_0001.CR3")),
+            jpg: Some(dir.join("IMG_0001.JPG")),
+            kind: SrcKind::Jpeg,
+            cloud_placeholder: false,
+            sniffed: None,
+        };
+        assert!(!dir.exists(), "precondition: nothing on disk to read");
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<tick::ThumbDrop>();
+        let ctx = ThumbWorkerCtx {
+            shots: Arc::new(Mutex::new(Arc::new(vec![shot]))),
+            generation: Arc::new(AtomicU64::new(7)),
+            thumb_res_tx: res_tx,
+            output_gamut: Arc::new(AtomicU32::new(0)),
+            thumb_failed: Arc::new(Mutex::new(HashSet::new())),
+            frost_map: Arc::new(Mutex::new(HashMap::new())),
+            auto_orient: Arc::new(AtomicBool::new(true)),
+            orient_cache: Arc::new(Mutex::new(OrientCache::new())),
+            cloud_skipped: Arc::new(Mutex::new(HashSet::new())),
+        };
+        // The pair's RAW was freed up; its JPEG is still here. The scan tags a pair if either file is
+        // a placeholder, and so does this check.
+        let raw_freed = |p: &std::path::Path| p.extension().is_some_and(|e| e == "CR3");
+        run_thumb_job_with(&ctx, support::ThumbReq::whole_folder(0, 7, 0), raw_freed);
+        let d = res_rx.try_recv().expect("always answered");
+        assert_eq!((d.0, d.1, d.2.len(), d.3), (0, 7, 0, 0), "an empty marker frees the pending slot");
+        assert!(ctx.thumb_failed.lock().unwrap().is_empty(), "no failure: the read was never tried");
+        assert!(ctx.cloud_skipped.lock().unwrap().contains(&(7, 0)), "noted for the feeder");
+        // A tile on screen reads it as before (the cloud rule lets one photo download its file).
+        run_thumb_job_with(&ctx, support::ThumbReq::explicit(0, 7, 0), raw_freed);
+        assert!(res_rx.try_recv().is_ok());
+        assert!(ctx.thumb_failed.lock().unwrap().contains(&(7, 0)), "an explicit job is read (here: no such file)");
+        // …and so is a whole-folder job for a pair still on this device.
+        ctx.thumb_failed.lock().unwrap().clear();
+        ctx.cloud_skipped.lock().unwrap().clear();
+        run_thumb_job_with(&ctx, support::ThumbReq::whole_folder(0, 7, 0), |_: &std::path::Path| false);
+        assert!(res_rx.try_recv().is_ok());
+        assert!(ctx.thumb_failed.lock().unwrap().contains(&(7, 0)), "a local file is read");
+        assert!(ctx.cloud_skipped.lock().unwrap().is_empty());
+        // Production asks the real, metadata-only probe, and writes the set the feeder reads (the
+        // production part of the file only: this test's own text would match itself).
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        assert_eq!(prod.matches("run_thumb_job_with(ctx, req, falcon_decode::file_is_cloud_placeholder);").count(), 1);
+        assert_eq!(prod.matches("cloud_skipped: film.cloud_skipped.clone(),").count(), 1, "the feeder's own set");
     }
 
     /// R4 — **BOTH WORKER STALENESS SITES ASK THE ONE PREDICATE, AND `main.rs` KEEPS NO SECOND

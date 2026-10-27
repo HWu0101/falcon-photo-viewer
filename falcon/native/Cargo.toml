@@ -115,7 +115,19 @@ windows = { version = "0.62", features = [
     # The acceptance gate is a PE import-table walk of the staged exe: the only NEW import this
     # feature may add is kernel32!GetSystemPowerStatus.
     "Win32_System_Power",
+    # 2026-10-25 (graphics-memory sharing, round 1): the whole-card memory counter (`gpu_memory`).
+    # pdh.dll has shipped since Windows Vista, so these are ordinary static imports; the release
+    # check's allowed system DLLs include pdh.dll. New imports: pdh!PdhOpenQueryW,
+    # PdhAddEnglishCounterW, PdhCollectQueryData, PdhGetFormattedCounterArrayW and PdhCloseQuery.
+    "Win32_System_Performance",
+    # …and the rendering device's adapter LUID (`ID3D12Device::GetAdapterLuid`, a COM vtable call
+    # on wgpu's own device: no new import).
+    "Win32_Graphics_Direct3D12",
 ] }
+# 2026-10-25 (graphics-memory sharing, round 1): Vulkan's PhysicalDeviceIDProperties, to read the
+# rendering device's LUID through wgpu's own Vulkan device. The SAME ash 0.38 wgpu-hal already
+# resolves (see Cargo.lock), so it adds no new crate to the build graph.
+ash = "0.38"
 # v0.8.193 (§1F): mscms.dll's ColorProfileGetDisplayDefault / ColorProfileGetDisplayUserScope are
 # documented "minimum Windows 10 build 20348" — newer than every consumer Windows 10 (22H2 = 19045).
 # As STATIC imports (which is what the windows crate's `link!` produces, and what the v0.8.192 exe's

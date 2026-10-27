@@ -87,9 +87,10 @@
 use crate::*;
 
 /// The film / thumbnail tier's owned state (see the module doc for the membership boundary). Wrapped in an
-/// `Rc<Film>` on the UI thread; the two worker-shared stores (`frost`, `failed`) are individually
-/// `Arc`-cloned into the pool workers at spawn — `frost` into BOTH the thumb pool (writes it) and the fast
-/// decode pool (reads it), `failed` into the thumb pool (writes it) — exactly as the loose handles were.
+/// `Rc<Film>` on the UI thread; the worker-shared stores (`frost`, `failed`, and since round 2b
+/// `cloud_skipped`) are individually `Arc`-cloned into the pool workers at spawn — `frost` into BOTH the
+/// thumb pool (writes it) and the fast decode pool (reads it), `failed` and `cloud_skipped` into the thumb
+/// pool (writes them) — exactly as the loose handles were.
 pub(crate) struct Film {
     pub(crate) defer_requests: Cell<bool>,
     pub(crate) thumbs: RefCell<HashMap<usize, crate::tick::ThumbEntry>>,
@@ -105,6 +106,26 @@ pub(crate) struct Film {
     /// keeps thumbnails near it as well as near the current photo and the filmstrip, so rows the
     /// user scrolls back to are still in RAM when the dock is far from the current photo.
     pub(crate) grid_anchor: Cell<Option<usize>>,
+    /// 2026-10-27 (round 2b review C-01): cached thumbnails whose frost mip `drain_thumbs`' belt
+    /// trimmed. The frost map keeps the `THUMB_CACHE_MAX` nearest while the thumbnail cache may keep
+    /// the whole folder, and only a thumbnail decode makes a mip, so a preview window whose thumbnails
+    /// were cached never got its mips back. `step_frost_feed` asks for these again inside the window.
+    /// An index leaves the set when its thumbnail lands again or is evicted (a stale entry for a
+    /// thumbnail removed another way costs nothing: a missing thumbnail is a candidate anyway).
+    pub(crate) mipless: RefCell<HashSet<usize>>,
+    /// …and the preview window the frost feeder last asked within, `(lo, hi)` inclusive (empty while
+    /// `lo > hi`). The belt never trims a mip inside it, so a mip the feeder has just made again is not
+    /// trimmed again at once when the anchors are far apart (round 2b re-check T1).
+    pub(crate) frost_window: Cell<(usize, usize)>,
+    /// …and how many times the cache has lost thumbnails (an eviction, or a request retired or
+    /// dropped), so the whole-folder feeder's cursor scans again from the current photo (review C-02).
+    pub(crate) losses: Cell<u64>,
+    /// 2026-10-27 (round 2b, owner: "do the check"): the (gen, idx) of photos the whole folder's worker
+    /// found only in the cloud just before reading them (made online-only since the scan). Written by
+    /// the thumbnail workers (`main.rs::run_thumb_job_with`), read by `tick::step_whole_folder_thumbs`,
+    /// which asks for them no more this folder. Not a failure: a tile on screen still asks for its
+    /// thumbnail as before. Cleared on a folder swap.
+    pub(crate) cloud_skipped: Arc<Mutex<HashSet<(u64, usize)>>>,
     pub(crate) visible_signal: Arc<(Mutex<(u64, usize)>, std::sync::Condvar)>,
     startup_at: Cell<Option<Instant>>,
     startup_request: Cell<(u64, usize)>,
@@ -125,6 +146,10 @@ impl Film {
             pinned: RefCell::new(HashSet::new()),
             visible_pending: RefCell::new(HashSet::new()),
             grid_anchor: Cell::new(None),
+            mipless: RefCell::new(HashSet::new()),
+            frost_window: Cell::new((1, 0)),
+            losses: Cell::new(0),
+            cloud_skipped: Arc::new(Mutex::new(HashSet::new())),
             visible_signal: Arc::new((Mutex::new((0, 0)), std::sync::Condvar::new())),
             startup_at: Cell::new(None), startup_request: Cell::new((0, 0)),
             models_ready: Cell::new(false), any_thumb: Cell::new(false),
@@ -215,6 +240,10 @@ impl Film {
         self.pinned.borrow_mut().clear();
         self.visible_pending.borrow_mut().clear();
         self.grid_anchor.set(None);
+        self.mipless.borrow_mut().clear();
+        self.frost_window.set((1, 0));
+        self.losses.set(0);
+        self.cloud_skipped.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -261,6 +290,10 @@ mod tests {
         f.pinned.borrow_mut().insert(7); // v0.8.42: the Selection-viewport eviction exemption
         f.visible_pending.borrow_mut().insert(9);
         f.grid_anchor.set(Some(7));
+        f.mipless.borrow_mut().insert(7);
+        f.frost_window.set((5, 9));
+        f.losses.set(3);
+        f.cloud_skipped.lock().unwrap().insert((3, 7));
     }
 
     /// The direct swap-clear test (the review's "cheap first target", film edition): populate every owned
@@ -282,6 +315,10 @@ mod tests {
         assert!(f.pinned.borrow().is_empty(), "Selection-viewport pin set cleared on swap (v0.8.42)");
         assert!(f.visible_pending.borrow().is_empty(), "the retirement marks are folder-scoped too");
         assert_eq!(f.grid_anchor.get(), None, "so is the grid dock's eviction anchor");
+        assert!(f.mipless.borrow().is_empty(), "the trimmed-mip notes are folder-scoped (round 2b)");
+        assert_eq!(f.frost_window.get(), (1, 0), "…and so is the frost feeder's window");
+        assert_eq!(f.losses.get(), 0, "…and so is the loss count");
+        assert!(f.cloud_skipped.lock().unwrap().is_empty(), "…and so are the photos found online-only");
     }
 
     /// Idempotence: `on_folder_swap` on an already-clean tier is a no-op — this pins that a second swap in a

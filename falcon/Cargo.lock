@@ -1210,6 +1210,7 @@ dependencies = [
 name = "falcon-native"
 version = "1.0.15"
 dependencies = [
+ "ash",
  "cc",
  "clipboard-win",
  "falcon-color",

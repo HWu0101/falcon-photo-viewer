@@ -211,6 +211,8 @@ pub(crate) fn prepare_settings(settings: &mut crate::support::Settings, diagnost
     if diagnostic {
         settings.onboarding_shown = true;
         settings.assoc_prompt_shown = true;
+        // Round 2a: …and the guide's return after a feature update, for the same reason.
+        settings.guide_seen_feature = crate::support::feature_version_text(env!("CARGO_PKG_VERSION"));
     }
 }
 

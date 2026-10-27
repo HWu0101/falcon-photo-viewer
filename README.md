@@ -92,8 +92,8 @@ out.
 
 ### Bursts play like video
 
-Hold the arrow key and Falcon moves through the folder at a sustained 30 frames per second, the same
-rate my camera shoots. A burst plays back as motion: a wingbeat or a sprinter's stride unfolds on
+Hold the arrow key and Falcon moves through the folder at a sustained 30 frames per second in
+Turbo mode, the same rate my camera shoots. A burst plays back as motion: a wingbeat or a sprinter's stride unfolds on
 screen, and you stop on the exact frame you want. Settings go up to 120 frames per second, as fast as
 your hardware allows.
 
@@ -159,7 +159,7 @@ step through challengers against it. Your rating goes to whichever half you are 
   controls appear.
 - **Safe with your originals.** Falcon never re-encodes your photos. Deletes go to the Recycle Bin
   or Trash with Undo, and your ratings are saved safely beside the photos.
-- **Ready for location work.** Efficiency mode stretches a laptop's battery, and photos that live
+- **Ready for location work.** Eco mode, used on battery by default, stretches a laptop's battery, and photos that live
   only in OneDrive aren't downloaded just because you scrolled past them.
 - **At home on a Mac.** The native menu bar and full screen, trackpad pinch to zoom, and Falcon as
   Finder's default viewer.

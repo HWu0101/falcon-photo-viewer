@@ -773,6 +773,13 @@ pub(crate) fn drain_thumbs(
     cm_now: u64,
     c: usize,
     strip_anchor: usize,
+    // 2026-10-27 (round 2b): the most thumbnails the cache keeps, the mode's
+    // (`EfficiencyLimits::thumbs_max`): `THUMB_CACHE_MAX` (400) unless the whole folder is prepared.
+    // The frost-mip map keeps its own 400 below whatever this is: the fast tier reads a mip only for
+    // the preview window, which is never wider than that. A mip trimmed from a thumbnail still cached
+    // is noted in `film.mipless`, so the frost feeder makes it again when the window reaches it
+    // (review C-01); every loss of a thumbnail bumps `film.losses` for the whole-folder cursor (C-02).
+    cap: usize,
 ) {
     // v0.8.32 (§64): rebind the three Film fields this fn uses to the locals its body already references, so
     // not one logic line below changes (pure state-move extraction). `&film.frost` is `&FrostMap` verbatim.
@@ -781,6 +788,8 @@ pub(crate) fn drain_thumbs(
     let frost_map = &film.frost;
     let mut tc = thumb_cache.borrow_mut();
     let mut tp = thumb_pending.borrow_mut();
+    let mut ml = film.mipless.borrow_mut();
+    let mut lost = false;
     // v0.8.105 (W2): did anything land this tick? The frost belt below only needs to run when the
     // map can have GROWN, and it grows only when a worker inserts a mip — which every worker does
     // immediately before sending the payload this loop receives. Keeps the "never lock on a no-op
@@ -793,6 +802,7 @@ pub(crate) fn drain_thumbs(
         }
         // A stale result does not own a current generation's same-index request.
         tp.remove(&idx);
+        ml.remove(&idx); // a trimmed mip comes back with its thumbnail's decode (round 2b, C-01)
         // A landing of the CURRENT folder must trigger a rebuild even when the cache is pinned at
         // THUMB_CACHE_MAX (insert+evict below leaves len unchanged), and a failure marker (w==0)
         // frees a pending slot so the rebuild re-runs past the pending cap. Bump for BOTH.
@@ -810,6 +820,7 @@ pub(crate) fn drain_thumbs(
         // thumb was in flight, its baked rotation is stale: drop it — pending was already freed
         // and the gen bumped, so the cell re-enters need_thumb and re-requests with live turns.
         if applied != rot.compose(base, idx) {
+            lost = true;
             continue;
         }
         // v0.8.104 (Round-A C2): …and the same rule for COLOUR. The worker baked these bytes into the
@@ -819,6 +830,7 @@ pub(crate) fn drain_thumbs(
         // side-by-side mismatch this round exists to remove. Same drop discipline as the rotation
         // guard above: pending is freed and the gen is bumped, so the cell re-requests.
         if cm != cm_now {
+            lost = true;
             continue;
         }
         let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
@@ -839,7 +851,15 @@ pub(crate) fn drain_thumbs(
         let near = (i as i64 - c as i64).abs().min((i as i64 - strip_anchor as i64).abs());
         grid.map_or(near, |g| near.min((i as i64 - g as i64).abs()))
     };
-    if tc.len() > THUMB_CACHE_MAX {
+    // Round 2b review R1 (Codex): …and the preview window the frost feeder asks within
+    // (`film.frost_window`) ranks before any distance in both branches below. With the anchors far
+    // apart the nearest `cap` can leave out that window's far end; the feeder asks for those
+    // thumbnails again for their blur sources, each landing was evicted again, and nothing settled.
+    // The window is at most `FAST_CACHE_MAX` + 1 photos, inside every cap (400 or more), so this
+    // changes which thumbnails stay, not how many.
+    let frost_win = film.frost_window.get();
+    let outside_window = |i: usize| i < frost_win.0 || i > frost_win.1;
+    if tc.len() > cap {
         // v0.8.42 (Selection demand-loading): tiles in the OPEN Selection panel's live viewport are
         // PINNED (`film.pinned`, fed wholesale each tick by step_selection) and exempt from eviction —
         // this exact farthest-from-anchor rule used to evict the panel's visible thumbs the moment the
@@ -857,13 +877,15 @@ pub(crate) fn drain_thumbs(
             // key order feeding a stable sort), so an unstable partition changes nothing observable — at O(n)
             // instead of O(n log n). len > THUMB_CACHE_MAX here, so the pivot index is always in range.
             let mut idxs: Vec<usize> = tc.keys().copied().collect();
-            idxs.select_nth_unstable_by_key(THUMB_CACHE_MAX, |&i| dist(i));
+            idxs.select_nth_unstable_by_key(cap, |&i| (outside_window(i), dist(i)));
             // A3: mirror the removals into the frost-mip map (lock ONCE, only while actually evicting).
             let mut fm = frost_map.lock().unwrap_or_else(|e| e.into_inner());
-            for &i in &idxs[THUMB_CACHE_MAX..] {
+            for &i in &idxs[cap..] {
                 tc.remove(&i);
                 fm.remove(&i); // keep the frost map bounded to the same keys as the thumb cache
+                ml.remove(&i);
             }
+            lost = true;
         } else {
             // Same partial-selection idea over the UNPINNED keys only — and since v0.8.183 (W9) the
             // cap governs THAT population, which is the one it can actually evict.
@@ -885,17 +907,19 @@ pub(crate) fn drain_thumbs(
             // `THUMB_CACHE_MAX`, bounded by one dock viewport. What it buys is that an unpinned tile
             // the user IS looking at is never evicted to make room for a pinned one they are not.
             let mut idxs: Vec<usize> = tc.keys().copied().filter(|i| !pin.contains(i)).collect();
-            let keep = support::thumb_keep_unpinned(tc.len(), tc.len() - idxs.len(), THUMB_CACHE_MAX);
+            let keep = support::thumb_keep_unpinned(tc.len(), tc.len() - idxs.len(), cap);
             if keep < idxs.len() {
                 // partition: [0, keep) = the nearest survivors, [keep..] = the farthest → evicted.
-                idxs.select_nth_unstable_by_key(keep, |&i| dist(i));
+                idxs.select_nth_unstable_by_key(keep, |&i| (outside_window(i), dist(i)));
                 // A3: mirror the removals into the frost-mip map (lock ONCE, only while actually
                 // evicting — which since W9 is a real condition rather than always-true here).
                 let mut fm = frost_map.lock().unwrap_or_else(|e| e.into_inner());
                 for &i in &idxs[keep..] {
                     tc.remove(&i);
                     fm.remove(&i); // keep the frost map bounded to the same keys as the thumb cache
+                    ml.remove(&i);
                 }
+                lost = true;
             }
         }
     }
@@ -908,15 +932,34 @@ pub(crate) fn drain_thumbs(
     // next folder swap. W2 removed that clear; this makes the bound hold WHATEVER a future caller
     // does, with the same farthest-from-anchor rule (pins are not exempt here: a frost miss costs the
     // fast tier one `downscale_rgba`, never a blank tile).
+    // Round 2b (re-check T1): never inside the window the frost feeder last asked within
+    // (`film.frost_window`, at most a few hundred photos). With the anchors far apart the nearest 400
+    // can leave out the far end of that window, and the feeder would make those mips again and the
+    // belt trim them again on every tick.
     if landed {
         let mut fm = frost_map.lock().unwrap_or_else(|e| e.into_inner());
         if fm.len() > THUMB_CACHE_MAX {
-            let mut idxs: Vec<usize> = fm.keys().copied().collect();
-            idxs.select_nth_unstable_by_key(THUMB_CACHE_MAX, |&i| dist(i));
-            for &i in &idxs[THUMB_CACHE_MAX..] {
+            let (wlo, whi) = film.frost_window.get();
+            let mut idxs: Vec<usize> = fm.keys().copied().filter(|&i| i < wlo || i > whi).collect();
+            let keep = THUMB_CACHE_MAX.saturating_sub(fm.len() - idxs.len());
+            if keep < idxs.len() {
+                idxs.select_nth_unstable_by_key(keep, |&i| dist(i));
+            }
+            for &i in idxs.get(keep..).unwrap_or_default() {
                 fm.remove(&i);
+                // Round 2b (review C-01): the thumbnail cache may keep far more than this, and only a
+                // thumbnail decode makes a mip, so a mip trimmed from a cached thumbnail is noted; the
+                // frost feeder asks for that thumbnail again when the preview window reaches it.
+                if tc.contains_key(&i) {
+                    ml.insert(i);
+                }
             }
         }
+    }
+    // Round 2b (review C-02): the cache lost thumbnails (evicted, or a landing dropped for its turns
+    // or colour), so the whole-folder feeder scans again from the current photo.
+    if lost {
+        film.losses.set(film.losses.get().wrapping_add(1));
     }
 }
 
@@ -1008,7 +1051,7 @@ fn zoom_sharp_active(app: &MainWindow) -> bool {
 ///
 /// v0.8.195 (EFFICIENCY MODE, consumer 4) — **AND THE BATTERY CEILING, WHICH IS ONE MORE `min()`.**
 /// This is the round's ONE feel-visible arm, and it is flagged for the owner's own ruling: engaged,
-/// the browse steps at most [`support::EFFICIENCY_SCRUB_FPS_MAX`] times a second, which directly
+/// the browse steps at most the mode's ceiling ([`support::EfficiencyLimits::ceiling_fps`]) times a second, which directly
 /// bounds decode + upload + present throughput rather than trimming around it. It composes with the
 /// zoom-sharp cap above rather than replacing it — both are `min()` terms on the same number, so
 /// whichever is lower wins and a user who has already chosen a slower rate is untouched either way.
@@ -2551,12 +2594,16 @@ pub(crate) fn step_prefetch_fast(
         // `support::fast_window_split` — pa takes the momentum share, pb takes the REMAINDER (so an
         // ahead side clamped by max_side redirects its surplus to behind and the cache still fills),
         // and both are capped at max_side.
-        let (pa, pb) = if throttle {
+        let card_win = if throttle {
             (0, 0)
         } else {
             let max_side = prefetch_ahead.get().max(prefetch_behind.get()); // symmetric cap
             support::fast_window_split(byte_cap, FAST_CACHE_MAX, split_ahead, max_side)
         };
+        // 2026-10-26 (round 2a): …then the kept window of the mode in effect, lead and trail in the
+        // browsing direction (Balanced about 40 + 10, Power saver 24 + 6; Performance untouched). It
+        // only ever narrows a side, so a small card's window stays its own.
+        let (pa, pb) = support::mode_window(card_win, split_ahead, eff);
         // Publish the EFFECTIVE window for the perf line: the boot `win=105+35` number hid the
         // live capacity clamp during the 2026-07-06 lag forensics (at 39 MB frames the real
         // window was 52+17 — the log said otherwise and sent the hunt down a wrong path).
@@ -2578,11 +2625,24 @@ pub(crate) fn step_prefetch_fast(
         let genuinely_costly =
             |i: usize| shots.get(i).is_some_and(|s| cost.costly(s.kind));
         let any_genuine = eff.engaged && (lo..=hi).any(genuinely_costly);
-        let costly_win = support::efficiency_runway_window(eff, (pa, pb), any_genuine);
+        let costly_win = support::efficiency_runway_window(eff, (pa, pb), split_ahead, any_genuine);
+        // 2026-10-26 (round 2a): the shots Performance ALSO caps — a costly prior, the Settings-open
+        // throttle, a lane-served HEIC — spelled once here because `is_capped` below and the two
+        // round-2a rules beside the cap and the pause read it. While a mode limits work, a window
+        // holding one keeps Performance's cap as the ceiling and keeps the pause: a mode only takes
+        // away (owner rule, 25 October).
+        let base_capped = |i: usize| {
+            shots.get(i).is_some_and(|s| {
+                cost.costly_by_prior(s.kind)
+                    || settings_throttle
+                    || (lane_bound_heic && s.kind == SrcKind::Heic)
+            })
+        };
+        let any_base = eff.engaged && (lo..=hi).any(base_capped);
         // …and the CAP takes the same term (v0.8.196 fix tail, skeptic A R1). Written here rather than
         // above the early exit because this is where the window — and therefore the membership the
         // term is about — first exists.
-        let cap_now = cap_for(any_genuine);
+        let cap_now = cap_for(any_genuine || any_base);
         cap_eff.set(cap_now);
         // v0.8.112 (R1): TWO predicates, and the difference between them is the whole audit fix.
         //   `is_costly`  — the LIVE class. Narrows the runway. A measurement may relax it.
@@ -2646,12 +2706,7 @@ pub(crate) fn step_prefetch_fast(
             // the other half of what refused the far half, because `costly_prefetch_budget` returns
             // ZERO while an ROI/zoom or CPU-bound detail decode is in flight, and a universally
             // capped folder then stops every non-`c` dispatch for that decode's whole life.
-            eff_spec(i)
-                || shots.get(i).is_some_and(|s| {
-                    cost.costly_by_prior(s.kind)
-                        || settings_throttle
-                        || (lane_bound_heic && s.kind == SrcKind::Heic)
-                })
+            eff_spec(i) || base_capped(i)
         };
         // Published as a statement about the POSTURE in force, not about whether this particular
         // tick happened to skip something — otherwise a warm cache would make `cwin=` flicker.
@@ -2680,7 +2735,21 @@ pub(crate) fn step_prefetch_fast(
         // re-queued + re-decoded every tick while in the window (a fast-tier retry storm; the full-res tier
         // has `det_failed` for this). `is_unsupported()` is static per shot, so no worker round-trip needed.
         let failed = fast.failed.lock().unwrap_or_else(|e| e.into_inner());
+        // 2026-10-26 (round 2a): …and the on-screen Compare halves the CARD's window covers. A mode's
+        // narrower kept window must never drop one (they are always served, whatever the mode):
+        // a half pinned nine photos back sits outside Power saver's 6 behind but inside the window
+        // Performance would ask over. Halves beyond the card's window are the detail tier's, exactly
+        // as in Performance. Empty in Performance, where the two windows are one.
+        let outside_kept: Vec<usize> = if compare.get() && (pa, pb) != card_win {
+            [cmp_a_idx.get(), cmp_b_idx.get()]
+                .into_iter()
+                .filter(|&i| i < len && !(lo..=hi).contains(&i) && i + card_win.1 >= c && i <= c + card_win.0)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut wanted: Vec<(usize, bool)> = (lo..=hi)
+            .chain(outside_kept)
             .filter_map(|i| {
                 // Stage 3 dim-aware: a cached entry only UN-wants its index while its bucket
                 // satisfies the current one (dim_satisfies). After a GROW the kept stale entries
@@ -2742,7 +2811,8 @@ pub(crate) fn step_prefetch_fast(
         // no re-scan, no invalidation pass and no machinery to stand down. It is also why L45 does
         // not bite: nothing about the present/dedup records changes, because nothing was produced
         // and nothing was recorded.
-        let stale_upgrades: HashSet<usize> = if efficiency {
+        // (Round 2a: Power saver's cut, as it was Efficiency mode's; Balanced does not hold it.)
+        let stale_upgrades: HashSet<usize> = if eff.quiet {
             wanted.iter().filter(|&&(_, up)| up).map(|&(i, _)| i).collect()
         } else {
             HashSet::new()
@@ -2915,7 +2985,13 @@ pub(crate) fn step_prefetch_fast(
         let mut ready = pool_wanted;
         ready.retain(|i| !p.inflight.contains(i));
         let inflight_costly = p.costly_inflight.iter().filter(|&&i| i != c).count();
-        let budget = support::costly_prefetch_budget(cap_now, inflight_costly, interactive_busy);
+        // 2026-10-26 (round 2a): the pause while the on-screen photo's full-resolution decode is
+        // pending (`interactive_busy`) holds for everything Performance pauses for and for all of
+        // Power saver (Efficiency mode's behaviour). Balanced's own rationing of a cheap window does
+        // NOT pause: Balanced is the default, and holding every preview decode ahead while the user
+        // steps through JPEGs would make the default browse worse than Performance's.
+        let pause = interactive_busy && (!eff.engaged || eff.quiet || any_base);
+        let budget = support::costly_prefetch_budget(cap_now, inflight_costly, pause);
         // v1.0.0-rc (FIX 2026-09-07, round X1 / F1): …and the DISPLAYED SET, which until this
         // round this admission could not be told about — it hand-spelled `i == c` and refused an
         // on-screen compare half as speculation on both of its arms. `displayed` is the closure
@@ -3171,6 +3247,18 @@ pub(crate) fn step_frost_feed(
     if len == 0 {
         return;
     }
+    // Mirror step_prefetch_fast's EFFECTIVE (capacity-clamped) window — the exact indices the fast
+    // pool will decode this tick (it published `eff_win` just above). No point feeding frost for shots
+    // outside the pool's window. (0,0) during a zoom/ROI throttle ⇒ just [c..=c] ⇒ effectively idle.
+    let (pa, pb) = eff_win.get();
+    let lo = c.saturating_sub(pb);
+    let hi = (c + pa).min(len - 1);
+    // Round 2b (re-check T1): published for `drain_thumbs`' belt, which spares this window's mips —
+    // except while the window is collapsed to the photo on screen (a sharp decode on the processor,
+    // or a zoomed region), when the belt keeps sparing the last open one (its re-check P-1).
+    if (pa, pb) != (0, 0) {
+        film.frost_window.set((lo, hi));
+    }
     let mut tp = thumb_pending.borrow_mut();
     // BUDGET PARTITION + self-throttle: bail before any scan once the feeder's share is spent. This
     // is what reserves ≥16 slots for the strip (which fills to THUMB_PENDING_MAX independently) and
@@ -3178,28 +3266,27 @@ pub(crate) fn step_frost_feed(
     if tp.len() >= FROST_FEED_PENDING_MAX {
         return;
     }
-    // Mirror step_prefetch_fast's EFFECTIVE (capacity-clamped) window — the exact indices the fast
-    // pool will decode this tick (it published `eff_win` just above). No point feeding frost for shots
-    // outside the pool's window. (0,0) during a zoom/ROI throttle ⇒ just [c..=c] ⇒ effectively idle.
-    let (pa, pb) = eff_win.get();
-    let lo = c.saturating_sub(pb);
-    let hi = (c + pa).min(len - 1);
     // Cheap pre-filter (no frost lock): window indices missing from the thumb cache AND not already
     // pending AND not permanently-failed/unsupported — byte-for-byte the strip/pool exclusion set. In
     // warm steady state this is empty ⇒ we return before ever locking `frost_map` (read by the pool on
     // every decode job).
     let tc = thumb_cache.borrow();
+    let ml = film.mipless.borrow();
     // v0.8.22: cheap RefCell/slice pre-filter FIRST — no cross-thread lock. Window indices missing from
     // the thumb cache, not already pending, not statically unsupported. In warm steady state this is
     // empty, so we return WITHOUT ever locking `thumb_failed` (contended by the thumb-pool workers).
+    // Round 2b (review C-01): …or cached with the mip `drain_thumbs`' belt trimmed (`film.mipless`):
+    // the thumbnail cache may keep the whole folder while the frost map keeps 400, and only a
+    // thumbnail decode makes a mip.
     let mut cand: Vec<usize> = (lo..=hi)
         .filter(|&i| {
-            !tc.contains_key(&i)
+            (!tc.contains_key(&i) || ml.contains(&i))
                 && !tp.contains(&i)
                 && !shots.get(i).map_or(false, |s| s.is_unsupported())
         })
         .collect();
     drop(tc);
+    drop(ml);
     if cand.is_empty() {
         return;
     }
@@ -3222,7 +3309,19 @@ pub(crate) fn step_frost_feed(
     let budget = FROST_FEED_PENDING_MAX - tp.len();
     let to_send: Vec<usize> = {
         let fm = frost_map.lock().unwrap_or_else(|e| e.into_inner());
-        cand.into_iter().filter(|i| !fm.contains_key(i)).take(budget).collect()
+        let mut ml = film.mipless.borrow_mut();
+        cand.into_iter()
+            .filter(|i| {
+                // A noted index whose mip is back (its landing was dropped after the worker parked
+                // the mip) leaves the set here, so the warm path stays free of this lock.
+                let has = fm.contains_key(i);
+                if has {
+                    ml.remove(i);
+                }
+                !has
+            })
+            .take(budget)
+            .collect()
     };
     for idx in to_send {
         if tp.len() >= FROST_FEED_PENDING_MAX {
@@ -3238,6 +3337,152 @@ pub(crate) fn step_frost_feed(
             send_or_rollback(
                 thumb_req,
                 support::ThumbReq::speculative(idx, gen_now, rot.delta_of(idx)),
+                ReqLane::Thumb,
+                || {
+                    tp.remove(&idx);
+                },
+            );
+        }
+    }
+}
+
+/// 2026-10-27 (round 2b): the whole-folder feeder's share of the thumbnail queue. It asks only while
+/// fewer than this many thumbnails are pending, so the tiles on screen — which fill the queue up to
+/// `THUMB_PENDING_MAX` (48) — are always asked for first; and its jobs are speculative, so they run
+/// at below-normal priority behind every tile a photographer is looking at (round 3a).
+pub(crate) const WHOLE_FOLDER_PENDING_MAX: usize = 8;
+
+/// The radius around the current photo whose thumbnails the cache can keep at `cap`: the largest `r`
+/// for which every photo within `r` of an anchor — the current photo, the filmstrip's centre and the
+/// grid's middle, the three `drain_thumbs` keeps nearest — numbers at most `cap`. Inside it the
+/// eviction (nearest `cap` kept) never drops a thumbnail the feeder asked for, so feeding cannot
+/// churn (L29). `cap ≥ len` is the whole folder.
+#[must_use]
+pub(crate) fn whole_folder_radius(len: usize, anchors: &[usize], cap: usize) -> usize {
+    if len == 0 || anchors.is_empty() {
+        return 0;
+    }
+    let covered = |r: usize| -> usize {
+        let mut iv: Vec<(usize, usize)> =
+            anchors.iter().map(|&a| (a.min(len - 1).saturating_sub(r), a.min(len - 1).saturating_add(r).min(len - 1))).collect();
+        iv.sort_unstable();
+        let (mut n, mut end) = (0usize, None::<usize>);
+        for (lo, hi) in iv {
+            match end {
+                Some(e) if lo <= e => {
+                    if hi > e {
+                        n += hi - e;
+                        end = Some(hi);
+                    }
+                }
+                _ => {
+                    n += hi - lo + 1;
+                    end = Some(hi);
+                }
+            }
+        }
+        n
+    };
+    if covered(len) <= cap {
+        return len;
+    }
+    // The largest r with covered(r) <= cap; covered is monotone in r.
+    let (mut lo, mut hi) = (0usize, len);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if covered(mid) <= cap {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+/// 6-whole) 2026-10-27 (round 2b, owner answer 5) — **THE WHOLE FOLDER'S THUMBNAILS.** Where the mode
+/// prepares the whole folder (Performance, Balanced, Custom's choice), this asks for the rest of the
+/// folder's thumbnails after the visible and nearby ones: nearest the current photo first, out to
+/// [`whole_folder_radius`] (the whole folder when the cap allows it), skipping what is cached,
+/// pending, unsupported or permanently failed, and **never a cloud-only file** (`cloud`, the folder
+/// scan's placeholder tags with hydrated files dropped — AGENTS.md's cloud rule: batch work never
+/// downloads). A file made online-only since the scan is not tagged, so each request is
+/// [`support::ThumbReq::whole_folder`]: the worker checks the file is still on this device just before
+/// reading it, and notes one that is not in `film.cloud_skipped`, which this asks for no more (owner,
+/// 27 October: "do the check").
+///
+/// It runs only when the caller says nothing else is asked for (settled, no decode awaited, no open
+/// hold, not in the background — see the call in the tick), within its own small share of the queue
+/// ([`WHOLE_FOLDER_PENDING_MAX`]), as speculative requests. `cursor` is where the last scan stopped,
+/// `(generation, c, radius, losses, distance)`: everything nearer was cached, pending or skipped then,
+/// so a warm folder costs one comparison a tick. Moving the current photo starts again from it, and so
+/// does any loss in the cache since (`film.losses`: an eviction, say after a mode or scope round trip
+/// shrank the cache, or a retired or dropped request; round 2b review C-02).
+///
+/// FALSIFIER (L28): drop the `cloud` term and the cloud row of
+/// `the_thumbnail_scope_reaches_every_feeder` reddens with a placeholder asked for; ask past the
+/// radius and its cap row reddens with a request the eviction would drop; drop the `skipped` term or
+/// send a plain speculative request and its online-only rows redden.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn step_whole_folder_thumbs(
+    c: usize,
+    len: usize,
+    shots: &[Shot],
+    cloud: &HashSet<usize>,
+    film: &Film,
+    thumb_req: &Sender<support::ThumbReq>,
+    gen_now: u64,
+    rot: &RotState,
+    radius: usize,
+    cursor: &Cell<(u64, usize, usize, u64, usize)>,
+) {
+    if len == 0 {
+        return;
+    }
+    let mut tp = film.pending.borrow_mut();
+    if tp.len() >= WHOLE_FOLDER_PENDING_MAX {
+        return;
+    }
+    let (g, cc, r, lost, mut d) = cursor.get();
+    let losses = film.losses.get();
+    if (g, cc, r, lost) != (gen_now, c, radius, losses) {
+        d = 0;
+    }
+    let budget = WHOLE_FOLDER_PENDING_MAX - tp.len();
+    let mut cand: Vec<usize> = Vec::with_capacity(budget);
+    {
+        let tc = film.thumbs.borrow();
+        // The (cross-thread) failure latch is asked last and one index at a time, so a warm folder,
+        // whose every index stops at the cache test, never takes the lock the thumb workers write.
+        let failed = |i: usize| film.failed.lock().unwrap_or_else(|e| e.into_inner()).contains(&(gen_now, i));
+        // …and so is the workers' note of the files found online-only since the scan.
+        let skipped = |i: usize| film.cloud_skipped.lock().unwrap_or_else(|e| e.into_inner()).contains(&(gen_now, i));
+        let wanted = |i: usize| {
+            i < len
+                && !tc.contains_key(&i)
+                && !tp.contains(&i)
+                && !cloud.contains(&i)
+                && !shots.get(i).is_some_and(|s| s.is_unsupported())
+                && !failed(i)
+                && !skipped(i)
+        };
+        'scan: while d <= radius {
+            for i in [c.checked_sub(d), (d > 0).then(|| c.saturating_add(d))].into_iter().flatten() {
+                if wanted(i) && !cand.contains(&i) {
+                    cand.push(i);
+                    if cand.len() >= budget {
+                        break 'scan;
+                    }
+                }
+            }
+            d += 1;
+        }
+    }
+    cursor.set((gen_now, c, radius, losses, d));
+    for idx in cand {
+        if tp.insert(idx) {
+            send_or_rollback(
+                thumb_req,
+                support::ThumbReq::whole_folder(idx, gen_now, rot.delta_of(idx)),
                 ReqLane::Thumb,
                 || {
                     tp.remove(&idx);
@@ -4258,6 +4503,15 @@ pub(crate) fn step_upload_drain(
     fast_failed: &Mutex<HashSet<(u64, usize)>>,
     det_failed: &RefCell<HashSet<usize>>,
     eff_win: &Cell<(usize, usize)>, // the live fast window — the eviction must respect its shape
+    // 2026-10-26 (round 2a): the fast cache's count limit in the mode in effect — `FAST_CACHE_MAX`
+    // in Performance, the kept window plus the never-evicted photos in Balanced and Power saver
+    // (`support::EfficiencyLimits::keep_count`), so the previews a mode keeps ready are what it keeps.
+    fast_keep_max: usize,
+    // 2026-10-26 (round 2a re-check R3): whether that count limit is a MODE's (Balanced, Power saver).
+    // Then every preview this step releases — at an arrival or in the retention below — is counted in
+    // the step's return, so the panels that are not refreshing let go of it too
+    // (`background_memory::release_after_trim`). Performance (false) keeps its pre-2a behaviour.
+    fast_keep_is_mode: bool,
     // v1.0.0-rc (queue item 31): `fast.hover_pin` — the Review tile under the pointer, exempt from
     // the eviction below for as long as its card is on screen. See `FastTier::hover_pin`.
     hover_pin: &Cell<Option<usize>>,
@@ -4273,7 +4527,11 @@ pub(crate) fn step_upload_drain(
     // so idle-deepened frames survive a resume instead of being evicted when the window narrows.
     detail: &RefCell<DetailCache>,
     order: &RefCell<VecDeque<usize>>,
-    detail_budget: &Cell<u64>,
+    // 2026-10-26 (round 2a review R2): the bytes the full-resolution cache may RETAIN — the card's
+    // detail budget, or, while the mode's sharp-photo allowance sizes the window (zoomed, or settled
+    // and widening), the smaller of the two. Read by the landing's eviction and the per-tick retention,
+    // so what stays agrees with what the window asked for.
+    det_retain_bytes: u64,
     last_detail_ms: &Cell<u32>,
     last_detail_gpu: &Cell<bool>,
     det_uploading: &Cell<Option<usize>>,
@@ -4317,7 +4575,7 @@ pub(crate) fn step_upload_drain(
     // block is re-evaluated on every tick of the browse. Same shape and the same `-1` sentinel as
     // `FastTier::hover_ask`, one tier down.
     det_awaited: &AtomicI64,
-) {
+) -> usize {
     // H7: compare-at-drain snapshot — used only for an EQUALITY check against the lander's stamp
     // (a mismatch just re-decodes). Relaxed is sound here; the accept-by-stamp Acquire/Release pairing
     // lives on the worker read + the develop-config bumps.
@@ -4330,6 +4588,8 @@ pub(crate) fn step_upload_drain(
     let mut carried = parked_done.borrow_mut().drain(..).collect::<Vec<_>>().into_iter();
     let mut carry_out: Vec<UploadDone> = Vec::new();
     let mut heavy_drained = 0usize;
+    // 2026-10-26 (round 2a re-check R3): previews the mode's limits released at an arrival this tick.
+    let mut mode_released = 0usize;
     loop {
         let done = match carried.next() {
             Some(d) => d,
@@ -4499,58 +4759,13 @@ pub(crate) fn step_upload_drain(
                 // pixels changed — a grow re-decode, a re-orientation), which is exactly what a tile
                 // showing that frame needs to hear.
                 fast_gen.set(fast_gen.get().wrapping_add(1));
-                let mut bytes: u64 =
-                    cache.values().map(|e| e.w as u64 * e.h as u64 * 4).sum();
-                let budget = fast_budget.get();
-                if bytes > budget || cache.len() > FAST_CACHE_MAX {
-                    // Evict WINDOW-AWARE (v0.3.56 churn root-cause), never the on-screen frame.
-                    // The old key — raw |i − c| — deadlocked against the ASYMMETRIC prefetch
-                    // window (105 ahead / 35 behind): after a scrub, the stale behind-trail at
-                    // distance 36–105 was numerically CLOSER than the still-wanted far-ahead edge
-                    // at 76–105, so a full cache evicted the frame just inserted for the window
-                    // edge instead of the trail → insert/evict/re-decode PING-PONG that never
-                    // converged (measured: idle pool pinned at 20–60 dec/s forever; at 39 MB
-                    // frames the destroy firehose behind the idle VRAM OOMs; pf-diag showed
-                    // wanted stuck at the ahead edge for 10+ s). Rank instead by how far OUTSIDE
-                    // the effective window a frame sits (inside = 0), tie-broken by raw distance
-                    // — the trail drains first and the window converges to a stable, idle cache.
-                    let (pa, pb) = eff_win.get();
-                    let outside_then_dist = |i: usize| -> (usize, usize) {
-                        let (dist, allow) = if i >= c { (i - c, pa) } else { (c - i, pb) };
-                        (dist.saturating_sub(allow), dist)
-                    };
-                    let mut idxs: Vec<usize> = cache.keys().copied().collect();
-                    idxs.sort_by_key(|&i| std::cmp::Reverse(outside_then_dist(i)));
-                    // v0.8.183 (W1 rider, AUDIT_2026-08-13 Y1): the on-screen exemption is
-                    // `support::displayed_shot`, the ninth site to use the one spelling — this LRU
-                    // was still asking `i != c`, which in compare protects only the FOCUSED half.
-                    // `outside_then_dist` scores the other half maximally outside the window (`c`
-                    // tracks the focused one, so its twin can sit hundreds of indices away), making
-                    // it the FIRST thing evicted the moment the byte budget binds — and nothing
-                    // re-asks it, because this tier's want set is `lo..=hi` around `c` and
-                    // `displayed()` there is an exemption from the hold, never an addition. It
-                    // self-heals today only because `step_compare_feed` prefers the DETAIL frame,
-                    // which is a property of another tier rather than of this one.
-                    // v1.0.0-rc (queue item 31, §3.C.2): …OR the Review tile the pointer is
-                    // resting on. Its frame was fetched BECAUSE it is outside the window, so
-                    // `outside_then_dist` scores it maximally evictable and the very next
-                    // over-budget insert would take it back — the fetch/evict ping-pong this key
-                    // exists to prevent, arriving through a new door. ONE spelling of the whole
-                    // exemption, here, beside `displayed_shot`; `fast.hover_pin` is `None` whenever
-                    // nothing is shown, so the frame is ordinary again the moment the pointer moves.
-                    // v1.0.0-rc (round X1 / F2): `protected` is built above the cache insert now,
-                    // because the RAM L2 deposit at the end of this arm asks the SAME closure.
-                    for i in idxs {
-                        if bytes <= budget && cache.len() <= FAST_CACHE_MAX {
-                            break;
-                        }
-                        if !protected(i) {
-                            if let Some(e) = cache.remove(&i) {
-                                bytes = bytes.saturating_sub(e.w as u64 * e.h as u64 * 4);
-                            }
-                        }
-                    }
-                }
+                // The byte budget and the mode's count limit, window-aware, never a protected photo
+                // (`evict_fast_window_aware`, the same body the per-tick retention below runs). In a
+                // mode its releases are counted (re-check R3): on a mode-change tick this arrival can
+                // do the whole reduction before the retention runs, which then finds nothing to do.
+                // v1.0.0-rc (round X1 / F2): `protected` is built above the cache insert, because
+                // the RAM L2 deposit at the end of this arm asks the SAME closure.
+                mode_released += evict_at_arrival(&mut cache, c, eff_win.get(), fast_budget.get(), fast_keep_max, &protected, fast_keep_is_mode);
                 // v0.7.7 (RAM L2): park the SOURCE bytes in RAM so this frame never re-decodes.
                 // `rgba` moves in (zero copy); the blur Arc was cloned above. Anchor the symmetric
                 // eviction on the current shot `c`; tag the frame's OWN decode-time bucket (`dim`)
@@ -4601,7 +4816,8 @@ pub(crate) fn step_upload_drain(
                 }
                 // G2 (UI side): jumped away while the texture was in flight → drop, re-requestable
                 // (det_sent was already cleared at dequeue). Never in compare.
-                if !compare.get() && (id as i64 - c as i64).abs() > det_ahead as i64 {
+                // Round 2b (review A1): the window's wider side, as the worker's own check.
+                if !compare.get() && (id as i64 - c as i64).abs() > support::detail_jump_radius(det_ahead, det_behind) as i64 {
                     continue;
                 }
                 if turns != rot.effective(id) {
@@ -4684,9 +4900,6 @@ pub(crate) fn step_upload_drain(
                     let mut order = order.borrow_mut();
                     order.retain(|&x| x != id);
                     order.push_back(id);
-                    let detail_bytes = || -> u64 {
-                        detail.borrow().values().map(|(_, w, h)| *w as u64 * *h as u64 * 4).sum()
-                    };
                     // v0.8.178 (W4 tail 2): the eviction's own "on the screen" list, and it is the
                     // SAME predicate the publish gates and the drain bound ask — clamped. It was a
                     // hand-written unclamped copy, so after a rescan that shortens the folder the
@@ -4698,25 +4911,10 @@ pub(crate) fn step_upload_drain(
                     // E3: the count cap follows the budget CAPACITY (passed in — stable across
                     // idle↔motion), so idle-deepened frames aren't evicted the moment the prefetch
                     // window narrows on resume; the byte budget stays the real VRAM guard.
-                    let _ = det_behind; // (kept for the jump re-check above; cap is capacity-based now)
-                    let cache_cap = det_cache_cap;
-                    while order.len() > cache_cap || detail_bytes() > detail_budget.get() {
-                        let n_protected = order.iter().filter(|&&i| protected(i)).count();
-                        if order.len() <= n_protected {
-                            break; // nothing evictable left (only on-screen frames remain)
-                        }
-                        match order.front().copied() {
-                            Some(front) if protected(front) => {
-                                order.pop_front();
-                                order.push_back(front);
-                            }
-                            Some(front) => {
-                                order.pop_front();
-                                detail.borrow_mut().remove(&front);
-                            }
-                            None => break,
-                        }
-                    }
+                    // 2026-10-26 (round 2a review R2): the byte budget is what the cache may RETAIN in
+                    // the mode in effect (`det_retain_bytes`), not the card's whole budget — the same
+                    // allowance the zoomed and settled windows are sized from.
+                    evict_detail_lru(detail, &mut order, det_cache_cap, det_retain_bytes, &protected);
                 }
                 last_detail_ms.set(ms);
                 last_detail_gpu.set(gpu);
@@ -4836,6 +5034,214 @@ pub(crate) fn step_upload_drain(
     // A plain assignment, not an append: `carried` was drained empty at the top, so anything still
     // owed is in `carry_out` already.
     *parked_done.borrow_mut() = carry_out;
+    // 2026-10-26 (round 2a review R1, R2): …and both caches keep to the mode in effect on a tick with
+    // no landing at all. A mode change narrows them over a cache that is already warm, and no insert
+    // would ever revisit it. Returns every preview the mode's limits released this tick, at an arrival
+    // or here, so the tick can have the panels that are not refreshing let go of them too (re-check R3,
+    // `background_memory::release_after_trim`).
+    let trimmed = step_cache_retention(
+        c, len, compare, cmp_a_idx, cmp_b_idx, hover_pin, awaited, cache, eff_win, fast_budget,
+        fast_keep_max, fast_gen, detail, order, det_cache_cap, det_retain_bytes,
+    );
+    mode_released + trimmed
+}
+
+/// 2026-10-26 (round 2a review R1): how many previews one tick's retention may release. A mode change
+/// from a warm Performance cache can owe a hundred evictions at once (150 → Balanced's 55 or Power
+/// saver's 35); spread over a few ticks they cost nothing a frame can see.
+pub(crate) const FAST_RETENTION_TRIM_PER_TICK: usize = 8;
+
+/// 2026-10-26 (round 2a review R1, R2): **RETENTION WITHOUT AN UPLOAD.** The two evictions used to
+/// run only where a frame lands, so a limit that narrowed over an already warm cache — the mode's
+/// kept window after a switch to Balanced or Power saver, the mode's sharp-photo allowance on the
+/// first zoomed tick — released nothing until something new arrived, which in a settled browse is
+/// never. Called once per tick at the end of `step_upload_drain`, after every landing, with the same
+/// protections as the landings' own evictions: the fast tier's `support::ExplicitSet` (the photo on
+/// screen, both Compare halves, the hovered Review tile, the awaited frame) and the detail tier's
+/// `support::displayed_shot`.
+///
+/// The fast trim fires on the COUNT limit only (the byte budget has always been enforced at the
+/// insert) and releases at most `FAST_RETENTION_TRIM_PER_TICK` previews a tick. The detail trim runs
+/// the landing's own LRU against `det_retain_bytes` and `det_cache_cap`.
+///
+/// **A RELEASED PREVIEW IS ALSO LET GO BY THE PANELS** (re-check R3). The grid, the filmstrip and the
+/// Review panel show a cached preview as the stopgap while a thumbnail is out (`lookup_thumb`), and
+/// each row holds its own handle to that texture. So a trim that released anything bumps `fast_gen`
+/// once, the key every refreshing tile feed rebuilds on (as the X4 sweep and `release_to` do), and
+/// returns the count, which the tick hands to `background_memory::release_after_trim` for the
+/// panels that cannot rebuild: a closed Review panel and a grid hidden by immersive mode.
+///
+/// FALSIFIER (L28): return before the fast trim and
+/// `a_mode_change_trims_a_warm_preview_cache_without_waiting_for_an_upload` keeps all 123 previews;
+/// pass the card budget instead of `det_retain_bytes` to the detail trim and
+/// `the_sharp_photo_cache_keeps_to_the_mode_allowance_and_asks_only_for_what_can_stay` keeps 1.5 GB
+/// in Power saver.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn step_cache_retention(
+    c: usize,
+    len: usize,
+    compare: &Cell<bool>,
+    cmp_a_idx: &Cell<usize>,
+    cmp_b_idx: &Cell<usize>,
+    hover_pin: &Cell<Option<usize>>,
+    awaited: i64,
+    cache: &RefCell<FastCache>,
+    eff_win: &Cell<(usize, usize)>,
+    fast_budget: &Cell<u64>,
+    fast_keep_max: usize,
+    fast_gen: &Cell<u64>,
+    detail: &RefCell<DetailCache>,
+    order: &RefCell<VecDeque<usize>>,
+    det_cache_cap: usize,
+    det_retain_bytes: u64,
+) -> usize {
+    let released = {
+        let mut cache = cache.borrow_mut();
+        if cache.len() > fast_keep_max {
+            let set_ex = support::ExplicitSet::new(
+                c, compare.get(), cmp_a_idx.get(), cmp_b_idx.get(), len, hover_pin.get(),
+                awaited,
+            );
+            evict_fast_window_aware(
+                &mut cache, c, eff_win.get(), fast_budget.get(), fast_keep_max, &|i: usize| set_ex.holds(i),
+                FAST_RETENTION_TRIM_PER_TICK,
+            )
+        } else {
+            0
+        }
+    };
+    // Once for the sweep, not once per eviction (the X4 rule).
+    if released > 0 {
+        fast_gen.set(fast_gen.get().wrapping_add(1));
+    }
+    let mut order = order.borrow_mut();
+    evict_detail_lru(detail, &mut order, det_cache_cap, det_retain_bytes, &|i: usize| {
+        support::displayed_shot(i, c, compare.get(), cmp_a_idx.get(), cmp_b_idx.get(), len)
+    });
+    released
+}
+
+/// 2026-10-26 (round 2a re-check R3): **THE ARRIVAL'S EVICTION, AND HOW MANY OF ITS RELEASES ARE THE
+/// MODE'S.** The arrival in `step_upload_drain` (`UploadDone::Fast`) evicts to the byte budget and the
+/// count limit through `evict_fast_window_aware`. Under a mode's count limit (`keep_is_mode`) every
+/// preview it releases is the mode's to report — on the tick the mode changes, this arrival can take
+/// the cache all the way down before `step_cache_retention` runs, which then reports nothing — so the
+/// count is returned for the drain's total. In Performance it releases the same previews and reports
+/// none, as before round 2a.
+///
+/// FALSIFIER (L28): return 0 here and
+/// `a_mode_trim_is_let_go_by_open_feeds_and_hidden_panels`'s arrival row keeps the hidden rows.
+pub(crate) fn evict_at_arrival(
+    cache: &mut FastCache,
+    c: usize,
+    win: (usize, usize),
+    budget: u64,
+    keep_max: usize,
+    protected: &dyn Fn(usize) -> bool,
+    keep_is_mode: bool,
+) -> usize {
+    let released = evict_fast_window_aware(cache, c, win, budget, keep_max, protected, usize::MAX);
+    if keep_is_mode {
+        released
+    } else {
+        0
+    }
+}
+
+/// **THE FAST CACHE'S WINDOW-AWARE EVICTION** — one body for its two callers, the insert in
+/// `step_upload_drain` (`UploadDone::Fast`) and the per-tick `step_cache_retention`. Evicts until the
+/// cache is within both the byte `budget` and the count limit `keep_max`, never a `protected` photo,
+/// at most `max_evictions` at a time. Returns how many it released.
+///
+/// Evict WINDOW-AWARE (v0.3.56 churn root-cause), never the on-screen frame. The old key — raw
+/// |i − c| — deadlocked against the ASYMMETRIC prefetch window (105 ahead / 35 behind): after a scrub,
+/// the stale behind-trail at distance 36–105 was numerically CLOSER than the still-wanted far-ahead
+/// edge at 76–105, so a full cache evicted the frame just inserted for the window edge instead of the
+/// trail → insert/evict/re-decode PING-PONG that never converged (measured: idle pool pinned at 20–60
+/// dec/s forever; at 39 MB frames the destroy firehose behind the idle VRAM OOMs; pf-diag showed
+/// wanted stuck at the ahead edge for 10+ s). Rank instead by how far OUTSIDE the effective window a
+/// frame sits (inside = 0), tie-broken by raw distance — the trail drains first and the window
+/// converges to a stable, idle cache.
+///
+/// v0.8.183 (W1 rider, AUDIT_2026-08-13 Y1): the on-screen exemption is `support::displayed_shot`,
+/// the ninth site to use the one spelling — this LRU was still asking `i != c`, which in compare
+/// protects only the FOCUSED half. `outside_then_dist` scores the other half maximally outside the
+/// window (`c` tracks the focused one, so its twin can sit hundreds of indices away), making it the
+/// FIRST thing evicted the moment the byte budget binds — and nothing re-asks it, because this tier's
+/// want set is `lo..=hi` around `c` and `displayed()` there is an exemption from the hold, never an
+/// addition. It self-heals today only because `step_compare_feed` prefers the DETAIL frame, which is
+/// a property of another tier rather than of this one.
+/// v1.0.0-rc (queue item 31, §3.C.2): …OR the Review tile the pointer is resting on. Its frame was
+/// fetched BECAUSE it is outside the window, so `outside_then_dist` scores it maximally evictable and
+/// the very next over-budget insert would take it back — the fetch/evict ping-pong this key exists to
+/// prevent, arriving through a new door. ONE spelling of the whole exemption, at the callers, beside
+/// `displayed_shot`; `fast.hover_pin` is `None` whenever nothing is shown, so the frame is ordinary
+/// again the moment the pointer moves.
+pub(crate) fn evict_fast_window_aware(
+    cache: &mut FastCache,
+    c: usize,
+    (pa, pb): (usize, usize),
+    budget: u64,
+    keep_max: usize,
+    protected: &dyn Fn(usize) -> bool,
+    max_evictions: usize,
+) -> usize {
+    let mut bytes: u64 = cache.values().map(|e| e.w as u64 * e.h as u64 * 4).sum();
+    if bytes <= budget && cache.len() <= keep_max {
+        return 0;
+    }
+    let outside_then_dist = |i: usize| -> (usize, usize) {
+        let (dist, allow) = if i >= c { (i - c, pa) } else { (c - i, pb) };
+        (dist.saturating_sub(allow), dist)
+    };
+    let mut idxs: Vec<usize> = cache.keys().copied().collect();
+    idxs.sort_by_key(|&i| std::cmp::Reverse(outside_then_dist(i)));
+    let mut evicted = 0;
+    for i in idxs {
+        if (bytes <= budget && cache.len() <= keep_max) || evicted >= max_evictions {
+            break;
+        }
+        if !protected(i) {
+            if let Some(e) = cache.remove(&i) {
+                bytes = bytes.saturating_sub(e.w as u64 * e.h as u64 * 4);
+                evicted += 1;
+            }
+        }
+    }
+    evicted
+}
+
+/// **THE FULL-RESOLUTION CACHE'S LRU EVICTION** — one body for the landing in `step_upload_drain`
+/// (`UploadDone::Detail`) and the per-tick `step_cache_retention`. Oldest first, until the cache is
+/// within the count cap `cap` and the byte `budget`; a `protected` (on-screen) frame is rotated to the
+/// back instead, and when only protected frames remain the loop stops, so the photo the user is
+/// looking at survives any budget.
+pub(crate) fn evict_detail_lru(
+    detail: &RefCell<DetailCache>,
+    order: &mut VecDeque<usize>,
+    cap: usize,
+    budget: u64,
+    protected: &dyn Fn(usize) -> bool,
+) {
+    let detail_bytes =
+        || -> u64 { detail.borrow().values().map(|(_, w, h)| *w as u64 * *h as u64 * 4).sum() };
+    while order.len() > cap || detail_bytes() > budget {
+        let n_protected = order.iter().filter(|&&i| protected(i)).count();
+        if order.len() <= n_protected {
+            break; // nothing evictable left (only on-screen frames remain)
+        }
+        match order.front().copied() {
+            Some(front) if protected(front) => {
+                order.pop_front();
+                order.push_back(front);
+            }
+            Some(front) => {
+                order.pop_front();
+                detail.borrow_mut().remove(&front);
+            }
+            None => break,
+        }
+    }
 }
 
 /// 3) hand ONE dequeue-validated full-res frame to the UPLOAD THREAD (U1). All the dequeue guards
@@ -4851,7 +5257,8 @@ pub(crate) fn step_upload_detail(
     // want-list build and the drain's bound ask (see the gate below).
     len: usize,
     gen_now: u64,
-    det_ahead: usize,
+    // Round 2b (review A1): the jump-away radius, `support::detail_jump_radius` of the window.
+    det_reach: usize,
     det_rx: &Receiver<Detail>,
     det_epoch: &AtomicU64,
     gpu_ready: bool,
@@ -5013,7 +5420,7 @@ pub(crate) fn step_upload_detail(
         // G2 (UI side): a DECODED result the user jumped away from is discarded before it can
         // occupy the upload slot — else the landed shot's own detail queues behind a string of
         // stale publishes. Same distance rule as the worker; re-requestable.
-        if !compare.get() && (dt.id as i64 - c as i64).abs() > det_ahead as i64 {
+        if !compare.get() && (dt.id as i64 - c as i64).abs() > det_reach as i64 {
             continue;
         }
         if detail.cache.borrow().contains_key(&dt.id) {
@@ -6491,6 +6898,10 @@ pub(crate) fn feed_visible_thumb(
 ) {
     if pending.contains(&idx) {
         send_or_rollback(tx, support::ThumbReq::promote(idx, gen, delta), ReqLane::Thumb, || {});
+        // 2026-10-25 (round 3 step a): the queue's promotion cannot reach a job that has already
+        // left the queue; this raises that one to normal priority, or has it start at normal if
+        // its worker has not registered it yet (`prep_priority`).
+        prep_priority::PREP.promote_thumb(idx, gen, delta);
     } else if pending.len() < limit && pending.insert(idx) {
         send_or_rollback(tx, support::ThumbReq::explicit(idx, gen, delta), ReqLane::Thumb, || { pending.remove(&idx); });
     }
@@ -6547,6 +6958,7 @@ pub(crate) fn step_retire_thumbs(
     }
     if !gone.is_empty() {
         thumb_gen.set(thumb_gen.get().wrapping_add(1));
+        film.losses.set(film.losses.get().wrapping_add(1)); // round 2b (C-02): holes the whole folder refills
     }
     gone.len()
 }
@@ -6732,6 +7144,9 @@ pub(crate) fn step_filmstrip(
     last_film_key: &RefCell<FilmKey>, // v0.8.187 (Y1): slot 1 is `fast_gen` now, not `cache.len()`
     film_model: &slint::VecModel<FilmItem>,
     rot: &RotState, // v0.8.0: the delta each thumb request carries
+    // 2026-10-27 (round 2b): the mode's thumbnails. "Visible only" asks for the cells on screen; the
+    // model keeps its two extra cells each side, so a glide never shows a missing cell.
+    scope: support::ThumbScope,
 ) {
     // v0.8.32 (§64): rebind the three Film fields this fn uses to the locals its body already references, so
     // not one logic line below changes (pure state-move extraction). `&film.failed` deref-coerces to &Mutex.
@@ -6869,6 +7284,12 @@ pub(crate) fn step_filmstrip(
         // before the edges (FIFO order was left-to-right, so a right-of-centre current shot's
         // neighbourhood filled LAST on a cold scroll).
         need_thumb.sort_by_key(|&i| (i as f32 - pos).abs() as i64);
+        // "Visible only" (round 2b): the cells on screen and the one each side that can come on screen
+        // before this model is rebuilt — its key moves with round(pos), so `pos` moves up to a cell
+        // between rebuilds (review C-03).
+        if scope == support::ThumbScope::VisibleOnly {
+            need_thumb.retain(|&i| (i as f32 - pos).abs() <= vis_half + 1.5);
+        }
         let mut tp = thumb_pending.borrow_mut();
         let tfail = thumb_failed.lock().unwrap_or_else(|e| e.into_inner());
         for idx in need_thumb {
@@ -13550,6 +13971,17 @@ pub(crate) fn grid_window(scroll: f32, view_h: f32, vrows: i64, margin: i64) -> 
     (base, live)
 }
 
+/// Whether `step_folder_grid` reaches its key-gated refill: its three early returns, in order —
+/// immersive mode (the dock is unmounted but keeps its open setting), closed or empty, and the
+/// mount tick before the dock's layout solves. A grid that does not refill keeps whatever images
+/// its rows hold, so the background release empties it instead (Codex review R1, 25 October). The
+/// drag-to-compare guard is not a term: a drag's grid is open on screen and refills on the drop.
+/// `tipgeom_tests::a_grid_hidden_by_immersive_mode_lets_go_of_released_previews` drives the step
+/// through each state and checks the two agree.
+pub(crate) fn grid_refills(app: &MainWindow, len: usize) -> bool {
+    !app.get_immersive() && app.get_grid_open() && len > 0 && app.get_grid_vp_h() > 0.0
+}
+
 /// 8c) v0.8.50 (G1): the folder-grid dock — window math + key-gated refill + demand loading.
 /// Runs AFTER step_selection: both feeders contribute to `film.pinned` each tick — the Selection
 /// step REPLACES the set wholesale (or clears it when closed, its v0.8.42 contract, untouched)
@@ -13578,7 +14010,7 @@ pub(crate) fn step_folder_grid(
     sel_gen: &Cell<u64>,
     select: &RefCell<support::SelectSet>, // v0.8.129 (W1-1): see step_filmstrip's note
     select_gen: &Cell<u64>,
-    last_grid_key: &Cell<(i64, usize, usize, u64, u64, u64, u64, u64)>, // v0.8.187 (Y1): slot 3 is `fast_gen` now
+    last_grid_key: &Cell<(i64, usize, usize, u64, u64, u64, u64, u64, (i64, i64))>, // v0.8.187 (Y1): slot 3 is `fast_gen` now; round 2b: slot 8, see the key
     last_grid_view: &Cell<(bool, u64)>, // (was-open, folder gen) — drives the open-edge/swap recenter
     last_grid_c: &Cell<usize>, // v0.8.52 (owner fix 3): the follow-recenter's current-shot memo
     // ── v0.8.178 (W4 tail): WHERE THIS STEP DECLARES A SCROLL IT WROTE ITSELF ────────────────────
@@ -13594,6 +14026,9 @@ pub(crate) fn step_folder_grid(
     grid_vp_prog: &Cell<Option<support::PanelMemo>>,
     grid_model: &slint::VecModel<FilmItem>,
     rot: &RotState,
+    // 2026-10-27 (round 2b): the mode's thumbnails. "Visible only" asks for the rows on screen; the
+    // window keeps its margin rows, so a scroll never shows a missing row.
+    scope: support::ThumbScope,
 ) {
     // Immersive hides the dock but must RESTORE it as-was on exit (the owner rule): return
     // without touching was-open or the scroll mirror — grid-vp-y persists through the unmount
@@ -13691,7 +14126,20 @@ pub(crate) fn step_folder_grid(
     let fgen = fast_gen.get();
     let sgv = sel_gen.get();
     let tgen = thumb_gen.get();
-    let key = (base, count, cols, fgen, sgv, tgen, gen_now, select_gen.get());
+    // Round 2b (re-check V-01): under "Visible only" the key also holds the first and last rows on
+    // screen, unclamped — `base` stops at the folder's two ends, and `count` stops growing once the
+    // window holds the whole folder, so without them a scroll there, or a taller dock over a small
+    // folder (re-check Q-01), brought rows on screen that were never asked for. In the middle of a
+    // large folder they move exactly when `base` does.
+    let on_screen = if scope == support::ThumbScope::VisibleOnly {
+        (
+            ((scroll - GRID_PAD) / GRID_ROW_PITCH).floor() as i64,
+            ((scroll + view_h - GRID_PAD) / GRID_ROW_PITCH).floor() as i64,
+        )
+    } else {
+        (0, 0)
+    };
+    let key = (base, count, cols, fgen, sgv, tgen, gen_now, select_gen.get(), on_screen);
     if !app.get_sel_dragging() && last_grid_key.get() != key {
         last_grid_key.set(key);
         let sel = select.borrow(); // v0.8.129 (W1-1)
@@ -13741,6 +14189,15 @@ pub(crate) fn step_folder_grid(
         need_thumb.sort_by_key(|&i| {
             (GRID_PAD + ((i + leading) / cols) as f32 * GRID_ROW_PITCH + GRID_CELL_H / 2.0 - centre).abs() as i64
         });
+        // "Visible only" (round 2b): the rows on screen and the part-row each side that can scroll on
+        // screen before this window is rebuilt — its key moves once per row pitch of scroll or of
+        // dock height, at the folder's ends too (`on_screen`; review C-03, re-check V-01 and Q-01).
+        if scope == support::ThumbScope::VisibleOnly {
+            need_thumb.retain(|&i| {
+                let top = GRID_PAD + ((i + leading) / cols) as f32 * GRID_ROW_PITCH;
+                top + GRID_CELL_H > scroll - GRID_ROW_PITCH && top < scroll + view_h + GRID_ROW_PITCH
+            });
+        }
         let mut tp = film.pending.borrow_mut();
         let tfail = film.failed.lock().unwrap_or_else(|e| e.into_inner());
         for idx in need_thumb {
@@ -14414,7 +14871,7 @@ pub(crate) fn rotate_invalidate(
     order: &RefCell<VecDeque<usize>>,
     roi_tiles: &RefCell<Vec<RoiTile>>,
     roi_region: &RefCell<Option<RegionState>>,
-    thumb_cache: &RefCell<HashMap<usize, ThumbEntry>>,
+    film: &Film,
     shown: &RefCell<Option<support::ShownRec>>,
     blur_key: &RefCell<BackdropKey>,
 ) {
@@ -14426,7 +14883,11 @@ pub(crate) fn rotate_invalidate(
     if region_stale {
         *roi_region.borrow_mut() = None;
     }
-    thumb_cache.borrow_mut().remove(&idx);
+    // Round 2b (re-check T2): a thumbnail removed here is a loss the whole-folder feeder hears.
+    if film.thumbs.borrow_mut().remove(&idx).is_some() {
+        film.losses.set(film.losses.get().wrapping_add(1));
+    }
+    film.mipless.borrow_mut().remove(&idx);
     *shown.borrow_mut() = None;
     blur_key.borrow_mut().invalidate();
 }
@@ -14444,8 +14905,7 @@ pub(crate) fn rotate_invalidate_all(
     order: &RefCell<VecDeque<usize>>,
     roi_tiles: &RefCell<Vec<RoiTile>>,
     roi_region: &RefCell<Option<RegionState>>,
-    thumb_cache: &RefCell<HashMap<usize, ThumbEntry>>,
-    thumb_pending: &RefCell<HashSet<usize>>,
+    film: &Film,
     thumb_gen: &Cell<u64>,
     shown: &RefCell<Option<support::ShownRec>>,
     blur_key: &RefCell<BackdropKey>,
@@ -14455,8 +14915,10 @@ pub(crate) fn rotate_invalidate_all(
     order.borrow_mut().clear();
     roi_tiles.borrow_mut().clear();
     *roi_region.borrow_mut() = None;
-    thumb_cache.borrow_mut().clear();
-    thumb_pending.borrow_mut().clear();
+    film.thumbs.borrow_mut().clear();
+    film.pending.borrow_mut().clear();
+    film.mipless.borrow_mut().clear();
+    film.losses.set(film.losses.get().wrapping_add(1)); // round 2b (re-check T2): the whole folder refills
     thumb_gen.set(thumb_gen.get().wrapping_add(1)); // strip/grid re-request rotated thumbs
     *shown.borrow_mut() = None;
     blur_key.borrow_mut().invalidate();
@@ -14520,6 +14982,36 @@ mod rotate_invalidate_tests {
         RoiTile { id, u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0, src_long: 100, img: img(), bytes: 4, turns: 1 }
     }
 
+    /// Round 2b (re-check T2): the folder-wide sweep empties the thumbnail cache, a loss the
+    /// whole-folder feeder must hear, or a fully prepared folder would stay empty until the photo
+    /// moved. FALSIFIER: drop the `losses` bump in `rotate_invalidate_all` and the feeder asks for
+    /// nothing after the sweep.
+    #[test]
+    fn the_folder_wide_rotation_sweep_restarts_the_whole_folder_feeder() {
+        let cache: RefCell<FastCache> = RefCell::new(HashMap::new());
+        let detail: RefCell<DetailCache> = RefCell::new(HashMap::new());
+        let order: RefCell<VecDeque<usize>> = RefCell::new(VecDeque::new());
+        let roi_tiles: RefCell<Vec<RoiTile>> = RefCell::new(Vec::new());
+        let roi_region: RefCell<Option<RegionState>> = RefCell::new(None);
+        let shown: RefCell<Option<support::ShownRec>> = RefCell::new(None);
+        let blur_key: RefCell<BackdropKey> = RefCell::new(BackdropKey::default());
+        let film = Film::new();
+        let rot = RotState::new(true);
+        let (tx, rx) = channel::<support::ThumbReq>();
+        let cursor = Cell::new((u64::MAX, 0, 0, 0, 0));
+        for i in 0..5usize {
+            film.thumbs.borrow_mut().insert(i, (img(), 0));
+        }
+        step_whole_folder_thumbs(2, 5, &[], &HashSet::new(), &film, &tx, 1, &rot, 5, &cursor);
+        assert!(rx.try_recv().is_err(), "a prepared folder asks for nothing");
+        let gen = Cell::new(0u64);
+        rotate_invalidate_all(&cache, &detail, &order, &roi_tiles, &roi_region, &film, &gen, &shown, &blur_key);
+        assert!(film.thumbs.borrow().is_empty(), "the sweep empties the thumbnails");
+        step_whole_folder_thumbs(2, 5, &[], &HashSet::new(), &film, &tx, 1, &rot, 5, &cursor);
+        let again: Vec<usize> = std::iter::from_fn(|| rx.try_recv().ok().map(|r| r.idx)).collect();
+        assert_eq!(again, vec![2, 1, 3, 0, 4], "…and restarts the whole-folder feeder from the photo");
+    }
+
     /// The eviction contract: idx's entries leave EVERY rotation-baked store; other ids survive;
     /// `shown`/`blur_key` reset so the stage re-presents and the backdrop rebuilds.
     #[test]
@@ -14536,7 +15028,8 @@ mod rotate_invalidate_tests {
         let roi_region: RefCell<Option<RegionState>> = RefCell::new(Some(RegionState {
             id: 3, u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0, src_long: 100,
         }));
-        let thumbs: RefCell<HashMap<usize, ThumbEntry>> = RefCell::new(HashMap::new());
+        let film = Film::new();
+        let thumbs = &film.thumbs;
         thumbs.borrow_mut().insert(3, (img(), 1));
         thumbs.borrow_mut().insert(4, (img(), 1));
         let shown: RefCell<Option<support::ShownRec>> = RefCell::new(Some((3, true, 4)));
@@ -14547,7 +15040,7 @@ mod rotate_invalidate_tests {
             RefCell::new(BackdropKey { shown: Some(k), pending: Some(k) });
 
         rotate_invalidate(
-            3, &cache, &detail, &order, &roi_tiles, &roi_region, &thumbs, &shown, &blur_key,
+            3, &cache, &detail, &order, &roi_tiles, &roi_region, &film, &shown, &blur_key,
         );
 
         assert!(!cache.borrow().contains_key(&3) && cache.borrow().contains_key(&4));
@@ -14557,6 +15050,7 @@ mod rotate_invalidate_tests {
         assert_eq!(roi_tiles.borrow().len(), 1);
         assert!(roi_region.borrow().is_none(), "the shown-region latch for idx resets");
         assert!(!thumbs.borrow().contains_key(&3) && thumbs.borrow().contains_key(&4));
+        assert_eq!(film.losses.get(), 1, "a removed thumbnail is a loss the whole-folder feeder hears (round 2b)");
         assert!(shown.borrow().is_none(), "forces a re-present (a 180 flip keeps dims)");
         // v0.8.128 (SEL-LAG P1): BOTH halves. The pending one is the load-bearing addition — a 180
         // rotate leaves `BlurKey` identical, so a canvas still in flight would otherwise land, be
@@ -14584,11 +15078,11 @@ mod rotate_invalidate_tests {
         let roi_region: RefCell<Option<RegionState>> = RefCell::new(Some(RegionState {
             id: 9, u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0, src_long: 100,
         }));
-        let thumbs: RefCell<HashMap<usize, ThumbEntry>> = RefCell::new(HashMap::new());
+        let film = Film::new();
         let shown: RefCell<Option<support::ShownRec>> = RefCell::new(Some((9, false, 4)));
         let blur_key: RefCell<BackdropKey> = RefCell::new(BackdropKey::default());
         rotate_invalidate(
-            5, &cache, &detail, &order, &roi_tiles, &roi_region, &thumbs, &shown, &blur_key,
+            5, &cache, &detail, &order, &roi_tiles, &roi_region, &film, &shown, &blur_key,
         );
         assert!(roi_region.borrow().is_some(), "another shot's region latch survives");
         assert_eq!(roi_tiles.borrow().len(), 1, "another shot's tiles survive");
@@ -14826,6 +15320,9 @@ mod pool_posture_enqueue_tests {
         compare: Cell<bool>,
         cmp_a: Cell<usize>,
         cmp_b: Cell<usize>,
+        // Round 2b review R2: the momentum split the step is handed (0.67, the resting forward lean,
+        // unless a row browses backward).
+        split: Cell<f32>,
     }
 
     impl Rig {
@@ -14854,6 +15351,7 @@ mod pool_posture_enqueue_tests {
                 compare: Cell::new(false),
                 cmp_a: Cell::new(0),
                 cmp_b: Cell::new(0),
+                split: Cell::new(0.67),
             }
         }
 
@@ -14957,6 +15455,50 @@ mod pool_posture_enqueue_tests {
             ram_l2: bool,
             efficiency: bool,
         ) -> Vec<usize> {
+            self.tick_mode_full(
+                c, shots, cost, cap, interactive_busy, derive_c, settings_throttle, lane_cap,
+                fast_hold, ram_l2,
+                // v0.8.196 (WAVE 2): the bool becomes the whole derivation. Round 2a: `true` is
+                // Power saver (Efficiency mode's arithmetic) on its DEFAULT arm on an 18-worker box —
+                // the honest answer for a rig that has decoded nothing and benchmarked nothing: N=8,
+                // ahead=12, behind=3, ceiling 12, the kept window 24 + 6. `false` is Performance.
+                support::mode_limits(
+                    if efficiency { support::MODE_POWER_SAVER } else { support::MODE_PERFORMANCE },
+                    support::CustomLimits::BALANCED_COPY,
+                    None, 18, 30.0, None, None, None,
+                ),
+            )
+        }
+
+        /// 2026-10-26 (round 2a): one tick in a given mode's limits, with the other terms at their
+        /// defaults (no derive, no throttle, no lane cap, no hold, no RAM L2).
+        fn tick_mode(
+            &self,
+            c: usize,
+            shots: &[Shot],
+            cost: support::FastCostView,
+            cap: usize,
+            interactive_busy: bool,
+            limits: support::EfficiencyLimits,
+        ) -> Vec<usize> {
+            self.tick_mode_full(c, shots, cost, cap, interactive_busy, false, false, None, false, false, limits)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn tick_mode_full(
+            &self,
+            c: usize,
+            shots: &[Shot],
+            cost: support::FastCostView,
+            cap: usize,
+            interactive_busy: bool,
+            derive_c: bool,
+            settings_throttle: bool,
+            lane_cap: Option<usize>,
+            fast_hold: bool,
+            ram_l2: bool,
+            limits: support::EfficiencyLimits,
+        ) -> Vec<usize> {
             // v0.8.117 (F12): seeded false every tick, exactly as the production call site does —
             // the step only writes it when it actually classifies `c`.
             self.c_serves.set(false);
@@ -14968,14 +15510,10 @@ mod pool_posture_enqueue_tests {
                 // the production call site hands them over. v0.8.157's rig pre-composed them with
                 // `admission_cap` — mirroring the defect, which is why ROW 14 could not see it.
                 cap, &self.cap_eff, settings_throttle, lane_cap,
-                0.67,
+                self.split.get(),
                 1, &self.l2, ram_l2, 2048, &self.gamut, &self.sup, &self.tx, &self.hits,
                 false, interactive_busy, derive_c, &self.c_serves, &self.rot, fast_hold,
-                // v0.8.196 (WAVE 2): the bool becomes the whole derivation. `true` maps to the
-                // DEFAULT arm on an 18-worker box — the honest answer for a rig that has decoded
-                // nothing and benchmarked nothing — so an engaged rig tick runs the same numbers a
-                // freshly-launched laptop's first second does: N=8, ahead=18, behind=6, ceiling 12.
-                support::efficiency_limits(efficiency, None, 18, 30.0, None, None),
+                limits,
             );
             let p = self.fast.pump.0.lock().unwrap();
             p.queue.iter().copied().collect()
@@ -15051,6 +15589,313 @@ mod pool_posture_enqueue_tests {
     /// its lane prior — the only thing the cap consults — is unchanged.
     fn relaxed_view() -> support::FastCostView {
         support::FastCostView::for_test(support::FastCostView::bit_of(SrcKind::Heic), 0, false)
+    }
+
+    /// 2026-10-26 (round 2a) — plan test 8 (L29): **POWER SAVER KEEPS 24 AHEAD AND 6 BEHIND — BELOW
+    /// THE OLD 22 + 8 MINIMUM — AND THE SCHEDULER RUNS THERE**, tick after tick of a forward browse,
+    /// every admission inside the kept window and inside the decode reach, a capful at a time.
+    ///
+    /// FALSIFIER (L28): drop `mode_window` from the step and the window reads the 95 + 47 a card this
+    /// size keeps in Performance; bound the lead side regardless of direction and the backward row of
+    /// `mode_window` reddens.
+    #[test]
+    fn power_saver_keeps_24_ahead_6_behind_and_the_scheduler_runs_there() {
+        let shots: Vec<Shot> = (0..200).map(jpeg).collect();
+        let cap = support::costly_prefetch_cap(18);
+        let ps = support::mode_limits(support::MODE_POWER_SAVER, support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None);
+        let rig = Rig::new();
+        let mut dispatched = HashSet::new();
+        for c in 100..110usize {
+            let q = rig.tick_mode(c, &shots, costly_view(), cap, false, ps);
+            assert_eq!(rig.eff_win.get(), (24, 6), "c={c}: the kept window is 24 + 6, below the old 8 behind");
+            assert!(q.contains(&c), "c={c}: the displayed photo is always served");
+            assert!(q.len() <= ps.concurrency + 1, "c={c}: a capful at a time: {q:?}");
+            for &i in q.iter().filter(|&&i| i != c) {
+                assert!(i <= c + ps.ahead && i + ps.behind >= c, "c={c}: {i} is inside the decode reach");
+                assert!(i <= c + 24 && i + 6 >= c, "c={c}: {i} is inside the kept window");
+            }
+            dispatched.extend(q.iter().copied());
+            // The pool takes the capful and finishes it, so the next tick has a budget again.
+            rig.pop_all();
+            let mut p = rig.fast.pump.0.lock().unwrap();
+            p.inflight.clear();
+            p.costly_inflight.clear();
+        }
+        assert!(dispatched.len() > ps.concurrency + 1, "the scheduler kept running: {dispatched:?}");
+        assert!(
+            dispatched.iter().max().copied().unwrap_or(0) > 100 + ps.ahead,
+            "…and its reach moved with the browse: {dispatched:?}"
+        );
+        // Browsing backward, the lead is behind (the split leans the other way).
+        assert_eq!(support::mode_window((95, 47), 0.3, ps), (6, 24));
+        // Performance through the same rig keeps the card's own window.
+        let perf = Rig::new();
+        let _ = perf.tick_mode(100, &shots, costly_view(), cap, false, support::EfficiencyLimits::RELEASED);
+        assert_eq!(perf.eff_win.get(), (95, 47), "Turbo is untouched");
+        // Balanced keeps about two seconds at its 20/s.
+        let bal = Rig::new();
+        let b = support::mode_limits(support::MODE_BALANCED, support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None);
+        let _ = bal.tick_mode(100, &shots, costly_view(), cap, false, b);
+        assert_eq!(bal.eff_win.get(), (40, 10));
+    }
+
+    /// Round 2b review R2 (Codex): **CUSTOM UNLIMITED PREPARES ITS WHOLE KEPT WINDOW IN EITHER
+    /// DIRECTION.** 40 ahead and 10 behind, cheap JPEGs, nothing cached, an ample card. Browsing
+    /// backward the kept window is 10 photos up and 40 down (60–110 at photo 100); forward it is
+    /// 90–140. Each tick the pool takes the capful and finishes it (the frames enter the cache), so a
+    /// range that excludes photos and a work cap that only delays them are told apart: every photo of
+    /// the kept window is prepared in time, and none outside it.
+    ///
+    /// FALSIFIER (L28): drop the direction from `support::efficiency_runway_window` (the lead always on
+    /// the increasing side) and 60–89 are never asked for browsing backward.
+    #[test]
+    fn custom_unlimited_prepares_its_kept_window_in_either_direction() {
+        let shots: Vec<Shot> = (0..200).map(jpeg).collect();
+        let cap = support::costly_prefetch_cap(18);
+        let custom = support::CustomLimits {
+            fps: support::CUSTOM_FPS_UNLIMITED,
+            previews: (40, 10),
+            ..support::CustomLimits::BALANCED_COPY
+        };
+        let un = support::mode_limits(support::MODE_CUSTOM, custom, None, 18, 30.0, None, None, None);
+        assert!(un.engaged && !un.ceiling_fps.is_finite(), "Unlimited: {un:?}");
+        let entry = || FastEntry {
+            img: slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(1, 1)),
+            w: 4,
+            h: 3,
+            blur: Arc::from(vec![0u8; 4].into_boxed_slice()),
+            bw: 1,
+            bh: 1,
+            dim: 2048,
+            turns: 0,
+        };
+        for (split, kept, lo, hi) in [(0.3f32, (10usize, 40usize), 60usize, 110usize), (0.67, (40, 10), 90, 140)] {
+            let rig = Rig::new();
+            rig.split.set(split);
+            let mut prepared = HashSet::new();
+            for _ in 0..40 {
+                let q = rig.tick_mode(100, &shots, costly_view(), cap, false, un);
+                assert_eq!(rig.eff_win.get(), kept, "split {split}: the kept window");
+                rig.pop_all();
+                {
+                    let mut p = rig.fast.pump.0.lock().unwrap();
+                    p.inflight.clear();
+                    p.costly_inflight.clear();
+                }
+                for &i in &q {
+                    rig.fast.cache.borrow_mut().insert(i, entry());
+                    prepared.insert(i);
+                }
+            }
+            let want: HashSet<usize> = (lo..=hi).collect();
+            let mut missing: Vec<usize> = want.difference(&prepared).copied().collect();
+            missing.sort_unstable();
+            assert!(missing.is_empty(), "split {split}: never prepared: {missing:?}");
+            assert!(prepared.is_subset(&want), "split {split}: nothing outside the kept window: {prepared:?}");
+        }
+    }
+
+    /// 2026-10-26 (round 2a review R1): **A MODE CHANGE TRIMS A WARM PREVIEW CACHE WITHOUT WAITING FOR
+    /// AN UPLOAD.** A Performance cache full of previews, a switch to Balanced or Power saver, and a
+    /// settled browse whose window is already cached: no frame lands, so the insert's eviction never
+    /// runs. The per-tick retention (`step_cache_retention`, at the end of `step_upload_drain`) brings
+    /// the cache to the mode's count, keeps the window, and never takes the photo on screen, the far
+    /// Compare half, the hovered Review tile or the awaited frame.
+    ///
+    /// FALSIFIER (L28): see `step_cache_retention`; drop its call from `step_upload_drain` and the
+    /// census row reddens.
+    #[test]
+    fn a_mode_change_trims_a_warm_preview_cache_without_waiting_for_an_upload() {
+        let entry = || FastEntry {
+            img: slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(1, 1)),
+            w: 4,
+            h: 3,
+            blur: Arc::from(vec![0u8; 4].into_boxed_slice()),
+            bw: 1,
+            bh: 1,
+            dim: 2048,
+            turns: 0,
+        };
+        let (c, len) = (100usize, 400usize);
+        // A warm Performance cache around the photo on screen, plus the three photos no eviction may
+        // take: the far Compare half (300), the hovered Review tile (5) and the awaited frame (250).
+        let warm = || {
+            let cache = RefCell::new(FastCache::new());
+            for i in (41..=160).chain([5, 250, 300]) {
+                cache.borrow_mut().insert(i, entry());
+            }
+            cache
+        };
+        let compare = Cell::new(true);
+        let (cmp_a, cmp_b) = (Cell::new(c), Cell::new(300usize));
+        let hover = Cell::new(Some(5usize));
+        let awaited = 250i64;
+        let detail = RefCell::new(DetailCache::new());
+        let order = RefCell::new(VecDeque::new());
+        let fast_gen = Cell::new(0u64);
+        let tick = |cache: &RefCell<FastCache>, win: (usize, usize), keep: usize| {
+            step_cache_retention(
+                c, len, &compare, &cmp_a, &cmp_b, &hover, awaited, cache, &Cell::new(win),
+                &Cell::new(u64::MAX), keep, &fast_gen, &detail, &order, 6, u64::MAX,
+            );
+        };
+        for mode in [support::MODE_BALANCED, support::MODE_POWER_SAVER] {
+            let limits = support::mode_limits(mode, support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None);
+            let win = support::mode_window((95, 47), 0.75, limits);
+            let keep = limits.keep_count().expect("a limited mode keeps a count");
+            let cache = warm();
+            assert_eq!(cache.borrow().len(), 123);
+            // One tick releases a few; the following ticks finish the job and then settle.
+            tick(&cache, win, keep);
+            assert_eq!(cache.borrow().len(), 123 - FAST_RETENTION_TRIM_PER_TICK, "mode {mode}: a few a tick");
+            for _ in 0..64 {
+                tick(&cache, win, keep);
+            }
+            let cache = cache.borrow();
+            assert_eq!(cache.len(), keep, "mode {mode}: the cache is the mode's count, window {win:?}");
+            for i in [c, 300, 5, 250] {
+                assert!(cache.contains_key(&i), "mode {mode}: {i} is protected");
+            }
+            for i in c - win.1..=c + win.0 {
+                assert!(cache.contains_key(&i), "mode {mode}: {i} is inside the kept window and stays");
+            }
+        }
+        // Performance keeps its own count limit: a warm cache under it loses nothing.
+        let cache = warm();
+        for _ in 0..8 {
+            tick(&cache, (95, 47), 150);
+        }
+        assert_eq!(cache.borrow().len(), 123, "Turbo releases nothing");
+        // The drain runs it once per tick, after every landing, and the insert shares its eviction.
+        let src = std::fs::read_to_string(format!("{}/src/tick.rs", env!("CARGO_MANIFEST_DIR"))).unwrap().replace('\r', "");
+        let call = "\n    let trimmed = step_cache_retention(\n        c, len, compare, cmp_a_idx, cmp_b_idx, hover_pin, awaited, cache, eff_win, fast_budget,\n        fast_keep_max, fast_gen, detail, order, det_cache_cap, det_retain_bytes,\n    );\n    mode_released + trimmed\n}\n";
+        assert_eq!(src.matches(call).count(), 1, "one call, the last statement of the drain, with the drain's own limits");
+        // (`concat!` keeps this needle from matching its own source line.)
+        let insert = concat!("mode_released += evict_at_arrival(&mut cache, c, eff_win.get(), ", "fast_budget.get(), fast_keep_max, &prot", "ected, fast_keep_is_mode);");
+        assert_eq!(src.matches(insert).count(), 1, "the insert's eviction is the same body");
+    }
+
+    /// 2026-10-26 (round 2a review R2): **THE SHARP-PHOTO CACHE KEEPS TO THE MODE'S ALLOWANCE, AND
+    /// ASKS ONLY FOR WHAT CAN STAY.** Six 8000 × 8000 frames are 1.536 GB, within the six-entry count
+    /// cap and an ordinary 4 GB card budget, but over Power saver's 1 GiB. While zoomed, the cache
+    /// retains to the allowance (oldest first, the photo on screen always kept), the zoomed window and
+    /// the want-list ceiling are sized from the same number, and the ordinary unzoomed 3 + 1 keeps
+    /// the card's own budget.
+    ///
+    /// FALSIFIER (L28): see `step_cache_retention`; compute `det_retain_bytes` from the card budget
+    /// alone in `main.rs`, or size `detail_wanted_cap` from it, and the census rows redden.
+    #[test]
+    fn the_sharp_photo_cache_keeps_to_the_mode_allowance_and_asks_only_for_what_can_stay() {
+        let seed = |dims: &[(usize, u32, u32)]| {
+            let detail = RefCell::new(DetailCache::new());
+            let order = RefCell::new(VecDeque::new());
+            for &(i, w, h) in dims {
+                let img = slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(1, 1));
+                detail.borrow_mut().insert(i, (img, w, h));
+                order.borrow_mut().push_back(i);
+            }
+            (detail, order)
+        };
+        let bytes = |d: &RefCell<DetailCache>| -> u64 {
+            d.borrow().values().map(|(_, w, h)| *w as u64 * *h as u64 * 4).sum()
+        };
+        let kept = |o: &RefCell<VecDeque<usize>>| o.borrow().iter().copied().collect::<Vec<_>>();
+        let fast = RefCell::new(FastCache::new());
+        let fast_gen = Cell::new(0u64);
+        let run = |c: usize, cmp: Option<(usize, usize)>, d: &RefCell<DetailCache>, o: &RefCell<VecDeque<usize>>, retain: u64| {
+            let (a, b) = cmp.unwrap_or((c, c));
+            step_cache_retention(
+                c, 400, &Cell::new(cmp.is_some()), &Cell::new(a), &Cell::new(b), &Cell::new(None), -1, &fast,
+                &Cell::new((3, 1)), &Cell::new(u64::MAX), 150, &fast_gen, d, o, 6, retain,
+            );
+        };
+        let card = 4_000_000_000u64;
+        let ps = support::mode_limits(support::MODE_POWER_SAVER, support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None);
+        let bal = support::mode_limits(support::MODE_BALANCED, support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None);
+        let ps_retain = card.min(ps.detail_bytes_max);
+        // Codex's case: six 8000 × 8000 frames, the photo on screen (15) the newest.
+        let six: Vec<(usize, u32, u32)> = (10..16).map(|i| (i, 8000, 8000)).collect();
+        let (d, o) = seed(&six);
+        assert_eq!(bytes(&d), 1_536_000_000);
+        run(15, None, &d, &o, ps_retain);
+        assert!(bytes(&d) <= ps.detail_bytes_max, "within Eco's allowance: {}", bytes(&d));
+        assert_eq!(kept(&o), vec![12, 13, 14, 15], "the oldest go first; the photo on screen stays");
+        // Mixed sizes: still within the allowance, the photo on screen kept.
+        let (d, o) = seed(&[(20, 8000, 8000), (21, 6000, 4000), (22, 8192, 5464), (23, 8000, 8000), (24, 4000, 3000), (25, 8000, 8000)]);
+        assert!(bytes(&d) > ps.detail_bytes_max);
+        run(25, None, &d, &o, ps_retain);
+        assert!(bytes(&d) <= ps.detail_bytes_max, "{}", bytes(&d));
+        assert_eq!(kept(&o), vec![21, 22, 23, 24, 25], "one 8000 x 8000 goes, the rest fit");
+        // Balanced's 2 GiB holds all six.
+        let (d, o) = seed(&six);
+        run(15, None, &d, &o, card.min(bal.detail_bytes_max));
+        assert_eq!(kept(&o).len(), 6, "Balanced keeps them");
+        // Unzoomed, the ordinary 3 + 1 keeps the card's own budget, as before round 2a.
+        let (d, o) = seed(&six);
+        run(15, None, &d, &o, card);
+        assert_eq!(kept(&o).len(), 6, "the card budget, not the mode's allowance");
+        // The one exception: the photos on screen stay even past the allowance.
+        let (d, o) = seed(&[(50, 16000, 10000), (51, 16000, 10000), (52, 8000, 8000)]);
+        run(50, Some((50, 51)), &d, &o, ps_retain);
+        assert_eq!(kept(&o), vec![50, 51], "both Compare halves stay; the neighbour goes");
+        // What the window asks for is what can stay: the zoomed window and the want-list ceiling come
+        // from the same allowance.
+        let est = 8000u64 * 8000 * 4;
+        let wide = zoomed_detail_ahead(ps_retain, est);
+        let (ahead, behind) = support::mode_detail_window(wide, if wide >= 4 { 2 } else { 1 }, ps);
+        assert!((ahead + behind + 1) as u64 * est <= ps_retain, "{ahead} + {behind}");
+        assert!(support::detail_wanted_cap(ps_retain, est, 6, false) as u64 * est <= ps_retain);
+        // The tick computes the retained budget from that allowance and spends it in all three places.
+        let main = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        assert_eq!(main.matches("let det_retain_bytes = if zoomed || idle_deepen {").count(), 1);
+        assert_eq!(main.matches("detail_budget_t.get().min(limits.detail_bytes_max)").count(), 2, "the window and the retention");
+        assert_eq!(main.matches("det_retain_bytes, est_frame, det_cache_cap, compare_t.get(),").count(), 1, "the want-list ceiling");
+        assert_eq!(main.matches("&detail_t.order,\n            det_retain_bytes,").count()
+            + main.matches("&detail_t.order,\r\n            det_retain_bytes,").count(), 1, "the drain");
+        let tick = std::fs::read_to_string(format!("{}/src/tick.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let landing = concat!("evict_detail_lru(detail, &mut order, ", "det_cache_cap, det_retain_bytes, &protected);");
+        assert_eq!(tick.matches(landing).count(), 1, "the landing's eviction keeps to the same budget");
+    }
+
+    /// 2026-10-26 (round 2a): **BALANCED RATIONS A CHEAP FOLDER WITHOUT PAUSING; POWER SAVER STILL
+    /// PAUSES; A FOLDER PERFORMANCE PAUSES FOR PAUSES IN BALANCED TOO, AND KEEPS ITS CAP.**
+    ///
+    /// The pause (`interactive_busy`: the on-screen photo's full-resolution decode is pending) zeroes
+    /// the capped budget. Balanced caps every speculative frame to size its decodes to its speed, and
+    /// Balanced is the default: pausing all of them while the user steps through JPEGs would make the
+    /// default browse worse than Performance's. "Limits only take away" holds the other two rows.
+    ///
+    /// FALSIFIER (L28): drop the `!eff.quiet` / `any_base` terms from `pause` (pause every limited
+    /// mode) and the first row reddens; drop `|| any_base` from the cap and the costly row admits
+    /// Balanced's 14 instead of the shipped 4.
+    #[test]
+    fn balanced_rations_a_cheap_folder_without_pausing_and_power_saver_still_pauses() {
+        let jpegs: Vec<Shot> = (0..200).map(jpeg).collect();
+        let heics: Vec<Shot> = (0..200).map(heic).collect();
+        let cap = support::costly_prefetch_cap(18);
+        let at = |mode: u8, ms: f32| support::mode_limits(mode, support::CustomLimits::BALANCED_COPY, Some(ms), 18, 30.0, None, None, None);
+        let bal = at(support::MODE_BALANCED, 100.0);
+        let q = Rig::new().tick_mode(100, &jpegs, costly_view(), cap, true, bal);
+        assert_eq!(q.len(), bal.concurrency + 1, "Balanced keeps preparing ahead while the full-res is pending: {q:?}");
+        let q = Rig::new().tick_mode(100, &jpegs, costly_view(), cap, true, at(support::MODE_POWER_SAVER, 100.0));
+        assert_eq!(q, vec![100], "Eco pauses, as Efficiency mode did");
+        // A costly folder: Performance pauses, and so does Balanced.
+        let q = Rig::new().tick_mode(100, &heics, costly_view(), cap, true, bal);
+        assert_eq!(q, vec![100], "Balanced pauses wherever Turbo does");
+        // …and never spends more than Performance's cap there, however slow the folder.
+        let slow = at(support::MODE_BALANCED, 900.0);
+        assert!(slow.concurrency > cap, "premise: Balanced's own number is above the shipped cap");
+        let q = Rig::new().tick_mode(100, &heics, costly_view(), cap, false, slow);
+        assert_eq!(q.len(), cap + 1, "the shipped costly cap stands: {q:?}");
+        let perf = Rig::new().tick_mode(100, &heics, costly_view(), cap, false, support::EfficiencyLimits::RELEASED);
+        assert_eq!(q.len(), perf.len(), "…exactly Turbo's");
+        // …and the Settings-open throttle (which caps every format in Performance) keeps that cap too.
+        let q = Rig::new().tick_mode_full(100, &jpegs, costly_view(), cap, false, false, true, None, false, false, slow);
+        assert_eq!(q.len(), cap + 1, "Settings open: Turbo's cap, never Balanced's 14: {q:?}");
+        let perf = Rig::new().tick_posture(100, &jpegs, costly_view(), cap, false, false, true, None);
+        assert_eq!(q.len(), perf.len());
+        // Balanced does NOT hold the stale-upgrade sweep (Power saver's cut).
+        assert!(!bal.quiet);
     }
 
     /// ROW 1 — THE BUDGET HONOURS THE COUNTER, and the counter is a fact about the pool rather than a
@@ -15932,8 +16777,14 @@ mod pool_posture_enqueue_tests {
     /// FALSIFIER (L28), ALL THREE RUN, one per assert: re-inline the predicate at the VRAM
     /// eviction (`support::fast_evict_protected(i, c, …)`) and the FIRST assert reddens with
     /// `left: 1 right: 0`; build a second `ExplicitSet` at the L2 deposit instead of sharing the
-    /// closure and the SECOND reads `left: 2 right: 1`; pass `&|_| false` to the deposit — F2
-    /// backwards — and the THIRD reads `left: 0 right: 1`.
+    /// closure and the SECOND reads `left: 3 right: 2`; pass `&|_| false` to the deposit — F2
+    /// backwards — and the THIRD reads `left: 1 right: 2`.
+    ///
+    /// 2026-10-26 (round 2a review R1): the VRAM eviction moved into `evict_fast_window_aware`,
+    /// which the drain's arm hands the same `protected` closure (so two hand-offs now, one per
+    /// eviction of the arm), and `step_cache_retention` runs that eviction once per tick with its
+    /// own set — a second step that owns a fast eviction. The second assert now also checks that
+    /// both constructions take the same seven terms, so the two sets cannot drift apart.
     #[test]
     fn the_two_evictions_ask_one_protection() {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tick.rs"))
@@ -15949,14 +16800,24 @@ mod pool_posture_enqueue_tests {
         let built = format!("ExplicitSet::{}(", "new");
         assert_eq!(
             code.iter().filter(|l| l.contains(&built)).count(),
-            1,
-            "ONE construction per step that owns an eviction, and this file's step owns two"
+            2,
+            "ONE construction per step that owns a fast eviction: the drain's arrival (its VRAM and \
+             RAM evictions share it) and the per-tick retention"
         );
+        let terms = format!(
+            "ExplicitSet::{}( c, compare.get(), cmp_a_idx.get(), cmp_b_idx.get(), len, hover_pin.get(), awaited, );",
+            "new"
+        );
+        for (i, l) in code.iter().enumerate().filter(|(_, l)| l.contains(&built)) {
+            let window = code[i..(i + 4).min(code.len())].join(" ");
+            let window = window.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(window.contains(&terms), "both sets take the same seven terms: {l}");
+        }
         let handed = format!("&{},", "protected");
         assert_eq!(
             code.iter().filter(|l| l.contains(&handed)).count(),
-            1,
-            "…and the RAM deposit is handed that same closure, not a second answer"
+            2,
+            "…and the VRAM eviction and the RAM deposit are handed that same closure, not a second answer"
         );
     }
 
@@ -16429,10 +17290,10 @@ mod pool_posture_enqueue_tests {
     /// ── v0.8.196 (WAVE 2, §A): THE TWO NUMBERS THIS ROW PINNED ARE NO LONGER CONSTANTS. ───────
     /// The membership rule is unchanged and is still what this row is about; what changed is WHICH
     /// cap and WHICH runway the members then spend. Engaged, both come from
-    /// `support::efficiency_limits` — here through the rig's `tick_eff`, which drives the DEFAULT
+    /// `support::mode_limits` (Power saver since round 2a) — here through the rig's `tick_eff`, which drives the DEFAULT
     /// arm on an 18-worker box (nothing decoded, nothing benchmarked: N=8, ahead=18, behind=6,
     /// ceiling 12), i.e. exactly what a freshly-launched laptop's first second runs. The row asserts
-    /// against `support::efficiency_limits(...)` itself rather than against literals, so the wave's
+    /// against `support::mode_limits(...)` itself rather than against literals, so the wave's
     /// arithmetic and its wiring cannot drift apart without this reddening.
     ///
     /// FALSIFIER (L28): delete either `|| efficiency` term and the matching block reddens; latch the
@@ -16445,7 +17306,7 @@ mod pool_posture_enqueue_tests {
         let shots: Vec<Shot> = (0..200).map(jpeg).collect();
         let cap = support::costly_prefetch_cap(18);
         // The posture the rig's engaged tick derives — the SAME expression `tick_eff` hands the step.
-        let lim = support::efficiency_limits(true, None, 18, 30.0, None, None);
+        let lim = support::mode_limits(support::MODE_POWER_SAVER, support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None);
 
         // RELEASED — v0.8.194, byte for byte: a JPEG folder banks its whole window at full depth.
         let rig = Rig::new();
@@ -16489,12 +17350,15 @@ mod pool_posture_enqueue_tests {
             (lim.ahead, lim.behind),
             "the meter measures against what the app is trying for, which is the POSTURE's runway now"
         );
+        // Round 2a: Power saver keeps its own 24 + 6 (owner ruling), and no narrower — the DECODE
+        // runway inside it is narrower still.
         assert_eq!(
             rig.eff_win.get(),
-            released_win,
-            "the RETENTION window is untouched: the posture narrows the DECODE runway, and evicting \
-             what is already banked would make a step backwards pay for a frame the app just threw away"
+            support::mode_window(released_win, 0.67, lim),
+            "the RETENTION window is Power saver's kept window and no narrower: evicting what it holds \
+             would make a step backwards pay for a frame the app just threw away"
         );
+        assert_eq!(rig.eff_win.get(), (24, 6));
 
         // RELEASED AGAIN on the same rig, with the capful still in flight: the whole window is back
         // on the very next tick. No hysteresis, no latch — re-plugging is one tick, as L43 requires.
@@ -16545,7 +17409,7 @@ mod pool_posture_enqueue_tests {
         let heics: Vec<Shot> = (0..200).map(heic).collect();
         let jpegs: Vec<Shot> = (0..200).map(jpeg).collect();
         let cap = support::costly_prefetch_cap(18);
-        let lim = support::efficiency_limits(true, None, 18, 30.0, None, None);
+        let lim = support::mode_limits(support::MODE_POWER_SAVER, support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None);
         assert!(lim.concurrency > cap, "premise: the posture wants MORE than the shipped cap");
 
         // ENGAGED on a genuinely costly folder: the shipped cap stands.
@@ -16628,7 +17492,7 @@ mod pool_posture_enqueue_tests {
         // …and the budget really was spent before it got there, so this is the EXEMPTION and not
         // luck: a capful of ordinary speculation is in the queue beside the two halves.
         // v0.8.196: the capful is the POSTURE's derived one now, not the shipped costly cap.
-        let ncap = support::efficiency_limits(true, None, 18, 30.0, None, None).concurrency;
+        let ncap = support::mode_limits(support::MODE_POWER_SAVER, support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None).concurrency;
         assert_eq!(
             q.len(),
             ncap + 2,
@@ -16695,7 +17559,7 @@ mod pool_posture_enqueue_tests {
         assert_eq!(
             rig.pf_win.get(),
             {
-                let l = support::efficiency_limits(true, None, 18, 30.0, None, None);
+                let l = support::mode_limits(support::MODE_POWER_SAVER, support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None);
                 (l.ahead, l.behind)
             },
             "the narrowing in force under the classic switch is the EFFICIENCY one — and v0.8.196's \
@@ -16712,7 +17576,7 @@ mod pool_posture_enqueue_tests {
         // …and the boot line the owner would read while bisecting names the exception.
         let line = support::classic_posture_boot_line();
         assert!(
-            line.contains("EFFICIENCY MODE") && line.contains("does NOT revert"),
+            line.contains("THE MODE CONTROL") && line.contains("does NOT revert"),
             "the classic revert's own line must name the posture it does not revert: {line}"
         );
     }
@@ -16780,6 +17644,16 @@ mod pool_posture_enqueue_tests {
             vec![5],
             "the grow sweep is HELD — nothing but the displayed shot may leave: {q:?}"
         );
+
+        // ── (2b) Round 2a: the hold is Power saver's alone. BALANCED re-sharpens the grown window
+        //        through the ordinary path (its own concurrency, its own runway).
+        let brig = Rig::new();
+        for i in 0..12usize {
+            brig.fast.cache.borrow_mut().insert(i, stale());
+        }
+        let balanced = support::mode_limits(support::MODE_BALANCED, support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None);
+        let bq = brig.tick_mode(5, &shots, costly_view(), cap, false, balanced);
+        assert!(bq.len() > 1, "Balanced does not hold the sweep — only Eco does: {bq:?}");
 
         // …and in COMPARE both on-screen halves come with it, the same exemption every other holding
         // site asks. (Half B is a photograph the user is LOOKING AT; a soft one is not acceptable
@@ -17058,6 +17932,7 @@ mod thumb_retire_tests {
         assert!(!film.pending.borrow().contains(&200), "every slot is held by the old rows");
         assert_eq!(step_retire_thumbs(&tx, &film, strip, &thumb_keep_around(2, None), 7, &tg), 10, "all ten old requests retire, the running one too");
         assert_eq!(tg.get(), 1, "one arrival-counter bump, so the key-gated dock refills next tick");
+        assert_eq!(film.losses.get(), 1, "…and one loss, so the whole-folder feeder rescans (round 2b, C-02)");
         feed(&film, &tx, 200..210, 10); // that refill
         let next: Vec<usize> = std::iter::from_fn(|| queue.try_take().map(|r| r.idx)).collect();
         assert_eq!(next, (200..210).collect::<Vec<_>>(), "the new rows run first; the old queued rows never run");
@@ -17113,7 +17988,7 @@ mod thumb_retire_tests {
         assert!(queue.try_take().is_none());
 
         res_tx.send(landed(100)).unwrap(); // the decode that started before its retirement
-        drain_thumbs(&res_rx, &film, &rot, &tg, 7, 0, 2, 0);
+        drain_thumbs(&res_rx, &film, &rot, &tg, 7, 0, 2, 0, THUMB_CACHE_MAX);
         assert!(film.thumbs.borrow().contains_key(&100), "finished work is cached, not discarded");
         assert!(film.pending.borrow().contains(&101), "and it does not free another tile's slot");
     }
@@ -17158,7 +18033,7 @@ mod thumb_retire_tests {
         assert!(!ready(&film), "the wheel step is waiting for 501");
         assert_eq!(queue.try_take().map(|r| r.idx), Some(501));
         res_tx.send(landed(501)).unwrap();
-        drain_thumbs(&res_rx, &film, &rot, &tg, 7, 0, 0, 0);
+        drain_thumbs(&res_rx, &film, &rot, &tg, 7, 0, 0, 0, THUMB_CACHE_MAX);
         assert!(ready(&film), "its thumbnail lands and the Compare step can go");
         assert_eq!(thumb_keep_around(9, None), [9; 3], "outside Compare only the current photo is kept");
     }
@@ -17176,7 +18051,7 @@ mod thumb_retire_tests {
         for i in (0..300).chain(800..1000) {
             res_tx.send(landed(i)).unwrap();
         }
-        drain_thumbs(&res_rx, &film, &rot, &tg, 7, 0, 0, 0);
+        drain_thumbs(&res_rx, &film, &rot, &tg, 7, 0, 0, 0, THUMB_CACHE_MAX);
         let tc = film.thumbs.borrow();
         assert_eq!(tc.len(), THUMB_CACHE_MAX);
         assert!((800..1000).all(|i| tc.contains_key(&i)), "the dock's neighbourhood is kept");
@@ -17218,7 +18093,7 @@ mod thumb_drain_tests {
         for i in 0..(THUMB_CACHE_MAX + 50) {
             tx.send((i, gen_now, px(), 1, 1, 0, 0, 0)).unwrap();
         }
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0); // v0.8.32 (§64): &Film
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0, THUMB_CACHE_MAX); // v0.8.32 (§64): &Film
         assert_eq!(cache.borrow().len(), THUMB_CACHE_MAX, "cache pins at the cap");
         let gen_after_fill = gen.get();
         assert!(gen_after_fill > 0, "the fill bumped the arrival generation");
@@ -17226,7 +18101,7 @@ mod thumb_drain_tests {
         // (a) A further DECODED thumbnail past the cap: len stays pinned, gen still bumps once.
         let pinned = cache.borrow().len();
         tx.send((10_000, gen_now, px(), 1, 1, 0, 0, 0)).unwrap();
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0); // v0.8.32 (§64): &Film
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0, THUMB_CACHE_MAX); // v0.8.32 (§64): &Film
         assert_eq!(cache.borrow().len(), pinned, "cache stays pinned at the cap");
         assert_eq!(gen.get(), gen_after_fill + 1, "a pinned-cache arrival still bumps the gen");
 
@@ -17234,7 +18109,7 @@ mod thumb_drain_tests {
         pending.borrow_mut().insert(20_000);
         let before = gen.get();
         tx.send((20_000, gen_now, Vec::new(), 0, 0, 0, 0, 0)).unwrap();
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0); // v0.8.32 (§64): &Film
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0, THUMB_CACHE_MAX); // v0.8.32 (§64): &Film
         assert_eq!(gen.get(), before + 1, "a failure marker bumps the gen");
         assert!(!pending.borrow().contains(&20_000), "a failure marker frees the pending slot");
         assert_eq!(cache.borrow().len(), pinned, "a failure marker adds nothing to the cache");
@@ -17243,7 +18118,7 @@ mod thumb_drain_tests {
         let before = gen.get();
         pending.borrow_mut().insert(30_000);
         tx.send((30_000, gen_now + 1, px(), 1, 1, 0, 0, 0)).unwrap();
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0); // v0.8.32 (§64): &Film
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0, THUMB_CACHE_MAX); // v0.8.32 (§64): &Film
         assert_eq!(gen.get(), before, "a stale-generation message does not bump the gen");
         assert_eq!(cache.borrow().len(), pinned, "a stale message is not cached");
         assert!(pending.borrow().contains(&30_000), "stale result must not release a new generation's pending request");
@@ -17253,9 +18128,11 @@ mod thumb_drain_tests {
         // stale-rotation pixels never enter the cache; the cell re-requests with live turns.
         rot.delta_idx.borrow_mut().insert(40_000, 1); // live turns for 40_000 are now 1
         let before = gen.get();
+        let lost = film.losses.get();
         tx.send((40_000, gen_now, px(), 1, 1, 0, 0, 0)).unwrap(); // applied=0 ≠ live 1
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0); // v0.8.32 (§64): &Film
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0, THUMB_CACHE_MAX); // v0.8.32 (§64): &Film
         assert_eq!(gen.get(), before + 1, "a dropped stale-turns thumb still bumps the gen");
+        assert_eq!(film.losses.get(), lost + 1, "…and is a loss the whole-folder feeder hears (round 2b)");
         assert!(!cache.borrow().contains_key(&40_000), "stale-rotation pixels are not cached");
         assert_eq!(rot.base.borrow().get(&40_000), Some(&0), "the base is cached even on a drop");
 
@@ -17264,7 +18141,7 @@ mod thumb_drain_tests {
         // eviction contract, not the turns guard, doing the dropping.
         rot.delta_idx.borrow_mut().insert(2, 1);
         tx.send((2, gen_now, px(), 1, 1, 0, 1, 0)).unwrap(); // applied=1 == live (0 base + 1 delta)
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0); // v0.8.32 (§64): &Film
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0, THUMB_CACHE_MAX); // v0.8.32 (§64): &Film
         assert!(cache.borrow().contains_key(&2), "a live-turns thumb is cached");
     }
 
@@ -17313,13 +18190,14 @@ mod thumb_drain_tests {
         pending.borrow_mut().insert(11);
         tx.send((11, gen_now, px(), 1, 1, 0, 0, p3_key)).unwrap();
         let before = gen.get();
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, srgb_key, 0, 0);
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, srgb_key, 0, 0, THUMB_CACHE_MAX);
         assert!(!cache.borrow().contains_key(&11), "a thumb baked for another gamut must not cache");
+        assert_eq!(film.losses.get(), 1, "…and the drop is a loss the whole-folder feeder hears (round 2b)");
         assert!(!pending.borrow().contains(&11), "…but the request slot is freed, like a stale-turns drop");
         assert_eq!(gen.get(), before + 1, "…and the landing still bumps the gen, so the cell re-requests");
         // …while a lander carrying the LIVE key is cached exactly as before.
         tx.send((12, gen_now, px(), 1, 1, 0, 0, srgb_key)).unwrap();
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, srgb_key, 0, 0);
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, srgb_key, 0, 0, THUMB_CACHE_MAX);
         assert!(cache.borrow().contains_key(&12), "a live-gamut thumb is cached");
 
         // ── (2)+(3) the switch sweep: the tile STAYS (with its old key), pending is cleared, the
@@ -17412,7 +18290,7 @@ mod thumb_drain_tests {
         // One landing, so the drain runs its belt (it locks the map only when something arrived).
         film.pending.borrow_mut().insert(0);
         tx.send((0, gen_now, px(), 1, 1, 0, 0, 0)).unwrap();
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0);
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0, THUMB_CACHE_MAX);
         let fm = film.frost.lock().unwrap();
         assert_eq!(fm.len(), THUMB_CACHE_MAX, "the frost map must hold its own cap");
         assert!(fm.contains_key(&0), "…keeping the entries NEAREST the viewport");
@@ -17492,7 +18370,7 @@ mod thumb_drain_tests {
             tx.send((i, gen_now, px(), 1, 1, 0, 0, 0)).unwrap();
         }
         // Anchors at 0 → the far HIGH indices are the eviction victims in BOTH structures.
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0); // v0.8.32 (§64): &Film
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0, THUMB_CACHE_MAX); // v0.8.32 (§64): &Film
 
         assert_eq!(cache.borrow().len(), THUMB_CACHE_MAX, "thumb cache pins at the cap");
         {
@@ -17543,7 +18421,7 @@ mod thumb_drain_tests {
         }
         // Pin the two FARTHEST indices — precisely the entries the unpinned rule evicts first.
         film.pinned.borrow_mut().extend([n - 1, n - 2]);
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0);
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0, THUMB_CACHE_MAX);
 
         let tc = film.thumbs.borrow();
         assert_eq!(
@@ -17581,7 +18459,7 @@ mod thumb_drain_tests {
         // is now the farthest key overall — the formerly pinned n−1.
         film.pinned.borrow_mut().clear();
         tx.send((398, gen_now, px(), 1, 1, 0, 0, 0)).unwrap(); // push past the cap once more
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0);
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0, THUMB_CACHE_MAX);
         let tc = film.thumbs.borrow();
         assert_eq!(tc.len(), THUMB_CACHE_MAX, "cap holds after unpinning too");
         assert!(!tc.contains_key(&(n - 1)), "an unpinned far tile is evictable again");
@@ -17609,7 +18487,7 @@ mod thumb_drain_tests {
             tx.send((i, gen_now, px(), 1, 1, 0, 0, 0)).unwrap();
         }
         film.pinned.borrow_mut().extend(0..n);
-        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0);
+        drain_thumbs(&rx, &film, &rot, &gen, gen_now, 0, 0, 0, THUMB_CACHE_MAX);
         assert_eq!(
             film.thumbs.borrow().len(),
             n,
@@ -18032,6 +18910,212 @@ mod frost_feed_tests {
             assert!(got.contains(&i), "feeds uncovered window shot #{i}");
         }
         assert!(tp.borrow().is_superset(&got), "every fed index is now pending (dedup + failed-set discipline)");
+    }
+
+    /// 2026-10-27 (round 2b) — plan test 4, the feeders' half: **THE WHOLE FOLDER, NEAREST FIRST,
+    /// NEVER A CLOUD-ONLY FILE, WITHIN ITS SHARE AND THE RADIUS THE CACHE KEEPS; AND THE CACHE KEEPS
+    /// THE MODE'S CAP.** (The mode → scope rows are `support::mode_tests::each_mode_prepares_its_
+    /// thumbnails`; the strip, grid and frost gates are `tipgeom_tests::visible_only_asks_only_for_
+    /// the_tiles_on_screen`.)
+    ///
+    /// FALSIFIER (L28): drop the `cloud` term in `step_whole_folder_thumbs` and the cloud row reddens
+    /// with 98 and 102 asked for; scan past `radius` and the radius row reddens with a sixth photo;
+    /// evict at `THUMB_CACHE_MAX` in `drain_thumbs` and the cap row reddens at 400.
+    #[test]
+    fn the_thumbnail_scope_reaches_every_feeder() {
+        // THE RADIUS: every photo within it of any anchor numbers at most the cap.
+        assert_eq!(whole_folder_radius(10_000, &[5_000], 2_855), 1_427);
+        assert_eq!(whole_folder_radius(10_000, &[5_000], usize::MAX), 10_000, "no cap: the whole folder");
+        assert_eq!(whole_folder_radius(300, &[150], 400), 300, "a folder under the cap: all of it");
+        assert_eq!(whole_folder_radius(10_000, &[0], 2_855), 2_854, "at the folder's start the ring is one-sided");
+        let two = whole_folder_radius(10_000, &[1_000, 6_000], 2_855);
+        assert!(2 * (2 * two + 1) <= 2_855 && 2 * (2 * two + 3) > 2_855, "two anchors share the cap: {two}");
+        assert_eq!(whole_folder_radius(10_000, &[4_000, 4_000], 2_855), 1_427, "one anchor counted once");
+
+        // THE FEEDER: nearest first, inside its share of the queue, skipping what it must.
+        let (tx, rx) = channel::<support::ThumbReq>();
+        let film = Film::new();
+        let rot = RotState::new(true);
+        let cursor = Cell::new((u64::MAX, 0, 0, 0, 0));
+        let gen_now = 3u64;
+        film.thumbs.borrow_mut().insert(100, (px_img(), 0)); // cached
+        film.pending.borrow_mut().insert(101); // already asked for
+        film.failed.lock().unwrap().insert((gen_now, 99)); // permanently failed
+        let cloud: HashSet<usize> = [98usize, 102].into_iter().collect(); // cloud-only placeholders
+        step_whole_folder_thumbs(100, 1_000, empty_shots(), &cloud, &film, &tx, gen_now, &rot, 500, &cursor);
+        let got: Vec<support::ThumbReq> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(got.iter().all(|r| !r.explicit && r.gen == gen_now), "speculative, this folder's");
+        assert!(got.iter().all(|r| r.local_only), "each read only if the file is still on this device");
+        let idx: Vec<usize> = got.iter().map(|r| r.idx).collect();
+        assert_eq!(idx, vec![97, 103, 96, 104, 95, 105, 94], "nearest the current photo first");
+        assert_eq!(film.pending.borrow().len(), WHOLE_FOLDER_PENDING_MAX, "its share of the queue, no more");
+        for skipped in [98, 99, 100, 101, 102] {
+            assert!(!idx.contains(&skipped), "skips {skipped}: cloud-only, failed, cached or pending");
+        }
+        // A full share asks for nothing.
+        step_whole_folder_thumbs(100, 1_000, empty_shots(), &cloud, &film, &tx, gen_now, &rot, 500, &cursor);
+        assert!(rx.try_recv().is_err(), "the queue is the tiles' first");
+        // Once those land, it resumes where it stopped, not from the photo.
+        for i in &idx {
+            film.pending.borrow_mut().remove(i);
+            film.thumbs.borrow_mut().insert(*i, (px_img(), 0));
+        }
+        step_whole_folder_thumbs(100, 1_000, empty_shots(), &cloud, &film, &tx, gen_now, &rot, 500, &cursor);
+        let next: Vec<usize> = std::iter::from_fn(|| rx.try_recv().ok().map(|r| r.idx)).collect();
+        assert_eq!(next.first(), Some(&106), "resuming outward: {next:?}");
+
+        // THE RADIUS BINDS, and a scan that reached it asks for nothing more until the photo moves.
+        let (tx2, rx2) = channel::<support::ThumbReq>();
+        let film2 = Film::new();
+        let cursor2 = Cell::new((u64::MAX, 0, 0, 0, 0));
+        step_whole_folder_thumbs(50, 1_000, empty_shots(), &HashSet::new(), &film2, &tx2, 1, &rot, 2, &cursor2);
+        let near: Vec<usize> = std::iter::from_fn(|| rx2.try_recv().ok().map(|r| r.idx)).collect();
+        assert_eq!(near, vec![50, 49, 51, 48, 52], "radius 2: five photos and no more");
+        film2.pending.borrow_mut().clear();
+        step_whole_folder_thumbs(50, 1_000, empty_shots(), &HashSet::new(), &film2, &tx2, 1, &rot, 2, &cursor2);
+        assert!(rx2.try_recv().is_err(), "the scan is done for this photo");
+        // …until the cache loses thumbnails (none of those five is cached now): it scans again from
+        // the photo without waiting for it to move (review C-02).
+        film2.losses.set(film2.losses.get() + 1);
+        step_whole_folder_thumbs(50, 1_000, empty_shots(), &HashSet::new(), &film2, &tx2, 1, &rot, 2, &cursor2);
+        let again: Vec<usize> = std::iter::from_fn(|| rx2.try_recv().ok().map(|r| r.idx)).collect();
+        assert_eq!(again, vec![50, 49, 51, 48, 52], "a loss rescans the radius");
+        film2.pending.borrow_mut().clear();
+        step_whole_folder_thumbs(53, 1_000, empty_shots(), &HashSet::new(), &film2, &tx2, 1, &rot, 2, &cursor2);
+        assert_eq!(rx2.try_recv().map(|r| r.idx).ok(), Some(53), "a new current photo starts again from it");
+
+        // A FILE FOUND ONLY IN THE CLOUD SINCE THE SCAN (the worker's note) is asked for no more this
+        // folder; a note from another folder does not count (owner, 27 October: "do the check").
+        let (tx5, rx5) = channel::<support::ThumbReq>();
+        let film5 = Film::new();
+        film5.cloud_skipped.lock().unwrap().insert((1, 49));
+        film5.cloud_skipped.lock().unwrap().insert((0, 51));
+        let cursor5 = Cell::new((u64::MAX, 0, 0, 0, 0));
+        step_whole_folder_thumbs(50, 1_000, empty_shots(), &HashSet::new(), &film5, &tx5, 1, &rot, 2, &cursor5);
+        let found: Vec<usize> = std::iter::from_fn(|| rx5.try_recv().ok().map(|r| r.idx)).collect();
+        assert_eq!(found, vec![50, 51, 48, 52], "49 was found online-only; 51's note is another folder's");
+
+        // THE CAP: the cache keeps the mode's number (here 600), the nearest kept; the blur sources
+        // keep their own 400 whatever it is.
+        let (rtx, rrx) = channel::<ThumbDrop>();
+        let film3 = Film::new();
+        for i in 0..700usize {
+            film3.pending.borrow_mut().insert(i);
+            rtx.send((i, 1, vec![255u8; 4], 1, 1, 0, 0, 0)).unwrap();
+            film3.frost.lock().unwrap().insert(i, (Arc::from(vec![0u8; 4]), 1, 1, falcon_color::Gamut::Srgb));
+        }
+        let tg = Cell::new(0u64);
+        drain_thumbs(&rrx, &film3, &rot, &tg, 1, 0, 0, 0, 600);
+        assert_eq!(film3.thumbs.borrow().len(), 600, "the mode's cap, not 400");
+        assert!((0..600).all(|i| film3.thumbs.borrow().contains_key(&i)), "the nearest the current photo kept");
+        assert_eq!(film3.frost.lock().unwrap().len(), THUMB_CACHE_MAX, "the blur sources keep their own 400");
+        assert!(film3.losses.get() > 0, "an eviction is a loss the whole-folder cursor hears");
+        // …and a cached thumbnail whose blur source was trimmed is asked for again when the preview
+        // window reaches it, once: its landing brings the mip back (review C-01).
+        assert!((400..600).all(|i| film3.mipless.borrow().contains(&i)), "the trimmed blur sources are noted");
+        let (ftx, frx) = channel::<support::ThumbReq>();
+        step_frost_feed(550, 700, empty_shots(), &Cell::new((3, 3)), &film3, &ftx, 1, &rot);
+        let mut asked: Vec<usize> = std::iter::from_fn(|| frx.try_recv().ok().map(|r| r.idx)).collect();
+        asked.sort_unstable();
+        assert_eq!(asked, (547..=553).collect::<Vec<_>>(), "the window's cached thumbnails, for their blur");
+        step_frost_feed(100, 700, empty_shots(), &Cell::new((3, 3)), &film3, &ftx, 1, &rot);
+        assert!(frx.try_recv().is_err(), "where the blur sources were kept, nothing");
+        film3.frost.lock().unwrap().insert(550, (Arc::from(vec![0u8; 4]), 1, 1, falcon_color::Gamut::Srgb));
+        rtx.send((550, 1, vec![255u8; 4], 1, 1, 0, 0, 0)).unwrap();
+        drain_thumbs(&rrx, &film3, &rot, &tg, 1, 0, 550, 550, 600);
+        assert!(!film3.mipless.borrow().contains(&550), "landed again, with its blur source");
+
+        // …and with the three anchors far apart (photo 1000, the strip at 2000, the grid at 3000), the
+        // far end of a Turbo-sized window (95 ahead, 47 behind) keeps its blur sources: the belt
+        // spares the window the frost feeder asks within, so nothing is made and trimmed again on
+        // every tick (re-check T1).
+        let (ttx, trx) = channel::<ThumbDrop>();
+        let film4 = Film::new();
+        film4.grid_anchor.set(Some(3_000));
+        for a in [1_000usize, 2_000, 3_000] {
+            for i in a - 100..=a + 100 {
+                film4.thumbs.borrow_mut().insert(i, (px_img(), 0));
+                film4.frost.lock().unwrap().insert(i, (Arc::from(vec![0u8; 4]), 1, 1, falcon_color::Gamut::Srgb));
+            }
+        }
+        let (wtx, wrx) = channel::<support::ThumbReq>();
+        let window = Cell::new((95, 47));
+        step_frost_feed(1_000, 5_000, empty_shots(), &window, &film4, &wtx, 1, &rot);
+        assert!(wrx.try_recv().is_err(), "everything in the window is ready");
+        // While the window is collapsed to the photo on screen (a sharp decode on the processor), the
+        // belt keeps sparing the last open one (re-check P-1).
+        step_frost_feed(1_000, 5_000, empty_shots(), &Cell::new((0, 0)), &film4, &wtx, 1, &rot);
+        assert_eq!(film4.frost_window.get(), (953, 1_095), "a collapsed window keeps the last open one");
+        ttx.send((1_000, 1, vec![255u8; 4], 1, 1, 0, 0, 0)).unwrap();
+        drain_thumbs(&trx, &film4, &rot, &tg, 1, 0, 1_000, 2_000, usize::MAX);
+        assert_eq!(film4.frost.lock().unwrap().len(), THUMB_CACHE_MAX, "the belt still keeps 400");
+        assert!((953..=1_095).all(|i| film4.frost.lock().unwrap().contains_key(&i)), "the whole window keeps its blur sources");
+        step_frost_feed(1_000, 5_000, empty_shots(), &window, &film4, &wtx, 1, &rot);
+        assert!(wrx.try_recv().is_err(), "so the feeder asks for nothing again");
+    }
+
+    /// Round 2b review R1 (Codex): **THE THUMBNAIL CACHE KEEPS THE PREVIEW WINDOW'S THUMBNAILS, SO THE
+    /// FROST FEEDER SETTLES.** The photo at 1000, the strip scrolled to 2000 and the grid to 3000 (its
+    /// 41 live tiles pinned), a warm cache around each, a Turbo-sized preview window (95 ahead, 47
+    /// behind: 953–1095) prepared only up to 1080, and Nearby's cap of 400. The feeder has been
+    /// running (it published its window on an earlier tick, as in the app, where the drain comes
+    /// first in a tick) and asks for the window's unprepared end, 1081–1095. Then each pass is one
+    /// tick's drain, the feeder, and every request completing as a worker's does (the blur source,
+    /// then the thumbnail). Those photos land and stay: nothing is asked for again, and the cap still
+    /// binds. Then the same without pins (the other eviction branch).
+    ///
+    /// FALSIFIER (L28): rank by distance alone in either eviction branch of `drain_thumbs` (drop the
+    /// `outside_window` term) and that branch's row asks for the window's far end on every pass.
+    #[test]
+    fn the_preview_window_keeps_its_thumbnails_so_the_frost_feeder_settles() {
+        let rot = RotState::new(true);
+        let tg = Cell::new(0u64);
+        let window = Cell::new((95usize, 47usize));
+        let mip = || (Arc::from(vec![0u8; 4]), 1, 1, falcon_color::Gamut::Srgb);
+        for pins in [true, false] {
+            let film = Film::new();
+            film.grid_anchor.set(Some(3_000));
+            if pins {
+                film.pinned.borrow_mut().extend(2_980..=3_020);
+            }
+            for i in (900..=1_080).chain(1_900..=2_100).chain(2_900..=3_100) {
+                film.thumbs.borrow_mut().insert(i, (px_img(), 0));
+                film.frost.lock().unwrap().insert(i, mip());
+            }
+            let (rtx, rrx) = channel::<ThumbDrop>();
+            let (qtx, qrx) = channel::<support::ThumbReq>();
+            step_frost_feed(1_000, 5_000, empty_shots(), &window, &film, &qtx, 1, &rot);
+            let mut first: Vec<usize> = std::iter::from_fn(|| qrx.try_recv().ok().map(|r| r.idx)).collect();
+            first.sort_unstable();
+            assert_eq!(first, (1_081..=1_095).collect::<Vec<_>>(), "pins={pins}: the window's unprepared end");
+            for &i in &first {
+                film.frost.lock().unwrap().insert(i, mip());
+                rtx.send((i, 1, vec![255u8; 4], 1, 1, 0, 0, 0)).unwrap();
+            }
+            let mut asked_per_pass = Vec::new();
+            for _ in 0..12 {
+                drain_thumbs(&rrx, &film, &rot, &tg, 1, 0, 1_000, 2_000, THUMB_CACHE_MAX);
+                let unpinned = film.thumbs.borrow().keys().filter(|i| !film.pinned.borrow().contains(i)).count();
+                assert!(unpinned <= THUMB_CACHE_MAX, "pins={pins}: the cap still binds: {unpinned}");
+                step_frost_feed(1_000, 5_000, empty_shots(), &window, &film, &qtx, 1, &rot);
+                let asked: Vec<usize> = std::iter::from_fn(|| qrx.try_recv().ok().map(|r| r.idx)).collect();
+                for &i in &asked {
+                    film.frost.lock().unwrap().insert(i, mip());
+                    rtx.send((i, 1, vec![255u8; 4], 1, 1, 0, 0, 0)).unwrap();
+                }
+                asked_per_pass.push(asked.len());
+            }
+            assert!(asked_per_pass.iter().all(|&n| n == 0), "pins={pins}: landed and kept, asked for no more: {asked_per_pass:?}");
+            assert!(
+                (953..=1_095).all(|i| film.thumbs.borrow().contains_key(&i) && film.frost.lock().unwrap().contains_key(&i)),
+                "pins={pins}: the whole window is ready"
+            );
+        }
+        // With no feeder (the developer switch off, or Custom's "On screen") there is no window for
+        // the evictions to spare (production part of main.rs only).
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        assert_eq!(prod.matches("film_t.frost_window.set((1, 0));").count(), 1, "the window is cleared when nothing feeds");
     }
 }
 
@@ -19585,7 +20669,7 @@ mod one_decode_detail_serve_tests {
     /// and its dispatch hold, `step_upload_drain`'s heavy bound, and `step_upload_detail`'s publish
     /// gate. All four now ask `support::detail_frame_explicit`.
     ///
-    /// **AND THE FIVE `displayed_shot` SITES THAT ARE NOT EXEMPTIONS FROM A HOLD, each with its
+    /// **AND THE SIX `displayed_shot` SITES THAT ARE NOT EXEMPTIONS FROM A HOLD, each with its
     /// reason** — the whole point of the last assert, which is a COUNT and would move if one of them
     /// were widened by accident: (1) `step_prefetch_fast`'s `displayed` closure and (2)
     /// `step_upload_fast`'s — the FAST tier's, whose own widening is `support::fast_frame_exempt`
@@ -19595,9 +20679,11 @@ mod one_decode_detail_serve_tests {
     /// (4) the DETAIL cache's LRU `protected` closure — not a hold, and it cannot need the awaited
     /// term by construction, because a frame that is IN that cache is a frame the advance gate is no
     /// longer blocked on; (5) `step_upload_roi`'s `valid`, a "still wanted" test on a tier that
-    /// takes no gate at all. The four widened sites call it too — inside
-    /// `support::detail_frame_explicit`'s first argument — so the total is nine, unchanged by this
-    /// round, which is the same figure the tree's own recount recipe in `step_upload_roi` reports.
+    /// takes no gate at all; (6) since round 2a's review (R2, 2026-10-26), `step_cache_retention`'s
+    /// per-tick run of that same detail LRU, with the same `protected` closure as (4) and for the
+    /// same reason. The four widened sites call it too — inside `support::detail_frame_explicit`'s
+    /// first argument — so the total is ten (nine at `e814035`, the figure the recount recipe in
+    /// `step_upload_roi` records).
     ///
     /// The needles are ASSEMBLED AT RUN TIME so this row cannot count its own text.
     ///
@@ -19606,8 +20692,8 @@ mod one_decode_detail_serve_tests {
     /// second (the dispatch hold) and it reads `left: 2 right: 4`; revert the dispatch hold while
     /// adding a decoy `support::detail_frame_explicit` call elsewhere in the file — so the COUNT is
     /// still four and only the BINDING is gone — and the per-site assert names that hold; add a
-    /// tenth bare code line spelling the on-screen test (the detail LRU's `protected` closure written
-    /// to spell it twice) and the last assert reads `left: 10 right: 9`.
+    /// further bare code line spelling the on-screen test (the detail LRU's `protected` closure
+    /// written to spell it twice) and the last assert reads `left: 11 right: 10`.
     #[test]
     fn every_detail_tier_hold_asks_the_awaited_exemption() {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tick.rs"))
@@ -19643,9 +20729,9 @@ mod one_decode_detail_serve_tests {
         let bare = format!("support::displayed_{}(", "shot");
         assert_eq!(
             code.iter().filter(|l| l.contains(&bare)).count(),
-            9,
-            "nine code lines still spell the on-screen test: the four holds' own first \
-             argument, and the five sites that are not exemptions from a hold (this row's doc)"
+            10,
+            "ten code lines still spell the on-screen test: the four holds' own first \
+             argument, and the six sites that are not exemptions from a hold (this row's doc)"
         );
     }
 

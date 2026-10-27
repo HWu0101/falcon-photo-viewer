@@ -3248,6 +3248,7 @@ fn grid_dock_reopen_recenters_on_current_shot() {
         u64::MAX,
         u64::MAX,
         u64::MAX,
+        (i64::MIN, i64::MIN), // round 2b: the rows on screen under Visible only
     ));
     let last_grid_view: Cell<(bool, u64)> = Cell::new((false, u64::MAX)); // the shared recenter cell, boot state
     let last_grid_c: Cell<usize> = Cell::new(usize::MAX);
@@ -3262,7 +3263,7 @@ fn grid_dock_reopen_recenters_on_current_shot() {
         step_folder_grid(
             &app, c, 60, 1, &shots, &plan, &cache, &film, &thumb_gen, &thumb_req, &fast_gen, &ratings, &marks,
             &sel_gen, &select, &select_gen, &last_grid_key, &last_grid_view, &last_grid_c,
-            &grid_vp_prog, &grid_model, &rot,
+            &grid_vp_prog, &grid_model, &rot, crate::support::ThumbScope::Nearby,
         )
     };
 
@@ -3370,6 +3371,365 @@ fn grid_dock_reopen_recenters_on_current_shot() {
         "with nothing programmatic owed, a moved mirror is a user scroll"
     );
 
+    app.set_grid_open(false);
+}
+
+/// 2026-10-25 (graphics-memory sharing, Codex review R1): immersive mode hides the grid but keeps
+/// its open setting, and the grid step returns before its refill, so a released preview's texture
+/// stayed alive in the rows that showed it as a stopgap. `tick::grid_refills` is the step's own
+/// condition: this drives the REAL `step_folder_grid` through each state and checks the two agree,
+/// then walks the release over a hidden grid and the rebuild after immersive mode ends.
+///
+/// FALSIFIERS: drop the immersive term from `grid_refills` → the agreement and the "lets go"
+/// asserts redden; have `release_unrefreshed_models` skip the grid → "lets go" reddens; leave the
+/// grid's key as it was → the rebuild assert reddens.
+#[test]
+fn a_grid_hidden_by_immersive_mode_lets_go_of_released_previews() {
+    use crate::background_memory::{release_unrefreshed_models, GRID_KEY_UNBUILT, SEL_KEY_UNBUILT};
+    use crate::tick::{grid_refills, step_folder_grid, FastCache, FastEntry};
+    use slint::Model;
+    use std::cell::{Cell, RefCell};
+
+    let app = boot();
+    let shots: Vec<crate::Shot> = (0..60)
+        .map(|i| crate::Shot {
+            id: i,
+            name: format!("HWU_{i:04}"),
+            has_raw: false,
+            has_jpg: true,
+            raw: None,
+            jpg: Some(std::path::PathBuf::from(format!("C:/rig/HWU_{i:04}.jpg"))),
+            kind: crate::SrcKind::Jpeg,
+            cloud_placeholder: false,
+            sniffed: None,
+        })
+        .collect();
+    // Previews for every photo and no thumbnails yet: every tile shows its preview as the stopgap.
+    let cache = RefCell::new(FastCache::new());
+    for id in 0..60 {
+        cache.borrow_mut().insert(id, FastEntry {
+            img: slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(1, 1)),
+            w: 1, h: 1, blur: std::sync::Arc::from([0u8; 4]), bw: 1, bh: 1, dim: 1, turns: 0,
+        });
+    }
+    let film = crate::Film::new();
+    let thumb_gen = Cell::new(0u64);
+    let (thumb_req, _thumb_rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+    let ratings = RefCell::new(vec![0i32; 60]);
+    let marks = RefCell::new(vec![0u8; 60]);
+    let sel_gen = Cell::new(0u64);
+    let select = RefCell::new(crate::support::SelectSet::default());
+    let select_gen = Cell::new(0u64);
+    let last_grid_key = Cell::new(GRID_KEY_UNBUILT);
+    let last_grid_view: Cell<(bool, u64)> = Cell::new((false, u64::MAX));
+    let last_grid_c: Cell<usize> = Cell::new(usize::MAX);
+    let grid_model = slint::VecModel::<ui::FilmItem>::default();
+    let sel_model = slint::VecModel::<ui::SelTileRow>::default();
+    let last_sel_key = Cell::new(SEL_KEY_UNBUILT);
+    let rot = crate::RotState::new(false);
+    let plan = crate::support::plan_from_shots(&shots);
+    let grid_vp_prog: Cell<Option<crate::support::PanelMemo>> = Cell::new(None);
+    let fast_gen = Cell::new(0u64);
+    let step = || {
+        step_folder_grid(
+            &app, 30, 60, 1, &shots, &plan, &cache, &film, &thumb_gen, &thumb_req, &fast_gen, &ratings, &marks,
+            &sel_gen, &select, &select_gen, &last_grid_key, &last_grid_view, &last_grid_c,
+            &grid_vp_prog, &grid_model, &rot, crate::support::ThumbScope::Nearby,
+        )
+    };
+    // Did this tick's step reach its refill? (The refill writes a key; boot's never comes back.)
+    let refilled = || {
+        let kept = last_grid_key.get();
+        last_grid_key.set(GRID_KEY_UNBUILT);
+        step();
+        let ran = last_grid_key.get() != GRID_KEY_UNBUILT;
+        if !ran {
+            last_grid_key.set(kept);
+        }
+        ran
+    };
+    let lay_out = |app: &ui::MainWindow| {
+        hover(app, 600.0, 300.0);
+        if app.get_grid_vp_h() <= 0.0 {
+            app.set_grid_vp_h(654.0); // the Flickable's mirror, as in the recenter rig above
+        }
+    };
+
+    app.set_grid_open(true);
+    lay_out(&app);
+    assert!(grid_refills(&app, 60) && refilled(), "an open grid on screen refills");
+    let valid = |m: &slint::VecModel<ui::FilmItem>| m.iter().filter(|t| t.valid).count();
+    assert!(valid(&grid_model) > 0, "the rows show previews as their stopgap");
+    let vh = app.get_grid_vp_h();
+    app.set_grid_vp_h(0.0);
+    assert!(!grid_refills(&app, 60) && !refilled(), "the mount tick before layout does not refill");
+    app.set_grid_vp_h(vh);
+    assert!(grid_refills(&app, 60) && refilled());
+
+    // Immersive mode: the open setting stays, the step returns before its refill.
+    app.set_immersive(true);
+    lay_out(&app);
+    assert!(app.get_grid_open());
+    assert!(!grid_refills(&app, 60) && !refilled(), "a grid hidden by immersive mode does not refill");
+    // A release takes every preview and moves the tile feed's key, as `release_to` does; the hidden
+    // grid cannot follow, so its rows still hold the released textures.
+    cache.borrow_mut().clear();
+    fast_gen.set(fast_gen.get() + 1);
+    step();
+    assert!(valid(&grid_model) > 0, "the hidden grid's rows still hold released previews");
+    release_unrefreshed_models(app.get_sel_open(), &sel_model, &last_sel_key, grid_refills(&app, 60),
+        &grid_model, &last_grid_key);
+    assert_eq!(grid_model.row_count(), 0, "a grid that cannot refill lets go of its rows");
+    assert_eq!(last_grid_key.get(), GRID_KEY_UNBUILT);
+
+    // Leaving immersive mode rebuilds the grid, now without the released previews.
+    app.set_immersive(false);
+    lay_out(&app);
+    assert!(grid_refills(&app, 60));
+    step();
+    assert!(grid_model.row_count() > 0, "the grid rebuilds when it can refill again");
+    assert_eq!(valid(&grid_model), 0, "and none of its tiles holds a released preview");
+
+    // A closed grid does not refill either (checked last: closing re-arms the recenter).
+    app.set_grid_open(false);
+    lay_out(&app);
+    assert!(!grid_refills(&app, 60) && !refilled(), "a closed grid does not refill");
+}
+
+/// 2026-10-26 (round 2a re-check R3): **A MODE'S PREVIEW TRIM IS LET GO BY EVERY PANEL, NOT ONLY BY
+/// THE CACHE.** The grid, the filmstrip and the Review panel show a cached preview as the stopgap
+/// while a thumbnail is out (`tick::lookup_thumb`), and each row holds its own handle to it. This
+/// drives the production mode-retention wiring of a tick (`tick::step_cache_retention`, the drain's
+/// last statement, then `background_memory::release_after_trim`, `main.rs`'s next call) over the REAL
+/// `step_folder_grid`: (1) an open grid hears the trim through `fast_gen` and rebuilds without the
+/// released previews; (2) a closed Review panel and a grid hidden by immersive mode let go of their
+/// rows; (3) leaving immersive mode rebuilds without them; (4) a tick that released nothing leaves
+/// even a hidden panel alone; (5) second re-check: on a mode-change tick an ARRIVAL does the
+/// reduction first (`tick::evict_at_arrival`, the arm's production call), retention then reports
+/// nothing, and the hidden panels still let go, because the drain's total counts both.
+///
+/// FALSIFIERS: drop the `fast_gen` bump in `step_cache_retention` and (1) reddens; make
+/// `release_after_trim` do nothing and (2) reddens; make `evict_at_arrival` report 0 and (5) reddens;
+/// drop its call from `main.rs`, stop the drain returning the count, or drop the arrival's count from
+/// it, and the census reddens.
+#[test]
+fn a_mode_trim_is_let_go_by_open_feeds_and_hidden_panels() {
+    use crate::background_memory::{release_after_trim, GRID_KEY_UNBUILT, SEL_KEY_UNBUILT};
+    use crate::tick::{
+        evict_at_arrival, grid_refills, step_cache_retention, step_folder_grid, DetailCache, FastCache, FastEntry,
+    };
+    use slint::Model;
+    use std::cell::{Cell, RefCell};
+    use std::collections::{HashSet, VecDeque};
+
+    let app = boot();
+    let (c, len) = (30usize, 60usize);
+    let shots: Vec<crate::Shot> = (0..len)
+        .map(|i| crate::Shot {
+            id: i,
+            name: format!("HWU_{i:04}"),
+            has_raw: false,
+            has_jpg: true,
+            raw: None,
+            jpg: Some(std::path::PathBuf::from(format!("C:/rig/HWU_{i:04}.jpg"))),
+            kind: crate::SrcKind::Jpeg,
+            cloud_placeholder: false,
+            sniffed: None,
+        })
+        .collect();
+    // A warm Performance cache: a preview for every photo and no thumbnails yet, so every tile shows
+    // its preview as the stopgap.
+    let cache = RefCell::new(FastCache::new());
+    let warm = || {
+        let mut cache = cache.borrow_mut();
+        cache.clear();
+        for id in 0..len {
+            cache.insert(id, FastEntry {
+                img: slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(1, 1)),
+                w: 1, h: 1, blur: std::sync::Arc::from([0u8; 4]), bw: 1, bh: 1, dim: 1, turns: 0,
+            });
+        }
+    };
+    warm();
+    let film = crate::Film::new();
+    let thumb_gen = Cell::new(0u64);
+    let (thumb_req, _thumb_rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+    let ratings = RefCell::new(vec![0i32; len]);
+    let marks = RefCell::new(vec![0u8; len]);
+    let sel_gen = Cell::new(0u64);
+    let select = RefCell::new(crate::support::SelectSet::default());
+    let select_gen = Cell::new(0u64);
+    let last_grid_key = Cell::new(GRID_KEY_UNBUILT);
+    let last_grid_view: Cell<(bool, u64)> = Cell::new((false, u64::MAX));
+    let last_grid_c: Cell<usize> = Cell::new(usize::MAX);
+    let grid_model = slint::VecModel::<ui::FilmItem>::default();
+    let sel_model = slint::VecModel::<ui::SelTileRow>::default();
+    let last_sel_key = Cell::new(SEL_KEY_UNBUILT);
+    let rot = crate::RotState::new(false);
+    let plan = crate::support::plan_from_shots(&shots);
+    let grid_vp_prog: Cell<Option<crate::support::PanelMemo>> = Cell::new(None);
+    let fast_gen = Cell::new(0u64);
+    let step = || {
+        step_folder_grid(
+            &app, c, len, 1, &shots, &plan, &cache, &film, &thumb_gen, &thumb_req, &fast_gen, &ratings, &marks,
+            &sel_gen, &select, &select_gen, &last_grid_key, &last_grid_view, &last_grid_c,
+            &grid_vp_prog, &grid_model, &rot, crate::support::ThumbScope::Nearby,
+        )
+    };
+    let lay_out = || {
+        hover(&app, 600.0, 300.0);
+        app.set_grid_vp_h(3000.0); // tall enough that the grid's rows cover the whole folder
+    };
+    // Power saver after Performance: 35 kept, the window around the photo on screen.
+    let ps = crate::support::mode_limits(crate::support::MODE_POWER_SAVER, crate::support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None);
+    let win = crate::support::mode_window((95, 47), 0.75, ps);
+    let keep = ps.keep_count().expect("Eco keeps a count");
+    let detail = RefCell::new(DetailCache::new());
+    let order = RefCell::new(VecDeque::new());
+    let (no_cmp, half_a, half_b, hover_pin) = (Cell::new(false), Cell::new(c), Cell::new(c), Cell::new(None));
+    // One tick of the production mode-retention wiring: the drain's last statement, then main.rs's.
+    let mode_tick = || {
+        let n = step_cache_retention(
+            c, len, &no_cmp, &half_a, &half_b, &hover_pin, -1, &cache, &Cell::new(win), &Cell::new(u64::MAX),
+            keep, &fast_gen, &detail, &order, 6, u64::MAX,
+        );
+        release_after_trim(n, app.get_sel_open(), &sel_model, &last_sel_key, grid_refills(&app, len),
+            &grid_model, &last_grid_key);
+        n
+    };
+    let shown = |m: &slint::VecModel<ui::FilmItem>| -> HashSet<usize> {
+        m.iter().filter(|t| t.valid).map(|t| t.idx as usize).collect()
+    };
+    let gone = || -> HashSet<usize> { (0..len).filter(|i| !cache.borrow().contains_key(i)).collect() };
+
+    // ── (1) An OPEN grid hears the trim and rebuilds without the released previews.
+    app.set_grid_open(true);
+    lay_out();
+    assert!(grid_refills(&app, len));
+    step();
+    let before = shown(&grid_model);
+    assert!(!before.is_empty(), "the rows show previews as their stopgap");
+    let gen0 = fast_gen.get();
+    let released: usize = (0..16).map(|_| mode_tick()).sum();
+    assert_eq!((released, cache.borrow().len()), (len - keep, keep), "the cache is Eco's count");
+    assert_ne!(fast_gen.get(), gen0, "the trim notifies the tile feeds");
+    let gone1 = gone();
+    assert!(!before.is_disjoint(&gone1), "the grid was showing released previews: {before:?} / {gone1:?}");
+    assert!(grid_model.row_count() > 0, "an open grid is refreshing, so it rebuilds its own rows");
+    step();
+    let after = shown(&grid_model);
+    assert!(!after.is_empty() && after.is_disjoint(&gone1), "the open grid rebuilt without them: {after:?}");
+
+    // ── (2) A CLOSED Review panel and a grid HIDDEN by immersive mode let go of their rows.
+    warm();
+    fast_gen.set(fast_gen.get() + 1); // the re-warm is a run of arrivals, each of which moves it
+    step();
+    let tiles: Vec<ui::FilmItem> = grid_model.iter().filter(|t| t.valid).collect();
+    assert!(tiles.len() > keep, "the stopgaps are back for the whole folder");
+    // The Review panel showed the same stopgaps while it was open; then it was closed.
+    let rows: Vec<ui::SelTileRow> = tiles
+        .chunks(2)
+        .map(|p| ui::SelTileRow { a: p[0].clone(), b: p.get(1).cloned().unwrap_or_default(), has_b: p.len() == 2 })
+        .collect();
+    sel_model.set_vec(rows);
+    last_sel_key.set((1, 2, 3, 4, 5, 6));
+    assert!(!app.get_sel_open());
+    app.set_immersive(true);
+    lay_out();
+    assert!(app.get_grid_open() && !grid_refills(&app, len), "immersive mode hides the grid");
+    // (4) first: a tick that released nothing leaves even a hidden panel alone.
+    release_after_trim(0, app.get_sel_open(), &sel_model, &last_sel_key, grid_refills(&app, len), &grid_model,
+        &last_grid_key);
+    assert!(grid_model.row_count() > 0 && sel_model.row_count() > 0, "only a trim lets go");
+    let released: usize = (0..16).map(|_| mode_tick()).sum();
+    assert_eq!(released, len - keep);
+    assert_eq!(grid_model.row_count(), 0, "the hidden grid lets go of its rows");
+    assert_eq!(last_grid_key.get(), GRID_KEY_UNBUILT);
+    assert_eq!(sel_model.row_count(), 0, "the closed Review panel lets go of its rows");
+    assert_eq!(last_sel_key.get(), SEL_KEY_UNBUILT);
+
+    // ── (3) Leaving immersive mode rebuilds the grid, without the released previews.
+    let gone2 = gone();
+    app.set_immersive(false);
+    lay_out();
+    assert!(grid_refills(&app, len));
+    step();
+    let rebuilt = shown(&grid_model);
+    assert!(!rebuilt.is_empty() && rebuilt.is_disjoint(&gone2), "rebuilt without them: {rebuilt:?}");
+
+    // ── (5) The mode changes on a tick an ARRIVAL lands: the arrival does the reduction, retention
+    //        then finds the cache already small and reports nothing, and the hidden panels must still
+    //        let go. Performance → Balanced, 59 previews warm and the 60th arriving.
+    warm();
+    cache.borrow_mut().remove(&59);
+    fast_gen.set(fast_gen.get() + 1);
+    step(); // the grid, open and on screen, shows the stopgaps again
+    let tiles: Vec<ui::FilmItem> = grid_model.iter().filter(|t| t.valid).collect();
+    let rows: Vec<ui::SelTileRow> = tiles
+        .chunks(2)
+        .map(|p| ui::SelTileRow { a: p[0].clone(), b: p.get(1).cloned().unwrap_or_default(), has_b: p.len() == 2 })
+        .collect();
+    sel_model.set_vec(rows);
+    last_sel_key.set((1, 2, 3, 4, 5, 6));
+    app.set_immersive(true);
+    lay_out();
+    assert!(!grid_refills(&app, len) && grid_model.row_count() > 0 && sel_model.row_count() > 0);
+    let bal = crate::support::mode_limits(crate::support::MODE_BALANCED, crate::support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None);
+    let bwin = crate::support::mode_window((95, 47), 0.75, bal);
+    let bkeep = bal.keep_count().expect("Balanced keeps a count");
+    let protect = |i: usize| i == c;
+    // The arrival arm: insert, then its eviction (the production call), counted because the limit is
+    // the mode's.
+    let at_arrival = {
+        let mut cache = cache.borrow_mut();
+        cache.insert(59, FastEntry {
+            img: slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(1, 1)),
+            w: 1, h: 1, blur: std::sync::Arc::from([0u8; 4]), bw: 1, bh: 1, dim: 1, turns: 0,
+        });
+        evict_at_arrival(&mut cache, c, bwin, u64::MAX, bkeep, &protect, true)
+    };
+    assert_eq!((at_arrival, cache.borrow().len()), (len - bkeep, bkeep), "the arrival did the whole reduction");
+    // …then the drain's last statement, which finds nothing left to do.
+    let trimmed = step_cache_retention(
+        c, len, &no_cmp, &half_a, &half_b, &hover_pin, -1, &cache, &Cell::new(bwin), &Cell::new(u64::MAX),
+        bkeep, &fast_gen, &detail, &order, 6, u64::MAX,
+    );
+    assert_eq!(trimmed, 0, "retention alone would report nothing");
+    // The drain returns both (`mode_released + trimmed`, pinned below); main.rs hands that on.
+    release_after_trim(at_arrival + trimmed, app.get_sel_open(), &sel_model, &last_sel_key, grid_refills(&app, len),
+        &grid_model, &last_grid_key);
+    assert_eq!(grid_model.row_count(), 0, "the hidden grid lets go of what the arrival released");
+    assert_eq!(sel_model.row_count(), 0, "…and so does the closed Review panel");
+    assert_eq!((last_grid_key.get(), last_sel_key.get()), (GRID_KEY_UNBUILT, SEL_KEY_UNBUILT));
+    // Performance releases the same previews at an arrival and reports none, as before round 2a.
+    {
+        let mut cache = cache.borrow_mut();
+        cache.insert(0, FastEntry {
+            img: slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(1, 1)),
+            w: 1, h: 1, blur: std::sync::Arc::from([0u8; 4]), bw: 1, bh: 1, dim: 1, turns: 0,
+        });
+        assert_eq!(evict_at_arrival(&mut cache, c, bwin, u64::MAX, bkeep, &protect, false), 0);
+        assert_eq!(cache.len(), bkeep, "…though it still evicted to the limit");
+    }
+    app.set_immersive(false);
+
+    // The tick takes the drain's count and hands it to the release, once (production code only:
+    // main.rs's own census quotes the same lines).
+    let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let prod = src.replace('\r', "");
+    let prod = prod.split_once("\nmod tests {").map_or(prod.as_str(), |(p, _)| p);
+    assert_eq!(prod.matches("let previews_trimmed = step_upload_drain(").count(), 1);
+    let call = "background_memory::release_after_trim(previews_trimmed, app.get_sel_open(), &sel_model,";
+    assert_eq!(prod.matches(call).count(), 1, "main.rs hands the drain's count to the release");
+    // The drain itself needs a GPU texture to run, so its two seams are pinned by source: main.rs says
+    // when the count limit is a mode's, and the drain's total includes the arrival's releases.
+    let limit = prod.find("limits.keep_count().map_or(FAST_CACHE_MAX, |n| n.min(FAST_CACHE_MAX)),").expect("the count limit");
+    let flag = prod.find("            limits.keep_count().is_some(),\n").expect("the mode flag");
+    assert!(limit < flag && prod.matches("limits.keep_count().is_some()").count() == 1, "the flag follows the limit, once");
+    let tick = std::fs::read_to_string(format!("{}/src/tick.rs", env!("CARGO_MANIFEST_DIR"))).unwrap().replace('\r', "");
+    let arrival = concat!("mode_released += evict_at_arrival(&mut cache, c, eff_win.get(), ", "fast_budget.get(),");
+    assert_eq!(tick.matches(arrival).count(), 1, "the arrival's releases are counted");
+    assert_eq!(tick.matches(concat!("    mode_released + ", "trimmed\n}")).count(), 1, "…and returned with the trim's");
     app.set_grid_open(false);
 }
 
@@ -5692,8 +6052,9 @@ fn deferred_seg_pill_follows_the_finger() {
 fn right_click_on_a_seg_commits_nothing() {
     let app = boot();
     // Tall enough that the Fast View card is inside the Settings viewport (the Flickable clips);
-    // 1600 → 1800 when the LANGUAGE section came to lead Settings (4 October 2026).
-    app.window().set_size(slint::LogicalSize::new(1200.0, 1800.0));
+    // 1600 → 1800 when the LANGUAGE section came to lead Settings (4 October 2026); 1800 → 2100
+    // when the mode row and the background wait joined PERFORMANCE above Fast View (round 2a).
+    app.window().set_size(slint::LogicalSize::new(1200.0, 2100.0));
     app.set_settings_open(true);
     hover(&app, 600.0, 300.0); // layout pass
     let (dxs, dy) = seg_cell_centres(&app, "MainWindow::detailseg", 2);
@@ -8922,7 +9283,7 @@ fn the_filmstrip_centres_on_the_window_not_the_stage() {
         &app, 20, 40, now, &last_tick, 0, &shots, &plan, &cache, &film, &thumb_gen, &tx, &fast_gen,
         &ratings, &marks, &sel_gen, &select, &select_gen, &pos, &base, &dragging, &follow,
         &target, &film_clamp, &last_key,
-        &film_model, &rot,
+        &film_model, &rot, crate::support::ThumbScope::Nearby,
     );
     // …and it is the SAME `(lo, hi)` the step just clamped with: a 40-shot folder on this window is
     // wider than the strip, so the pair is the real range and every strip gesture can move.
@@ -9930,16 +10291,18 @@ fn the_welcome_columns_are_real_settings_cards() {
     // FALSIFIER (L28): put the card back in column 2 and the x-equality assert reddens (its x
     // becomes the benchmark column's); leave a copy behind in column 2 and the census at the top of
     // this test reddens at 5; drop it entirely and the census reddens at 3.
+    // 2026-10-26 (round 2a, owner ruling): the mode control replaced the wheel card in the Feel
+    // column (the wheel row stays in Settings → INPUT); the card it took over is measured the same way.
     let wheel = i_slint_backend_testing::ElementHandle::find_by_accessible_label(
         &app,
-        "Off = wheel zooms. Trackpads: two-finger scroll browses when on.",
+        "Smooth browsing with a moderate load. Recommended.",
     )
     .next()
-    .expect("the welcome's wheel-card caption is mounted");
+    .expect("the welcome's mode-card line is mounted");
     let (wx, wy) = (wheel.absolute_position().x, wheel.absolute_position().y);
     let wheel_card = card_of(wx, wy);
     assert!(wheel_card.0 > keys_card.0 && wheel_card.0 < colour_card.0,
-        "wheel preference belongs to the middle Feel column");
+        "the mode control belongs to the middle Feel column");
     let bench = i_slint_backend_testing::ElementHandle::find_by_accessible_label(&app, "Quick benchmark")
         .next()
         .expect("the benchmark card's title is mounted");
@@ -13798,7 +14161,9 @@ fn every_scrub_cap_the_estimator_can_hold_is_one_the_advance_loops_can_step() {
     app.set_zoom_always_sharp(false); // the ceiling is the UNZOOMED browse rate's own cap
     app.set_zoom(1.0);
     app.set_scrub_fps(30.0);
-    let ceiling = crate::support::EFFICIENCY_SCRUB_FPS_MAX;
+    // Round 2a: the 20 fps ceiling is Balanced's own limit now (the default mode's), driven through
+    // a hand-built limited value exactly as before.
+    let ceiling = crate::support::BALANCED_FPS_MAX;
     let capped = interval_ms(ceiling);
     let uncapped = interval_ms(30.0);
     assert!(capped > uncapped, "premise: the posture really is a slower step ({capped} vs {uncapped} ms)");
@@ -15191,7 +15556,7 @@ fn the_frost_feeder_does_not_get_ahead_of_the_visible_tiles() {
     let mut q = crate::support::ThumbQueue::new(rx);
     let mut got: Vec<usize> = Vec::new();
     for _ in 0..6 {
-        got.push(q.take().expect("the queue holds every request both steps just sent").idx);
+        got.push(q.take_via(crate::support::ThumbQueue::try_take).expect("the queue holds every request both steps just sent").idx);
     }
     while let Some(r) = q.try_take() {
         got.push(r.idx);
@@ -22293,6 +22658,7 @@ fn a_fast_frame_landing_repaints_the_strip_at_constant_cache_length() {
             &app, 20, 40, now, &last_tick, 0, &shots, &plan, &cache, &film, &thumb_gen, &tx,
             &fast_gen, &ratings, &marks, &sel_gen, &select, &select_gen, &pos, &base, &dragging,
             &follow, &target, &film_clamp, &last_key, &film_model, &rot,
+            crate::support::ThumbScope::Nearby,
         );
     };
     // The model is a window [base, base+count); this maps an absolute index to its slot.
@@ -25631,147 +25997,263 @@ fn the_copy_sheets_content_segments_name_the_slot_and_fit_their_cells() {
     app.set_confirm_kind(0);
 }
 
-/// v0.8.195 (EFFICIENCY MODE, §1B — OWNER RULING 2026-08-30 "option c") — **THE CONTROL IS THREE
-/// STATES, IT LIVES IN PERFORMANCE, AND EVERY LABEL FITS ITS OWN CELL.**
-///
-/// Three claims, and a test that proved only the first would be worse than none.
-///
-/// **(1) THE TRIAD.** Auto | On | Off, in that order, with Auto first because Auto is the default
-/// and a segmented control reads left-to-right as least-intervention-first (the "Custom | 4 |
-/// Uncapped" grammar the lane-cap card already wears). Count-asserted against the shipped markup, so
-/// a fourth state or a renamed one cannot arrive without this row saying so.
-///
-/// **(2) THE PLACEMENT.** In the PERFORMANCE section — mounted with the sheet OPEN and the Developer
-/// legacy fold CLOSED, which is how a user finds it — and NOT inside that fold. It is a product row:
-/// it changes what the person browsing gets (less speculative decoding, and a browse capped to
-/// 20 fps while it is engaged), so it belongs where Adaptive Hi-Res and HEIC speed priority are.
-///
-/// **(3) THE FIT, which is the half the v0.8.194 hotfix had to learn the hard way.** `Seg` centres
-/// each label over a `clip: true` track and does NOT elide, so a label wider than its pill is cut
-/// off at BOTH ends with nothing on screen to say so — no ellipsis, no overflow, just a quietly
-/// shorter word. The only way to know is to measure, so this measures: each of the three labels,
-/// against this instance's own live pill, in the real Settings Flickable at the real width.
-///
-/// The window is 1200x9000 because the rig's finder honours `ItemRc::is_visible` and PERFORMANCE is
-/// far enough down the sheet to be Flickable-clipped at any ordinary height (the v0.8.96-audit
-/// precedent).
-///
-/// FALSIFIER (L28): rename any segment in `main_window.slint` and block 1 reddens by name; move the
-/// card inside `if root.dev-legacy-open` and block 2's mount assert reddens; widen any label past
-/// its cell (try "Automatic" / "Follow power") and block 3 reddens with both measurements printed.
-#[test]
-fn the_efficiency_mode_control_is_three_fitting_states_in_performance() {
-    let app = boot();
-    app.window().set_size(slint::LogicalSize::new(1200.0, 9000.0));
-    app.set_motion_ui(false);
+/// The zh-CN text of an English string, from the shipped pack (the English itself while untranslated).
+fn zh(english: &str) -> String {
+    let pack: serde_json::Value =
+        serde_json::from_str(include_str!("../translations/zh-CN.json")).expect("the zh-CN pack parses");
+    pack.get(english).and_then(|v| v.as_str()).unwrap_or(english).to_string()
+}
 
-    // ── (1) THE SHIPPED TRIAD, count-asserted at the one mount that carries it.
+/// 2026-10-26 (round 2a) — plan test 12: **THE MODE ROW FITS THE SETTINGS CARD IN ITS WIDEST STATE,
+/// ENGLISH AND ZH-CN (L5), AND THE STATUS LINE MOUNTS ON ITS TEXT.**
+///
+/// (1) The triad is Performance | Balanced | Power saver, count-asserted against the shipped markup
+/// (the same `Seg` on the welcome guide makes it two). (2) It lives in PERFORMANCE with the
+/// Developer fold shut, between CMYK and Fast View, and the battery switch and the background wait
+/// sit with it. (3) `Seg` centres each label over a clipped track and does NOT elide, so every label
+/// is measured against this instance's own pill, in both languages. (4) The status line is
+/// Rust-composed and mounts on its text (L4).
+///
+/// FALSIFIER (L28): rename a cell in the markup and block 1 reddens; give the Seg a row label (the
+/// Efficiency card's "When it runs") and the "Performance" label overflows its pill in block 3;
+/// render the status line unconditionally and block 4's unmount assert reddens.
+#[test]
+fn the_mode_row_fits_the_settings_card_in_english_and_chinese() {
+    use i_slint_backend_testing::ElementHandle as E;
+    // ── (1) THE TRIAD, at the two mounts that carry it (Settings and the welcome guide).
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/main_window.slint"))
         .expect("the shipped markup");
     assert_eq!(
-        src.matches(r#"opts: [@tr("falcon" => "Auto"), @tr("falcon" => "On"), @tr("falcon" => "Off")];"#).count(),
-        1,
-        "the efficiency control is the owner's option (c): Auto (follow power source) | On | Off"
+        src.matches(r#"opts: [@tr("falcon" => "Turbo"), @tr("falcon" => "Balanced"), @tr("falcon" => "Eco"), @tr("falcon" => "Custom")];"#)
+            .count(),
+        2,
+        "the owner's four modes (round 2b names), in this order, on Settings and on the guide (the same Seg)"
     );
-
-    // ── (2) PERFORMANCE, with the Developer fold shut — which is the state Settings opens in.
-    app.set_settings_open(true);
-    hover(&app, 600.0, 300.0);
-    assert!(!app.get_dev_legacy_open(), "precondition: the Developer fold opens collapsed");
-    let seen = |t: &str| i_slint_backend_testing::ElementHandle::find_by_accessible_label(&app, t).count();
-    assert_eq!(seen("Efficiency mode"), 1, "the card's title is mounted in the visible tier");
-    assert_eq!(
-        i_slint_backend_testing::ElementHandle::find_by_element_id(&app, "MainWindow::effseg").count(),
-        1,
-        "…and so is the three-option control itself, without opening any fold"
-    );
-    // The neighbours it was placed between, so a later reorder that strands it somewhere else has
-    // to move one of these too.
-    assert_eq!(seen("HEIC speed priority"), 1, "the PERFORMANCE row directly above it");
-    // v0.8.195 fix tail (skeptic B, O4): the row label is a NOUN naming the axis, on this section's
-    // own grammar ("Detail", "Benchmark with", "Target size"). "When to save" was the only verb
-    // phrase in the section AND its verb is the one word in a photo app that already means writing
-    // an image to disk, so it read as a file preference before the card title was reached.
-    assert_eq!(seen("When it runs"), 1, "the Seg's row label names the axis the control sets");
-    assert_eq!(seen("When to save"), 0, "…and the file-writing misread is gone, not merely joined");
-    assert_eq!(seen("Fast View"), 1, "…and the card directly below it");
-
-    // ── (3) EVERY LABEL FITS ITS OWN CELL. The pill IS the cell (segw - 3px) and each label is a
-    //        free Text at its natural run, so this is a direct comparison — the v0.8.194 shape.
-    let seg = i_slint_backend_testing::ElementHandle::find_by_element_id(&app, "MainWindow::effseg")
-        .next()
-        .expect("the efficiency Seg");
-    let (sp, ss) = (seg.absolute_position(), seg.size());
-    // AN OVERLAP TEST, not a containment test, and the difference is the whole reason this row can
-    // bite. `Seg` centres each label with `x: i*segw + 3px + (segw - 3px - self.width) / 2`, so a
-    // label WIDER than its cell gets a NEGATIVE centring offset and cell 0's label starts to the
-    // LEFT of the track's own origin. A containment test (`p.x >= sp.x`) would therefore stop
-    // FINDING exactly the label that overflows — the failure would arrive as "no such element"
-    // instead of as two measurements, which is a worse message about a different thing.
-    let inside = |e: &i_slint_backend_testing::ElementHandle| {
-        let p = e.absolute_position();
-        let w = e.size().width;
-        w > 1.0 && p.x < sp.x + ss.width && p.x + w > sp.x && p.y >= sp.y && p.y < sp.y + ss.height
-    };
-    let pill = i_slint_backend_testing::ElementHandle::find_by_element_id(&app, "Seg::pill")
-        .find(inside)
-        .expect("the efficiency Seg's pill");
-    let cell = pill.size().width;
-    assert!(cell > 1.0, "premise: the control has real geometry ({cell}px)");
-    for opt in ["Auto", "On", "Off"] {
-        let label = i_slint_backend_testing::ElementHandle::find_by_accessible_label(&app, opt)
-            .find(inside)
-            .unwrap_or_else(|| panic!("the \"{opt}\" segment label inside the control"));
-        assert!(
-            label.size().width <= cell,
-            "\"{opt}\" measures {:.2}px in a {cell:.2}px cell — Seg clips (no elide), so the \
-             overflow would be cut off both ends with nothing on screen to say so",
-            label.size().width
-        );
+    for (lang, tr) in [("en", (|s: &str| s.to_string()) as fn(&str) -> String), ("zh-CN", zh)] {
+        let app = boot();
+        slint::select_bundled_translation(lang).expect("the language is bundled");
+        app.window().set_size(slint::LogicalSize::new(1200.0, 9000.0));
+        app.set_motion_ui(false);
+        // ── (2) PERFORMANCE, with the Developer fold shut — the state Settings opens in.
+        app.set_settings_open(true);
+        hover(&app, 600.0, 300.0);
+        assert!(!app.get_dev_legacy_open(), "precondition: the Developer fold opens collapsed");
+        let seen = |t: &str| E::find_by_accessible_label(&app, t).count();
+        assert_eq!(seen(&tr("Mode")), 1, "[{lang}] the card's title is mounted in the visible tier");
+        assert_eq!(E::find_by_element_id(&app, "MainWindow::modeseg").count(), 1, "[{lang}] the control");
+        assert_eq!(seen(&tr("Use Eco on battery power")), 1, "[{lang}] the battery switch");
+        assert_eq!(seen(&tr("In the background")), 1, "[{lang}] the wait card beside it");
+        assert_eq!(E::find_by_element_id(&app, "MainWindow::bgwaitseg").count(), 1);
+        assert_eq!(seen(&tr("Efficiency mode")), 0, "[{lang}] the Efficiency card is gone, not joined");
+        // ── (3) EVERY LABEL FITS ITS OWN CELL — an OVERLAP test (see the export sheet's twin).
+        let seg = E::find_by_element_id(&app, "MainWindow::modeseg").next().expect("the mode Seg");
+        let (sp, ss) = (seg.absolute_position(), seg.size());
+        let inside = |e: &E| {
+            let p = e.absolute_position();
+            let w = e.size().width;
+            w > 1.0 && p.x < sp.x + ss.width && p.x + w > sp.x && p.y >= sp.y && p.y < sp.y + ss.height
+        };
+        let pill = E::find_by_element_id(&app, "Seg::pill").find(inside).expect("the mode Seg's pill");
+        let cell = pill.size().width;
+        assert!(cell > 1.0, "premise: the control has real geometry ({cell}px)");
+        for opt in ["Turbo", "Balanced", "Eco", "Custom"] {
+            let t = tr(opt);
+            let label = E::find_by_accessible_label(&app, &t)
+                .find(inside)
+                .unwrap_or_else(|| panic!("[{lang}] the \"{t}\" segment label inside the control"));
+            assert!(
+                label.size().width <= cell,
+                "[{lang}] \"{t}\" measures {:.2}px in a {cell:.2}px cell — Seg clips (no elide)",
+                label.size().width
+            );
+        }
+        // The battery switch's label fits the card beside its switch: its row is the card's width.
+        let row = E::find_by_element_id(&app, "MainWindow::batteryrow").next().expect("the battery row");
+        let label = E::find_by_accessible_label(&app, &tr("Use Eco on battery power")).next().unwrap();
+        let (rp, rs) = (row.absolute_position(), row.size());
+        let (lp, ls) = (label.absolute_position(), label.size());
+        assert!(lp.x >= rp.x && lp.x + ls.width <= rp.x + rs.width - 40.0, "[{lang}] the label clears the switch");
+        // ── (4) THE STATUS LINE: Rust-composed, mounted on its text, and it names the reason.
+        assert_eq!(E::find_by_element_id(&app, "MainWindow::modenote").count(), 0, "[{lang}] empty ⇒ unmounted");
+        let longest = "On battery: Eco. Eco is limiting browsing to 5 fps right now. That is the slowest step Falcon will use — this machine is currently slower than 5 fps. Eco is using Faster preview right now — your setting is kept.";
+        app.set_mode_note(longest.into());
+        hover(&app, 600.0, 300.0);
+        let note = E::find_by_element_id(&app, "MainWindow::modenote").next().expect("the status line mounts");
+        assert!(note.size().width <= ss.width + 0.5, "[{lang}] the line wraps inside the card");
+        assert_eq!(seen(longest), 1, "[{lang}] …and says why");
+        app.set_mode_note("".into());
+        hover(&app, 600.0, 300.0);
+        assert_eq!(E::find_by_element_id(&app, "MainWindow::modenote").count(), 0, "UNMOUNTED, not blank (L4)");
+        app.set_settings_open(false);
     }
+    let _ = slint::select_bundled_translation("en");
+}
 
-    // ── (4) v0.8.195 FIX TAIL (skeptic B, R2 + O1): THE LIVE-STATE LINE, AND THE ENV UNMOUNT. ───
-    //
-    // Four states of this control used to render identically. The note is what tells them apart, and
-    // the env arm is the lane-cap card's other half — "Dev levers win; the UI says so rather than
-    // pretending otherwise" — which the first cut dropped: a lit, persisting Seg that could not
-    // move the live value.
-    assert_eq!(seen("Waiting for battery power."), 0, "the note is Rust-composed, not a literal");
-    app.set_efficiency_note("Waiting for battery power.".into());
+/// 2026-10-26 (round 2a) — plan test 13: **THE GUIDE'S "THE FEEL" HOLDS THE MODE CONTROL AND QUICK
+/// BENCHMARK WITHOUT THE WHEEL TOGGLE, THE SELECTED MODE'S LINE FOLLOWS THE CONTROL, AND THE HEADING
+/// SPEAKS TO PEOPLE UPDATING ONLY WHEN IT SHOULD.**
+///
+/// FALSIFIER (L28): put the wheel ToggleRow back in column 2 and block 1 reddens; bind the guide's
+/// Seg to its own property and the click row reddens; drop the `welcome-updating` reset in the close
+/// observer and block 3's reopen row reddens.
+#[test]
+fn the_welcome_guide_feel_column_holds_the_mode_control() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let app = boot();
+    app.window().set_size(slint::LogicalSize::new(1200.0, 900.0));
+    app.set_motion_ui(false);
+    app.set_welcome_open(true);
     hover(&app, 600.0, 300.0);
-    assert_eq!(seen("Waiting for battery power."), 1, "…and it renders inside the card");
-    app.set_efficiency_note("".into());
+    let seen = |t: &str| E::find_by_accessible_label(&app, t).count();
+    // ── (1) the column: the mode control and Quick benchmark, and no wheel toggle on the guide.
+    assert_eq!(E::find_by_element_id(&app, "MainWindow::wcmodeseg").count(), 1);
+    assert_eq!(seen("Quick benchmark"), 1);
+    assert_eq!(seen("Mouse wheel changes photo"), 0, "the wheel row lives in Settings → INPUT now");
+    let seg = E::find_by_element_id(&app, "MainWindow::wcmodeseg").next().unwrap();
+    let (sp, ss) = (seg.absolute_position(), seg.size());
+    assert!(ss.width <= 296.5, "inside the 296 px column: {}", ss.width);
+    // ── (2) the selected mode's line follows the control, through the shared property.
+    let line = |app: &ui::MainWindow| {
+        E::find_by_element_id(app, "MainWindow::wcmodeline").next().unwrap().accessible_label().unwrap().to_string()
+    };
+    assert_eq!(app.get_mode(), 1, "Balanced by default");
+    assert_eq!(line(&app), "Smooth browsing with a moderate load. Recommended.");
+    // The Seg writes `mode` (its click path is the stock component's, pinned by its own rows); the
+    // line under it reads the same property the Settings row does.
+    let _ = sp;
+    for (want, text) in [
+        (2, "Lightest load. Browsing stays usable; good on battery."),
+        (0, "Fastest browsing this PC can sustain. Uses the most memory and processor."),
+    ] {
+        app.set_mode(want);
+        hover(&app, 600.0, 300.0);
+        assert_eq!(line(&app), text);
+    }
+    // ── (3) the heading: first-run words by default, the update words only when asked, and closing
+    //        returns the guide to its first-run words.
+    assert_eq!(seen("Welcome to Falcon"), 1);
+    app.set_welcome_feature("1.1".into());
+    app.set_welcome_updating(true);
     hover(&app, 600.0, 300.0);
-    assert_eq!(seen("Waiting for battery power."), 0, "empty ⇒ the line does not mount at all (L4)");
+    assert_eq!(seen("New in Falcon 1.1"), 1, "after a feature update");
     assert_eq!(
-        i_slint_backend_testing::ElementHandle::find_by_element_id(&app, "MainWindow::effnote").count(),
-        0,
-        "UNMOUNTED, not merely blank — the mount gate is the `if`, never an empty string"
+        seen("Choose how hard Falcon works. You can change it any time in Settings → Performance."),
+        1
     );
+    assert_eq!(seen("Welcome to Falcon"), 0);
+    app.set_welcome_open(false);
+    hover(&app, 600.0, 300.0);
+    assert!(!app.get_welcome_updating(), "closing ends the update wording");
+    app.set_welcome_open(true);
+    hover(&app, 600.0, 300.0);
+    assert_eq!(seen("Welcome to Falcon"), 1, "Show welcome reads as it always has");
+}
 
-    app.set_efficiency_note("Turned off for this session by FALCON_EFFICIENCY=0.".into());
-    app.set_efficiency_env(true);
+/// 2026-10-26 (round 2a) — plan test 14: **THE SPEED PANEL GREYS THE STOPS ABOVE THE MODE'S LIMIT BY
+/// GEOMETRY (L49), DISTINCT FROM THE BENCHMARK'S FROST, AND A PICK ON ONE ASKS INSTEAD OF COMMITTING.**
+///
+/// The veil is proved by where it STARTS (the cell boundary before the first greyed stop), never by
+/// `visible:`. A pick on a greyed stop must leave the speed alone and raise the ask with its pills;
+/// "Switch to …" changes the mode and then the speed; the battery variant offers the override.
+///
+/// FALSIFIER (L28): drop `grey-from` from the speed panel and block 1 reddens; route `picked` back to
+/// `set-fps` and block 2's unchanged-speed assert reddens; drop the second-row pills and their
+/// mount asserts redden.
+#[test]
+fn the_speed_panel_greys_mode_limited_stops_and_asks_before_switching() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let app = boot();
+    app.window().set_size(slint::LogicalSize::new(1200.0, 900.0));
+    app.set_motion_ui(false);
+    app.set_scrub_fps(12.0);
+    app.set_loading_open(true);
     hover(&app, 600.0, 300.0);
-    assert_eq!(
-        i_slint_backend_testing::ElementHandle::find_by_element_id(&app, "MainWindow::effseg").count(),
-        0,
-        "with the env lever governing, the Seg is UNMOUNTED — not lit and silently refusing"
-    );
-    assert_eq!(
-        seen("Turned off for this session by FALCON_EFFICIENCY=0."),
-        1,
-        "…and the card still says WHY, which is the half the lane-cap precedent is about"
-    );
-    assert_eq!(seen("Efficiency mode"), 1, "the card itself stays — only its control goes");
-    app.set_efficiency_env(false);
-    app.set_efficiency_note("".into());
+    // ── (1) GREYING BY GEOMETRY: none in Performance; from the 30 stop at Balanced's 20/s.
+    assert_eq!(E::find_by_element_id(&app, "CustomSeg::greyveil").count(), 0, "Turbo greys nothing");
+    app.set_mode_limit_fps(20.0);
     hover(&app, 600.0, 300.0);
-    assert_eq!(
-        i_slint_backend_testing::ElementHandle::find_by_element_id(&app, "MainWindow::effseg").count(),
-        1,
-        "…and it comes back without the lever"
-    );
-    app.set_settings_open(false);
+    let veil = E::find_by_element_id(&app, "CustomSeg::greyveil").next().expect("the mode's veil mounts");
+    let thirty = E::find_by_accessible_label(&app, "30").next().expect("the 30 stop");
+    let twenty = E::find_by_accessible_label(&app, "20").next().expect("the 20 stop");
+    let vx = veil.absolute_position().x;
+    assert!(vx > twenty.absolute_position().x + twenty.size().width, "20/s is allowed in Balanced");
+    assert!(vx < thirty.absolute_position().x, "30/s and Max are greyed");
+    app.set_mode_limit_fps(12.0);
+    hover(&app, 600.0, 300.0);
+    let vx12 = E::find_by_element_id(&app, "CustomSeg::greyveil").next().unwrap().absolute_position().x;
+    assert!(vx12 < vx, "Eco's 12/s greys from the 20 stop");
+    // …and it is a different element from the benchmark's frost, which needs a benchmark to mount.
+    assert_eq!(E::find_by_element_id(&app, "CustomSeg::greyveil").count(), 1);
+    // ── (2) THE ASK: a click on a greyed stop reaches Rust as a REQUEST (`pick-fps`, where
+    //        `support::mode_ask` decides), never as a speed. Back at Balanced's 20/s for the click.
+    app.set_mode_limit_fps(20.0);
+    hover(&app, 600.0, 300.0);
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0.0f32));
+    let set = std::rc::Rc::new(std::cell::Cell::new(0.0f32));
+    {
+        let asked = asked.clone();
+        app.on_pick_fps(move |f| asked.set(f));
+        let set = set.clone();
+        app.on_set_fps(move |f| set.set(f));
+    }
+    let thirty = E::find_by_accessible_label(&app, "30").next().expect("the 30 stop");
+    let (tp, ts) = (thirty.absolute_position(), thirty.size());
+    click(&app, tp.x + ts.width / 2.0, tp.y + ts.height / 2.0, i_slint_core::items::PointerEventButton::Left);
+    assert_eq!(asked.get(), 30.0, "the greyed pick is a request");
+    assert_eq!(set.get(), 0.0, "…and nothing committed the speed");
+    assert_eq!(app.get_scrub_fps(), 12.0, "the speed is unchanged");
+    // The pills mount on the card's second row with Rust-composed labels, one per variant.
+    app.set_toast_text("30 photos/s needs Turbo.".into());
+    app.set_toast_show(true);
+    app.set_toast_mode_yes("Switch to Turbo".into());
+    app.set_toast_mode_no("Keep Balanced".into());
+    app.set_toast_mode_ask(1);
+    hover(&app, 600.0, 300.0);
+    assert_eq!(E::find_by_element_id(&app, "MainWindow::modeaskyes").count(), 1);
+    assert_eq!(E::find_by_element_id(&app, "MainWindow::modeaskno").count(), 1);
+    assert_eq!(E::find_by_element_id(&app, "MainWindow::modeholdyes").count(), 0);
+    app.set_toast_mode_yes("Use Balanced until the power source changes".into());
+    app.set_toast_mode_no("Keep Eco".into());
+    app.set_toast_mode_ask(2);
+    hover(&app, 600.0, 300.0);
+    let yes = E::find_by_element_id(&app, "MainWindow::modeholdyes").next().expect("the battery variant");
+    let no = E::find_by_element_id(&app, "MainWindow::modeholdno").next().unwrap();
+    assert!(no.absolute_position().y > yes.absolute_position().y, "the long pill gets its own row");
+    assert_eq!(E::find_by_element_id(&app, "MainWindow::modeaskyes").count(), 0);
+    let card = E::find_by_element_id(&app, "MainWindow::toastcard").next().expect("the toast card");
+    let (cp, cs) = (card.absolute_position(), card.size());
+    for e in [&yes, &no] {
+        let (p, s) = (e.absolute_position(), e.size());
+        assert!(p.x >= cp.x && p.x + s.width <= cp.x + cs.width, "a pill stays on the card");
+    }
+    app.set_toast_mode_ask(0);
+    app.set_loading_open(false);
+}
+
+/// 2026-10-26 (round 2a) — plan test 15: **THE LEAF FOLLOWS POWER SAVER IN EFFECT, WHATEVER THE
+/// REASON** — chosen, on battery or on Battery saver — and never Balanced. The tick publishes
+/// `limits.quiet`, which the leaf's `if` reads (its geometry rows are the three `efficiency_leaf_*`
+/// tests above).
+///
+/// FALSIFIER (L28): publish `mode_eff.forced()` instead of `limits.quiet` and the chosen row reddens;
+/// publish `limits.engaged` and the Balanced row reddens.
+#[test]
+fn the_leaf_mounts_while_power_saver_is_in_effect_whatever_the_reason() {
+    use crate::support::*;
+    let dc = PowerSnapshot { source: PowerSource::Dc, saver: false };
+    let saver = PowerSnapshot { source: PowerSource::Ac, saver: true };
+    let ac = PowerSnapshot { source: PowerSource::Ac, saver: false };
+    let leaf = |saved: u8, s: PowerSnapshot| {
+        let eff = mode_in_effect(saved, true, s, false, false);
+        mode_limits(eff.mode, crate::support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None).quiet
+    };
+    assert!(leaf(MODE_POWER_SAVER, ac), "chosen");
+    assert!(leaf(MODE_BALANCED, dc), "on battery");
+    assert!(leaf(MODE_PERFORMANCE, saver), "on Battery saver");
+    assert!(!leaf(MODE_BALANCED, ac), "Balanced has no leaf");
+    assert!(!leaf(MODE_PERFORMANCE, ac));
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+    assert_eq!(src.matches("app.set_efficiency_leaf(limits.quiet);").count(), 1, "the one publisher");
 }
 
 /// v0.8.195 FIX TAIL (skeptic B, R1c — CONFIRMED) — **THE BROWSE-SPEED POPUP STOPS CLAIMING A RATE
@@ -25798,7 +26280,7 @@ fn the_browse_speed_popup_says_when_the_posture_is_holding_it() {
     app.set_motion_ui(false);
     app.set_loading_open(true);
     hover(&app, 600.0, 300.0);
-    let note = "Efficiency mode is limiting browsing to 20 fps right now.";
+    let note = "Balanced limits browsing to 20 fps.";
     let seen = |t: &str| i_slint_backend_testing::ElementHandle::find_by_accessible_label(&app, t).count();
     let mounted = |id: &str| {
         i_slint_backend_testing::ElementHandle::find_by_element_id(&app, id).count()
@@ -26113,7 +26595,7 @@ fn a_grow_under_the_posture_keeps_its_stale_frames_and_the_log_names_the_hold() 
     //        withheld sweep from a warm cache.
     let held = crate::support::adaptive_res_suffix(false, true, true);
     let free = crate::support::adaptive_res_suffix(false, true, false);
-    assert!(held.contains("held") && held.contains("efficiency"), "{held}");
+    assert!(held.contains("held") && held.contains("Eco"), "{held}");
     assert_ne!(held, free, "a withheld sweep and a running one may not share a sentence");
 }
 
@@ -32535,7 +33017,7 @@ fn a_compare_browse_survives_two_steps_after_a_grid_scroll() {
         while let Some(r) = queue.try_take() {
             res_tx.send((r.idx, r.gen, vec![255; 4], 1, 1, 0, 0, 0)).unwrap();
         }
-        drain_thumbs(&res_rx, &film, &rot, &tg, 0, 0, 0, 0);
+        drain_thumbs(&res_rx, &film, &rot, &tg, 0, 0, 0, 0, crate::THUMB_CACHE_MAX);
     };
     let keep = |a: usize, b: usize| thumb_keep_around(a, Some((a, b)));
 
@@ -32785,4 +33267,457 @@ fn grid_preference_survives_resize_and_restart() {
             assert_eq!(app.get_grid_dock_w(), preferred, "same-session enlargement restores the choice");
         }
     }
+}
+
+/// 2026-10-27 (round 2b) — plan test 6, the guide's half: **THE FOUR MODES FIT THE GUIDE'S 296 PX
+/// COLUMN AT THE SEG'S OWN 12 PX IN ENGLISH AND ZH-CN (L5), AND CUSTOM'S LINE IS A LINK THAT OPENS
+/// SETTINGS.**
+///
+/// FALSIFIER (L28): put "Performance" back as the first name and the English label row reddens
+/// (74 px in a 70 px cell); leave `wcmodeline` mounted for Custom and its row reddens; drop the
+/// link's `settings-open = true` and the click row reddens.
+#[test]
+fn the_four_modes_fit_the_guide_and_custom_links_to_settings() {
+    use i_slint_backend_testing::ElementHandle as E;
+    for (lang, tr) in [("en", (|s: &str| s.to_string()) as fn(&str) -> String), ("zh-CN", zh)] {
+        let app = boot();
+        slint::select_bundled_translation(lang).expect("the language is bundled");
+        app.window().set_size(slint::LogicalSize::new(1200.0, 900.0));
+        app.set_motion_ui(false);
+        app.set_welcome_open(true);
+        hover(&app, 600.0, 300.0);
+        let seg = E::find_by_element_id(&app, "MainWindow::wcmodeseg").next().expect("the guide's Seg");
+        let (sp, ss) = (seg.absolute_position(), seg.size());
+        let inside = |e: &E| {
+            let p = e.absolute_position();
+            let w = e.size().width;
+            w > 1.0 && p.x < sp.x + ss.width && p.x + w > sp.x && p.y >= sp.y && p.y < sp.y + ss.height
+        };
+        let cell = E::find_by_element_id(&app, "Seg::pill").find(inside).expect("its pill").size().width;
+        assert!(cell > 60.0, "[{lang}] four cells in 296 px: {cell}");
+        for opt in ["Turbo", "Balanced", "Eco", "Custom"] {
+            let t = tr(opt);
+            let label = E::find_by_accessible_label(&app, &t).find(inside).unwrap_or_else(|| panic!("[{lang}] {t}"));
+            assert!(label.size().width <= cell, "[{lang}] \"{t}\" {:.1}px in a {cell:.1}px cell", label.size().width);
+        }
+        // Custom: the line becomes the link.
+        assert_eq!(E::find_by_element_id(&app, "MainWindow::wccustomlink").count(), 0, "[{lang}] not for Balanced");
+        app.set_mode(3);
+        hover(&app, 600.0, 300.0);
+        assert_eq!(E::find_by_element_id(&app, "MainWindow::wcmodeline").count(), 0, "[{lang}] the plain line is unmounted");
+        let link = E::find_by_element_id(&app, "MainWindow::wccustomlink").next().expect("the link");
+        assert_eq!(
+            link.accessible_label().unwrap().to_string(),
+            tr("Your own numbers. Starts as Balanced — adjust it in Settings → Performance.")
+        );
+        let (lp, ls) = (link.absolute_position(), link.size());
+        assert!(ls.width <= ss.width + 0.5, "[{lang}] the link wraps inside the column");
+        click(&app, lp.x + 20.0, lp.y + ls.height / 2.0, i_slint_core::items::PointerEventButton::Left);
+        assert!(!app.get_welcome_open() && app.get_settings_open(), "[{lang}] the link opens Settings");
+    }
+    let _ = slint::select_bundled_translation("en");
+}
+
+/// 2026-10-27 (round 2b) — plan test 6, the card's half: **THE CUSTOM CARD MOUNTS ONLY WHILE CUSTOM
+/// IS SELECTED, EVERY ROW FITS IT IN ENGLISH AND ZH-CN (L5), TEXT CELLS SHARE ONE WIDTH AND NUMBER
+/// CELLS ANOTHER (the owner's rule), A STOP WRITES ITS NUMBER, AND EACH LINE NAMES THE CHOICE IN
+/// FULL.**
+///
+/// FALSIFIER (L28): mount the card without `if root.mode == 3` and the Balanced row reddens; drop
+/// `wide-last` from the speed row (or `wide-first` from the keep row) and its equal-width row
+/// reddens; point a CountRow's `pick` at another property and the click row reddens; swap two of
+/// the thumbnail lines and the line rows redden; mount the whole folder's cap row without its
+/// `if root.custom-thumbs == 2`, or fix the line's number at 500, and the cap rows redden (owner,
+/// 27 October: adjustable, starting at 500 MB, shown only with Whole folder).
+#[test]
+fn the_custom_card_mounts_only_for_custom_and_its_rows_fit() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let settle = |app: &ui::MainWindow| {
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(500));
+        hover(app, 600.0, 300.0);
+    };
+    for (lang, tr) in [("en", (|s: &str| s.to_string()) as fn(&str) -> String), ("zh-CN", zh)] {
+        let app = boot();
+        slint::select_bundled_translation(lang).expect("the language is bundled");
+        app.window().set_size(slint::LogicalSize::new(1200.0, 9000.0));
+        app.set_motion_ui(false);
+        app.set_settings_open(true);
+        settle(&app);
+        let find = |n: &str| E::find_by_element_id(&app, &format!("MainWindow::{n}")).next();
+        // ── (1) MOUNTED ONLY FOR CUSTOM (L4/L49: the `if` is the mount).
+        assert_eq!(app.get_mode(), 1);
+        assert!(find("customcard").is_none(), "[{lang}] Balanced: no Custom card");
+        app.set_mode(3);
+        settle(&app);
+        let card = find("customcard").unwrap_or_else(|| panic!("[{lang}] Custom: the card"));
+        let (cp, cs) = (card.absolute_position(), card.size());
+        assert!(find("modenote").is_none(), "precondition: no status line in the way");
+        let mode = find("modeseg").expect("the mode Seg");
+        assert!(cp.y > mode.absolute_position().y, "[{lang}] under the Mode card");
+        // ── (2) EVERY ROW INSIDE THE CARD.
+        assert_eq!(app.get_custom_thumbs(), 2, "precondition: Whole folder, so the cap row is mounted");
+        let rows = ["customfpsseg", "cprevahead", "cprevbehind", "csharpahead", "csharpbehind", "czoomahead",
+            "czoombehind", "cthumbseg", "cthumbmb", "cthumbline", "ckeepseg", "ckeepline", "creleaseseg"];
+        for n in rows {
+            let e = find(n).unwrap_or_else(|| panic!("[{lang}] {n}"));
+            let (p, s) = (e.absolute_position(), e.size());
+            assert!(s.width > 100.0 && p.x >= cp.x && p.x + s.width <= cp.x + cs.width + 0.5, "[{lang}] {n} inside the card");
+        }
+        let inside = |e: &E, n: &str| {
+            let r = find(n).unwrap();
+            let (rp, rs, p, w) = (r.absolute_position(), r.size(), e.absolute_position(), e.size().width);
+            w > 1.0 && p.x >= rp.x - 0.5 && p.x + w <= rp.x + rs.width + 0.5 && p.y >= rp.y - 0.5 && p.y < rp.y + rs.height
+        };
+        let pill = |n: &str, which: &str| {
+            E::find_by_element_id(&app, which).find(|e| inside(e, n)).unwrap_or_else(|| panic!("[{lang}] {n}'s pill")).size().width
+        };
+        let label = |n: &str, t: &str| {
+            E::find_by_accessible_label(&app, t).find(|e| inside(e, n)).map(|e| e.size().width)
+        };
+        // ── (3) THE SPEED ROW: the typed cell and "Unlimited" one width, 12 / 20 / 30 another.
+        let mut w = Vec::new();
+        for v in [33, 0, 12, 20, 30] {
+            app.set_custom_fps(v);
+            settle(&app);
+            w.push(pill("customfpsseg", "CustomSeg::cpill"));
+        }
+        assert!((w[0] - w[1]).abs() < 0.5, "[{lang}] typed and Unlimited share a width: {w:?}");
+        assert!((w[2] - w[3]).abs() < 0.5 && (w[3] - w[4]).abs() < 0.5, "[{lang}] the numbers share one: {w:?}");
+        assert!(w[2] + 5.0 < w[1], "[{lang}] and it is narrower: {w:?}");
+        assert!(label("customfpsseg", &tr("Unlimited")).expect("Unlimited") <= w[1], "[{lang}] Unlimited fits");
+        assert!(label("customfpsseg", &tr("Custom")).expect("the typed cell's word") <= w[1], "[{lang}] Custom fits");
+        // Until the user picks, the row shows Balanced's own limit: a stop when it is one, else typed.
+        app.set_custom_fps(-1);
+        app.set_custom_fps_balanced(16);
+        settle(&app);
+        assert!(label("customfpsseg", "16").is_some(), "[{lang}] Balanced's 16 in the typed cell");
+        app.set_custom_fps_balanced(20);
+        settle(&app);
+        assert!(label("customfpsseg", "16").is_none() && label("customfpsseg", &tr("Custom")).is_some());
+        assert!((pill("customfpsseg", "CustomSeg::cpill") - w[3]).abs() < 0.5, "[{lang}] on the 20 stop");
+        // ── (4) THE KEEP AND RELEASE ROWS: the text cell wider, the number cells equal; THE THUMBNAIL
+        //        ROW: three text cells, equal. Every label inside its cell.
+        let seg_widths = |n: &str, set: &dyn Fn(i32), values: &[i32]| -> Vec<f32> {
+            values.iter().map(|&v| { set(v); settle(&app); pill(n, "Seg::pill") }).collect()
+        };
+        let k = seg_widths("ckeepseg", &|v| app.set_custom_bg_keep(v), &[0, 10, 25, 50]);
+        assert!((k[1] - k[2]).abs() < 0.5 && (k[2] - k[3]).abs() < 0.5 && k[0] > k[1] + 5.0, "[{lang}] keep {k:?}");
+        assert!(label("ckeepseg", &tr("In use")).expect("In use") <= k[0]);
+        assert!(label("ckeepseg", "50%").expect("50%") <= k[3]);
+        let r = seg_widths("creleaseseg", &|v| app.set_custom_bg_release_s(v), &[0, 10, 30]);
+        assert!((r[1] - r[2]).abs() < 0.5 && r[0] > r[1] + 5.0, "[{lang}] release {r:?}");
+        assert!(label("creleaseseg", &tr("At once")).expect("At once") <= r[0]);
+        assert!(label("creleaseseg", &tr("30 s")).expect("30 s") <= r[2]);
+        let th = seg_widths("cthumbseg", &|v| app.set_custom_thumbs(v), &[0, 1, 2]);
+        assert!((th[0] - th[1]).abs() < 0.5 && (th[1] - th[2]).abs() < 0.5, "[{lang}] thumbnails {th:?}");
+        for (i, opt) in ["On screen", "Nearby", "Whole folder"].iter().enumerate() {
+            assert!(label("cthumbseg", &tr(opt)).unwrap_or_else(|| panic!("[{lang}] {opt}")) <= th[i], "[{lang}] {opt} fits");
+        }
+        // The count rows: the typed cell's word fits it.
+        for n in ["cprevahead", "csharpbehind", "czoomahead"] {
+            let typed_w = {
+                let seg = E::find_by_element_id(&app, "CountRow::seg").find(|e| inside(e, n)).expect("the row's control");
+                let _ = seg;
+                // A value that is not a stop puts the pill on the typed cell.
+                match n {
+                    "cprevahead" => app.set_custom_previews_ahead(55),
+                    "csharpbehind" => app.set_custom_sharp_behind(7),
+                    _ => app.set_custom_zoomed_ahead(30),
+                }
+                settle(&app);
+                pill(n, "CustomSeg::cpill")
+            };
+            match n {
+                "cprevahead" => app.set_custom_previews_ahead(40),
+                "csharpbehind" => app.set_custom_sharp_behind(1),
+                _ => app.set_custom_zoomed_ahead(8),
+            }
+            settle(&app);
+            assert!(label(n, &tr("Custom")).expect("Custom") <= typed_w, "[{lang}] {n}: Custom fits");
+        }
+        // THE WHOLE FOLDER'S CAP (owner, 27 October): "Up to [typed | 250 | 500 | 1000 | 2000] MB",
+        // starting at 500, the count rows' shape (the typed cell is their wider text cell, the four
+        // numbers share one width), the unit after it inside the card, and mounted only while Whole
+        // folder is the choice.
+        assert_eq!(app.get_custom_thumbs_mb(), 500, "[{lang}] it starts at 500 MB");
+        let mb: Vec<f32> = [750, 250, 500, 1000, 2000]
+            .iter()
+            .map(|&v| { app.set_custom_thumbs_mb(v); settle(&app); pill("cthumbmb", "CustomSeg::cpill") })
+            .collect();
+        assert!(mb[1..].windows(2).all(|p| (p[0] - p[1]).abs() < 0.5), "[{lang}] the cap's numbers share one width: {mb:?}");
+        assert!(mb[0] > mb[1] + 5.0, "[{lang}] and the typed cell is the wider one: {mb:?}");
+        assert!(label("cthumbmb", &tr("Custom")).is_some_and(|w| w <= mb[0]), "[{lang}] the typed cell's word fits it");
+        for (i, t) in ["250", "500", "1000", "2000"].iter().enumerate() {
+            assert!(label("cthumbmb", t).unwrap_or_else(|| panic!("[{lang}] {t}")) <= mb[i + 1], "[{lang}] {t} fits");
+        }
+        let seg = E::find_by_element_id(&app, "CountRow::seg").find(|e| inside(e, "cthumbmb")).expect("the cap's control");
+        let unit = E::find_by_accessible_label(&app, &tr("MB")).find(|e| inside(e, "cthumbmb")).expect("the unit");
+        assert!(
+            unit.absolute_position().x >= seg.absolute_position().x + seg.size().width
+                && unit.absolute_position().x + unit.size().width <= cp.x + cs.width + 0.5,
+            "[{lang}] MB after the control, inside the card"
+        );
+        app.set_custom_thumbs_mb(750);
+        settle(&app);
+        assert!(label("cthumbmb", "750").is_some(), "[{lang}] a typed 750 shows in the typed cell");
+        // The tick and the save read the cap off the card, and the settings apply writes it there.
+        assert_eq!(crate::support::custom_limits_of(&app).thumbs_mb, 750, "[{lang}] the card is read");
+        crate::support::set_custom_limits_on(&app, crate::support::CustomLimits { thumbs_mb: 1000, ..crate::support::custom_limits_of(&app) });
+        assert_eq!(app.get_custom_thumbs_mb(), 1000, "[{lang}] and written");
+        app.set_custom_thumbs_mb(500);
+        app.set_custom_thumbs(1);
+        settle(&app);
+        assert!(find("cthumbmb").is_none(), "[{lang}] Nearby: no cap row");
+        app.set_custom_thumbs(2);
+        settle(&app);
+        assert!(find("cthumbmb").is_some(), "[{lang}] Whole folder: the cap row");
+        // A typed 0 (no sharp photos ahead) shows in the typed cell, not on the nearest stop.
+        app.set_custom_sharp_ahead(0);
+        settle(&app);
+        assert!(label("csharpahead", "0").is_some(), "[{lang}] a typed 0 is shown");
+        app.set_custom_sharp_ahead(3);
+        settle(&app);
+        // ── (5) A STOP WRITES ITS NUMBER, through the real control.
+        let click_label = |n: &str, t: &str| {
+            let e = E::find_by_accessible_label(&app, t).find(|e| inside(e, n)).unwrap_or_else(|| panic!("[{lang}] {t} in {n}"));
+            let (p, s) = (e.absolute_position(), e.size());
+            click(&app, p.x + s.width / 2.0, p.y + s.height / 2.0, i_slint_core::items::PointerEventButton::Left);
+            settle(&app);
+        };
+        click_label("cprevahead", "80");
+        assert_eq!(app.get_custom_previews_ahead(), 80, "[{lang}] 80 previews ahead");
+        click_label("czoombehind", "4");
+        assert_eq!(app.get_custom_zoomed_behind(), 4, "[{lang}] 4 zoomed behind");
+        click_label("cthumbmb", "1000");
+        assert_eq!(app.get_custom_thumbs_mb(), 1000, "[{lang}] up to 1000 MB");
+        assert_eq!(app.get_custom_previews_ahead(), 80, "…and nothing else moved");
+        click_label("customfpsseg", &tr("Unlimited"));
+        assert_eq!(app.get_custom_fps(), 0, "[{lang}] Unlimited");
+        click_label("cthumbseg", &tr("Nearby"));
+        assert_eq!(app.get_custom_thumbs(), 1, "[{lang}] Nearby");
+        click_label("ckeepseg", "25%");
+        assert_eq!(app.get_custom_bg_keep(), 25);
+        click_label("creleaseseg", &tr("At once"));
+        assert_eq!(app.get_custom_bg_release_s(), 0);
+        // ── (6) EACH LINE NAMES THE CHOICE IN FULL, and follows it.
+        let line = |n: &str| find(n).unwrap().accessible_label().unwrap().to_string();
+        for (v, text) in [
+            (0, "Visible only: thumbnails for the photos on screen."),
+            (1, "Visible and nearby: also the ones just off screen and around the current photo."),
+        ] {
+            app.set_custom_thumbs(v);
+            settle(&app);
+            assert_eq!(line("cthumbline"), tr(text), "[{lang}] thumbnails {v}");
+        }
+        let whole = "Whole folder: then the rest of the folder while Falcon is idle, up to {} MB. Cloud-only files are skipped.";
+        for mb in [500, 750] {
+            app.set_custom_thumbs(2);
+            app.set_custom_thumbs_mb(mb);
+            settle(&app);
+            assert_eq!(line("cthumbline"), tr(whole).replace("{}", &mb.to_string()), "[{lang}] the line names the cap");
+        }
+        app.set_custom_bg_keep(0);
+        settle(&app);
+        assert_eq!(line("ckeepline"), tr("Only the photos in use: everything else is released."));
+        app.set_custom_bg_keep(25);
+        settle(&app);
+        assert_eq!(line("ckeepline"), tr("Up to {}% of the graphics memory.").replace("{}", "25"));
+        for n in ["cthumbline", "ckeepline"] {
+            assert!(find(n).unwrap().size().width <= cs.width, "[{lang}] {n} wraps inside the card");
+        }
+        // Leaving Custom unmounts the card (and keeps its numbers).
+        app.set_mode(0);
+        settle(&app);
+        assert!(find("customcard").is_none(), "[{lang}] Turbo: no card");
+        assert_eq!(app.get_custom_previews_ahead(), 80);
+        app.set_settings_open(false);
+    }
+    let _ = slint::select_bundled_translation("en");
+}
+
+/// 2026-10-27 (round 2b) — plan test 4, the tile feeds' half: **"VISIBLE ONLY" ASKS FOR THE TILES ON
+/// SCREEN AND NO MORE, WHERE "VISIBLE AND NEARBY" ALSO ASKS FOR THE MARGIN; AND THE TICK GATES THE
+/// BLUR FEEDER AND THE WHOLE-FOLDER FEEDER ON THE MODE'S THUMBNAILS.** The strip and the grid are the
+/// real steps over the rig window; the gates are a census (they need the whole tick).
+///
+/// FALSIFIER (L28): drop the `VisibleOnly` filter from `step_filmstrip` (or `step_folder_grid`) and
+/// its row reddens with the margin's requests; drop the scope term from the frost feeder's gate, or
+/// the scope or a pause term (the Mac memory hold included) from the whole-folder call, and the
+/// census reddens.
+#[test]
+fn visible_only_asks_only_for_the_tiles_on_screen() {
+    use crate::support::ThumbScope;
+    use std::cell::{Cell, RefCell};
+    use std::time::Instant;
+    use crate::tick::{step_folder_grid, FastCache, GRID_CELL_H, GRID_PAD, GRID_ROW_PITCH};
+    let app = boot();
+    hover(&app, 600.0, 300.0);
+    let n = 400usize;
+    let shots: Vec<crate::Shot> = (0..n)
+        .map(|i| crate::Shot {
+            id: i,
+            name: format!("IMG_{i:04}.JPG"),
+            has_raw: false,
+            has_jpg: true,
+            raw: None,
+            jpg: Some(std::path::PathBuf::from(format!("C:/rig/IMG_{i:04}.jpg"))),
+            kind: crate::SrcKind::Jpeg,
+            cloud_placeholder: false,
+            sniffed: None,
+        })
+        .collect();
+    let plan = crate::support::plan_from_shots(&shots);
+    let rot = crate::RotState::new(false);
+    // ── THE STRIP, held (a drag) at each position in turn, on photo 200; what each call asked for.
+    let strip_at = |scope: ThumbScope, at: &[f32]| -> Vec<Vec<usize>> {
+        let film = crate::Film::new();
+        let (tx, rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+        let cache = RefCell::new(FastCache::default());
+        let ratings = RefCell::new(vec![0i32; n]);
+        let marks = RefCell::new(vec![0u8; n]);
+        let film_model = slint::VecModel::<ui::FilmItem>::default();
+        let now = Instant::now();
+        let (last_tick, pos, base) = (Cell::new(now), Cell::new(at[0]), Cell::new(0i64));
+        let (dragging, follow, target) = (Cell::new(true), Cell::new(false), Cell::new(at[0]));
+        let (thumb_gen, sel_gen, select_gen, fast_gen) = (Cell::new(0u64), Cell::new(0u64), Cell::new(0u64), Cell::new(0u64));
+        let select = RefCell::new(crate::support::SelectSet::default());
+        let last_key = RefCell::new((0i64, 0u64, 0usize, 0usize, 0u64, 0u64, 0u64));
+        let film_clamp = Cell::new((0.0f32, f32::MAX));
+        at.iter()
+            .map(|&p| {
+                pos.set(p);
+                crate::tick::step_filmstrip(
+                    &app, 200, n, now, &last_tick, 0, &shots, &plan, &cache, &film, &thumb_gen, &tx, &fast_gen,
+                    &ratings, &marks, &sel_gen, &select, &select_gen, &pos, &base, &dragging, &follow,
+                    &target, &film_clamp, &last_key, &film_model, &rot, scope,
+                );
+                std::iter::from_fn(|| rx.try_recv().ok().map(|r| r.idx)).collect()
+            })
+            .collect()
+    };
+    let strip = |scope: ThumbScope| strip_at(scope, &[200.0]).remove(0);
+    let vis_half = app.get_strip_w() / (2.0 * 128.0);
+    let on_screen = |i: usize, p: f32| (i as f32 - p).abs() <= vis_half + 0.5;
+    // What can come on screen before the model is rebuilt: one cell further each side (its key moves
+    // with round(pos)).
+    let reach = |i: usize| (i as f32 - 200.0).abs() <= vis_half + 1.5;
+    let near = strip(ThumbScope::Nearby);
+    let vis = strip(ThumbScope::VisibleOnly);
+    assert!(!vis.is_empty() && vis.iter().all(|&i| reach(i)), "only the cells on screen, and one each side: {vis:?}");
+    assert!((0..n).filter(|&i| on_screen(i, 200.0)).all(|i| vis.contains(&i)), "every cell on screen: {vis:?}");
+    assert!(near.iter().any(|&i| !reach(i)), "Nearby also asks for the margin: {near:?}");
+    assert_eq!(near.iter().filter(|&&i| reach(i)).count(), vis.len(), "…and the same cells on screen");
+    // BETWEEN REBUILDS (review C-03): a move within one cell does not rebuild the model, so asks for
+    // nothing; a cell it brings on screen was asked for at the rebuild.
+    let (p0, p1) = (199.51f32, 200.49f32);
+    let held = strip_at(ThumbScope::VisibleOnly, &[p0, p1]);
+    assert!(held[1].is_empty(), "no rebuild within the cell: {:?}", held[1]);
+    assert!((0..n).any(|i| on_screen(i, p1) && !on_screen(i, p0)), "the move brings a cell on screen");
+    assert!((0..n).filter(|&i| on_screen(i, p1)).all(|i| held[0].contains(&i)),
+        "…which was asked for at the rebuild: {:?}", held[0]);
+    // ── THE GRID, open over the first `len` photos, then at each (scroll, dock height) in turn.
+    let grid_at = |scope: ThumbScope, len: usize, steps: &[(f32, f32)]| -> Vec<Vec<usize>> {
+        let film = crate::Film::new();
+        let (tx, rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+        let cache = RefCell::new(FastCache::new());
+        let ratings = RefCell::new(vec![0i32; n]);
+        let marks = RefCell::new(vec![0u8; n]);
+        let (thumb_gen, sel_gen, select_gen, fast_gen) = (Cell::new(0u64), Cell::new(0u64), Cell::new(0u64), Cell::new(0u64));
+        let select = RefCell::new(crate::support::SelectSet::default());
+        let last_grid_key = Cell::new(crate::background_memory::GRID_KEY_UNBUILT);
+        let last_grid_view: Cell<(bool, u64)> = Cell::new((false, u64::MAX)); // a first open: recenters on 0
+        let last_grid_c: Cell<usize> = Cell::new(usize::MAX);
+        let grid_model = slint::VecModel::<ui::FilmItem>::default();
+        let grid_vp_prog: Cell<Option<crate::support::PanelMemo>> = Cell::new(None);
+        steps
+            .iter()
+            .enumerate()
+            .map(|(k, &(s, h))| {
+                if k > 0 {
+                    app.set_grid_vp_y(-s); // the first call opens the dock, which recenters on photo 0
+                }
+                app.set_grid_vp_h(h);
+                step_folder_grid(
+                    &app, 0, len, 1, &shots[..len], &plan, &cache, &film, &thumb_gen, &tx, &fast_gen, &ratings, &marks,
+                    &sel_gen, &select, &select_gen, &last_grid_key, &last_grid_view, &last_grid_c,
+                    &grid_vp_prog, &grid_model, &rot, scope,
+                );
+                let asked: Vec<usize> = std::iter::from_fn(|| rx.try_recv().ok().map(|r| r.idx)).collect();
+                film.pending.borrow_mut().clear(); // served, so the dock's share never binds
+                asked
+            })
+            .collect()
+    };
+    let grid = |scope: ThumbScope| grid_at(scope, n, &[(0.0, app.get_grid_vp_h())]).remove(0);
+    app.set_grid_open(true);
+    hover(&app, 600.0, 300.0);
+    if app.get_grid_vp_h() <= 0.0 {
+        app.set_grid_vp_h(654.0);
+    }
+    app.set_grid_vp_y(0.0);
+    let vh = app.get_grid_vp_h();
+    let gnear = grid(ThumbScope::Nearby);
+    let cols = app.get_grid_cols().max(1) as usize; // the dock's own, written by the step
+    let row_at = |i: usize, s: f32| {
+        let top = GRID_PAD + (i / cols) as f32 * GRID_ROW_PITCH;
+        top + GRID_CELL_H > s && top < s + vh
+    };
+    // What can scroll on screen before the window is rebuilt: a row pitch further each side.
+    let row_reach = |i: usize| {
+        let top = GRID_PAD + (i / cols) as f32 * GRID_ROW_PITCH;
+        top + GRID_CELL_H > -GRID_ROW_PITCH && top < vh + GRID_ROW_PITCH
+    };
+    let gvis = grid(ThumbScope::VisibleOnly);
+    assert!(!gvis.is_empty(), "the rows on screen are asked for");
+    assert!(gvis.iter().all(|&i| row_reach(i)), "only the rows on screen, and a pitch each side: {gvis:?}");
+    assert!(gnear.iter().any(|&i| !row_reach(i)), "Nearby also asks for the margin rows: {gnear:?}");
+    // BETWEEN REBUILDS (review C-03 and its re-check V-01): walk the dock a few px at a time down
+    // from the top, where the window's first row is held at 0 for about three pitches, and up from
+    // the bottom, where it is held again. Every tile on screen at each scroll has been asked for by
+    // then, and a scroll within a row pitch asks for nothing new.
+    let bottom = GRID_PAD + n.div_ceil(cols) as f32 * GRID_ROW_PITCH - vh;
+    let walks: [Vec<f32>; 2] = [
+        (0..100).map(|k| k as f32 * 7.0).collect(),
+        std::iter::once(0.0).chain((0..60).map(|k| bottom - k as f32 * 7.0)).collect(),
+    ];
+    for scrolls in &walks {
+        let steps: Vec<(f32, f32)> = scrolls.iter().map(|&s| (s, vh)).collect();
+        let asked_at = grid_at(ThumbScope::VisibleOnly, n, &steps);
+        let mut asked = std::collections::HashSet::new();
+        for (k, &s) in scrolls.iter().enumerate() {
+            asked.extend(asked_at[k].iter().copied());
+            let missing: Vec<usize> = (0..n).filter(|&i| row_at(i, s) && !asked.contains(&i)).collect();
+            assert!(missing.is_empty(), "at scroll {s} px, tiles on screen never asked for: {missing:?} ({cols} columns)");
+        }
+        assert!(asked_at.iter().skip(1).any(Vec::is_empty), "a scroll within a row pitch asks for nothing new");
+    }
+    // …and over a folder the window holds whole (11 rows), a taller dock asks for the rows it brings
+    // on screen (re-check Q-01).
+    let small = 11 * cols;
+    let tall = vh + 250.0;
+    let grown = grid_at(ThumbScope::VisibleOnly, small, &[(0.0, vh), (0.0, tall)]);
+    let shown_at = |i: usize, h: f32| GRID_PAD + (i / cols) as f32 * GRID_ROW_PITCH < h;
+    assert!((0..small).any(|i| shown_at(i, tall) && !grown[0].contains(&i)), "premise: the taller dock shows rows not asked for yet");
+    assert!((0..small).filter(|&i| shown_at(i, tall)).all(|i| grown[0].contains(&i) || grown[1].contains(&i)),
+        "…and asks for them: {:?} then {:?}", grown[0], grown[1]);
+    app.set_grid_vp_h(vh);
+    // ── THE TICK'S GATES (census: they need the whole tick).
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+    let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+    // (Spelled as one `frost_feeding` term since review R1, which clears the window without it.)
+    let frost = prod.find("let frost_feeding =").expect("the frost gate");
+    assert!(prod[frost..frost + 200].contains("&& limits.thumbs != support::ThumbScope::VisibleOnly"), "the blur feeder is part of nearby");
+    assert!(prod[frost..frost + 400].contains("if frost_feeding && !thumbnail_startup_hold && !defer_thumbs"), "…behind its holds");
+    let whole = prod.find(concat!("if limits.thumbs == support::ThumbScope::", "WholeFolder")).expect("the whole-folder gate");
+    let end = whole + prod[whole..].find("mk!(\"whole_folder\");").expect("the block's end");
+    let gate = &prod[whole..end];
+    for term in ["!thumbnail_startup_hold", "!defer_thumbs", "!bg_hold", "!memory_hold", "app.get_photo_ready()",
+        "det_awaited_t.load(Ordering::Relaxed) < 0", "!*scr_t.borrow()", "!film_dragging_t.get()",
+        "Duration::from_millis(IDLE_DEEPEN_MS)"] {
+        assert!(gate.contains(term), "the whole folder waits while {term} says something is asked for");
+    }
+    assert!(gate.contains("&meta_t.cloud_tagged.borrow()"), "…and never asks for a cloud-only file");
+    let retire = prod.find("tick::step_retire_thumbs(&thumb_req_t").expect("the retire pass");
+    assert!(retire < whole, "after every visible producer");
+    assert_eq!(prod.matches("limits.thumbs_max, // round 2b").count(), 1, "the cache keeps the mode's cap");
 }

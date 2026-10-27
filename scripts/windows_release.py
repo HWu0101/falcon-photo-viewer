@@ -21,7 +21,7 @@ HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY SSL_CERT_FILE SSL_CERT_DIR'''.split())
 SYSTEM_IMPORTS = frozenset('''advapi32.dll api-ms-win-core-synch-l1-2-0.dll
 api-ms-win-core-winrt-error-l1-1-0.dll bcryptprimitives.dll combase.dll comctl32.dll d3d11.dll
 dwmapi.dll dwrite.dll dxgi.dll gdi32.dll imm32.dll kernel32.dll mscms.dll ntdll.dll ole32.dll
-oleaut32.dll opengl32.dll propsys.dll setupapi.dll shell32.dll shlwapi.dll user32.dll uxtheme.dll'''.split())
+oleaut32.dll opengl32.dll pdh.dll propsys.dll setupapi.dll shell32.dll shlwapi.dll user32.dll uxtheme.dll'''.split())
 
 
 def clean_revision(root):

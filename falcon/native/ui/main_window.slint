@@ -13,7 +13,7 @@ import { IconBtn, PillBtn, TextField, ActionBtn, FocusBadge } from "controls.sli
 import { GlassPanel, SolidPanel, SettingsGroup, SectionLabel, PanelHeader, HRule, PanelBottomFade, PanelRightFade, ExifRowsView, FloatingExif, HoverPreview } from "panels.slint";
 import { MenuItem, MenuSep, MenuHeader } from "menu.slint";
 import { HudChip, SectionChip, CacheMeter, DropZone, ComparePinLabel, CullActionRow } from "hud.slint";
-import { SegPill, Seg, CustomSeg } from "segs.slint";
+import { SegPill, Seg, CustomSeg, CountRow } from "segs.slint";
 import { ToggleRow, ToggleTrack, OptionChip, SelectedChip, CopyRankList } from "settings.slint";
 import { FilmThumb, BriefCell, BriefSep, SelTile } from "filmstrip.slint";
 import { GridThumb } from "grid.slint";
@@ -511,7 +511,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // posture engaged all of it said 30 while the browse stepped at 20 — the v0.8.123 defect
         // ("built from a JPEG benchmark figure and said nothing about lanes that cannot reach it")
         // re-cut on the title. Rust-composed and EMPTY unless the posture is actually binding, so
-        // the mount is the emptiness (`support::scrub_fps_efficiency_note`).
+        // the mount is the emptiness (`support::scrub_fps_mode_note`, round 2a).
         in property <string> fps-eff-note: "";
         // v0.8.196 fix tail (skeptic B, R4): the Fast View card's own state-derived note. While the
         // posture holds the sampling tier, that card's Seg sits on the user's stop and the app is
@@ -544,28 +544,54 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // v1.0.0-rc TAIL: platform table gates the CMYK row (Windows=true; the row's words name
         // Windows' codec, so macOS does not offer it — see platform.rs `cmyk_route_visible`).
         in-out property <bool> cmyk-route-visible: true;
-        // ── v0.8.195 (OWNER RULING 2026-08-30, option c): EFFICIENCY MODE ───────────────────
-        // "go with option c for the efficiency mode." ONE control, three states — 0 Auto (follow
-        // the power source), 1 On, 2 Off — DEFAULT Auto, which is why the default here is 0.
-        //
-        // A PRODUCT row in PERFORMANCE beside HEIC speed priority and Adaptive Hi-Res, not a
-        // Developer lever: it changes what the person browsing gets (less speculative decoding,
-        // and a browse capped to 20 fps while it is engaged), so it belongs where he can find it.
-        // Rust holds the live value in an atomic the tick re-reads every pass, so this is a real
-        // live callback — a click applies on the next tick, with nothing latched (L43).
-        in-out property <int> efficiency-mode: 0;
-        callback set-efficiency-mode(int);
-        // v0.8.195 fix tail (skeptic B, R2/O1): the control's LIVE-STATE line, Rust-composed off the
-        // same three inputs `efficiency_engaged` takes (`support::efficiency_note`). Without it a
-        // desktop's permanent no-op, a laptop engaged right now, a laptop released and a session
-        // vetoed by the env lever all rendered as the identical lit "Auto" pill under a caption
-        // about a battery — the VISUAL-THINKERS lens, and the spec's own L15 line.
-        in property <string> efficiency-note: "";
-        // …and whether `FALCON_EFFICIENCY=0` is governing this boot. The Seg is MOUNT-GATED on it
-        // (never `visible:` — ledger L4), the note above says why, and the setting still persists:
-        // the `heic-lane-cap-env` precedent thirty lines down, whose own comment is "Dev levers win;
-        // the UI says so rather than pretending otherwise."
-        in property <bool> efficiency-env: false;
+        // ── 2026-10-26 (round 2a, owner rulings): THE MODE CONTROL ────────────────────────────
+        // One choice shapes how hard Falcon works: 0 Performance, 1 Balanced (the default), 2 Power
+        // saver. It replaced Efficiency mode. Rust holds the live value in an atomic the tick
+        // re-reads every pass, so a click applies on the next tick, with nothing latched (L43).
+        // "Use Power saver on battery power" puts Power saver in effect on battery without changing
+        // `mode` — the saved choice is the user's alone (L44).
+        in-out property <int> mode: 1;
+        callback set-mode(int);
+        in-out property <bool> battery-power-saver: true;
+        callback set-battery-power-saver(bool);
+        // The row's live status line — what is in effect and why, and what it is doing to the
+        // browse (`support::mode_note`); mounted on its text.
+        in property <string> mode-note: "";
+        // The Performance line names the machine in the platform's word ("this PC" / "this Mac").
+        in property <string> mode-performance-line: @tr("falcon" => "Fastest browsing this PC can sustain. Uses the most memory and processor.");
+        // The mode IN EFFECT (may be Power saver on battery while `mode` is Balanced), and whether the
+        // power state imposed it: 0 chosen, 1 battery, 2 Battery saver. The speed panel's ask reads
+        // both; Rust writes both with the status line.
+        in property <int> mode-in-effect: 1;
+        in property <int> mode-forced: 0;
+        // The mode's own speed limit, fps (−1 in Performance): the speed panel greys the stops above it.
+        in property <float> mode-limit-fps: -1;
+        // The background wait for every mode, seconds, 5–300 (default 20). A stop writes it directly;
+        // the typed value goes through Rust, which brings it into range.
+        in-out property <int> bg-wait-s: 20;
+        callback set-bg-wait-custom(string);
+        // ── 2026-10-27 (round 2b, owner rulings): CUSTOM'S NUMBERS — the Custom card's, shown while
+        // `mode` is 3. The tick reads them off these properties every pass (`support::custom_limits_of`)
+        // and `build_settings` saves them. A stop writes its property here; a typed value goes through
+        // `set-custom-number(row, text)` (rows 0 speed, 1/2 previews ahead/behind, 3/4 sharp photos,
+        // 5/6 sharp photos while zoomed, 7 the whole folder's cap in MB), which brings it into the row's
+        // range. The defaults are a copy of Balanced (`support::CustomLimits::BALANCED_COPY`).
+        // `custom-fps`: −1 follows Balanced's limit (until the user picks), 0 Unlimited, else typed.
+        in-out property <int> custom-fps: -1;
+        in-out property <int> custom-previews-ahead: 40;
+        in-out property <int> custom-previews-behind: 10;
+        in-out property <int> custom-sharp-ahead: 3;
+        in-out property <int> custom-sharp-behind: 1;
+        in-out property <int> custom-zoomed-ahead: 8;
+        in-out property <int> custom-zoomed-behind: 2;
+        in-out property <int> custom-thumbs: 2;        // 0 Visible only, 1 Visible and nearby, 2 Whole folder
+        in-out property <int> custom-thumbs-mb: 500;   // the whole folder's cap, 100–2,000 MB
+        in-out property <int> custom-bg-keep: 0;       // percent of the card; 0 = only the photos in use
+        in-out property <int> custom-bg-release-s: 10; // 0 = at once
+        // Balanced's own speed limit, rounded (Rust-written from the benchmark): what the speed row shows
+        // while `custom-fps` is −1, so Custom starts as a visible copy of Balanced.
+        in property <int> custom-fps-balanced: 20;
+        callback set-custom-number(int, string);
         in-out property <bool> use-nvjpeg: true;
         in property <bool> nvjpeg-avail: false;
         // v0.9.10 (Mac fix 2): persistence-only carrier for the one-shot accel migration flag (no UI
@@ -594,12 +620,11 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // button ladder the merge itself routed. Default = the Windows literal VERBATIM (the
         // byte-identity fallback the whole family uses), fed by `platform::overwrite_confirm_body`.
         in property <string> overwrite-confirm-body: "Overwrite re-renders those files and replaces them in place — the old versions are gone for good, not moved to the Recycle Bin (each replacement is atomic, so a file is never left half-written). Skip existing leaves them untouched and exports the rest. To keep both versions, cancel and turn on “Append the preset name to filenames”.";
-        // v1.0 MERGE TAIL [B-R1, L17]: the Efficiency card's LAST SENTENCE only. `Dc || saver` is
-        // the Auto predicate on Windows and both halves are named; on macOS `saver` is structurally
-        // false (Low Power Mode is not read at v1.0, and `power_probe`'s own doc says so), so the
-        // sentence would advertise an input the implementation documents it does not read. Default
-        // = the Windows literal VERBATIM, fed by `platform::efficiency_auto_clause`.
-        in property <string> efficiency-auto-clause: @tr("falcon" => "Auto follows your power source and Windows' Battery saver.");
+        // v1.0 MERGE TAIL [B-R1, L17] (round 2a): the battery switch's Battery saver clause. `Dc ||
+        // saver` is the battery rule on Windows; on macOS `saver` is structurally false (Low Power
+        // Mode is not read), so the clause is empty there and its line does not mount. Fed by
+        // `platform::battery_switch_clause`.
+        in property <string> battery-switch-clause: "";
         // v0.9.12 (C2/M10): macOS runs ONLY the Metal wgpu backend, so the Vulkan/DX12 override picker
         // in the DEVELOPER GPU card is meaningless there — this flag hides it (the read-only backend
         // status line stays). Windows = false → the picker mounts exactly as before (pixel-identical).
@@ -986,6 +1011,16 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // The ask-first arming flag. Cleared by EVERY toast teardown Rust-side, which is what
         // makes "every dismissal that is not Yes is a No" structural rather than enumerated (L18).
         in-out property <bool> toast-bulk-ask: false;
+        // 2026-10-26 (round 2a): the speed panel's question before a mode change — 0 none, 1 "Switch
+        // to …", 2 "Use … until the power source changes" (Power saver on battery). Its subject (the
+        // mode to switch to or hold, and the speed to apply after) rides beside it, and the pill
+        // labels are Rust-composed. Cleared with `toast-bulk-ask` by every raise and every dismissal.
+        in-out property <int> toast-mode-ask: 0;
+        in-out property <int> toast-mode-target: 1;
+        in-out property <float> toast-mode-fps: 0;
+        in-out property <string> toast-mode-yes: "";
+        in-out property <string> toast-mode-no: "";
+        callback mode-ask-yes();
         // Which delete dialog kind 6 currently is. Set true only by the bulk opener and false by
         // the single one, so a stale value can never reach a single delete.
         in-out property <bool> del-bulk: false;
@@ -1601,9 +1636,10 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // length + traffic-light colour, filling toward the centre (current shot). So "10 shots left,
         // all cached" = a short right half, 100% green. Lets the user SEE it's caching [status vis].
         in property <bool> cache-meter-show: false;
-        // v0.8.196 (WAVE 2, §C): is the efficiency posture engaged RIGHT NOW? Published from the
-        // tick's one derived `EfficiencyLimits` (main.rs), and read by exactly one thing: the `if`
-        // that mounts the leaf inside the meter below. L4 — the gate is the mount, never `visible:`.
+        // v0.8.196 (WAVE 2, §C): is Power saver in effect RIGHT NOW, for whatever reason (round 2a;
+        // it was "is Efficiency mode engaged")? Published from the tick's one derived limits value
+        // (main.rs), and read by exactly one thing: the `if` that mounts the leaf inside the meter
+        // below. L4 — the gate is the mount, never `visible:`.
         in property <bool> efficiency-leaf: false;
         in property <float> cache-frac-before: 0.0;    // cached ÷ available BEHIND (fill + colour)
         in property <float> cache-frac-after: 0.0;     // cached ÷ available AHEAD
@@ -2193,6 +2229,14 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // belt-and-braces) and build_settings persists it straight off this property.
         in-out property <bool> welcome-open: false;
         in-out property <bool> onboarding-shown: false;
+        // 2026-10-26 (round 2a): the guide returns once after a FEATURE update (1.0 → 1.1), with
+        // wording for people who already use Falcon (`support::guide_boot`). `welcome-updating`
+        // selects that wording for the boot showing; `guide-seen-feature` is the persisted feature
+        // version that last showed the guide (written at show, like `onboarding-shown`); and
+        // `welcome-feature` is the running build's ("1.1"), for the heading.
+        in-out property <bool> welcome-updating: false;
+        in-out property <string> guide-seen-feature: "";
+        in property <string> welcome-feature: "";
         // The RECOMMENDED card: Rust-composed one-liner ("Scrub 20 fps · Supersample 2054"; "" =
         // not yet benchmarked → quiet placeholder), the one-tap apply, and its applied latch
         // (re-armed by every fresh bench result in drain_bench).
@@ -2339,6 +2383,9 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // gesture is exported.
         callback cmp-pan-input();
         callback set-fps(float);
+        // 2026-10-26 (round 2a): a speed picked in the speed panel. Rust commits it through `set-fps`
+        // when the mode allows it, and otherwise asks first (the mode-ask toast) and changes nothing.
+        callback pick-fps(float);
         // Custom slider inputs (Phase B) — strings so Rust can PARSE + clamp and REJECT invalid input
         // (a to-float() in Slint silently maps garbage to 0, which is exactly what we don't want).
         callback set-wm-custom(int, string);             // 0 opacity % / 1 size % / 2 JPEG quality
@@ -3376,7 +3423,9 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // lives in. Without it, a failure from one session's welcome would be the first thing the
         // NEXT open showed, above a "Now:" line that may since have become true. Folded into the
         // EXISTING observer because Slint allows one `changed` handler per property per component.
-        changed welcome-open => { if (!root.welcome-open) { root.onboarding-shown = true; root.gamut-detect-note = ""; keys.focus(); } }
+        // Round 2a: …and the after-an-update wording is for that one showing: closing returns the
+        // guide to its first-run words, so "Show welcome" in Settings reads as it always has.
+        changed welcome-open => { if (!root.welcome-open) { root.onboarding-shown = true; root.gamut-detect-note = ""; root.welcome-updating = false; keys.focus(); } }
         // v0.8.84 (the G11 unmount class, exactly the immersive-edge lesson): closing the Selection
         // panel while the XMP toggle is hovered unmounts xmpta — `changed has-hover` never fires on
         // an unmount, so the positioned tip would stick on screen with nothing hosting it. EVERY
@@ -5855,96 +5904,198 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                     }
                                 }
                             }
-                            // ── v0.8.195 (OWNER RULING 2026-08-30, option c): EFFICIENCY MODE. ────
-                            //    Sits in PERFORMANCE with Adaptive Hi-Res, HEIC speed priority and
-                            //    Fast View — the rows that trade decode work against what you see
-                            //    while browsing — and NOT in Developer: this one is user-facing.
-                            //    Placed directly after HEIC speed priority and before Fast View so
-                            //    the section reads narrowest-subject-first (one format, then the
-                            //    whole machine, then the proxy's own tier).
-                            //
-                            //    CARD GRAMMAR is the "Fast View" card below, verbatim: a
-                            //    SettingsGroup title slot, one description Text on the 12px-side
-                            //    wrapper, and the labelled Seg row underneath. Not the ToggleRow
-                            //    grammar of the two rows above it, because this is three states and
-                            //    a toggle cannot say Auto.
+                            // ── 2026-10-26 (round 2a, owner rulings): THE MODE ROW. ──────────────
+                            //    2026-10-27 (round 2b, owner rulings): a fourth stop, Custom, and the
+                            //    names the owner chose so all four fit at the Seg's own 12 px —
+                            //    Turbo · Balanced · Eco · Custom (code names unchanged:
+                            //    MODE_PERFORMANCE, MODE_BALANCED, MODE_POWER_SAVER, MODE_CUSTOM).
+                            //    Efficiency mode's card became it, in the same place: one choice
+                            //    that shapes how hard Falcon works (Performance | Balanced | Power
+                            //    saver), the line for the selected mode, "Use Power saver on battery
+                            //    power" under it, and the live status line saying what is in effect
+                            //    and why. The Seg is the stock `Seg` (owner ruling: the same control
+                            //    here and on the welcome guide), full card width with no row label so
+                            //    "Performance", the widest label, fits its pill in English and zh-CN
+                            //    (L5 — the rig measures it). Wording: the owner's drafts, 26 October.
                             SettingsGroup {
-                                title: @tr("falcon" => "Efficiency mode");
+                                title: @tr("falcon" => "Mode");
                                 VerticalLayout {
-                                    padding-left: 12px; padding-right: 12px; spacing: Theme.space-1h;
-                                    // v0.8.195 fix tail (skeptic B, R1 — CONFIRMED): SECOND PERSON,
-                                    // AND BOTH HALVES OF THE TRADE. The shipped caption said "Cuts
-                                    // background work", and two of the five consumers are not
-                                    // background at all: the browse rate itself caps at 20 fps, and
-                                    // after a window grow each neighbour lands on its kept-soft
-                                    // frame and sharpens a beat later. The house voice for a
-                                    // setting that costs the reader something is stated by this
-                                    // card's own upstairs neighbour (the HEIC row, ~30 lines up):
-                                    // "the subtitle states BOTH halves of the trade in the second
-                                    // person". The Auto sentence also names Windows' Battery saver,
-                                    // which is a real arm of the predicate (`Dc || saver`) and had
-                                    // its own toast sentence while the caption did not mention it.
-                                    Text {
-                                        // v0.8.196 (WAVE 2, §E): the "20 fps" literal had to go —
-                                        // the ceiling is derived from what THIS machine sustains
-                                        // now, so a caption naming a constant would be false on
-                                        // every box that cannot reach it and on every box that is
-                                        // held below it. The card's own live-state line underneath
-                                        // names the number; this sentence names the TRADE.
-                                        // v0.8.196 fix tail (skeptic B, R4): "a lighter sampling"
-                                        // becomes **Subsample** — the word the Fast View card two
-                                        // groups below prints on the control the user has actually
-                                        // touched. Three vocabularies for one thing (L11/L20) is
-                                        // what made the two cards contradict each other.
-                                        // **Owner veto.**
-                                        // v1.0 MERGE TAIL [B-R1]: the TRADE is platform-neutral and stays a
-                                        // literal here; the AUTO clause is routed (see
-                                        // `efficiency-auto-clause`). Concatenated rather than split into
-                                        // two Text elements so the paragraph still wraps as one.
-                                        text: @tr("falcon" => "Cuts background loading to save power. While it's on, browsing is capped to the rate this machine can actually keep up with, browsing uses Faster preview, and large previews can sharpen a moment late. {0}", root.efficiency-auto-clause);
+                                    padding-left: 12px; padding-right: 12px; spacing: 7px;
+                                    // `modeseg` is named for the rig: the label-fit row measures every
+                                    // label against this instance's own pill (Seg does not elide).
+                                    modeseg := Seg {
+                                        opts: [@tr("falcon" => "Turbo"), @tr("falcon" => "Balanced"), @tr("falcon" => "Eco"), @tr("falcon" => "Custom")];
+                                        sel: root.mode;
+                                        bg: Theme.well;
+                                        changed(i) => { root.mode = i; root.set-mode(i); keys.focus(); }
+                                    }
+                                    modeline := Text {
+                                        text: root.mode == 0 ? root.mode-performance-line
+                                            : root.mode == 2 ? @tr("falcon" => "Lightest load. Browsing stays usable; good on battery.")
+                                            : root.mode == 3 ? @tr("falcon" => "Your own numbers, in the card below. Starts as Balanced.")
+                                            : @tr("falcon" => "Smooth browsing with a moderate load. Recommended.");
                                         color: Theme.text-mute; font-size: Theme.font-sm; wrap: word-wrap;
                                     }
                                 }
-                                // v0.8.195 fix tail (skeptic B, R2/O1): THE LIVE-STATE LINE, in the
-                                // nvJPEG row's inline-reason grammar (mount on "Rust composed
-                                // something to say"). Inline rather than a Tip for that row's own
-                                // stated reason: "inline also reaches visual thinkers without a
-                                // hover hunt."
-                                if root.efficiency-note != "" : VerticalLayout {
+                                VerticalLayout {
+                                    padding-top: 0px; spacing: 0px;
+                                    batteryrow := ToggleRow {
+                                        label: @tr("falcon" => "Use Eco on battery power"); on: root.battery-power-saver;
+                                        bg: transparent; bw: 0px;
+                                        toggled => { root.battery-power-saver = !root.battery-power-saver; root.set-battery-power-saver(root.battery-power-saver); }
+                                    }
+                                    // The Battery saver half of the rule, Windows only (empty on macOS,
+                                    // which does not read Low Power Mode — L17), mounted on its text (L4).
+                                    if root.battery-switch-clause != "" : VerticalLayout {
+                                        padding-left: 12px; padding-right: 12px;
+                                        Text { text: root.battery-switch-clause; color: Theme.text-mute;
+                                               font-size: Theme.font-sm; wrap: word-wrap; }
+                                    }
+                                }
+                                // THE LIVE STATUS LINE (the v0.8.195 R2/O1 grammar): what is in effect
+                                // and why — "On battery: Power saver." — then what it is doing to the
+                                // browse. Rust-composed (`support::mode_note`), mounted on its text.
+                                if root.mode-note != "" : VerticalLayout {
                                     padding-left: 12px; padding-right: 12px;
-                                    // `effnote` is named for the rig: a Text bound to an empty
-                                    // string is findable by neither label nor text, so only an
-                                    // element id can tell "mount-gated" from "empty".
-                                    effnote := Text { text: root.efficiency-note; color: Theme.text-mute;
+                                    // `modenote` is named for the rig: a Text bound to an empty
+                                    // string is findable by neither label nor text.
+                                    modenote := Text { text: root.mode-note; color: Theme.text-mute;
                                            font-size: Theme.font-sm; wrap: word-wrap; }
                                 }
-                                // The Seg is MOUNT-GATED on the env lever (L4: a hidden body keeps
-                                // its space and steals its clicks). With FALCON_EFFICIENCY=0 the
-                                // card shows only its note, exactly as the lane-cap card does.
-                                if !root.efficiency-env : VerticalLayout {
+                            }
+                            // ── 2026-10-27 (round 2b, owner rulings): THE CUSTOM CARD, under the Mode
+                            //    card and MOUNTED only while Custom is selected (L4: the `if` is the
+                            //    mount, so Settings stays short for everyone else). Every number is the
+                            //    most Falcon prepares (its first line says so). Owner's layout rules:
+                            //    numbers on the CustomSeg pattern (typed cell + four stops); text and
+                            //    number cells in one control get a wider text cell and equal number
+                            //    cells (`wide-last`, `wide-first`); the two choices too long for a cell
+                            //    use short labels with a line under the row naming the choice in full.
+                            //    `customcard` and the rows' ids are for the rig. ──
+                            if root.mode == 3 : customcard := SettingsGroup {
+                                title: @tr("falcon" => "Custom");
+                                VerticalLayout {
                                     padding-left: 12px; padding-right: 12px; spacing: 7px;
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        // v0.8.195 fix tail (skeptic B, O4): "When to save" read as
-                                        // a file-writing preference in a photo app — "save" is the
-                                        // one verb here that already means writing an image to
-                                        // disk, and every sibling row label in this grammar is a
-                                        // noun naming the axis ("Detail", "Benchmark with",
-                                        // "Target size", "Resolution limit").
-                                        Text { text: @tr("falcon" => "When it runs"); color: Theme.text-mute; font-size: Theme.font-md; vertical-alignment: center; }
-                                        // `effseg` is named for the rig: the label-fit row measures
-                                        // every one of these three strings against this instance's
-                                        // own pill. Seg centres its labels over a clipped track and
-                                        // does NOT elide, so an over-long label is cut off at both
-                                        // ends with nothing on screen to say so — the v0.8.194
-                                        // hotfix's finding, one round later.
-                                        effseg := Seg {
-                                            horizontal-stretch: 1;
-                                            opts: [@tr("falcon" => "Auto"), @tr("falcon" => "On"), @tr("falcon" => "Off")];
-                                            sel: root.efficiency-mode;
-                                            bg: Theme.well;
-                                            changed(i) => { root.efficiency-mode = i; root.set-efficiency-mode(i); keys.focus(); }
-                                        }
+                                    Text { text: @tr("falcon" => "The most Falcon prepares; memory limits can lower these.");
+                                           color: Theme.text-mute; font-size: Theme.font-sm; wrap: word-wrap; }
+                                    // Browsing speed: Unlimited, or a limit (typed: 5 up to this machine's
+                                    // best; Rust holds it there). −1 shows Balanced's own limit.
+                                    Text { text: @tr("falcon" => "Browsing speed"); color: Theme.text-dim; font-size: Theme.font-md; }
+                                    customfpsseg := CustomSeg {
+                                        property <int> v: root.custom-fps < 0 ? root.custom-fps-balanced : root.custom-fps;
+                                        stops: ["12", "20", "30", @tr("falcon" => "Unlimited")];
+                                        wide-last: true;
+                                        index: self.v == 0 ? 3 : self.v == 12 ? 0 : self.v == 20 ? 1 : 2;
+                                        custom: self.v;
+                                        custom-active: !(self.v == 0 || self.v == 12 || self.v == 20 || self.v == 30);
+                                        picked(i) => { root.custom-fps = i == 0 ? 12 : i == 1 ? 20 : i == 2 ? 30 : 0; }
+                                        custom-committed(t) => { if (t != "") { root.set-custom-number(0, t); } keys.focus(); }
+                                    }
+                                    Text { text: @tr("falcon" => "Previews kept ready"); color: Theme.text-dim; font-size: Theme.font-md; }
+                                    cprevahead := CountRow {
+                                        label: @tr("falcon" => "Ahead"); value: root.custom-previews-ahead;
+                                        s0: 12; s1: 24; s2: 40; s3: 80;
+                                        pick(v) => { root.custom-previews-ahead = v; }
+                                        typed(t) => { if (t != "") { root.set-custom-number(1, t); } keys.focus(); }
+                                    }
+                                    cprevbehind := CountRow {
+                                        label: @tr("falcon" => "Behind"); value: root.custom-previews-behind;
+                                        s0: 3; s1: 6; s2: 10; s3: 20;
+                                        pick(v) => { root.custom-previews-behind = v; }
+                                        typed(t) => { if (t != "") { root.set-custom-number(2, t); } keys.focus(); }
+                                    }
+                                    Text { text: @tr("falcon" => "Sharp photos kept ready"); color: Theme.text-dim; font-size: Theme.font-md; }
+                                    csharpahead := CountRow {
+                                        label: @tr("falcon" => "Ahead"); value: root.custom-sharp-ahead;
+                                        s0: 1; s1: 3; s2: 5; s3: 8;
+                                        pick(v) => { root.custom-sharp-ahead = v; }
+                                        typed(t) => { if (t != "") { root.set-custom-number(3, t); } keys.focus(); }
+                                    }
+                                    csharpbehind := CountRow {
+                                        label: @tr("falcon" => "Behind"); value: root.custom-sharp-behind;
+                                        s0: 0; s1: 1; s2: 2; s3: 4;
+                                        pick(v) => { root.custom-sharp-behind = v; }
+                                        typed(t) => { if (t != "") { root.set-custom-number(4, t); } keys.focus(); }
+                                    }
+                                    Text { text: @tr("falcon" => "Sharp photos while zoomed"); color: Theme.text-dim; font-size: Theme.font-md; }
+                                    czoomahead := CountRow {
+                                        label: @tr("falcon" => "Ahead"); value: root.custom-zoomed-ahead;
+                                        s0: 3; s1: 8; s2: 16; s3: 32;
+                                        pick(v) => { root.custom-zoomed-ahead = v; }
+                                        typed(t) => { if (t != "") { root.set-custom-number(5, t); } keys.focus(); }
+                                    }
+                                    czoombehind := CountRow {
+                                        label: @tr("falcon" => "Behind"); value: root.custom-zoomed-behind;
+                                        s0: 0; s1: 1; s2: 2; s3: 4;
+                                        pick(v) => { root.custom-zoomed-behind = v; }
+                                        typed(t) => { if (t != "") { root.set-custom-number(6, t); } keys.focus(); }
+                                    }
+                                    Text { text: @tr("falcon" => "Thumbnails"); color: Theme.text-dim; font-size: Theme.font-md; }
+                                    cthumbseg := Seg {
+                                        opts: [@tr("falcon" => "On screen"), @tr("falcon" => "Nearby"), @tr("falcon" => "Whole folder")];
+                                        sel: root.custom-thumbs;
+                                        bg: Theme.well;
+                                        changed(i) => { root.custom-thumbs = i; keys.focus(); }
+                                    }
+                                    // The whole folder's cap (owner, 27 October): adjustable, starting at
+                                    // 500 MB, the stops plus a typed 100–2,000 MB (Rust brings it into
+                                    // range), MOUNTED only while Whole folder is the choice (L4).
+                                    if root.custom-thumbs == 2 : cthumbmb := CountRow {
+                                        label: @tr("falcon" => "Up to"); unit: @tr("falcon" => "MB");
+                                        value: root.custom-thumbs-mb;
+                                        s0: 250; s1: 500; s2: 1000; s3: 2000;
+                                        pick(v) => { root.custom-thumbs-mb = v; }
+                                        typed(t) => { if (t != "") { root.set-custom-number(7, t); } keys.focus(); }
+                                    }
+                                    cthumbline := Text {
+                                        text: root.custom-thumbs == 0 ? @tr("falcon" => "Visible only: thumbnails for the photos on screen.")
+                                            : root.custom-thumbs == 1 ? @tr("falcon" => "Visible and nearby: also the ones just off screen and around the current photo.")
+                                            : @tr("falcon" => "Whole folder: then the rest of the folder while Falcon is idle, up to {} MB. Cloud-only files are skipped.", root.custom-thumbs-mb);
+                                        color: Theme.text-mute; font-size: Theme.font-sm; wrap: word-wrap;
+                                    }
+                                    Text { text: @tr("falcon" => "In the background, keep"); color: Theme.text-dim; font-size: Theme.font-md; }
+                                    ckeepseg := Seg {
+                                        opts: [@tr("falcon" => "In use"), "10%", "25%", "50%"];
+                                        wide-first: true;
+                                        sel: root.custom-bg-keep == 0 ? 0 : root.custom-bg-keep == 10 ? 1 : root.custom-bg-keep == 25 ? 2 : 3;
+                                        bg: Theme.well;
+                                        changed(i) => { root.custom-bg-keep = i == 0 ? 0 : i == 1 ? 10 : i == 2 ? 25 : 50; keys.focus(); }
+                                    }
+                                    ckeepline := Text {
+                                        text: root.custom-bg-keep == 0 ? @tr("falcon" => "Only the photos in use: everything else is released.")
+                                            : @tr("falcon" => "Up to {}% of the graphics memory.", root.custom-bg-keep);
+                                        color: Theme.text-mute; font-size: Theme.font-sm; wrap: word-wrap;
+                                    }
+                                    Text { text: @tr("falcon" => "Release over"); color: Theme.text-dim; font-size: Theme.font-md; }
+                                    creleaseseg := Seg {
+                                        opts: [@tr("falcon" => "At once"), @tr("falcon" => "10 s"), @tr("falcon" => "30 s")];
+                                        wide-first: true;
+                                        sel: root.custom-bg-release-s == 0 ? 0 : root.custom-bg-release-s == 10 ? 1 : 2;
+                                        bg: Theme.well;
+                                        changed(i) => { root.custom-bg-release-s = i == 0 ? 0 : i == 1 ? 10 : 30; keys.focus(); }
+                                    }
+                                }
+                            }
+                            // ── 2026-10-26 (round 2a): THE BACKGROUND WAIT, one setting for every
+                            //    mode (owner rulings 25–26 October): 5 s / 20 s / 60 s / 300 s plus
+                            //    one typed value, checked against 5–300 s in Rust — the speed panel's
+                            //    `CustomSeg` pattern. Default 20 s. ──
+                            SettingsGroup {
+                                title: @tr("falcon" => "In the background");
+                                VerticalLayout {
+                                    padding-left: 12px; padding-right: 12px; spacing: Theme.space-1h;
+                                    Text { text: @tr("falcon" => "Release memory after Falcon has been in the background for");
+                                           color: Theme.text-mute; font-size: Theme.font-sm; wrap: word-wrap; }
+                                }
+                                VerticalLayout {
+                                    padding-left: 12px; padding-right: 12px; spacing: 7px;
+                                    bgwaitseg := CustomSeg {
+                                        stops: [@tr("falcon" => "5 s"), @tr("falcon" => "20 s"), @tr("falcon" => "60 s"), @tr("falcon" => "300 s")];
+                                        index: root.bg-wait-s <= 5 ? 0 : root.bg-wait-s <= 20 ? 1 : root.bg-wait-s <= 60 ? 2 : 3;
+                                        custom: (root.bg-wait-s == 5 || root.bg-wait-s == 20 || root.bg-wait-s == 60 || root.bg-wait-s == 300) ? 0 : root.bg-wait-s;
+                                        suffix: @tr("falcon" => " s");
+                                        picked(i) => { root.bg-wait-s = i == 0 ? 5 : i == 1 ? 20 : i == 2 ? 60 : 300; }
+                                        custom-committed(t) => { if (t != "") { root.set-bg-wait-custom(t); } keys.focus(); }
                                     }
                                 }
                             }
@@ -5988,11 +6139,11 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                     }
                                     // v0.8.196 fix tail (skeptic B, R4 — CONFIRMED): WHILE THE POSTURE
                                     // HOLDS THE TIER, THIS SEG'S PILL IS NOT WHAT THE APP IS DECODING.
-                                    // The efficiency posture forces Subsample; the pill above stayed on
+                                    // Power saver forces Faster preview; the pill above stayed on
                                     // the user's own stop with nothing anywhere connecting the two —
                                     // the v0.8.195 R1c defect ("the title IS the setting and the pill
                                     // sits on it") re-cut on the card next door, in the round that
-                                    // quotes it. Same grammar as `efficiency-note` and the nvJPEG row:
+                                    // quotes it. Same grammar as `mode-note` and the nvJPEG row:
                                     // Rust-composed, mount-gated on having something to say (L4), and
                                     // silent for a user already on Subsample, who sees no change.
                                     // `fvnote` is named for the rig — only an element id can tell
@@ -7844,7 +7995,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                         Text { text: @tr("falcon" => "Continuous browsing speed"); color: Theme.text-mute; font-size: Theme.font-sm; }
                         // v0.8.195 fix tail (skeptic B, R1c): …and what is actually in force. The
                         // title above IS the setting and the pill below sits on it, so while the
-                        // efficiency posture holds the browse to 20 fps this popup was stating a
+                        // mode holds the browse below it this popup was stating a
                         // rate the app was not delivering — the same class v0.8.123 exists for, on
                         // this popup's own title. Mount-gated on the composer having something to
                         // say, so a user at or under the ceiling sees nothing new.
@@ -7877,7 +8028,15 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                         limit-frac: (root.quality-super == 1 ? root.bench-super-fps : root.bench-sub-fps) > 0 && root.bench-governs
                             && root.fps-frac(root.quality-super == 1 ? root.bench-super-fps : root.bench-sub-fps) < 1.0
                             ? root.fps-frac(root.quality-super == 1 ? root.bench-super-fps : root.bench-sub-fps) : -1.0;
-                        picked(i) => { root.set-fps(i == 0 ? 5.0 : i == 1 ? 12.0 : i == 2 ? 20.0 : i == 3 ? 30.0 : 120.0); }
+                        // 2026-10-26 (round 2a): the stops above the mode's own limit are GREYED —
+                        // a second veil, distinct from the frost above (that one is what this PC's
+                        // benchmark cannot sustain; this one is what the mode allows) — and a pick on
+                        // one goes to Rust as a REQUEST (`pick-fps`), which asks before changing the
+                        // mode instead of committing. Measured by geometry in the rig (L49).
+                        grey-from: root.mode-limit-fps <= 0 ? -1
+                            : 5 > root.mode-limit-fps + 0.01 ? 0 : 12 > root.mode-limit-fps + 0.01 ? 1
+                            : 20 > root.mode-limit-fps + 0.01 ? 2 : 30 > root.mode-limit-fps + 0.01 ? 3 : 4;
+                        picked(i) => { root.pick-fps(i == 0 ? 5.0 : i == 1 ? 12.0 : i == 2 ? 20.0 : i == 3 ? 30.0 : 120.0); }
                         custom-committed(t) => { if (t != "") { root.set-fps-custom(t); } keys.focus(); }
                     }
                     // v0.9.60 (W2-5d [VD]): a benchmark exists but it cannot speak for this
@@ -8971,6 +9130,29 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 spacing: Theme.space-2;
                 PillBtn { text: @tr("falcon" => "Yes"); clicked => { root.bulk-rate-yes(); } }
                 PillBtn { text: @tr("falcon" => "No"); clicked => { root.bulk-rate-no(); root.dismiss-toast(); } }
+            }
+            // 2026-10-26 (round 2a): the speed panel's MODE QUESTION, on the second row like the
+            // rating question above, right-aligned. "Switch to Performance" + "Keep Balanced" fit one
+            // row (~260 px inside the card's 296); the battery variant's longer first pill ("Use
+            // Balanced until the power source changes") gets its own row, so neither pill can be pushed
+            // off the 320 px card in English or zh-CN (L5). [Switch]/[Use …] is ONE call — the handler
+            // dismisses, then acts (the `bulk-rate-yes` order); [Keep …] is a plain dismissal.
+            if root.toast-mode-ask == 1 && toastcard.hot : HorizontalLayout {
+                alignment: end;
+                spacing: Theme.space-2;
+                modeaskyes := PillBtn { text: root.toast-mode-yes; clicked => { root.mode-ask-yes(); } }
+                modeaskno := PillBtn { text: root.toast-mode-no; clicked => { root.dismiss-toast(); } }
+            }
+            if root.toast-mode-ask == 2 && toastcard.hot : VerticalLayout {
+                spacing: Theme.space-2;
+                HorizontalLayout {
+                    alignment: end;
+                    modeholdyes := PillBtn { text: root.toast-mode-yes; clicked => { root.mode-ask-yes(); } }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    modeholdno := PillBtn { text: root.toast-mode-no; clicked => { root.dismiss-toast(); } }
+                }
             }
             if root.toast-settings && toastcard.hot : HorizontalLayout {
                 alignment: end;
@@ -10874,8 +11056,13 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                         spacing: Theme.space-2;
                         VerticalLayout {
                             horizontal-stretch: 1; spacing: Theme.space-1;
-                            Text { text: @tr("falcon" => "Welcome to Falcon"); color: Theme.text; font-size: Theme.display-md; font-weight: 600; }
-                            Text { text: @tr("falcon" => "Three quick set-ups — all optional, all changeable later in Settings.");
+                            // Round 2a: after a feature update the heading and line speak to people
+                            // who already use Falcon (owner's wording, 26 October).
+                            Text { text: root.welcome-updating ? @tr("falcon" => "New in Falcon {0}", root.welcome-feature) : @tr("falcon" => "Welcome to Falcon");
+                                   color: Theme.text; font-size: Theme.display-md; font-weight: 600; }
+                            Text { text: root.welcome-updating
+                                       ? @tr("falcon" => "Choose how hard Falcon works. You can change it any time in Settings → Performance.")
+                                       : @tr("falcon" => "Three quick set-ups — all optional, all changeable later in Settings.");
                                    color: Theme.text-mute; font-size: Theme.font-md; wrap: word-wrap; }
                         }
                         VerticalLayout {
@@ -11092,8 +11279,8 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                 }
                             }
                         }
-                        // ── COLUMN 2 · THE FEEL (262:13) — the REAL ToggleRow on the live
-                        // wheel-nav setting, the Quick-benchmark block (existing machinery +
+                        // ── COLUMN 2 · THE FEEL (262:13) — the mode control (round 2a; it replaced
+                        // the wheel-nav ToggleRow), the Quick-benchmark block (existing machinery +
                         // bench-running guard; the worker's v0.8.67 panic guard means a failed
                         // run can never strand this panel), and the RECOMMENDED sub-card fed by
                         // Rust's bench_recommendation.
@@ -11123,25 +11310,48 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                         //      nesting stands.
                         WcCol {
                             SectionLabel { text: @tr("falcon" => "2 · THE FEEL"); }
+                            // 2026-10-26 (round 2a, owner rulings): THE MODE CONTROL replaces "Mouse
+                            // wheel changes photo" here (the wheel row stays in Settings → INPUT,
+                            // default on). The SAME `Seg` as Settings → Performance, bound to the same
+                            // property and callback, with the line for the selected mode under it,
+                            // beside Quick benchmark. Card grammar: the Settings mode card's, minus the
+                            // battery switch and the status line (Settings carries those).
                             SettingsGroup {
+                                title: @tr("falcon" => "Mode");
                                 VerticalLayout {
-                                    padding-top: 0px; padding-bottom: 12px; spacing: 0px;
-                                    ToggleRow {
-                                        label: @tr("falcon" => "Mouse wheel changes photo"); on: root.wheel-nav;
-                                        toggled => { root.wheel-nav = !root.wheel-nav; }
+                                    padding-left: 12px; padding-right: 12px; spacing: 7px;
+                                    wcmodeseg := Seg {
+                                        opts: [@tr("falcon" => "Turbo"), @tr("falcon" => "Balanced"), @tr("falcon" => "Eco"), @tr("falcon" => "Custom")];
+                                        sel: root.mode;
+                                        bg: Theme.well;
+                                        changed(i) => { root.mode = i; root.set-mode(i); }
                                     }
-                                    VerticalLayout {
-                                        padding-left: 12px; padding-right: 12px;
-                                        Text { text: @tr("falcon" => "Off = wheel zooms. Trackpads: two-finger scroll browses when on.");
-                                               color: Theme.text-mute; font-size: Theme.font-sm; wrap: word-wrap; }
+                                    if root.mode != 3 : wcmodeline := Text {
+                                        text: root.mode == 0 ? root.mode-performance-line
+                                            : root.mode == 2 ? @tr("falcon" => "Lightest load. Browsing stays usable; good on battery.")
+                                            : @tr("falcon" => "Smooth browsing with a moderate load. Recommended.");
+                                        color: Theme.text-mute; font-size: Theme.font-sm; wrap: word-wrap;
+                                    }
+                                    // 2026-10-27 (round 2b): Custom's line is a LINK — it opens Settings,
+                                    // where the Custom card sits under the Mode card in PERFORMANCE. It
+                                    // opens Settings rather than scrolling it to the card: the route the
+                                    // CONTROLS link below took and documents (the card lives inside the
+                                    // panel's mount-gated `if`, so there is no element to scroll to when
+                                    // this click runs), and the sentence names where to look.
+                                    if root.mode == 3 : Rectangle {
+                                        height: wccustomlink.preferred-height;
+                                        wccustomlink := Text {
+                                            width: 100%;
+                                            text: @tr("falcon" => "Your own numbers. Starts as Balanced — adjust it in Settings → Performance.");
+                                            color: Theme.accent; font-size: Theme.font-sm; font-weight: 600; wrap: word-wrap;
+                                        }
+                                        TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.welcome-open = false; root.settings-open = true; }
+                                        }
                                     }
                                 }
                             }
-                            // v0.8.169 (item 8): the wheel card LEFT this column for column 1 (see
-                            // the note at its new site). The Adaptive Hi-Res inner grammar it wore
-                            // — pt0 so the 44px stock row IS the card's top inset, caption flush
-                            // under it at the row's own 12px label inset, pb12 card bottom — moved
-                            // with it, unchanged.
                             SettingsGroup {
                                 title: @tr("falcon" => "Quick benchmark");
                                 VerticalLayout {

@@ -301,35 +301,36 @@ pub(crate) fn heic_assoc_missing_tip() -> String {
     crate::i18n::tr("Requires the HEVC/HEIF Image Extensions from the Microsoft Store").to_string()
 }
 
-/// v1.0 MERGE TAIL [B-R1] — **THE EFFICIENCY CARD'S AUTO CLAUSE, ROUTED.**
-///
-/// The card's caption ended "Auto follows your power source and Windows' Battery saver." On
-/// `c1ff8f8` that was TRUE and complete: efficiency mode was Windows-only, so both halves of
-/// `efficiency_engaged`'s Auto predicate (`Dc || saver`) were named. On `a0de9e4` the card does not
-/// exist. **This merge is the commit that puts the sentence in front of a Mac user**, because owner
-/// default L4 + ruling A-4 make the mode live on macOS — and eight lines above the new probe the
-/// code says in as many words that `saver` is always false there and Low Power Mode is NOT read.
-/// A card that advertises an input its own implementation documents it does not read is L17 (a
-/// control's label is a contract) on the one card the whole A-4 deliverable exists for.
-///
-/// So the last SENTENCE routes and the rest of the caption does not. The Windows arm is the
-/// pre-tail `.slint` literal VERBATIM (pinned by `windows_strings_unchanged`); the macOS arm names
-/// only the half that is real there. When Low Power Mode is wired, this is the one string to widen.
-pub(crate) fn efficiency_auto_clause() -> String {
-    let english = efficiency_auto_clause_english();
-    crate::i18n::tr(english).to_string()
+/// 2026-10-26 (round 2a) — **THE PERFORMANCE MODE'S LINE NAMES THE MACHINE IN THE PLATFORM'S WORD**
+/// (the owner's draft says "this PC"; on a Mac it is "this Mac" — L26, a platform noun travels with
+/// its platform). The `.slint` property's default is the Windows sentence.
+pub(crate) fn mode_performance_line() -> String {
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::i18n::tr("Fastest browsing this PC can sustain. Uses the most memory and processor.").to_string()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::i18n::tr("Fastest browsing this Mac can sustain. Uses the most memory and processor.").to_string()
+    }
 }
 
-/// Language packs (round 2): the same clause in English, for the `efficiency mode:` log line (logs
-/// stay English); the card shows `efficiency_auto_clause`, translated.
-pub(crate) fn efficiency_auto_clause_english() -> &'static str {
+/// v1.0 MERGE TAIL [B-R1] — **THE BATTERY SWITCH'S BATTERY SAVER CLAUSE, ROUTED** (round 2a; it was
+/// the Efficiency card's Auto clause).
+///
+/// "Use Power saver on battery power" also acts while Windows' Battery saver is on (`mode_in_effect`
+/// reads `Dc || saver`), and the row says so under the switch. On macOS `saver` is structurally false
+/// (Low Power Mode is not read), so the clause is empty there and its line does not mount: a row that
+/// advertises an input its own implementation does not read is L17 (a control's label is a
+/// contract). When Low Power Mode is wired, this is the one string to widen.
+pub(crate) fn battery_switch_clause() -> String {
     #[cfg(windows)]
     {
-        tr_noop!("Auto follows your power source and Windows' Battery saver.")
+        crate::i18n::tr("Also while Windows' Battery saver is on.").to_string()
     }
     #[cfg(not(windows))]
     {
-        tr_noop!("Auto follows your power source.")
+        String::new()
     }
 }
 

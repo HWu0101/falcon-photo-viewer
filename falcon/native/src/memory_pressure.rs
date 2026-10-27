@@ -1,5 +1,6 @@
 //! Mac shared-memory pressure: keep requested photos, release work done ahead of the user.
-//! Decisions and cache operations also run in Windows unit tests; normal Windows is unchanged.
+//! Decisions and cache operations also run in Windows unit tests. [`shed_work`] is shared with the
+//! background release on every platform (`background_memory`); the pressure hold stays Mac-only.
 #![cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 
 use crate::*;
@@ -51,6 +52,21 @@ pub(crate) fn shed(
     drop(cache);
     detail.cache.borrow_mut().retain(|&id, _| explicit.holds(id));
     detail.order.borrow_mut().retain(|&id| explicit.holds(id));
+    shed_work(explicit, fast, detail, drain, parked_full, sent, parked_done);
+}
+
+/// The queued, parked and drained half of [`shed`]: speculative work that has not reached a cache.
+/// The background release (`background_memory`) runs this every held tick and shrinks the caches
+/// gradually itself. Same rule as above: a running job keeps its accounting marks.
+pub(crate) fn shed_work(
+    explicit: &support::ExplicitSet,
+    fast: &FastTier,
+    detail: &DetailTier,
+    drain: &RefCell<VecDeque<Decoded>>,
+    parked_full: &RefCell<Option<Detail>>,
+    sent: &RefCell<HashSet<usize>>,
+    parked_done: &RefCell<Vec<support::UploadDone>>,
+) {
     drain.borrow_mut().retain(|frame| explicit.holds(frame.id));
     let mut parked = parked_full.borrow_mut();
     if parked.as_ref().is_some_and(|frame| !explicit.holds(frame.id)) {

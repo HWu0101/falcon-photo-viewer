@@ -161,9 +161,9 @@ The Settings body scrolls beneath its header. When it overflows, the same `MiniV
 
 | Section | Rows | Notes |
 | --- | --- | --- |
-| INPUT | **While the folder is loading**: View only or Allow photo edits (`photo_open_edits`, default View only) · **Mouse wheel changes photo** (default On) · **Press current rating again to clear** (default On) · **Never browse onto a blank photo** (`scrub_wait_cache`, default Off) · **Resume position memory** · **Remember sorting and panel layout** | The wheel setting also appears on the welcome guide. |
+| INPUT | **While the folder is loading**: View only or Allow photo edits (`photo_open_edits`, default View only) · **Mouse wheel changes photo** (default On) · **Press current rating again to clear** (default On) · **Never browse onto a blank photo** (`scrub_wait_cache`, default Off) · **Resume position memory** · **Remember sorting and panel layout** | |
 | COPY SHORTCUT | The ordered preference for what **Ctrl+C** copies: the image, the RAW or both (`CopyPrefRow`, `copy_prefs`) | One preference drives both Ctrl+C and the menu's shortcut hint. |
-| PERFORMANCE | **GPU JPEG decode** (nvJPEG on Windows; on Mac the row names Image I/O, `accel_toggle_label`) · **Adaptive Hi-Res** (default On; when off, a whole-image resolution limit) · **HEIC speed priority** (default Off) · **Colour-managed CMYK JPEGs** (Windows only, default Off: sends four-channel JPEGs to Windows' own codec instead of Falcon's portable conversion; hidden on Mac because its wording is about Windows' codec, `cmyk_route_visible`) · **Efficiency mode**: Auto, On or Off (default Auto) · **Fast View**: preview detail (Faster preview or Sharper preview) and **Benchmark** with the current folder or a generated target size (`run-benchmark`, `set-bench-target-mp`, `apply-bench-rec`) | The rows that trade decode work against what you see sit together. Efficiency mode cuts only preparing-ahead work — never the displayed photo, the compare halves, explicit requests, zoom tiles or filmstrip thumbnails — and a status line says whether it is active and why. Auto follows the power source and, on Windows, Battery saver. The browse rate itself (5, 12, 20, 30 or 120 fps, or custom; default 30) and **When zoomed** (Speed or Always sharp) are in the toolbar's browse-speed panel. |
+| PERFORMANCE | **GPU JPEG decode** (nvJPEG on Windows; on Mac the row names Image I/O, `accel_toggle_label`) · **Adaptive Hi-Res** (default On; when off, a whole-image resolution limit) · **HEIC speed priority** (default Off) · **Colour-managed CMYK JPEGs** (Windows only, default Off: sends four-channel JPEGs to Windows' own codec instead of Falcon's portable conversion; hidden on Mac because its wording is about Windows' codec, `cmyk_route_visible`) · **Mode**: Turbo, Balanced, Eco or Custom (default Balanced; Custom adds a card of its own numbers), with **Use Eco on battery power** (default on) · **In the background**: release memory after 5, 20, 60 or 300 s in another application, or a typed 5–300 s (default 20 s) · **Fast View**: preview detail (Faster preview or Sharper preview) and **Benchmark** with the current folder or a generated target size (`run-benchmark`, `set-bench-target-mp`, `apply-bench-rec`) | The rows that trade decode work against what you see sit together. A mode limits only preparing-ahead work — never the displayed photo, the compare halves, explicit requests, zoom tiles or the thumbnails on screen — and a status line says which mode is in effect and why. The battery switch follows the power source and, on Windows, Battery saver. See [The mode control](#the-mode-control-turbo-balanced-eco-custom). The browse rate itself (5, 12, 20, 30 or 120 fps, or custom; default 30) and **When zoomed** (Speed or Always sharp) are in the toolbar's browse-speed panel. |
 | DISPLAY | **Auto-orient (EXIF)** (default On) · **Interface motion** (default On) · **Remember window size & position** (default Off) · **Floating panels**: Hidden, Minimised or On · **Info panel view**: Simple, Standard or Full · **Corner controls stay visible** (1–10 s, default 3) | `motion_ui` is a pure interface switch: Off makes every panel, toast and full-screen transition instant. **Info panel view** is the launch default for folders without a remembered view and applies to the open panel at once; the panel's own header buttons change only the current view and that folder's memory. |
 | REVIEW | **Hover to preview** (default On) · **Appears**: After a short rest or At once (default after a short rest; dimmed, not hidden, while hover preview is off) | Placed between DISPLAY and COLOUR: what you see, then how you judge it. |
 | COLOUR | One card per display: gamut (sRGB, Display P3, Adobe RGB, Rec.2020, DCI-P3 or a custom profile) · **Auto-detect this monitor** · load an ICC profile · **Forget display** (with a confirm) · expand or collapse | One window, one active display and one live transform; the setting is stored per display. On Windows, Auto-detect reads the display's SDR profile and knows the colour mode: under Auto Colour Management or HDR it chooses sRGB and says which mode is on, how to turn it off and which profile it would use otherwise, because Windows already maps SDR windows and a second transform would convert twice. A background watcher reports colour changes made in Windows. On Mac, Auto-detect asks CoreGraphics for the window's display colour space (`CGDisplayCopyColorSpace` → `CGColorSpaceCopyICCData`), saves the bytes as an app-owned profile and installs it through `install_custom_icc`; the Mac listens for display changes with `CGDisplayRegisterReconfigurationCallback`. See [Colour](#colour). |
@@ -184,7 +184,7 @@ The Settings body scrolls beneath its header. When it overflows, the same `MiniV
 | Loading state | The current photo has no decoded frame yet | The stage dims the previous photo's pixels, so they never pass for the current photo, and shows a quiet **Loading…** pill | — |
 | Failure cards | A photo that cannot be shown | Three kinds. A **genuine failure**: warning colour and "Tap to retry — the other photos are unaffected". A **cloud placeholder**: a calm cloud and no retry line, because Falcon retries by itself; nothing is damaged. **Unsupported**: "This file type can't be previewed yet", with a format badge named from the file's bytes where they are readable — a HEIC on a Windows PC without the codec says HEIC, which tells the user what to install; a container Falcon can read but not decode (today AVIF) gets the generic wording. | `cur-failed`, `cur-cloud`, `cur-unsupported` |
 | Tick failure banner | About 30 consecutive failed ticks (~0.5 s) | A danger banner, and a rescue save of the review data outside the failing tick, repeated while the failures last. One clean tick clears it. See [The tick, threads and workers](#the-tick-threads-and-workers). | `PANIC_SURFACE_TICKS`, `tick-degraded` |
-| Welcome guide | First run; reopen it from the Settings footer's **Show welcome** (Mac: Falcon → Show Welcome Guide) | Three columns: **1 · The keys** (the live key map, **[Right-click] a photo for everything else**, and File associations → Apply to all), **2 · The feel** (the wheel setting and Quick benchmark) and **3 · The colour** (match Falcon to this display once). `onboarding_shown` is saved when the guide is shown, not when it is closed. | `welcome-open` |
+| Welcome guide | First run; reopen it from the Settings footer's **Show welcome** (Mac: Falcon → Show Welcome Guide) | Three columns: **1 · The keys** (the live key map, **[Right-click] a photo for everything else**, and File associations → Apply to all), **2 · The feel** (the mode control, the same `Seg` as Settings, and Quick benchmark) and **3 · The colour** (match Falcon to this display once). `onboarding_shown` is saved when the guide is shown, not when it is closed. The guide also returns once after a feature update: when the running version's major.minor (`feature_version`) is newer than `guide_seen_feature`, it opens headed "New in Falcon {version}" (`guide_boot`, `welcome-updating`). | `welcome-open` |
 | Context menus | Right-click | Two photo menus aimed at one photo — the photo menu (stage and filmstrip) and its Review-tile twin — plus the sort menu, the **Open ▾** menu and the events dropdown. `ctx-target` is −1 for the stage photo, or the clicked thumbnail's index. Both photo menus close on a folder change, use the frosted glass panel and show shortcut hints built from the live key map. While a photo menu is open, its shortcut keys act on that menu's photo (`menu-action`). See [Review, selection and menus](#review-selection-and-menus). | `ctx_populate_fields`, `menu.slint` |
 | About card | The version in the Settings footer | See [About card](#about-card) | `about.rs` |
 
@@ -242,7 +242,8 @@ Each of these is a real, deliberate coupling.
 | **Settings** is open | The dialog gate blocks the action keys and the photo wheels. Preparing ahead is slowed, not stopped: at most one prepared full-resolution frame is shown every 250 ms (`SETTINGS_PUBLISH_PACE_MS`). |
 | The user is **gesturing** (pan, zoom, panel or strip scroll) | Preparing ahead parks: no new prepared full-resolution decodes, finished ones are held, a bounded drain continues, and the preview tier holds too (`fast_speculation_held`). It eases back through a paced tail: parked for 0.9 s after the last input, paced until 3 s. |
 | A photo-first open is still **scanning the folder** | In View only, edits wait (`modal-open`); zoom, pan and browsing the verified nearby photos work; sorting and selection gestures wait. |
-| **Efficiency mode** is active | Prepared full-resolution frames are paced (`GateArm::Efficiency`) and the browse rate has a lower ceiling (`EfficiencyLimits`); the displayed photo is never slowed. |
+| **Balanced**, **Eco** or **Custom** is in effect | The browse rate has a lower ceiling and fewer previews are kept ready (`EfficiencyLimits`); in Eco prepared full-resolution frames are also paced (`GateArm::Efficiency`). The displayed photo is never slowed. |
+| Falcon is **in the background** for the set wait (default 20 s), or **minimised** | Preparing ahead stops and the photo caches give their graphics memory back gradually over 10 s (in Custom, at once or over 30 s if chosen), farthest photos first, down to the tier's target (`background_memory`). The displayed photo, both compare halves, the hovered Review tile, the awaited frame and thumbnails stay. Coming back stops it at once. See [Sharing the card with other applications](#sharing-the-card-with-other-applications). |
 | **Auto-orient** is off | EXIF orientation is ignored; manual turns still apply. |
 | **RAW mode** is on for a pair | The full-resolution tier develops the RAW while the preview tier still shows the finished image. That is why the full-resolution tier's RAM-cache shortcut is switched off in RAW mode (the `!raw` term beside `l2::full_res_serves`). |
 | A shot is a **cloud placeholder** | Its failure card is the calm cloud. It is the one kind of file the scan may not read, so it keeps its extension's type and says so in one log line. A retry sweep clears its failure marks after 30 s, then 60, 120 and 240 s, up to five times (`CLOUD_RETRY_CAP`); a completed download is noticed at once and the file's bytes are then read to classify it (`reclassify_hydrated`). Copy and Move confirms count it as needing a download first. |
@@ -297,7 +298,7 @@ These are current design facts, not unfinished work:
 
 - The hardware HEIC lane exists only on Windows (`hwheic::lane_admits` is a `false` stub elsewhere); the Mac decodes HEIC through Image I/O.
 - The colour-settings watcher is Windows only; the Mac listens for display changes instead.
-- The Mac has no Battery saver signal, so Efficiency mode's Auto follows only the power source there.
+- The Mac has no Battery saver signal, so the battery switch follows only the power source there.
 - The GPU backend choice (Auto, Vulkan or DX12) is Windows only; the Mac always uses Metal.
 - On a normal Mac build the CPU RAM frame cache (L2) is off. Mac memory is unified (shared by CPU and GPU), so a CPU byte cache would double-book the memory the Metal working-set budget already governs. The developer setting `FALCON_CLASSIC_POOLS=1` restores the Windows-style pools and the cache. The Mac's available-RAM probe (`host_statistics64`) still feeds the elastic decode-pool governor's memory-pressure input.
 - Neither platform has paid code signing.
@@ -464,8 +465,11 @@ Paths are relative to `falcon/native/src/` unless shown in full.
 | View and navigation state reset on a folder change (`ViewReset`); accepting a change of the Preview/RAW selector (`accept_raw_mode`) | `view.rs` |
 | Windows hardware HEIC decoding: capability probe, sessions and the decode hook | `hwheic.rs`; `falcon/crates/falcon-hwdec/` (`hevc.rs`, `session.rs`, `dxva.rs`, `photo.rs`) |
 | Mac decode-pool sizing: the elastic pool governor, as pure state machines that Windows never builds | `pool_gov.rs` |
-| Energy-saving (Efficiency) mode | `efficiency_mode`, `efficiency_engaged`, `efficiency_scrub_cap`, `efficiency_limits`, `efficiency_publish_arm` and the power watcher (`start_power_watch`) in `support.rs`; `effective_scrub_fps` in `tick.rs` |
+| The mode control (Turbo, Balanced, Eco, Custom) | `mode_in_effect`, `mode_override_step`, `mode_limits`, `CustomLimits`, `custom_ceiling`, `custom_detail_window`, `custom_typed`, `ThumbScope`, `mode_window`, `mode_detail_window`, `mode_ask`, `mode_note`, `mode_edge`, `migrate_modes`, `efficiency_scrub_cap`, `efficiency_publish_arm` and the power watcher (`start_power_watch`) in `support.rs`; `effective_scrub_fps` and the kept window in `step_prefetch_fast` (`tick.rs`); `step_whole_folder_thumbs` and `whole_folder_radius` (`tick.rs`); `Policy::for_mode` in `background_memory.rs`; the Mode and Custom cards in `main_window.slint` |
 | The tick's full and idle rates | `TickPosture` in `main.rs`; `TICK_FULL_MS`, `TICK_IDLE_MS` and `tick_wants_full` in `support.rs` |
+| Giving graphics memory back while Falcon is in the background: the controller, the gradual release and the activity reading | `background_memory.rs` |
+| Lower Windows priority for work done ahead of the user: the registry, each worker's low-priority pool, and the raise when a photo or an on-screen thumbnail becomes requested | `prep_priority.rs` |
+| Falcon's own and the whole card's graphics-memory use, measured once a second on Windows | `gpu_memory.rs` |
 | Temporary developer posture benchmark: measures worker widths and CPU classes and only writes diagnostic log lines; it schedules nothing | `posture.rs` |
 | Wording, glyphs and labels that differ by platform (`PlatformStrings`, `PLATFORM`) | `platform.rs` |
 | RAW-only export policy and progress | `raw_export.rs`; RAW development in `falcon/crates/falcon-decode/src/raw_export.rs` and `xtrans.rs` |
@@ -592,7 +596,7 @@ The UI thread collects every result and checks it (folder-open counter, photo an
 
 ### Tick rate: full and idle
 
-The tick has two rates (`TickPosture` in `main.rs`; the constants and the rule are in `support.rs`). These rates are separate from Efficiency mode, the energy-saving setting.
+The tick has two rates (`TickPosture` in `main.rs`; the constants and the rule are in `support.rs`). These rates are separate from the mode control (Turbo, Balanced, Eco, Custom).
 
 | Rate | Constant | When |
 | --- | --- | --- |
@@ -683,6 +687,7 @@ All workers are detached threads. Each job runs inside `catch_unwind`, and every
 | Durable writer (thread `falcon-writer`) | 1 | `mpsc::channel::<WriteMsg>`, the app's one unbounded queue (see [The save queue has no length limit](#the-save-queue-has-no-length-limit)) | none (a barrier answers) | `writer_barrier` |
 | Fonts, watermark strips, benchmark, file operations | One-off or per run | — | a `channel` or an `Arc<Mutex<Option<…>>>` slot | `wm_strips_started`, `bench_running`, `sel_busy` |
 | Colour watcher (Windows), power watcher (Windows and Mac) | 1 each, lowest priority, every 2 s | — | `mpsc` of changes only | none (drained with `try_iter`) |
+| Low-priority pools (Windows; threads `falcon-prep-W-N`) | One pool per worker, below normal priority: one thread for each preview and thumbnail worker, one per core for the full-resolution worker | Only its own worker hands it work: a preview or thumbnail job nobody asked for (`prep_priority::Worker::run`), or a speculative full-resolution job's CPU decode, RAW read and develop, and colour conversion (`Guard::on_low_pool`). The worker waits for it. See [Lower priority for work done ahead](#lower-priority-for-work-done-ahead-windows) | the handing worker's own channel | the handing worker's |
 
 **The derive handoff is its own resource limit.** `sync_channel(0)` succeeds only while the derive worker is waiting in `recv`, so at most one full-resolution copy exists at a time (about 186 MB for a 48 MP RGBA frame) and no backlog can form. Two producers use it:
 
@@ -710,7 +715,7 @@ The derive worker answers on the fast pool's own `Decoded` channel. A frame deri
 
 With browse scheduling off (`detail_sched`), or during zoomed always-sharp browsing (`zoom_sharp`), it uses arrival order instead, so a preview never jumps ahead of the sharp frame being watched. A detail-lane job that waited more than 1 s logs a "fast lane saturated" line, at most once every 5 s. Backdrops and benchmark probes are excluded from that check because waiting is their designed behaviour.
 
-**Back-pressure.** The tick never copies pixels and never polls the GPU device. All staging copies happen on the single upload thread. It polls the device after every job, and every 250 ms while idle, so textures freed by cache evictions are reclaimed even when nothing is uploading. Do not add a per-tick `device.poll`: under heavy upload traffic it was measured at 26–52 ms per tick, with spikes to 98 ms, and made zoom-drag, filmstrip glide and browsing stutter.
+**Back-pressure.** The tick never copies pixels and never polls the GPU device. All staging copies happen on the single upload thread. It polls the device after every job, and every 250 ms while idle, so textures freed by cache evictions are reclaimed even when nothing is uploading. A poll cannot free a staging buffer whose write no submission has carried yet, and only Slint's frames submit, so when the thread goes idle after staging anything it submits once, empty (`support::idle_reclaim`). Without that, uploads nobody displays (the stillness fill banking full-resolution neighbours) kept their staging until the next redraw: nine 178 MB buffers for about 50 s in the 25 October 2026 measurement, on the card itself under Vulkan. Do not add a per-tick `device.poll`: under heavy upload traffic it was measured at 26–52 ms per tick, with spikes to 98 ms, and made zoom-drag, filmstrip glide and browsing stutter.
 
 The tick limits what is in flight, all into the job queue of 8 (`sync_channel::<UploadJob>(8)`):
 
@@ -739,7 +744,7 @@ Three kinds of state exist, and the kind decides which threads may touch it. In 
 | --- | --- | --- |
 | UI thread only | `Rc`, `RefCell`, `Cell`; workers never touch it | `current`, `shown`, `shown_dims`; the UI halves of the tier structs (`FastTier.cache`/`uploading`/`hover_pin`, `DetailTier`, `RoiZoom` tiles/region/source sizes, `Film` thumbnails/`pending`/`pinned`); `l2` (`L2Store`); `meta` (`PerShotMeta`: `exif_cache`, `wb_cache`, `shot_gamut`, request sets); `rot` (`RotState`); `undo_stack`; `notif_log`; `select_set`; the `display_*` colour cells; every filmstrip scroll cell and `last_*_key` memo |
 | Shared with workers | `Arc` around an atomic or a mutex | `shots: Arc<Mutex<Arc<Vec<Shot>>>>`, `generation`, `len_atomic`, `cur_atomic`, `compare_atomic`, `detail_ahead_atomic`, `scrub_dim_atomic`, `fast_super`, `detail_dim_atomic`, `output_gamut`, `raw_mode`, `det_epoch`, `det_busy`, `det_cpu`, `det_awaited`, `roi_busy`, `meta.orient_cache`, `meta.file_gamuts`, `fast.pump`, `fast.failed`, `fast.hover_ask`, `film.frost`, `film.failed`, `roi.failed`, `vram_oom`, `gpu_lost`, `sel_busy`, `op_cancel`, `export_progress`, `upload_focus`, `scan_id`, `photo_open_id`; and the hand-off slots (`Arc<Mutex<Option<…>>>`): `reload_req`, `sort_reload_req`, `resolved_open`, `early_scan`, `scan_done`, `move_slot`, `rot.apply_slot`, `sel_status_slot`, `wm_sample_slot` |
-| Process-wide statics | Owned by one module | `support`: `WRITER`, `GPU_MEMO`, `WIN_GEOM` and its `LATCH_GATE`, `SETTINGS_WARN`, `TAKEN_CACHE`, `DECODE_STATS`, `FAST_COST_KNOWN`/`FAST_COST_MEASURED`/`FAST_COST_SAMPLES`, `HW_SERVICE`, `DISPLAY_TOPOLOGY_DIRTY`, `MIRROR_LOGGED`, `HEIC_PROBED`, `SHUTDOWN_ONCE`, `LOG_TO_PID`, `DIAGNOSTIC_LOG`, `EFFICIENCY_MODE`, `MODERN_ICC_API`, `WEB_PART_CTR`, thread-local `BULK_ASK`. `hwheic` (Windows): `LANE_LIVE`, `LANE_LOST`, `ASSEMBLER`, `POOL` and `POOL_CV`, `DECLINE_MEMO`, `FOLDER_GEN`, `PLAN_CACHE`, the two storage limits (`RENDER_STORAGE_LIMIT`, `ASSEMBLY_STORAGE_LIMIT`) and five session counters. `main` (Mac): `MENU_SNAP`, `MAC_VRAM_SRC` |
+| Process-wide statics | Owned by one module | `support`: `WRITER`, `GPU_MEMO`, `WIN_GEOM` and its `LATCH_GATE`, `SETTINGS_WARN`, `TAKEN_CACHE`, `DECODE_STATS`, `FAST_COST_KNOWN`/`FAST_COST_MEASURED`/`FAST_COST_SAMPLES`, `HW_SERVICE`, `DISPLAY_TOPOLOGY_DIRTY`, `MIRROR_LOGGED`, `HEIC_PROBED`, `SHUTDOWN_ONCE`, `LOG_TO_PID`, `DIAGNOSTIC_LOG`, `SAVED_MODE` and `BATTERY_POWER_SAVER`, `MODERN_ICC_API`, `WEB_PART_CTR`, thread-local `BULK_ASK`. `hwheic` (Windows): `LANE_LIVE`, `LANE_LOST`, `ASSEMBLER`, `POOL` and `POOL_CV`, `DECLINE_MEMO`, `FOLDER_GEN`, `PLAN_CACHE`, the two storage limits (`RENDER_STORAGE_LIMIT`, `ASSEMBLY_STORAGE_LIMIT`) and five session counters. `main` (Mac): `MENU_SNAP`, `MAC_VRAM_SRC` |
 
 ### Per-folder state and its owners
 
@@ -844,7 +849,7 @@ One helper, `reset_transient_ui`, closes or resets interface state that points i
 Process-wide memos are reset next to the owners:
 
 - `support::reset_fast_cost`: the per-format cost measurements and the hardware-HEIC service record.
-- `support::reset_fast_latency`: the energy-saving latency estimate, stamped with the new folder-open counter so a late result from the old folder cannot set it.
+- `support::reset_fast_latency`: the mode limits' latency estimate, stamped with the new folder-open counter so a late result from the old folder cannot set it.
 - `hwheic::note_folder_swap`: the hardware decline memo and the HEIC tile-plan cache.
 - `tick::release_parked_done`: frames the upload drain was holding, released together with their in-flight marks.
 
@@ -904,7 +909,7 @@ it, and each bundle has a contract test.
 3. `log_init(boot.diagnostic_logging)`: claim the primary-instance lock, fix the log location and install the panic hook (even with logging Off). Then `support::init_writer` starts the durable writer [before anything can queue a save], and `replay_startup_notes` writes or discards the held notes.
 4. On Windows, the `GetProcessTimes` line: time from process creation to `main()` [antivirus scans, cloud-file downloads and DLL loading are otherwise invisible].
 5. **CUDA/nvJPEG first**: `nv` for the detail worker and `nv_roi` for the zoom worker [both must exist before any D3D12 device, or nvJPEG can deadlock]. On Mac, Image I/O fills the same hardware slot (`accel_avail_for`).
-6. Early settings that the first decodes read: a Windows GPU memo found on a Mac is discarded (`stale_foreign_backend_memo`); the HEIC lane cap and speed priority; the CMYK route; Efficiency mode (`set_efficiency_mode`).
+6. Early settings that the first decodes read: a Windows GPU memo found on a Mac is discarded (`stale_foreign_backend_memo`); the HEIC lane cap and speed priority; the CMYK route; the saved mode and the battery switch (`set_saved_mode`, `set_battery_power_saver`).
 7. GPU power preference (`default_power_pref`; `LowPower` on a Mac running on battery) and backend selection (`plan_backend`; see [Choosing the GPU backend](#choosing-the-gpu-backend)).
 8. `hwheic::probe_and_arm()`: the Windows hardware HEIC probe, on its own thread and never waited for [placed after backend tuning so the tuning's timings are not disturbed]. A no-op on Mac.
 9. `MainWindow::new()`, then the four bundled Inter font faces are registered with `fontique`.
@@ -1101,7 +1106,7 @@ Each group's header reads "· N changed" while anything inside differs from `Set
 Some related settings live elsewhere:
 
 - **Interface motion** (`motion_ui`) is in Display.
-- Settings that trade decode work against what the user sees are in **Performance**: Adaptive Hi-Res, HEIC speed priority, Colour-managed CMYK JPEGs, Efficiency mode, and Fast View (Faster or Sharper preview, plus the Quick benchmark).
+- Settings that trade decode work against what the user sees are in **Performance**: Adaptive Hi-Res, HEIC speed priority, Colour-managed CMYK JPEGs, the mode control, the background wait, and Fast View (Faster or Sharper preview, plus the Quick benchmark).
 
 ## Interface markup (Slint)
 
@@ -1318,7 +1323,7 @@ The title bar's preload meter (`CacheMeter` in `hud.slint`) shows how many neigh
 
 There is one component with two mounting points, both in `MainToolbar` (`toolbar.slint`). On Windows it sits in the left button row; on macOS it sits immediately left of the notification bell. The two `if` gates on `native-window-controls` exclude each other, so exactly one meter exists. The toolbar decides when the meter is mounted (`cache-meter-show && hudclip.ctrl-show`) and owns its hover flag. That flag is cleared when the meter disappears (see [Hover state that outlives its element](#hover-state-that-outlives-its-element)).
 
-In Efficiency mode a leaf glyph (`LeafGlyph`, driven by `efficiency-leaf`) appears inside the same 62 px:
+While Eco is in effect a leaf glyph (`LeafGlyph`, driven by `efficiency-leaf`) appears inside the same 62 px:
 
 - It is gated with `if`, never `visible:`.
 - It sits in a `HorizontalLayout` with the track, so its 12 px cell plus 4 px spacing really shorten the track.
@@ -2382,7 +2387,7 @@ flowchart TB
   end
   subgraph INV["Invalidation"]
     I1["clear(): folder swap, output-colour or custom-profile change (drop_developed_caches),<br/>the user's own Faster/Sharper switch"]
-    I2["mark_stale_tier(): energy-saving release sets every dim to 0<br/>bytes kept as stand-ins, no hits until replaced"]
+    I2["mark_stale_tier(): Eco's Faster-preview release sets every dim to 0<br/>bytes kept as stand-ins, no hits until replaced"]
     I3["A frame decoded under the old Faster/Sharper choice<br/>is refused at the drain (sup tag)"]
     I4["det_epoch bump: RAW mode, colour, Resolution limit, Adaptive Hi-Res, Simulate VRAM<br/>stops full-detail serves only, preview serves continue"]
   end
@@ -2566,8 +2571,9 @@ set to `0`; the rest switch on an instrument.
 | `FALCON_CLASSIC_POOLS=1` (Mac) | Restores fixed decode and thumbnail pools, the RAM/2 GPU-memory estimate and the RAM keep-alive cache, instead of the elastic pool. |
 | `FALCON_SETTINGS_THROTTLE=0` | *Default on.* Turns off the throttle on preparing-ahead work while Settings is open. |
 | `FALCON_INTERACT_PACE=0` | *Default on.* Turns off only the interaction rows of the publish gate. With a browse inside 200 ms (`MOTION_PACE_WINDOW_MS`), preparing-ahead work is paced. With a stage or panel input inside 900 ms (`INTERACT_PARK_WINDOW_MS`) that is newer than the browse, it is parked, then paced for a 3 s tail (`INTERACT_PACE_TAIL_MS`). |
-| `FALCON_EFFICIENCY=0` | *Default on.* Never engages energy-saving mode. The control still shows and saves, for A/B runs on one build. |
-| `FALCON_POWER_SIM=ac\|dc\|saver`, `FALCON_EFFICIENCY_SIM_LATENCY_MS=<n>` | Simulate the power source and the measured latency for energy-saving mode. Calculation only; the log marks the source as simulated. |
+| `FALCON_EFFICIENCY=0` | *Default on.* Turns the battery rule off for the session: the saved mode stays in effect on battery. The controls still show and save, for A/B runs on one build. |
+| `FALCON_BACKGROUND_TIER=performance\|balanced` | Forces the background release target whatever the mode (diagnostic, read once at boot). |
+| `FALCON_POWER_SIM=ac\|dc\|saver`, `FALCON_EFFICIENCY_SIM_LATENCY_MS=<n>` | Simulate the power source and the measured latency for the mode limits. Calculation only; the log marks the source as simulated. |
 | `FALCON_SCAN_WORKERS=<n>` | Folder-scan header readers (capped at 8). |
 | `FALCON_BENCH_ON_BOOT=1` | Runs the Quick benchmark about 2.5 s after start-up. |
 | `WGPU_BACKEND=<name>\|auto` | One-off GPU backend override, or a reset of the saved choice. |
@@ -2995,8 +3001,8 @@ ahead is therefore rationed by format cost and paused during gestures. The visib
 use their own pool and are never held by the gesture gate.
 
 This section covers the rules: the *pool posture* (how much is prepared ahead, by format cost), the
-preview-and-detail choice, the *publish gate* (pausing during gestures), energy-saving mode, and the
-Mac pool governor. The Windows HEIC lane's own rules (folder service, lane cap) are in
+preview-and-detail choice, the *publish gate* (pausing during gestures), the mode control, the
+Mac pool governor, and the lower Windows priority for work done ahead. The Windows HEIC lane's own rules (folder service, lane cap) are in
 [Windows HEIC hardware decoding](#windows-heic-hardware-decoding).
 
 ### Why rationing exists (pool posture)
@@ -3012,11 +3018,11 @@ sharp, zooms took 4–11 s, and thumbnails waited about 15 s. The decoder was no
 scheduling was. Everything in this section is scheduling, not codec work.
 
 These scheduling rules are the **pool posture**; their log lines start with `pool posture:`. (This is
-a different thing from energy-saving mode, which the glossary also calls a posture.)
+a different thing from the mode control, whose code still says `efficiency` in places.)
 `FALCON_CLASSIC_POSTURE=1` (read once per process by `support::classic_posture`) switches the
 format-aware posture off for comparison runs: no narrowed runway, no costly-decode cap, no folder-open
-priming and no interaction gate. Energy-saving mode has its own switch, `FALCON_EFFICIENCY=0`, and the
-classic boot line says when energy-saving mode is still active.
+priming and no interaction gate. The mode control is separate (`FALCON_EFFICIENCY=0` turns only its
+battery rule off), and the classic boot line says when a mode is still limiting the browse.
 
 ### One posture, two pool shapes
 
@@ -3065,15 +3071,16 @@ A shot is CAPPED this tick (step_prefetch_fast) when any of these holds:
     costly_by_prior(kind)
     the Settings sheet is open (every format, so the sheet scrolls smoothly)
     the folder is hardware-served HEIC and a HEIC lane cap is set (default 4)
-    energy-saving mode is engaged and the photo is not on screen
+    Balanced, Eco or Custom is in effect and the photo is not on screen
 A shot is NARROWED (kept to the runway) when costly(kind) says so,
-    or energy-saving mode is engaged and the photo is not on screen
+    or Balanced, Eco or Custom is in effect and the photo is not on screen
 
 Cap in force  admission_cap(cap, lane cap) = the smaller: the lane cap can only tighten
               cap = costly_prefetch_cap(workers) = (workers / 4).clamp(2, 6)
-              (energy-saving mode: derived from measured latency, never above that)
+              (Balanced, Eco, Custom: derived from measured latency, never above that)
 Runway        costly_prefetch_window(full) = (min(8, ahead), min(3, behind)); it only ever narrows
 Duck          costly_prefetch_budget(cap, in_flight, interactive_busy) = 0 while the user waits on a decode
+              (Balanced ducks only where Turbo would cap)
 Priming       open_prime_holds: after a folder opens, speculation waits until the user moves or the
               first full-detail frame lands; past OPEN_PRIME_MAX_MS = 500 ms only while that decode runs
 Admission     admit_costly_prefetch: the displayed photo and both Compare halves are never rationed;
@@ -3181,7 +3188,7 @@ of a Compare drag showed the same twelve 45 MP photos republished about 9 times 
 - `support::idle_deepen_allowed(zoomed, compare, scrubbing, film_dragging, still_long_enough, efficiency)`:
   after `IDLE_DEEPEN_MS` (700 ms) of stillness the full-detail window may widen to the budget's
   capacity. It never does so in Compare (Compare is excluded from `zoomed`, so it needs its own term),
-  while zoomed, while scrubbing or dragging the strip, or in energy-saving mode. Narrowing the window
+  while zoomed, while scrubbing or dragging the strip, or in Eco. Narrowing the window
   evicts nothing, because the cache cap is sized from the budget, not from the window.
 - `support::detail_wanted_cap(detail_budget, est_frame, det_cache_cap, compare)`: the number of frames
   the tier can actually keep. That is the budget's frame count minus one, no more than the count cap,
@@ -3489,7 +3496,7 @@ flowchart TB
   GEST["Gesture → Park"]
   TAIL["Tail → Pace"]
   QUIET["Quiet → Full"]
-  EFF{"Energy-saving mode on<br/>and the answer is Full?<br/>efficiency_publish_arm"}
+  EFF{"Eco in effect<br/>and the answer is Full?<br/>efficiency_publish_arm"}
   EROW["Efficiency → Pace"]
   OUT["publish_arm.gate(): Full, Pace or Park<br/>and fast_hold_engaged(arm, clocks)"]
   START --> S
@@ -3519,9 +3526,9 @@ The rules that make it safe:
   followed by a browse does not park the browse. Equal clocks are not "newer".
 - **Why 900 ms.** Measured mid-gesture event gaps reach 200–800 ms; a shorter window reopened dispatch
   in the middle of a drag. The window itself is the hysteresis, so nothing latches, and three seconds of
-  an idle hand always reach Full (or the energy-saving Pace).
+  an idle hand always reach Full (or Eco's Pace).
 - **A park release never bursts.** The Tail row paces whatever the park held.
-- **Energy-saving mode** (`efficiency_publish_arm`) is applied last, and only to a Full answer, which it
+- **Eco** (`efficiency_publish_arm`) is applied last, and only to a Full answer, which it
   promotes to the `Efficiency` row (Pace). It can only hold more, never less, so a gesture on battery
   still parks.
 - **One evaluation per tick.** The tick computes the row once; the holding sites take `row.gate()`. The
@@ -3541,7 +3548,7 @@ The rules that make it safe:
 | `step_prefetch_detail` dispatch (`speculative_dispatch_held`) | full detail | new speculative asks under Park | `detail_frame_explicit` |
 | `step_upload_drain` bound (`drain_admits_heavy`) | both | under Park, more than one non-explicit finished preview or full-detail frame per tick; the rest are carried to the next tick with their in-flight marks intact | `detail_frame_explicit` frames, which also do not count against the bound |
 | `step_upload_fast` publish pick (`tick::fast_frame_parked`) | browsing preview | speculative frames while `fast_hold` is on; they stay in `drain_buf` | `fast_frame_exempt` |
-| `step_prefetch_fast` dispatch and RAM serve (`askable`) | browsing preview | speculative asks while `fast_hold` is on, under upload backpressure, or (energy-saving mode) stale-size upgrades | `fast_frame_exempt` |
+| `step_prefetch_fast` dispatch and RAM serve (`askable`) | browsing preview | speculative asks while `fast_hold` is on, under upload backpressure, or (Eco) stale-size upgrades | `fast_frame_exempt` |
 
 Never held at all: zoom-region tiles (`step_upload_roi`; they are the picture being dragged), the
 visible strip's thumbnails (their own pool), the menu blur and failure markers in the drain, and
@@ -3646,7 +3653,7 @@ navigation: it stamps the motion clock and frees the tier on the next tick.
   classifies `c`, so `c_serves` is written there too.
 - Two more reasons hold speculative preview asks behind the same exemption: the folder-open thumbnail
   start-up hold (`startup_hold`, until visible thumbnails are presented or 3 s pass), and, in
-  energy-saving mode, stale-size upgrades after a preview-size change.
+  Eco, stale-size upgrades after a preview-size change.
 
 **What the hold costs, and how it looks in the log.** Frames held in `drain_buf` are decoded RGBA in
 main memory, not GPU memory. They sit outside the browsing-preview GPU budget: `fast_budget` sizes the
@@ -3739,34 +3746,48 @@ retires both under the colour and epoch checks.
   tell "holding still mid-drag" from "let go 3 s ago". A pan-end or press-state callback is the
   structural fix. The filmstrip is the one surface that already has press state (`film_dragging`).
 
-### Energy-saving mode (Efficiency mode)
+### The mode control (Turbo, Balanced, Eco, Custom)
 
-**Efficiency mode** (the glossary's *energy-saving mode*; `posture` in code) cuts background work on
-battery. It is one control in Settings → PERFORMANCE: **Auto | On | Off**, default Auto
-(`EFFICIENCY_AUTO`). A status line under the control always says what is happening (`efficiency_note`):
+One choice shapes how hard Falcon works (rounds 2a and 2b; owner rulings of 25–27 October 2026). It
+replaced Efficiency mode. The four choices are **Turbo**, **Balanced** (the default), **Eco** and
+**Custom**. Until 27 October Turbo was called Performance and Eco was called Power saver; the owner
+renamed them so that all four names fit the control at its normal 12 px text. The code keeps the old
+names (`MODE_PERFORMANCE`, `MODE_POWER_SAVER`, `POWER_SAVER_*`; see the [glossary](docs/glossary.md)).
 
-- active, and why;
-- waiting for battery power;
-- "No battery detected — Auto never activates on this computer";
-- off;
-- turned off for this session by the developer switch.
+The saved choice is `Settings::mode` (0 Turbo, 1 Balanced, 2 Eco, 3 Custom; default Balanced). You
+pick it in Settings → PERFORMANCE (the **Mode** card) or on the welcome guide; both use the same
+segmented control (`Seg`) on the same `mode` property. While Custom is selected, a **Custom** card
+with its own numbers appears under the Mode card ([Custom](#custom-your-own-numbers), below). Under
+the control, **Use Eco on battery power** (`battery_power_saver`, default on) puts Eco in effect on
+battery, or on Windows with Battery saver on, without changing the saved mode. A status line says
+what is in effect and why (`mode_note`):
 
-The diagram shows how the power state becomes a decision and what the decision limits.
+- "On battery: Eco." / "Battery saver is on: Eco.";
+- "Until the power source changes: Balanced." (the speed panel's override, below);
+- "In effect: Balanced." (or Turbo, Eco, Custom), with a note on a desktop that reports no battery,
+  where the switch can never act, and when `FALCON_EFFICIENCY=0` turns the battery rule off for the
+  session;
+- then what the mode is doing to the browse, when it is holding it below the user's speed.
+
+The diagram shows how the inputs become one decision and what the decision sets.
 
 ```mermaid
 flowchart TB
   WATCH["falcon-power-watch, every 2 s<br/>Windows: GetSystemPowerStatus<br/>macOS: IOKit power sources"] --> SNAP["PowerSnapshot: source Ac / Dc / Unknown, saver"]
   SIM["FALCON_POWER_SIM = ac, dc or saver<br/>testing only"] --> SNAP
-  SNAP --> ENG{"efficiency_engaged<br/>once per tick"}
-  MODE["Setting: Auto / On / Off"] --> ENG
-  ENV["FALCON_EFFICIENCY=0"] --> ENG
-  ENG -->|"engaged"| LIM["efficiency_limits: concurrency, browse ceiling<br/>and runway from measured decode time"]
-  LIM --> C1["1. No widened idle detail window"]
-  LIM --> C2["2. Speculative publishes paced"]
-  LIM --> C3["3. Speculative runway and concurrency limited"]
-  LIM --> C4["4. Browse rate capped"]
-  LIM --> C5["5. Stale-upgrade sweep held"]
-  ENG -->|"released"| REL["EfficiencyLimits::RELEASED<br/>everything as normal"]
+  SNAP --> DEC{"mode_in_effect<br/>once per tick"}
+  SAVED["Saved mode<br/>Turbo / Balanced / Eco / Custom"] --> DEC
+  SWITCH["Use Eco on battery power"] --> DEC
+  HOLD["Until the power source changes<br/>mode_override_step"] --> DEC
+  ENV["FALCON_EFFICIENCY=0<br/>battery rule off for the session"] --> DEC
+  CARD["Custom card's numbers<br/>custom_limits_of, every tick"] --> LIM
+  DEC --> LIM["mode_limits: limit, ceiling, decodes at once,<br/>decode reach, kept window, sharp photos, thumbnails"]
+  LIM --> P["Turbo: RELEASED<br/>everything as before round 2a,<br/>thumbnails for the whole folder"]
+  LIM --> B["Balanced: 20/s, at most 2/3 of the benchmark<br/>about 2 s of previews kept"]
+  LIM --> PS["Eco: 12/s, at most 40%<br/>24 + 6 kept, Efficiency mode's cuts"]
+  LIM --> C["Custom: your numbers"]
+  DEC --> BG["Background release target<br/>Policy::for_mode"]
+  CARD --> BG
 ```
 
 **Reading the power state.** `falcon-power-watch` runs at lowest priority every 2 seconds.
@@ -3774,52 +3795,293 @@ flowchart TB
 - On Windows it calls `GetSystemPowerStatus`, a static kernel32 import, so Windows 10 support is
   unchanged. The result is decoded into `PowerSnapshot { source: Ac | Dc | Unknown, saver }`, where
   `saver` is Windows' Battery saver flag. One probe takes a few microseconds (1–7 µs measured). On macOS
-  it reads the IOKit power sources.
+  it reads the IOKit power sources; Low Power Mode is not read, so the switch follows only the power
+  source there.
 - It reports only changes. It needs no early wake-up and no baseline epoch, because nothing in Falcon
   changes the power state.
 - `FALCON_POWER_SIM=ac|dc|saver` simulates a power state for testing. Simulated runs say so in the log
-  and report no probe time.
+  and on the status line, and report no probe time.
 
-**The decision** is one pure function, `efficiency_engaged(snapshot, mode, env_disabled)`, evaluated
-once per tick. Off never engages, On always does, and Auto engages on battery or with Battery saver on.
-**Unknown never engages**, so Auto on a desktop honestly does nothing. Every evaluation reads the live
-state and nothing latches: unplugging engages the mode within one poll, and plugging in releases it.
+**The decision** is one pure function, `mode_in_effect(saved, battery_switch, snapshot, env_disabled,
+held)`, evaluated once per tick. A saved Eco is Eco on any power source. Otherwise, with the switch
+on, battery or Battery saver puts Eco in effect (`ModeReason::Battery` or `BatterySaver`); this is
+the same for Turbo, Balanced and Custom. **Unknown never does**, so a desktop honestly runs its saved
+mode. Nothing in the decision writes the saved mode or Custom's numbers (L44): back on mains the saved
+mode returns on the next tick, and the automatic settings save stores only what the user chose. `held`
+is the speed panel's override, stored as the power reading it was chosen under and cleared the first
+tick that reading changes (`mode_override_step`, L43: it never comes back by itself).
 
-**What it changes.** Only speculative work. The displayed photo (including both Compare halves),
-anything the user asked for, zoom regions and thumbnails are exempt.
+**What each mode does.** Once per tick, `mode_limits(mode, custom, …)` turns the mode in effect into
+one set of numbers (`EfficiencyLimits`, a name kept from Efficiency mode), and every part of Falcon
+that prepares photos reads the same set:
 
-1. The widened idle full-detail window is withheld (`idle_deepen_allowed`'s sixth term). Nothing
-   already loaded is thrown away.
-2. A quiet ladder's `Full` publish becomes `Pace` (`efficiency_publish_arm`, `GateArm::Efficiency`):
-   speculative frames appear at a steady pace, never in bursts. Gesture `Park` rows are untouched.
-3. The speculative runway and concurrency are limited (capped and narrowed in
-   [The cost rules at a glance](#the-cost-rules-at-a-glance)). The displayed set is exempt in both, so
-   the far Compare half never starves behind the runway.
-4. The browse rate is capped (`effective_scrub_fps`, `efficiency_scrub_cap`). This is the one change a
-   user can feel, so the browse-speed popup says so whenever the cap is in force
-   (`scrub_fps_efficiency_note`), and no control shows a rate the mode prevents.
-5. After the preview size grows, the stale-upgrade sweep is held. Frames stay marked, so turning the
-   mode off re-sharpens them through the normal path. When the mode releases, the RAM keep-alive cache
-   keeps its bytes but marks every entry stale (`mark_stale_tier`).
+| | Turbo | Balanced (default) | Eco | Custom |
+| --- | --- | --- | --- | --- |
+| Fastest browsing | no limit, Max included | 20/s, at most two-thirds of the benchmark's best | 12/s, at most 40% of it | Unlimited, or your number (5/s up to this machine's best) |
+| Slow folder | no change | lowered to what the machine keeps up with in this folder, never below 5/s | the same | the same for your number; Unlimited is never lowered |
+| Previews kept ready | as many as graphics memory allows (`fast_window_split`) | about 2 s of browsing (40 ahead, 10 behind at 20/s), never fewer than Eco | 24 ahead, 6 behind | your numbers (starts at 40 + 10) |
+| Previews decoded at once | all workers; slow formats capped | just enough to keep up with its speed, up to all workers but one | the same, up to half the workers | as Balanced; Unlimited: all workers but one |
+| How far ahead previews are decoded | the whole kept window (slow formats: 8 ahead, 3 behind) | 2 s ahead, 0.5 s behind | 1 s ahead, 0.25 s behind; at most 12 and 4 | as Balanced; Unlimited: the whole kept window |
+| Sharp photos kept ready | 3 ahead, 1 behind | the same | the same | your numbers (starts at 3 + 1) |
+| Sharp photos while zoomed or settled | as many as the memory budget holds, up to 16 ahead | within about 2 GB (`BALANCED_DETAIL_BYTES_MAX`) | within about 1 GB, at most 3 ahead and 1 behind | while zoomed, your numbers (starts at 8 + 2); no widening when settled |
+| Thumbnails prepared | the whole folder, within about 2 GB (a cap not shown in the interface) | the whole folder, within about 500 MB | visible and nearby | your choice (starts at the whole folder, within 500 MB; you set 100 MB to 2 GB) |
+| In the background | keeps up to a quarter of the graphics card | keeps only the photos in use | the same as Balanced | your choice, released at once, over 10 s or over 30 s |
 
-**Changes and logging.** `efficiency_edge(prev, now, mode)` returns `Nothing`, `Adopt`, `Log` or
+Eco also keeps Efficiency mode's other cuts:
+
+- photos prepared ahead appear at a steady pace, never in bursts (`efficiency_publish_arm`,
+  `GateArm::Efficiency`);
+- after the preview size grows, the old previews are not all re-sharpened at once; they stay marked,
+  and leaving Eco re-sharpens them the normal way;
+- browsing uses Faster preview once Eco has been in effect for 2 s (`efficiency_bias_step`).
+  When it switches back, the RAM keep-alive cache keeps its bytes but marks every entry stale
+  (`mark_stale_tier`);
+- when you stop, Falcon does not widen the set of sharp neighbours (`idle_deepen_allowed`'s sixth
+  term; `EfficiencyLimits::settled_fill` is false in Eco and in Custom);
+- preparing ahead pauses while the photo on screen waits for its full-resolution image
+  (`interactive_busy`).
+
+Every mode limits only work done ahead. The displayed photo (including both Compare halves), anything
+the user asked for, zoom regions and the thumbnails on screen are exempt (see
+[The cost rules at a glance](#the-cost-rules-at-a-glance)).
+
+- **Balanced does not pause** in a folder that is quick to decode, such as JPEGs. It is the default,
+  and pausing there would make everyday browsing worse than Turbo. Custom does the same.
+- **A mode only ever takes away.** Where Turbo itself would hold back (a format that is slow to
+  decode, the Settings sheet open, a HEIC folder on the hardware decoder: `base_capped`, `any_base`),
+  every mode holds back at least as much. A slower speed you chose stays (`efficiency_scrub_cap` takes
+  the lower of the two), and a mode never keeps more previews than Turbo would.
+- **The previews kept ready** follow your direction: each tick the mode limits how many are kept on
+  the side you are browsing toward and how many behind (`mode_window`, applied after
+  `fast_window_split`). The preview cache's count limit matches (`EfficiencyLimits::keep_count`: the
+  window, the photo on screen and four photos that are never let go), so photos outside the window are
+  released. Compare halves on screen are always kept, even outside a mode's window.
+- **Limits apply at once, not at the next new photo.** Both caches are trimmed every tick, not only
+  when a new frame arrives (`step_cache_retention`, at the end of `step_upload_drain`). So switching
+  from Turbo to another mode releases the extra previews within a few ticks, at most 8 a tick
+  (`FAST_RETENTION_TRIM_PER_TICK`), even in a settled browse where nothing new is decoded. The arrival
+  and the per-tick trim share one eviction each (`evict_fast_window_aware`, `evict_detail_lru`), with
+  the same protected photos.
+- **The panels let go too.** The grid, the filmstrip and the Review panel show a preview as a
+  stand-in until a thumbnail arrives, and each tile keeps its own copy. So a trim that released
+  previews tells the open panels to redraw without them (`fast_gen`), and a panel that cannot
+  redraw — the Review panel when closed, the grid while immersive mode hides it — empties its tiles
+  and rebuilds when it is shown again (`background_memory::release_after_trim`, the same step the
+  background release uses). In every mode but Turbo this covers every preview the mode lets go,
+  including one released when a newly decoded preview arrives (`tick::evict_at_arrival`); in Turbo
+  only the trim's.
+- **Sharp-photo limits** and the out-of-memory ladder both shrink the same memory; the smaller limit
+  wins (`zoomed_detail_ahead(budget.min(limits.detail_bytes_max), …)`, `mode_detail_window`). While
+  zoomed or settled, that smaller number is also what the cache may keep (`det_retain_bytes`) and the
+  ceiling on how many sharp photos it asks for (`detail_wanted_cap`), so it never decodes a neighbour
+  it would have to throw away. The photos on screen stay even past it. The usual 3 ahead and 1 behind
+  keep the card's own budget, the same in every mode but Custom.
+- **On the Mac** the decoding pool's minimum size and its governor follow the speed the mode allows
+  (`MacPoolGov::set_floor_rate`). The Mac's background behaviour is unchanged so far: Turbo, and
+  Custom's 10/25/50%, act like Balanced there, because there is no graphics-memory measurement yet
+  (round 2c adds one).
+
+#### Custom: your own numbers
+
+Round 2b (owner rulings of 25–27 October 2026). The **Custom** card sits under the Mode card and is
+mounted only while Custom is selected, so Settings stays short for everyone else. Its first line says
+what every number means: "The most Falcon prepares; memory limits can lower these." It starts as a
+copy of Balanced.
+
+| Row | Starts at | Choices |
+| --- | --- | --- |
+| Browsing speed | Balanced's own limit | Custom (type 5 up to this machine's best) · 12 · 20 · 30 · Unlimited |
+| Previews kept ready, ahead / behind | 40 / 10 | 12, 24, 40, 80 or type 6–200 / 3, 6, 10, 20 or type 2–64 |
+| Sharp photos kept ready, ahead / behind | 3 / 1 | 1, 3, 5, 8 or type 0–16 / 0, 1, 2, 4 or type 0–8 |
+| Sharp photos while zoomed, ahead / behind | 8 / 2 | 3, 8, 16, 32 or type 1–32 / 0, 1, 2, 4 or type 0–8 |
+| Thumbnails | Whole folder | On screen · Nearby · Whole folder, with a line naming the choice in full |
+| Whole folder, up to (only with Whole folder) | 500 MB | Custom (type 100–2,000) · 250 · 500 · 1000 · 2000, in MB; the grey line under it names the choice and the cap |
+| In the background, keep | In use | In use · 10% · 25% · 50%, with a line saying what it keeps |
+| Release over | 10 s | At once · 10 s · 30 s |
+
+How the card looks follows the owner's layout rules:
+
+- The number rows use the app's usual typed-value control (`CustomSeg`): a "Custom" cell you click and
+  type into, then four stops. A typed number is checked in Rust (`set-custom-number` →
+  `support::custom_typed`) and brought into the row's range; the speed is held to this machine's
+  best. A stop writes its number directly.
+- In a control that mixes words and numbers, every word cell has one wider width and every number
+  cell one narrower width (`wide-last` on the speed row, `wide-first` on the keep and release rows).
+- Choices too long for a cell use short labels ("On screen", "Nearby", "In use"), with a grey line
+  under the row that names the choice in full.
+- On the welcome guide, Custom's line is a link: "Your own numbers. Starts as Balanced — adjust it in
+  Settings → Performance." It opens Settings, like the guide's CONTROLS link, and does not scroll it.
+
+How the numbers are used:
+
+```mermaid
+flowchart LR
+  CARD["Custom card<br/>(stops write directly,<br/>typed values: custom_typed)"] --> READ["custom_limits_of<br/>every tick, in range"]
+  READ --> LIM["mode_limits(MODE_CUSTOM)"]
+  LIM --> SPEED["Speed: custom_ceiling<br/>Unlimited, or your number<br/>held to the benchmark's best"]
+  LIM --> KEEP["Previews: your ahead / behind<br/>never wider than the card's own window"]
+  LIM --> SHARP["Sharp photos: custom_detail_window<br/>fitted to the memory budget"]
+  LIM --> THUMBS["Thumbnails: your choice"]
+  READ --> BGP["Background: Policy::for_mode<br/>your keep and release time"]
+  READ --> SAVE["settings.json: custom_* keys<br/>build_settings"]
+```
+
+- **Speed** (`custom_ceiling`). Unlimited has no limit from the mode, as in Turbo, and the measured
+  slowness of a folder never lowers it. It decodes with Balanced's workers: all but one. A number works like Balanced at your
+  speed: decodes at once follow from it, and a folder the machine cannot keep up with lowers it. It is
+  never above the benchmark's best at the preview size you browse at (when a benchmark speaks for the
+  folder), otherwise never above 120, and never below 5. Until you pick one it follows Balanced's own
+  limit (stored as −1, `CUSTOM_FPS_AS_BALANCED`), and the row shows that number. The speed panel greys
+  the stops above your number and asks before switching, offering Turbo.
+- **Previews.** Your ahead and behind numbers are the kept window. On a small graphics card the card's
+  own window is smaller, and it wins, so a high number can never decode photos straight into eviction
+  (L29).
+- **Sharp photos** (`custom_detail_window`, `custom_detail_cache_cap`). Your numbers are fitted to the
+  memory budget (the out-of-memory ladder's): the window and the photo on screen take at most one less
+  than the budget holds, ahead first. There is no 2 GB allowance as in Balanced; the count is yours.
+  The count limit of the sharp-photo cache covers both of Custom's windows, so zooming in and out does
+  not throw away what the other kept. Custom does not widen its sharp photos when you stop: the "kept
+  ready" numbers are already the most it prepares. Custom may keep more photos behind than ahead, so a
+  sharp photo is given up as "left behind" only when you move further away than the wider side of the
+  window (`support::detail_jump_radius`). Otherwise the photos furthest behind would be asked for, given
+  up and asked for again on every tick.
+- **Background** (`Policy::for_mode`). "In use" keeps only the photos in use; 10, 25 or 50% keeps that
+  share of the graphics card (on the Mac, of Apple's recommended graphics budget, and only while macOS
+  reports normal memory pressure: round 2c). "At once" releases on the tick the release starts.
+- **Saving.** The numbers are saved as `custom_*` keys and brought into range at load. A settings file
+  from before round 2b has none and reads Balanced's copy. Only the user writes them.
+
+Where a copy of Balanced still differs from Balanced: it does not widen its sharp photos when you stop;
+its 8 + 2 zoomed sharp photos stay 8 + 2 for small photos, where Balanced's 2 GB allowance would keep
+more; and its 40 + 10 previews stay 40 + 10 where a benchmark lowers Balanced's speed limit, so
+Balanced keeps fewer (2 s of browsing ahead and 0.5 s behind at its limit).
+
+#### Thumbnails each mode prepares
+
+Round 2b (owner answer 5 and its confirmation, 26 October). The thumbnails on screen are always
+served. What changes is what Falcon prepares around them:
+
+- **Visible only** (Custom's "On screen"): the filmstrip and the grid ask only for the cells and rows
+  on screen, plus the one cell or part-row each side that can come into view before they next rebuild
+  their list (the filmstrip rebuilds as its centre crosses a cell, the grid as its first or last row
+  on screen changes, also at the top and bottom of the folder and when the dock gets taller).
+  Their other extra cells and rows are still drawn, so scrolling shows no gap, but they wait until they
+  come into view. The thumbnails for the frosted backdrop are not prepared either, so each new
+  preview makes its own blur source (about 20% more decode work).
+- **Visible and nearby** (Eco, and Custom's "Nearby"): Falcon before round 2b — the filmstrip's two
+  extra cells each side, the grid's two extra rows (`GRID_MARGIN_ROWS`), and the frosted-backdrop
+  feeder over the preview window (`step_frost_feed`).
+- **Whole folder** (Turbo, Balanced, and Custom's "Whole folder"): all of that, then the rest of the
+  folder.
+
+```mermaid
+flowchart TB
+  VIS["Tiles on screen<br/>filmstrip, Review panel, grid"] --> NEAR["Nearby<br/>strip and grid margins, frosted-backdrop feeder"]
+  NEAR --> IDLE{"Idle?<br/>still 0.7 s, photo on screen ready,<br/>no sharp photo awaited, not opening,<br/>not in the background, no Mac memory pressure"}
+  IDLE -->|"yes"| WHOLE["step_whole_folder_thumbs<br/>nearest the current photo first<br/>8 of the 48 queue slots, below-normal priority"]
+  IDLE -->|"no"| WAIT["waits"]
+  WHOLE --> SKIP["skips cloud-only files<br/>(the scan's tags, and a check<br/>just before each read),<br/>cached, queued and failed ones"]
+  WHOLE --> CAP["stops at the radius the cache can keep<br/>whole_folder_radius"]
+```
+
+- **The order.** The whole-folder feeder runs last in the tick, after every feeder for what is on
+  screen. It asks only while fewer than 8 thumbnails are queued (`WHOLE_FOLDER_PENDING_MAX`), so the
+  tiles you are looking at always come first, and its jobs run at below-normal priority.
+- **Never a cloud-only file.** It skips every photo the folder scan tagged as a cloud placeholder
+  (`meta.cloud_tagged`), so preparing ahead never downloads anything (AGENTS.md's cloud rule). A file
+  made online-only after the scan (Explorer's "Free up space", Storage Sense, the Mac's "Optimise Mac
+  Storage") is not tagged, so each whole-folder request is marked `ThumbReq::whole_folder`, and the
+  thumbnail worker checks the file just before reading it (`support::shot_is_cloud_only`, metadata
+  only, either file of a RAW + JPEG pair, the scan's rule). An online-only file is not read: the worker
+  answers with an empty result (no failure is recorded) and notes it in `film.cloud_skipped`, and the
+  feeder asks for it no more in this folder. The check runs on the worker, not in the tick, so a slow
+  or unreachable network drive cannot hold up the window. A tile on screen still shows its thumbnail as
+  before (one photo may download its own file), and a queued whole-folder job that comes on screen
+  follows that rule too. A file noted this way and later downloaded again is not prepared ahead until
+  the folder is opened again; its thumbnail still appears when it is on screen.
+- **The cap.** The thumbnail cache keeps `EfficiencyLimits::thumbs_max` thumbnails, the ones nearest
+  what is on screen: 400 normally (`THUMB_CACHE_MAX`), about 500 MB (2,855 thumbnails at 175 KB each,
+  `WHOLE_FOLDER_THUMBS`) for Balanced's whole folder, Custom's own cap for Custom's (100 MB to 2 GB,
+  starting at 500 MB; `whole_folder_thumbs_in`), and about 2 GB in Turbo (11,421 thumbnails,
+  `WHOLE_FOLDER_THUMBS_MAX`; owner, 27 October). That 2 GB is not shown in the interface; it is above
+  the 9,999 photos a camera's file numbering reaches, and nothing prepares more. The feeder only
+  asks within the radius the cache can keep (`whole_folder_radius`, counted around the current photo,
+  the filmstrip's centre and the grid's middle), so it never decodes a thumbnail the cache then drops.
+  The blur sources for the frosted backdrop keep their own 400. A blur source is made only when a
+  thumbnail is decoded, so when one is trimmed while its thumbnail stays, Falcon notes it
+  (`film.mipless`). The frosted-backdrop feeder decodes that thumbnail again once the preview window
+  reaches it, which brings the blur source back. The blur sources inside the preview window are never
+  the ones trimmed (`film.frost_window`), so one made again stays, even when the current photo, the
+  filmstrip and the grid are far apart. While the preview window is shrunk to the photo on screen (a
+  sharp photo decoding on the processor, or a zoomed region), the last full window stays protected.
+  The thumbnail cache keeps that window's thumbnails first too (Codex's review, R1, 27 October). With
+  the current photo, the filmstrip and the grid far apart, the nearest-first rule used to drop the far
+  end of the preview window; the frosted-backdrop feeder asked for those thumbnails again, and the two
+  repeated for ever. The window is at most about 150 photos, inside every cap, so this changes which
+  thumbnails stay, not how many. With the feeder off (the developer switch, or Custom's On screen)
+  there is no window to keep (`film.frost_window` is emptied).
+- **Cheap when done.** The feeder remembers where its last scan stopped (`(folder, photo, radius,
+  losses, distance)`), so a folder that is already prepared costs one comparison a tick. It scans again
+  from the current photo when that photo moves, or when the cache has lost thumbnails since
+  (`film.losses`: an eviction, for example after a mode or Thumbnails change shrank the cache, a
+  rotation that removed thumbnails, or a request that was dropped or retired).
+- **On battery**, with **Use Eco on battery power** on, Eco is in effect, so whole-folder preparation
+  stops.
+- Changing the choice re-runs the tile feeds at once (`thumb_gen`).
+
+**The speed panel.** Speeds above the mode's limit are greyed with a dark veil (`grey-from`,
+`greyveil`), unlike the light frost over speeds the benchmark says this machine cannot sustain.
+Clicking a greyed speed, or typing one above the limit, does not change the speed. Falcon asks first
+(`pick-fps` → `support::mode_ask`):
+
+```mermaid
+flowchart TB
+  PICK["You pick a speed in the speed panel"] --> UNDER{"At or below the<br/>mode's limit?"}
+  UNDER -->|"yes"| SET["The speed changes"]
+  UNDER -->|"no"| WHY{"Is Eco on only<br/>because of the battery?"}
+  WHY -->|"yes"| HOLDQ["'Eco is on because Falcon is running on battery.'<br/>[Use Balanced until the power source changes] [Keep Eco]"]
+  WHY -->|"no"| SWQ["'30 photos/s needs Turbo.'<br/>[Switch to Turbo] [Keep Balanced]"]
+  HOLDQ -->|"use"| SET
+  SWQ -->|"switch"| SET
+```
+
+- From Eco, the switch offers Balanced when Balanced's own limit allows the speed, otherwise Turbo.
+  From Balanced and from Custom with a typed limit, it offers Turbo.
+- The override names the saved mode ("Use Turbo until…" when Turbo is saved), and has its own sentence
+  when Windows' Battery saver is the reason.
+- The two buttons disappear whenever another message replaces the toast (`toast-mode-ask`, cleared
+  in `clear_bulk_ask`).
+- The panel's note says when a mode is holding browsing below your speed (`scrub_fps_mode_note`).
+
+**Changes, toasts and logging.** `mode_edge(prev, now, snapshot)` returns `Nothing`, `Adopt`, `Log` or
 `LogAndToast`.
 
-- A session that starts already engaged adopts that state silently.
-- Every real change logs one line.
-- Only an Auto engage also raises a toast: "On battery — reducing background work." or "Battery saver
-  is on — reducing background work."
-- An arm that flips back and forth within the same gate is logged at most once per 2 seconds, with a
-  count of the lines skipped.
-- `FALCON_EFFICIENCY=0` turns the feature off for the session, and the control is replaced by a note
-  saying so.
+- A session that starts on battery adopts that state silently; the boot line (`mode_boot_line`) states
+  the saved mode, the switch, the power reading and the mode in effect.
+- Every change of the mode in effect logs one `mode:` line with the limits it set
+  (`efficiency_limits_clause`, which also names the thumbnails and, in Custom, its sharp-photo
+  numbers).
+- A change of Custom's numbers logs one `mode: Custom set — …` line (`custom_log_line`).
+- Only a power change that moves Eco in or out raises a toast: "On battery — Eco", "Back on mains —
+  Balanced" (or the saved mode), or the Battery saver pair (`mode_power_toast`). The user's own clicks
+  (the row, the switch, the override pill) do not.
+- An arm that flips back and forth within the same publish gate is logged at most once per 2 seconds,
+  with a count of the lines skipped.
+- The leaf in the preload meter shows while Eco is in effect, whatever the reason.
 
-**Deliberately not part of it:** changing the tick rate; choosing a low-power GPU adapter (that is
-decided once at startup); Windows power-change push notifications (polling costs only microseconds).
+**Migration.** `migrate_modes` runs once from the retired `efficiency_mode` (marker `modes_migrated_v1`,
+inside `normalize_loaded_settings`, so both start-up reads agree and the log line is deduplicated): Auto,
+or a missing key, → Balanced with the switch on; On → Eco; Off → Balanced with the switch off.
+The old key is read and never written again, and the launch that migrates saves at once. Custom's keys
+are new and need no migration.
 
-**Measured.** On the test kit, speculative full-detail decodes at an engaged launch fell from 51 to 12,
-and the displayed photo's time to its full image did not change. The energy saved has not been measured
-in joules, because the test kit is fully cached.
+**Deliberately not part of it:** changing the tick rate; choosing a low-power GPU adapter (decided once
+at startup); Windows power-change push notifications (polling costs only microseconds). The Mac's own
+Turbo background rule is round 2c.
+
+**Measured** (Efficiency mode, whose cuts Eco keeps). On the test kit, speculative full-detail
+decodes at an engaged launch fell from 51 to 12, and the displayed photo's time to its full image did not
+change. The energy saved has not been measured in joules, because the test kit is fully cached.
 
 ### Mac pool governor
 
@@ -3925,21 +4187,94 @@ What that run established:
 - Image I/O's JPEG decode scaled with threads (11.3, 22.6 and 46.0 fps at 1, 2 and 4 threads), so it behaves like parallel software, not a fixed-function hardware decoder. It was about 1.6× faster than the CPU path at reduced preview sizes and no faster at full resolution. Its real value is native HEIC and fast reduced-size decoding.
 - Fixed numbers do not carry over between machines. For example, an 18 fps target leaves no efficiency-core headroom at 45 MP. Pool sizing is therefore derived per machine from the saved benchmark, never from constants.
 
-How the design uses this: the pool's floor and ceiling above come from these results. Production decode threads run at the default class. If a future energy-saving design moves decoding to the utility class, its width must not exceed the efficiency-core count.
+How the design uses this: the pool's floor and ceiling above come from these results. Production decode threads run at the default class. If a future power-saving design moves decoding to the utility class, its width must not exceed the efficiency-core count.
 
-### Efficiency limits are measured, not fixed
+### A mode's limits are measured, not fixed
 
-Fixed limits do not work on a laptop with only built-in graphics. JPEG frames there were measured at 450–1,700 ms per decode, so the decoders produce 3–7 frames a second against a 20 fps browse clock, and every step lands on a frame that is not ready. So while the mode is engaged, `efficiency_limits(...)` derives its numbers once per tick from one measured input: the fast tier's time per decode, `L`.
+Fixed limits do not work on a laptop with only built-in graphics. JPEG frames there were measured at 450–1,700 ms per decode, so the decoders produce 3–7 frames a second against a 20 fps browse clock, and every step lands on a frame that is not ready. So in Balanced, Eco and Custom (unless its speed is Unlimited), `mode_limits(...)` derives its numbers once per tick from one measured input: the fast tier's time per decode, `L`. Custom's Unlimited skips it, as Turbo does.
 
 - **Measuring L.** `note_fast_latency` keeps a smoothed average (EWMA, weight 0.25) for each format. It is stamped with the folder-open counter, so a late decode from the previous folder is dropped. `fast_latency_ewma` uses the displayed photo's format, or failing that the folder's most-decoded format.
-- **Concurrency**, by Little's law: `N = ceil(ceiling × L)`. It is at least 2 and at most half the workers left after the displayed photo's slot (`efficiency_worker_share`). If the window really contains a costly format (such as 48 MP HEIC on software decode), concurrency is never raised above the normal costly cap (`efficiency_concurrency_cap`).
-- **Browse ceiling**: `min(user setting, 20 fps, 0.8 × N_max / L)`, never below 5 fps (`EFFICIENCY_CEILING_FLOOR_FPS`). The clock must not outrun the decoders; slower but always sharp beats stuttering.
-- **Runway depth**: 1.0 s of browsing ahead and 0.25 s behind at that ceiling. That is at least 3 + 2 frames and at most 12 + 4, always less than the mains window. A window containing a genuinely costly format keeps the normal costly window (`efficiency_runway_window`).
-- **Where L comes from**, in this order: the test lever `FALCON_EFFICIENCY_SIM_LATENCY_MS`, the live measurement, a seed derived from the saved benchmark (`efficiency_seed`), then defaults (12 fps). A benchmark seed may lower the ceiling but never raise it above 12 fps, because a benchmark taken on mains does not predict battery clock speeds. The source (`LimitSource`: live, benchmark seed, default, simulated) is named in the log, the Settings line, the leaf tooltip and the browse-speed popup.
-- **Faster preview while engaged.** Once the mode has held for 2 seconds (`EFFICIENCY_BIAS_DEBOUNCE_MS`, `efficiency_bias_step`), browsing switches to Faster preview. Neither direction clears the cache: shrinking keeps the existing frames (the GPU downsamples them), and growing back keeps the stale frames and re-decodes them gradually. The user's own Faster/Sharper choice still clears the cache, and the preview card says when the mode is holding it.
+- **The mode's own limit** (`mode_ceiling`, and `custom_ceiling` for Custom's number): 20/s in Balanced and 12/s in Eco, lowered to two-thirds or 40% of the benchmark's best when a benchmark may speak for this folder (`mode_bench_fps`, at the preview tier the mode browses at: Faster preview in Eco), never below 5 fps. The speed panel greys the stops above it.
+- **Previews decoded at once**: just enough to keep up, `N = ceil(ceiling × L)` (Little's law). It is at least 2 and at most all the workers but the displayed photo's slot (Balanced) or half of them (Eco, `efficiency_worker_share`). If the window really contains a costly format (such as 48 MP HEIC on software decode), or any photo Turbo would cap, concurrency is never raised above the normal costly cap (`efficiency_concurrency_cap`).
+- **Fastest browsing**: the lowest of your setting, the mode's limit and what the decoders keep up
+  with, `min(user setting, the mode's limit, max(0.8 × N_max / L, 5 fps))` (`EFFICIENCY_CEILING_FLOOR_FPS`). The clock must not outrun the decoders; slower but always sharp beats stuttering.
+- **How far ahead previews are decoded**: Eco decodes 1.0 s ahead and 0.25 s behind at that ceiling (at least 3 + 2 frames, at most 12 + 4); Balanced 2 s and 0.5 s, within its kept window; Custom's Unlimited, the whole kept window. "Ahead" is the direction you are browsing: browsing backward, the longer reach is on the earlier photos, as in the kept window (Codex's review, R2, 27 October; before, Custom's Unlimited set to 40 + 10 prepared only 10 photos in the direction of travel when browsing backward). A window containing a genuinely costly format keeps the normal costly window (`efficiency_runway_window`).
+- **Where L comes from**, in this order: the test lever `FALCON_EFFICIENCY_SIM_LATENCY_MS`, the live measurement, a seed derived from the saved benchmark (`efficiency_seed`), then nothing. With no measurement the ceiling is the mode's own limit, and every derived ceiling is `min`'d with it, so a benchmark seed may lower the ceiling but never raise it (L31: a benchmark taken on mains does not predict battery clock speeds). The source (`LimitSource`) is named in the log.
+- **What set the number** (`LimitBound`: the mode's limit, its benchmark share, the live measurement, the seed, the floor, the simulation) decides the sentence. The mode's limit and its benchmark share are named as what they are ("Balanced limits browsing to 16 fps, two-thirds of this machine's benchmark speed."); only the measured arms say the machine is "keeping up with" a rate.
+- **Faster preview in Eco.** Once Eco has held for 2 seconds (`EFFICIENCY_BIAS_DEBOUNCE_MS`, `efficiency_bias_step`), browsing switches to Faster preview. Neither direction clears the cache: shrinking keeps the existing frames (the GPU downsamples them), and growing back keeps the stale frames and re-decodes them gradually. The user's own Faster/Sharper choice still clears the cache, and the Fast View card says when Eco is holding it.
 - Every user-facing sentence comes from one composer that knows the state. It claims a limit only when the user's own setting is above it, names the 5 fps floor when the floor applies, and says where the number came from.
 
-**The leaf.** While the mode is engaged, a small filled leaf (`Theme.leaf`) appears inside the title-bar preload meter (`CacheMeter` in `hud.slint`) on both platforms. The meter keeps its 62 px width: the bar shortens by the leaf plus a gap, and its fill is clipped to the shorter bar. The leaf is mounted with an `if`, not `visible:`, and geometry tests check it.
+**The leaf.** While Eco is in effect, for whatever reason, a small filled leaf (`Theme.leaf`) appears inside the title-bar preload meter (`CacheMeter` in `hud.slint`) on both platforms. The meter keeps its 62 px width: the bar shortens by the leaf plus a gap, and its fill is clipped to the shorter bar. The leaf is mounted with an `if`, not `visible:`, and geometry tests check it.
+
+### Lower priority for work done ahead (Windows)
+
+Round 3 step (a) of [the sharing plan](docs/planning/gpu-memory-sharing.md), October 2026
+(`prep_priority.rs`). The owner heard audio crackle through a USB audio device while browsing many
+PNGs, so another program must get the processor first when it wants it.
+
+- **Below normal:** work nobody has asked for yet. Previews ahead and behind, full-resolution
+  neighbours, the stillness fill, and thumbnails that are not on screen (the frost feeder).
+- **Normal, as before:**
+  - everything in `support::ExplicitSet` (the photo on screen, both Compare halves, the hovered
+    Review tile, the frame a stopped browse is waiting for);
+  - thumbnails on screen;
+  - the zoom worker, the derive worker and the upload thread.
+- **When nothing else competes,** a below-normal thread still gets the whole machine.
+- **One place and one pool per worker** (`Registry::worker`).
+  - `jpeg-decoder` (`in_place_scope`), `falcon-color`, rawler and jxl-oxide split their work
+    across whichever rayon pool they run in. Lowering only the worker thread would leave that work
+    at normal priority.
+  - So each worker has its own rayon pool, started below normal, that only it hands work to.
+    Preview and thumbnail workers get one thread each: a preview-size JPEG decode gains little from
+    more (measured in the round's `fix/lane_bench`). The full-resolution worker gets one per core,
+    as wide as the global pool its work used before.
+  - **Jobs never nest.** A rayon thread waiting for its helpers runs other work from its own pool.
+    With one shared pool, that was sometimes another worker's whole job, on the same thread. It
+    broke the registration and the HEIC supersession watch's one-job-per-thread rule, and in a
+    headless test it halved the decode throughput of 18 busy workers (the round's review, R1).
+    One submitter per pool, one job at a time per worker, and a guard that borrows its worker
+    mutably rule it out.
+- **One registry, one lock.**
+  - The tick publishes the requested set right after `step_bookkeeping`, before any step
+    dispatches work (`Registry::publish`).
+  - A thumbnail tile that comes on screen promotes its running job (`Registry::promote_thumb`,
+    called from `tick::feed_visible_thumb` beside the queue's own promotion, which cannot reach a
+    job that has already started). It matches the queue's identity (folder, photo, rotation) and
+    never raises that photo's preview or full-resolution job.
+  - A thumbnail leaves its queue under that same lock (`Worker::hand_over`, through
+    `ThumbQueue::take_via`) and is held for its worker until it starts. The tile sends the queue's
+    promotion first, then the registry's, so one of them always reaches the job: before the hand-over
+    the queue moves it on screen, after it the registry marks it held or raises it running. This
+    matters because the grid and filmstrip promote again only when what they show changes (the
+    round's re-checks, R6 and R7). Each worker holds at most one job, so no request outlives its job.
+  - In the same critical section, every running low job that is now requested is raised to normal
+    **with every thread doing its work**: the worker's own thread and its pool's. The photo you
+    browse onto is never left behind at low priority, and neither is its parallel work.
+  - A job registers under that lock too (`Worker::enter`), so a change between the decision and
+    the registration is caught. Whether its guard has an entry to remove is decided there as well,
+    never from the job's level, which a raise can change as soon as the lock is released (the
+    re-check, R5).
+  - Its guard removes the entry and restores the worker's thread on every exit, a caught panic
+    included. If the job was raised, the pool's threads go back below normal too, so the next job
+    never inherits a raise.
+  - Nothing is lowered before the first publish.
+- **Previews and thumbnails** run their whole job on the worker's pool while low (`Worker::run`,
+  rayon `install`). A requested job runs on its worker thread with the global pool, as before.
+- **The full-resolution worker never moves.**
+  - It owns thread-bound state: the GPU RAW developer, nvJPEG, and the HEIC lane's supersession
+    watch.
+  - For a speculative job it lowers its own thread and hands its CPU work to its pool
+    (`Guard::on_low_pool`): the CPU decode of every non-HEIC file (a non-HEIC file never reaches
+    the hardware lane or the watch), the RAW read and CPU develop, and the colour conversion.
+  - A HEIC decode stays on the worker's lowered thread, with the watch. The GPU develop and nvJPEG
+    run on the graphics card. Windows' own codecs (WIC) may run threads of their own, which Falcon
+    does not control.
+- **What it never does:** Windows' background-processing mode, or lowering the whole process.
+- **Locks:** a job takes shared locks only for short hand-offs (the queue, the shot list, the
+  failure latches, the frost map). No decode or file read runs under one.
+- **Switch:** `FALCON_LOW_PRIORITY_PREP=0` keeps everything at normal priority, for comparison
+  runs. It is read once at boot and logged.
+- **Mac:** unchanged. Mac scheduling is the elastic pool's, and the registry stays off.
 
 ## Memory: GPU budgets, RAM cache and recovery
 
@@ -3950,7 +4285,8 @@ parked decoded/uploaded frames. The current photo, comparison photos, hovered pr
 frame retain their existing explicit-request protections. In-flight work keeps its accounting;
 later expendable arrivals are shed on subsequent ticks. Background work resumes after four calm
 samples above the existing recovery band. This uses the existing available-memory approximation,
-not a claim to observe every macOS memory-pressure event. Windows keeps its existing policy.
+not a claim to observe every macOS memory-pressure event. That pressure hold is Mac-only; the
+background release below is on both platforms and reuses its work shedding (`memory_pressure::shed_work`).
 The tick keeps gesture and combined preparation holds separate (`FastHolds`): the RAM-cache
 controller and gesture posture log read only the gesture input. Memory pressure therefore
 cannot postpone the controller's last-resort cache clear as if a gesture were still active.
@@ -3999,6 +4335,98 @@ The same usable figure picks the sharp-zoom tier (Adaptive Hi-Res, `VramTier`):
 Region tiles are used only when the source is larger than `detail_cap`. With Adaptive Hi-Res off, the
 whole image loads up to the manual Resolution limit (default 16384 px). The Developer **Simulate VRAM**
 control drives the same function, so every tier can be checked on one machine.
+
+### Sharing the card with other applications
+
+Round 1 of [the sharing plan](docs/planning/gpu-memory-sharing.md), October 2026. Falcon's caches are
+sized for browsing, and on a 32 GB card a 300-photo folder of 45 MP photos held about 14.5 GB
+(DirectX 12) to 15.9 GB (Vulkan) of graphics memory, all of it kept while the photographer worked in
+another application. Three mechanisms address that.
+
+**The background release** (`background_memory.rs`). One controller per tick, evaluated above every
+consumer:
+- **Foreground → Waiting → Releasing → Reduced.** Being in another application starts the wait set in
+  Settings → PERFORMANCE → In the background (`bg_wait_s`: 5, 20, 60 or 300 s, or a typed 5–300 s,
+  default 20 s, clamped on load and on entry); minimising skips it.
+- **Activity reading.** On Windows the foreground window's process must be Falcon's, so Falcon's own
+  dialogs count as Falcon. On a Mac it is AppKit's `isActive`. A reading the platform cannot give is
+  unknown, and an unknown reading never starts or ends a release.
+- **Once releasing:**
+  - preparing ahead stops: `FastHolds.frames` (never the gesture term, so the RAM cache's pressure
+    controller can still shrink), `PublishGate::Park`, and the full-detail fill's `background` term;
+  - queued speculative work is shed with the Mac pressure hold's rules;
+  - the allowed photo-cache size falls linearly to the tier's target over 10 s (`RAMP`; in Custom its
+    own release time), evicting the entry farthest from the current photo first. A release keeps the
+    sizes and the time it started with, so a mode change part-way through applies to the next release;
+  - everything in `support::ExplicitSet` stays, and so do thumbnails.
+- **Panels that are not refreshing.** A Review panel or grid that does not rebuild keeps its rows,
+  and a row can keep a released preview alive through `lookup_thumb`'s stopgap. The Review panel
+  refreshes while it is open. The grid refreshes only while `tick::grid_refills` holds: not in
+  immersive mode, which hides it but keeps its open setting. On every held tick the other models are
+  emptied and their keys reset to the boot values (`release_unrefreshed_models`), so the next refresh
+  rebuilds as a first open. This runs whether or not that tick's release evicted anything, because an
+  earlier tick or the Mac pressure hold may have evicted the preview a row still holds.
+- **Coming back** stops the release at once. Previews come back from the RAM cache where it holds them
+  (Windows). The full-detail fill waits its usual stillness interval counted from the return.
+- **Targets** follow the mode in effect (`Policy::for_mode`, once per tick). Balanced and Eco
+  keep only the requested photos, about 2 GB in total. Turbo keeps Falcon's whole card use at a
+  quarter of the card. Custom keeps what its card says — only the photos in use, or 10%, 25% or 50% of
+  the card — and releases at once, over 10 s or over 30 s (round 2b). `FALCON_BACKGROUND_TIER=performance|balanced` forces one target whatever the
+  mode, for verification. The card and Falcon's use both come from
+  one measurement of the rendering adapter: its dedicated memory and Falcon's process on it. The cache
+  allowance is the quarter minus Falcon's non-cache use. The boot budget estimate is never used here,
+  because it counts shared system memory and takes the largest adapter. Without a measurement that
+  gives the card's size (a failed query), Turbo (and Custom's share) keeps only the requested photos,
+  as Balanced does.
+- **On the Mac** (round 2c, 27 October; the owner's option a). A Mac has no separate graphics card:
+  photos, the rest of Falcon and every other app share one memory. So the share is of Apple's
+  recommended graphics budget (Metal's `recommendedMaxWorkingSetSize`), and Falcon's use is its
+  footprint, what macOS charges the process. The caches may keep `share × budget − (footprint −
+  photo caches)`, and **only while macOS reports normal memory pressure and nothing is being swapped**
+  (`MacMemory::calm`). A reading that is missing does not count as calm.
+  - **The guard** (`Background::guard`). If pressure leaves normal or pages start going to swap during
+    a release that keeps a share, Falcon drops to the requested photos **at once** and stays there
+    until it is back in front; the next release decides afresh. The wait is not cut short, and
+    Balanced, Eco and Custom's "only the photos in use" keep their own release time. Low free memory
+    is handled separately, in every phase, by the Mac pressure hold (`memory_pressure.rs`).
+
+```mermaid
+stateDiagram-v2
+    [*] --> InFront
+    InFront --> Waiting: another app
+    Waiting --> InFront: back
+    Waiting --> Releasing: wait over, or minimised
+    Releasing --> Kept: share reached
+    Releasing --> OnlyInUse: pressure or swapping
+    Kept --> OnlyInUse: pressure or swapping
+    Releasing --> InFront: back
+    Kept --> InFront: back
+    OnlyInUse --> InFront: back
+    note right of OnlyInUse: at once, and no refill while away
+```
+
+**Exact-size memory blocks** (`device_memory_hints` in `main.rs`). Slint's default lets gpu-allocator
+grow its general blocks to 64 MB. A 46 MB preview took a whole block and left 18 MB unused, about
+2.5 GB over 140 previews. General blocks are capped at 16 MB (`MemoryHints::Manual`), so every larger
+texture gets an exact-size block. Measured: 14.45 → 11.42 GB on DirectX 12, 15.88 → 13.14 GB on Vulkan,
+median upload unchanged. The backend start-up probe mirrors the setting. macOS keeps Slint's default.
+
+**The measurement** (`gpu_memory.rs`, Windows).
+- The rendering device's adapter LUID comes from the wgpu device itself: DirectX 12's `GetAdapterLuid`,
+  or Vulkan's `PhysicalDeviceIDProperties` through `ash`.
+- A once-a-second thread reads, through DXGI, Falcon's own card use and Windows' allowance for it.
+- It also reads the whole card's use from the `GPU Adapter Memory` counter, through `pdh.dll`. The
+  release check allows that library.
+- The allowance is not free memory: beside Photoshop holding 15–17 GiB it stayed at 30.68 GiB. The
+  whole-card counter is the reading that moves.
+- Readings are logged with Diagnostic logging. The card's dedicated memory and Falcon's own use feed
+  the Turbo target (and Custom's share). Nothing shrinks in the foreground.
+- **On the Mac** (round 2c), the same sampler (`mac_impl`, thread `falcon-mac-memory`) reads, once a
+  second: Falcon's footprint (`proc_pid_rusage`, `ri_phys_footprint`), the memory pressure level
+  (`kern.memorystatus_vm_pressure_level`: normal, warning or critical), swap in use (`vm.swapusage`)
+  and the pages swapped out since the last reading (`host_statistics64`'s `swapouts`). Apple's
+  recommended graphics budget is read once. Its start line and its first reading are logged at once,
+  so even a launch of a few seconds shows them. Native Mac execution is the cloud run's (round 2c).
 
 ### GPU out of memory: a two-way ladder
 
@@ -4111,7 +4539,7 @@ What clears or invalidates the cache:
 
 - A folder change, and an output-colour or custom-profile change, clear it (`drop_developed_caches`).
 - The user's own Faster/Sharper switch clears both the GPU preview cache and RAM.
-- Energy-saving mode's switch down to Faster preview keeps everything, because it is a shrink.
+- Eco's switch down to Faster preview keeps everything, because it is a shrink.
 - Its switch back up to Sharper keeps the bytes but marks every entry stale (`L2Store::mark_stale_tier`
   sets `dim = 0`, which satisfies no request). The frames stay as stand-ins and are re-decoded through
   the normal path.
@@ -6362,7 +6790,7 @@ All user-visible text that differs between Windows and macOS comes from one tabl
 | `gamut_copy` | names Windows Auto Colour Management and HDR | names ColorSync in System Settings → Displays |
 | `accel_unavail_note` | No CUDA/nvJPEG GPU detected … | empty (Image I/O is always present) |
 
-Sentences that include a platform word are built by small pure functions in the same file, and production code calls them: `recycle_toast_text`, `partial_recycle_toast_text`, `empty_rejected_toast_text`, `recover_unavailable_text`, `recover_missing_text`, `cross_folder_recover_text`, `cloud_not_downloaded_text`, `heic_decode_failed_text`, `empty_rejected_confirm_body`, `empty_confirm_title`, `overwrite_confirm_body`, `accel_toggle_label`, `heic_assoc_missing_tip` and `efficiency_auto_clause`. The tests call the same functions, so they check the real text rather than a re-typed copy.
+Sentences that include a platform word are built by small pure functions in the same file, and production code calls them: `recycle_toast_text`, `partial_recycle_toast_text`, `empty_rejected_toast_text`, `recover_unavailable_text`, `recover_missing_text`, `cross_folder_recover_text`, `cloud_not_downloaded_text`, `heic_decode_failed_text`, `empty_rejected_confirm_body`, `empty_confirm_title`, `overwrite_confirm_body`, `accel_toggle_label`, `heic_assoc_missing_tip`, `mode_performance_line` and `battery_switch_clause`. The tests call the same functions, so they check the real text rather than a re-typed copy.
 
 Rules:
 - `windows_strings_unchanged` (a Windows-only test in `main.rs`) pins every Windows value byte for byte. Change Windows wording only together with that test.
@@ -6737,9 +7165,9 @@ flowchart TB
 - A failed probe counts as mains, so a plugged-in Mac is never slowed down by mistake.
 - `saver` is always false: macOS Low Power Mode is not read. A Mac on mains with Low Power Mode on is treated as mains, and Auto does not engage.
 
-The power watcher (`support::start_power_watch`) takes this reading every 2 seconds on a lowest-priority thread and reports only changes. The wording follows the platform: Auto follows the power source on both systems, and only Windows mentions Battery saver. Efficiency mode itself is described under [Rationing work ahead of the user](#rationing-work-ahead-of-the-user).
+The power watcher (`support::start_power_watch`) takes this reading every 2 seconds on a lowest-priority thread and reports only changes. The wording follows the platform: the battery switch follows the power source on both systems, and only Windows mentions Battery saver. The mode control itself is described under [The mode control](#the-mode-control-turbo-balanced-eco-custom).
 
-**Energy-saving indicator.** The title bar has one energy-saving indicator on both platforms: a small leaf inside the cache meter (`CacheMeter.leaf`, driven by the `efficiency-leaf` property). It follows the live power reading, so nothing about it is fixed at launch.
+**Eco indicator.** The title bar has one Eco indicator on both platforms: a small leaf inside the cache meter (`CacheMeter.leaf`, driven by the `efficiency-leaf` property). It follows the mode in effect, which follows the live power reading, so nothing about it is fixed at launch.
 
 **GPU choice on battery (Mac).** At launch, if `WGPU_POWER_PREF` is not set and the Mac is running on battery (IOKit's providing power source, `support::on_battery_power`), Falcon asks for the low-power GPU (`support::power_pref_choice` returns `LowPower`). The same choice goes to `falcon-gpu`'s separate RAW-development device through `falcon_gpu::set_low_power`, so a Mac with two GPUs can keep automatic graphics switching. The choice is made once, when the GPU is selected. Plugging in later does not change it, and the boot log says so. On Windows the battery input is always false, so the choice stays high performance.
 
@@ -6855,7 +7283,7 @@ No tester download is published without a passing report. The check proves launc
 The startup and shutdown order is the same on both platforms (see [Startup order](#startup-order) and [Shutdown order](#shutdown-order)). The Mac adds steps beside it without reordering it:
 
 1. Before `app.run()`, the settings-apply block sets `native-window-controls`, an 80 px `titlebar-leading-inset` and `is-mac`. This must happen before the window exists, because winit creates it at first show and `no-frame: !native-window-controls` must already hold its final value.
-2. The GPU adapter preference is chosen once, from the IOKit battery probe. On battery, Falcon asks for `LowPower` for its own adapter and, through `falcon_gpu::set_low_power`, for the separate RAW-development device, so a Mac with two GPUs keeps automatic graphics switching. This is the only power fact fixed at startup. The title bar shows the live Efficiency mode state, which the power watcher updates every 2 s.
+2. The GPU adapter preference is chosen once, from the IOKit battery probe. On battery, Falcon asks for `LowPower` for its own adapter and, through `falcon_gpu::set_low_power`, for the separate RAW-development device, so a Mac with two GPUs keeps automatic graphics switching. This is the only power fact fixed at startup. The title bar shows whether Eco is in effect, which the power watcher's reading updates every 2 s.
 3. The native menu bar is not built at startup. Each tick calls `mac_menu::tick_pump`, which installs Falcon's menus once the menu library's bar exists, checks every tick that the bar AppKit shows is still Falcon's, refreshes titles and check marks when state changes, and returns clicked commands for the tick to run.
 4. The Apple Events open-documents handler (`macos_open::install_odoc_handler`) lets Finder's "Open With → Falcon" and file double-clicks reach `begin_reload`, the same path as a command-line argument. The quit handler (`install_terminate_handler`) sends Dock Quit and other ordinary quit requests into the graceful shutdown tail after the loop, after stopping file operations and export at a safe point (`register_quit_cancel`). For a system log-out, restart or shut-down it runs the save sequence registered before the loop (`register_save_sequence`) itself, then lets macOS end Falcon; see [Shutdown order](#shutdown-order).
 
@@ -7223,7 +7651,7 @@ When two places must ask the same question, share one function rather than keepi
 ### Platforms
 
 - **Route every platform noun.** When Windows and Mac code meet (a merge, or a new platform branch), search every new user-facing string for platform words (Windows, Recycle Bin, Explorer, Battery saver, Ctrl/⌘) and take them from `PlatformStrings` in `platform.rs`. A noun typed for one platform is shown to the other platform's users as soon as the code is shared.
-- **A new platform probe must be able to answer "I don't know" wherever the other platform's probe can.** Windows' power probe maps an unknown line status to `PowerSource::Unknown`, which shows "No battery detected — Auto never activates on this computer." The Mac probe (`mac_power_from_sources`) gives the same answer on a Mac without a battery. Without it, a desktop Mac would wait for battery power forever.
+- **A new platform probe must be able to answer "I don't know" wherever the other platform's probe can.** Windows' power probe maps an unknown line status to `PowerSource::Unknown`, which shows "No battery detected, so this computer never switches to Eco by itself." The Mac probe (`mac_power_from_sources`) gives the same answer on a Mac without a battery. Without it, a desktop Mac would wait for battery power forever.
 - **When a rule is stated for both platforms, check which probe answers it on each.** The rule "never read a cloud placeholder" relies on Windows' placeholder attributes and on macOS's `SF_DATALESS` flag (`is_dataless`) during the scan. A stub that always answers "no" cannot be told apart from a probe that found nothing.
 
 ### Decoding and performance: where browsing time goes

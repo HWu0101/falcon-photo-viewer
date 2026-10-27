@@ -119,6 +119,14 @@ class WindowsRelease(unittest.TestCase):
                     binary.write_bytes(self.pe(name,delay))
                     with self.assertRaisesRegex(ValueError,'Microsoft CRT'):release.verify_runtime(binary)
 
+    def test_the_graphics_memory_counter_import_is_allowed(self):
+        # 2026-10-25: Falcon reads the whole-card memory counter through pdh.dll (Windows Vista+).
+        # Falsifier: remove pdh.dll from SYSTEM_IMPORTS.
+        with tempfile.TemporaryDirectory() as directory:
+            binary=Path(directory)/'fixture.exe'
+            binary.write_bytes(self.pe(b'pdh.dll'))
+            self.assertEqual(release.verify_runtime(binary),['pdh.dll'])
+
     def test_malformed_pe_tables_are_refused(self):
         for offset,value in [(0x84,0x14c),(0x98+112+8,0xfffffff0),(0x200+12,0xfffffff0)]:
             data=self.pe();struct.pack_into('<I',data,offset,value)

@@ -964,26 +964,47 @@ pub(crate) struct ThumbReq {
     /// a decode: the interface has already released the request's pending slot
     /// (`tick::step_retire_thumbs`), and a job that is already running lands as usual.
     pub(crate) retire: bool,
+    /// 2026-10-27 (round 2b, owner): the whole folder's request — the worker reads the file only if
+    /// it is still on this device, checked just before the read (metadata only), and answers a
+    /// file made online-only since the scan with an empty marker and no failure
+    /// (`main.rs::run_thumb_job_with`). Cleared when a tile on screen promotes the job.
+    pub(crate) local_only: bool,
 }
 impl ThumbReq {
     /// A tile the user is looking at — the strip's window, the Review panel's visible tiles, the
     /// folder dock's visible cells.
     pub(crate) fn explicit(idx: usize, gen: u64, delta: u8) -> ThumbReq {
-        ThumbReq { idx, gen, delta, explicit: true, promote_only: false, retire: false }
+        ThumbReq { idx, gen, delta, explicit: true, promote_only: false, retire: false, local_only: false }
     }
     /// The frost feeder's mip coverage: nobody is waiting for it.
     pub(crate) fn speculative(idx: usize, gen: u64, delta: u8) -> ThumbReq {
-        ThumbReq { idx, gen, delta, explicit: false, promote_only: false, retire: false }
+        ThumbReq { idx, gen, delta, explicit: false, promote_only: false, retire: false, local_only: false }
+    }
+    /// The whole folder's preparation (round 2b): speculative, and only for a file still on this
+    /// device ([`ThumbReq::local_only`]).
+    pub(crate) fn whole_folder(idx: usize, gen: u64, delta: u8) -> ThumbReq {
+        ThumbReq { local_only: true, ..ThumbReq::speculative(idx, gen, delta) }
     }
 
     pub(crate) fn promote(idx: usize, gen: u64, delta: u8) -> ThumbReq {
-        ThumbReq { idx, gen, delta, explicit: true, promote_only: true, retire: false }
+        ThumbReq { idx, gen, delta, explicit: true, promote_only: true, retire: false, local_only: false }
     }
 
     /// The tile scrolled out of every visible window before its decode started.
     pub(crate) fn retire(idx: usize, gen: u64) -> ThumbReq {
-        ThumbReq { idx, gen, delta: 0, explicit: false, promote_only: false, retire: true }
+        ThumbReq { idx, gen, delta: 0, explicit: false, promote_only: false, retire: true, local_only: false }
     }
+}
+
+/// 2026-10-27 (round 2b, owner: "do the check") — **IS THIS SHOT'S FILE ONLY IN THE CLOUD NOW?** The
+/// folder scan's rule (either file of a pair; `falcon_decode`'s scan tags a pair the same way), asked
+/// again through `probe` (in production `falcon_decode::file_is_cloud_placeholder`, metadata only:
+/// it never downloads). The scan's tags miss a file made online-only during the session (Free up
+/// space, Storage Sense, Optimise Mac Storage); the whole folder's worker asks this just before it
+/// would read one.
+#[must_use]
+pub(crate) fn shot_is_cloud_only(shot: &Shot, probe: impl Fn(&std::path::Path) -> bool) -> bool {
+    shot.raw.as_deref().is_some_and(&probe) || shot.jpg.as_deref().is_some_and(&probe)
 }
 
 /// v1.0.0-rc (FIX 2026-09-07, round X1 / F3) — **THE THUMB POOL'S DEQUEUE POINT, WITH TWO LANES.**
@@ -998,7 +1019,7 @@ impl ThumbReq {
 ///
 /// **IT IS WAKE-UP NEUTRAL, and that is a requirement, not a nicety** (the idle power contract:
 /// `TICK_IDLE_MS` and the elastic park's own note, which cost 160 timer wake-ups a second before
-/// v0.9.60 removed them). There is no poll and no timeout anywhere here. [`ThumbQueue::take`]
+/// v0.9.60 removed them). There is no poll and no timeout anywhere here. [`ThumbQueue::take_via`]
 /// blocks in exactly the same `Receiver::recv` the fixed worker blocked in before, and
 /// [`ThumbQueue::try_take`] is exactly the `try_recv` the elastic worker used. What changed is that
 /// a worker sorts whatever has ALREADY arrived into two lanes before it chooses, and takes an
@@ -1040,6 +1061,8 @@ impl ThumbQueue {
             if let Some(i) = self.speculative.iter().position(|q| (q.gen, q.idx, q.delta) == (r.gen, r.idx, r.delta)) {
                 if let Some(mut job) = self.speculative.remove(i) {
                     job.explicit = true;
+                    // A tile on screen now: the visible tiles' rule, not the whole folder's.
+                    job.local_only = false;
                     self.explicit.push_back(job);
                 }
             }
@@ -1069,16 +1092,23 @@ impl ThumbQueue {
     }
     /// The blocking take (the fixed pools). `Err` = the channel is closed, i.e. app shutdown — the
     /// same signal the bare `recv()` gave. The burst that wakes it is sorted BEFORE the choice, so
-    /// a worker woken by a speculative job still serves a visible tile that arrived with it.
-    pub(crate) fn take(&mut self) -> Result<ThumbReq, std::sync::mpsc::RecvError> {
-        self.take_with_idle_hook(|| {})
+    /// a worker woken by a speculative job still serves a visible tile that arrived with it. Each
+    /// look at the lanes is made through `look`: the fixed thumbnail pool passes the priority
+    /// registry's hand-over (`prep_priority::Worker::hand_over`), so a job leaves the queue under
+    /// the lock the thumbnail promotions take.
+    pub(crate) fn take_via(
+        &mut self, look: impl FnMut(&mut ThumbQueue) -> Option<ThumbReq>,
+    ) -> Result<ThumbReq, std::sync::mpsc::RecvError> {
+        self.take_with_idle_hook(look, || {})
     }
 
     // The hook makes the receive-after-empty race deterministic in the regression
     // test. The production empty closure optimizes away; waiting still uses recv.
-    fn take_with_idle_hook(&mut self, mut before_wait: impl FnMut()) -> Result<ThumbReq, std::sync::mpsc::RecvError> {
+    fn take_with_idle_hook(
+        &mut self, mut look: impl FnMut(&mut ThumbQueue) -> Option<ThumbReq>, mut before_wait: impl FnMut(),
+    ) -> Result<ThumbReq, std::sync::mpsc::RecvError> {
         loop {
-            if let Some(r) = self.try_take() { return Ok(r); }
+            if let Some(r) = look(self) { return Ok(r); }
             before_wait();
             let first = self.rx.recv()?;
             self.park(first);
@@ -2241,6 +2271,23 @@ pub(crate) fn pick_upload_idx(is_fast: impl Iterator<Item = bool>, priority: boo
     }
 }
 
+/// The upload thread's IDLE reclaim (2026-10-25, graphics-memory sharing round 1).
+///
+/// A texture staged with `write_texture` keeps its staging buffer in the queue's PENDING writes
+/// until some submission carries them, and on this queue only Slint's frames submit. So uploads
+/// nobody displays — the stillness fill banking full-resolution neighbours — held every staging
+/// buffer until the next redraw: nine of 178 MB for about 50 s in the 25 October measurement, on
+/// the card itself under Vulkan. Polling alone frees none of it (Codex's 24 October probe). When
+/// the thread goes idle after staging anything, ONE empty submit hands the writes to the GPU; this
+/// poll and the 250 ms idle polls after it free the buffers once the GPU is done. Never a wait:
+/// the poll is non-blocking, and an idle thread submits at most once per burst.
+pub(crate) fn idle_reclaim(gpu: &Gpu, staged: &mut bool) {
+    if std::mem::take(staged) {
+        gpu.1.submit(std::iter::empty());
+    }
+    let _ = gpu.0.poll(wgpu::PollType::Poll);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_upload_thread(
     gpu_rx: Receiver<Gpu>,
@@ -2302,6 +2349,8 @@ pub(crate) fn spawn_upload_thread(
             std::collections::VecDeque::new();
         // Tripwire rate-limit: seed 10 s in the past so the first qualifying stall logs immediately.
         let mut last_tripwire = Instant::now() - std::time::Duration::from_secs(10);
+        // 2026-10-25: anything staged since this thread last submitted — see `idle_reclaim`.
+        let mut staged = false;
         loop {
             // E2: device reclaim lives HERE now, not on the tick. The per-tick poll's "costs
             // microseconds" assumption broke under heavy traffic — measured 26–52 ms (spikes to
@@ -2318,7 +2367,7 @@ pub(crate) fn spawn_upload_thread(
                 match job_rx.recv_timeout(std::time::Duration::from_millis(250)) {
                     Ok(j) => backlog.push_back((Instant::now(), j)),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        let _ = gpu.0.poll(wgpu::PollType::Poll);
+                        idle_reclaim(&gpu, &mut staged);
                         continue;
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
@@ -2808,6 +2857,7 @@ pub(crate) fn spawn_upload_thread(
             if done_tx.send(msg).is_err() {
                 return; // the app is shutting down
             }
+            staged = true;
             // E2 busy-path reclaim: destroys from the evictions this upload just caused (plus the
             // U2 transient YUV plane textures) are processed here, overlapped with the next job's
             // decode — instead of stalling the UI tick. Also drains our own submissions' cleanup.
@@ -3446,6 +3496,7 @@ mod bulk_copy_tests {
 #[cfg(test)]
 mod publish_tests {
     use super::*;
+    use std::time::Duration;
 
     /// v0.8.167 — **A PUBLISH NEVER TOUCHES THE FRAME ALREADY ON SCREEN**, asserted where the
     /// claim actually lives.
@@ -3474,6 +3525,9 @@ mod publish_tests {
     /// Self-skips without a GPU adapter, like every other live-GPU row in this tree.
     #[test]
     fn a_publish_never_disturbs_the_frame_already_on_screen() {
+        if !live_gpu_row("a_publish_never_disturbs_the_frame_already_on_screen") {
+            return;
+        }
         let Some(gpu) = test_gpu() else {
             eprintln!("skip: no GPU adapter");
             return;
@@ -3502,6 +3556,46 @@ mod publish_tests {
         }
     }
 
+    /// 2026-10-25 (graphics-memory sharing, round 1). FALSIFIER: delete the empty submit in
+    /// `idle_reclaim` and the staging buffer is still in the allocator after the GPU went idle —
+    /// the 25 October shape (polling alone frees nothing). Self-skips without a GPU adapter, or on a
+    /// backend that gives no allocator report. Runs in its own process, with a time limit
+    /// ([`GPU_ROW_LIMIT`]): on 27 October a driver call in this row spun for over an hour.
+    #[test]
+    fn going_idle_hands_staged_uploads_to_the_gpu_so_their_staging_is_freed() {
+        if !live_gpu_row("going_idle_hands_staged_uploads_to_the_gpu_so_their_staging_is_freed") {
+            return;
+        }
+        let Some(gpu) = test_gpu() else {
+            eprintln!("skip: no GPU adapter");
+            return;
+        };
+        let staging = |gpu: &Gpu| -> Option<u64> {
+            let r = gpu.0.generate_allocator_report()?;
+            Some(r.allocations.iter().filter(|a| a.name.contains("Staging")).map(|a| a.size).sum())
+        };
+        if staging(&gpu).is_none() {
+            eprintln!("skip: no allocator report on this backend");
+            return;
+        }
+        let (w, h) = (1024u32, 1024u32);
+        let tex = create_texture_rgba(&gpu, &vec![7u8; (w * h * 4) as usize], w, h);
+        let _ = gpu.0.poll(wgpu::PollType::Poll);
+        assert!(staging(&gpu).unwrap() >= u64::from(w * h * 4), "the write waits in a staging buffer");
+        let mut staged = true;
+        idle_reclaim(&gpu, &mut staged);
+        assert!(!staged, "one submit per idle burst");
+        // Non-blocking polls only, as the thread's own 250 ms idle polls are: a blocking wait could
+        // itself flush the pending writes and hide a missing submit.
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        while staging(&gpu) != Some(0) && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let _ = gpu.0.poll(wgpu::PollType::Poll);
+        }
+        assert_eq!(staging(&gpu), Some(0), "the idle step must free the staging buffer");
+        drop(tex);
+    }
+
     /// A headless device for the live-GPU rows above. `None` self-skips.
     fn test_gpu() -> Option<Gpu> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -3511,6 +3605,136 @@ mod publish_tests {
         }))
         .ok()?;
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    /// Round 2b follow-up (owner, 27 October: "add the time limit"). The live-GPU rows run in a
+    /// child copy of this test binary, and the child is ended if it has not finished within this
+    /// limit. On 27 October a graphics-driver call inside `going_idle_…` spun for over an hour, and
+    /// the tests that started after it stalled with it, so the run never finished: the stuck call
+    /// held up more than its own row, which is why a limit inside the same process would not be
+    /// enough. In its own process the hung call holds nothing the other tests use, and ending the
+    /// process ends the hang: the row fails, naming the limit, and the run goes on. Both rows
+    /// normally finish in a few seconds, child start included.
+    const GPU_ROW_LIMIT: Duration = Duration::from_secs(120);
+    /// Set in the child, so a row runs its body there instead of starting another child.
+    const GPU_CHILD: &str = "FALCON_LIVE_GPU_CHILD";
+
+    #[derive(Debug, PartialEq)]
+    enum RowEnd {
+        Passed,
+        /// It failed, or it exited without running this row (a misspelt name runs no row).
+        Failed,
+        /// Not finished at the limit; `ended` says whether its process could then be ended.
+        TimedOut { ended: bool },
+    }
+
+    /// Runs this module's `row` alone in a child copy of the test binary, and ends the child at
+    /// `limit`. Returns how it ended, its stdout (without libtest's tally lines, so a run's totals
+    /// never count the child twice), its stderr, and how long the parent waited. The output goes to
+    /// files rather than pipes, so nothing the child leaves behind can keep the parent reading.
+    fn run_row_in_child(row: &str, limit: Duration, env: &[(&str, &str)]) -> (RowEnd, String, String, Duration) {
+        let module = module_path!().split_once("::").map_or(module_path!(), |(_, m)| m);
+        let path = format!("{module}::{row}");
+        let base = std::env::temp_dir().join(format!("falcon_child_row_{}_{row}", std::process::id()));
+        let (out_file, err_file) = (base.with_extension("out"), base.with_extension("err"));
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("the test binary"));
+        cmd.args([path.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(GPU_CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&out_file).expect("the child's stdout file"))
+            .stderr(std::fs::File::create(&err_file).expect("the child's stderr file"));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let start = Instant::now();
+        let mut child = cmd.spawn().expect("start the child");
+        // `Ok` with the child's exit status, or `Err(ended)` at the limit.
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("the child's status") {
+                break Ok(status);
+            }
+            if start.elapsed() >= limit {
+                let _ = child.kill();
+                // A child stuck in a kernel-mode driver call cannot exit until that call returns, so
+                // the parent never waits on it without a limit: reaped if it goes within the grace
+                // period, otherwise left (the row still fails, and says so).
+                let grace = Instant::now();
+                let ended = loop {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break true;
+                    }
+                    if grace.elapsed() >= Duration::from_secs(10) {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                break Err(ended);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let waited = start.elapsed();
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+        let (out, err) = (read(&out_file), read(&err_file));
+        let _ = std::fs::remove_file(&out_file);
+        let _ = std::fs::remove_file(&err_file);
+        let ran = out.contains(&format!("test {path} ...")) && out.contains("test result: ok. 1 passed");
+        let end = match status {
+            Err(ended) => RowEnd::TimedOut { ended },
+            Ok(s) if s.success() && ran => RowEnd::Passed,
+            Ok(_) => RowEnd::Failed,
+        };
+        let out = out.lines().filter(|l| !l.starts_with("test result:")).map(|l| format!("{l}\n")).collect();
+        (end, out, err, waited)
+    }
+
+    /// The live-GPU rows' first line. In the child it says "run the body here"; in the parent it
+    /// runs the row in a child ([`GPU_ROW_LIMIT`]), fails the row if the child failed or hung, and
+    /// says "done" (the child's skip lines are passed on).
+    fn live_gpu_row(row: &str) -> bool {
+        if std::env::var_os(GPU_CHILD).is_some() {
+            return true;
+        }
+        let (end, out, err, waited) = run_row_in_child(row, GPU_ROW_LIMIT, &[]);
+        match end {
+            RowEnd::Passed => eprint!("{err}"),
+            RowEnd::Failed => panic!("{row} failed in its own process (or ran no row by that name):\n{out}{err}"),
+            RowEnd::TimedOut { ended } => panic!(
+                "{row} did not finish within {GPU_ROW_LIMIT:?} (waited {waited:?}), and {}: most likely a \
+                 graphics-driver hang, as on 27 October; the other tests were not held up.\n{out}{err}",
+                if ended { "its process was ended" } else { "its process could not be ended (stuck in the driver), so it was left" }
+            ),
+        }
+        false
+    }
+
+    /// The time limit's own row. A child that never finishes is ended at its limit and reported as
+    /// timed out, and the parent is not kept waiting; a name that matches no row is a failure, not
+    /// a pass; and every live-GPU row in this file goes through [`live_gpu_row`]. The child's half
+    /// sleeps 60 s, far past the 2 s limit, and only when the parent asks for it. FALSIFIERS: drop
+    /// the `kill` and the sleeping child outlives the grace period (`ended` reddens); drop the
+    /// deadline and the child sleeps its 60 s and passes (the `TimedOut` assert reddens); drop
+    /// `&& ran` and the misspelt name passes; remove a row's `live_gpu_row` and the census reddens.
+    #[test]
+    fn a_child_row_that_hangs_is_ended_at_its_limit() {
+        const HANG: &str = "FALCON_CHILD_ROW_HANG_PROBE";
+        if std::env::var_os(GPU_CHILD).is_some() {
+            if std::env::var_os(HANG).is_some() {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+            return;
+        }
+        let (end, _, _, waited) =
+            run_row_in_child("a_child_row_that_hangs_is_ended_at_its_limit", Duration::from_secs(2), &[(HANG, "1")]);
+        assert_eq!(end, RowEnd::TimedOut { ended: true }, "a child that does not finish is ended at its limit");
+        assert!(waited < Duration::from_secs(30), "the parent waited {waited:?}: the child was not ended at its limit");
+        let (end, _, _, _) = run_row_in_child("no_row_has_this_name", Duration::from_secs(60), &[]);
+        assert_eq!(end, RowEnd::Failed, "a name that matches no row must not pass");
+        // Every live-GPU row in this file asks the guard first (the needles are split so this row's
+        // own text does not count). The other crates' GPU tests are not covered.
+        let src = std::fs::read_to_string(format!("{}/src/support.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let rows = src.matches(["= test_gpu", "() else {"].concat().as_str()).count();
+        assert!(rows >= 2, "the live-GPU rows are found");
+        assert_eq!(src.matches(["if !live_gpu_", "row(\""].concat().as_str()).count(), rows, "every live-GPU row in support.rs runs in its own process");
     }
 }
 
@@ -5856,18 +6080,52 @@ pub(crate) struct Settings {
     /// `hover_preview_instant_defaults_off_for_an_old_settings_json`.
     pub(crate) hover_preview_instant: bool,
     /// v0.8.195 (OWNER RULING 2026-08-30, option c) — **EFFICIENCY MODE.** `0` = Auto (follow the
-    /// power source), `1` = On (manual quiet mode), `2` = Off (today's behaviour exactly).
+    /// power source), `1` = On (manual quiet mode), `2` = Off. An absent key read as Auto.
     ///
-    /// **THE DEFAULT IS AUTO AND IT IS ZERO, which is the whole migration.** An absent key, a
-    /// settings.json from any earlier build, and a hand-edit that deletes the key all deserialise to
-    /// `0`, so every install — old and new — lands on the ruled default with no migration code, no
-    /// witness flag and no one-shot rewrite (contrast `heic_lane_cap`, whose ruling had two halves
-    /// that a plain integer could not express). An out-of-range value is read as Auto by
-    /// [`efficiency_mode_from_settings`], so the file can never mount a fourth state.
-    ///
-    /// LIVE, per [`efficiency_mode`]: the tick re-reads the atomic every pass, so a click applies on
-    /// the next tick with no restart and no folder reopen.
+    /// RETIRED by round 2a (26 October 2026): read once by [`migrate_modes`] and never written again
+    /// (`skip_serializing`), so the first save after the migration drops the key.
+    #[serde(default, skip_serializing)]
     pub(crate) efficiency_mode: u8,
+    /// 2026-10-26 (round 2a, owner rulings) — **THE MODE CONTROL.** `0` Performance, `1` Balanced
+    /// (the default), `2` Power saver; out of range reads as Balanced ([`mode_from_settings`]). LIVE:
+    /// the tick re-reads [`saved_mode`] every pass. Only the user writes it — Power saver on battery
+    /// never does (L44).
+    pub(crate) mode: u8,
+    /// "Use Power saver on battery power" (default on).
+    pub(crate) battery_power_saver: bool,
+    /// How long Falcon waits in the background before releasing graphics memory, in seconds, for
+    /// every mode: 5–300, default 20 (clamped at load).
+    pub(crate) bg_wait_s: u32,
+    /// The last feature version (major.minor, e.g. "1.1") that showed the welcome guide. Empty on
+    /// files from before round 2a, which reads as "1.0" ([`guide_boot`]). Saved the moment the
+    /// guide is shown, like `onboarding_shown`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) guide_seen_feature: String,
+    /// The SCHEMA MARKER for the four fields above — the `panels_default_v1` pattern. FIELD-level
+    /// serde default (false), deliberately NOT the container default, so a file from before round 2a
+    /// (no key) migrates once from `efficiency_mode` ([`migrate_modes`]). Every save stamps true.
+    #[serde(default)]
+    pub(crate) modes_migrated_v1: bool,
+    /// 2026-10-27 (round 2b) — **CUSTOM'S NUMBERS** ([`CustomLimits`]), read by the tick only while
+    /// Custom is the mode in effect. New keys, so a file from before round 2b reads Balanced's copy
+    /// (the container default) and needs no migration; every value is brought into range at load
+    /// ([`CustomLimits::clamped`]). `custom_fps`: −1 follows Balanced's limit (until the user picks),
+    /// 0 is Unlimited, otherwise a typed limit in photos a second.
+    pub(crate) custom_fps: i32,
+    pub(crate) custom_previews_ahead: u32,
+    pub(crate) custom_previews_behind: u32,
+    pub(crate) custom_sharp_ahead: u32,
+    pub(crate) custom_sharp_behind: u32,
+    pub(crate) custom_zoomed_ahead: u32,
+    pub(crate) custom_zoomed_behind: u32,
+    /// 0 Visible only, 1 Visible and nearby, 2 Whole folder ([`ThumbScope::from_index`]).
+    pub(crate) custom_thumbs: u8,
+    /// The whole folder's cap in MB, 100–2,000 (500 on a file without the key).
+    pub(crate) custom_thumbs_mb: u32,
+    /// In the background, keep: 0 (only the photos in use), 10, 25 or 50 percent of the card.
+    pub(crate) custom_bg_keep: u8,
+    /// …released over 0 (at once), 10 or 30 seconds.
+    pub(crate) custom_bg_release_s: u32,
     /// v0.8.169 (item 7, OWNER RULING): the hardware-HEIC lane's speculative concurrency cap, set
     /// from Settings → Developer. 0 = UNCAPPED; n > 0 = cap at n (clamped to `LANE_CAP_UI_MAX` on
     /// load). Unlike `pool18` this is LIVE — the tick re-reads `heic_lane_cap()` every pass — and it
@@ -6253,9 +6511,43 @@ pub(crate) struct Settings {
     // user had changed and not yet saved — so the marker goes to disk on the launch that earned it.
     #[serde(skip)]
     pub(crate) panels_migrated_boot: bool,
+    // 2026-10-26 (round 2a): TRANSIENT, the `panels_migrated_boot` twin for `migrate_modes`, for the
+    // same reason: the migrated mode and its marker go to disk on the launch that earned them.
+    #[serde(skip)]
+    pub(crate) modes_migrated_boot: bool,
 }
 
 impl Settings {
+    /// Round 2b: Custom's numbers as stored, in range.
+    #[must_use]
+    pub(crate) fn custom_limits(&self) -> CustomLimits {
+        let n = |v: u32| v as usize;
+        CustomLimits {
+            fps: self.custom_fps,
+            previews: (n(self.custom_previews_ahead), n(self.custom_previews_behind)),
+            sharp: (n(self.custom_sharp_ahead), n(self.custom_sharp_behind)),
+            zoomed: (n(self.custom_zoomed_ahead), n(self.custom_zoomed_behind)),
+            thumbs: ThumbScope::from_index(i32::from(self.custom_thumbs)),
+            thumbs_mb: self.custom_thumbs_mb,
+            bg_keep: self.custom_bg_keep,
+            bg_release_s: self.custom_bg_release_s,
+        }
+        .clamped()
+    }
+
+    /// …and back into the fields (the load-time clamp and [`build_settings`]).
+    pub(crate) fn set_custom_limits(&mut self, c: CustomLimits) {
+        let n = |v: usize| v as u32;
+        self.custom_fps = c.fps;
+        (self.custom_previews_ahead, self.custom_previews_behind) = (n(c.previews.0), n(c.previews.1));
+        (self.custom_sharp_ahead, self.custom_sharp_behind) = (n(c.sharp.0), n(c.sharp.1));
+        (self.custom_zoomed_ahead, self.custom_zoomed_behind) = (n(c.zoomed.0), n(c.zoomed.1));
+        self.custom_thumbs = c.thumbs.index() as u8;
+        self.custom_thumbs_mb = c.thumbs_mb;
+        self.custom_bg_keep = c.bg_keep;
+        self.custom_bg_release_s = c.bg_release_s;
+    }
+
     /// v0.9.16: the nine `assoc_prev_default_*` fields as an index-aligned array (ASSOC_FAMILIES
     /// order) — the LOAD side of the field↔index mapping (boot seeds the live slot from this; the
     /// save side writes the fields directly in `build_settings`).
@@ -7218,6 +7510,73 @@ pub(crate) fn migrate_panels_default(s: &mut Settings) -> Option<PanelsSegCell> 
     s.panels_default = cell.index();
     s.panels_migrated_boot = true; // the caller nudges an immediate save (see the field's doc)
     Some(cell)
+}
+
+/// The background wait's range and default, in seconds (owner rulings, 25–26 October 2026).
+pub(crate) const BG_WAIT_MIN_S: u32 = 5;
+pub(crate) const BG_WAIT_MAX_S: u32 = 300;
+pub(crate) const BG_WAIT_DEFAULT_S: u32 = 20;
+
+/// 2026-10-26 (round 2a): the ONE-SHOT migration from Efficiency mode to the mode control — the
+/// `panels_default_v1` pattern. A file from before round 2a (no `modes_migrated_v1` key) maps its
+/// stored Efficiency choice once, as ruled: Auto (and a missing key, which read as Auto) → Balanced
+/// with Power saver on battery; On → Power saver; Off → Balanced with the battery switch off. The
+/// marker is stamped in the same pass and by every save, so a re-run can never re-derive over a mode
+/// the user has since chosen.
+///
+/// Returns the mode it set (for the caller's one log line), or `None` when nothing was migrated.
+///
+/// FALSIFIER (L28): drop the marker's early return and the second-load row of
+/// `efficiency_settings_migrate_once` reddens; swap the On and Off arms and its mapping rows redden.
+pub(crate) fn migrate_modes(s: &mut Settings) -> Option<u8> {
+    if s.modes_migrated_v1 {
+        return None;
+    }
+    s.modes_migrated_v1 = true;
+    let (mode, battery) = match efficiency_mode_from_settings(i32::from(s.efficiency_mode)) {
+        EFFICIENCY_ON => (MODE_POWER_SAVER, true),
+        EFFICIENCY_OFF => (MODE_BALANCED, false),
+        _ => (MODE_BALANCED, true),
+    };
+    s.mode = mode;
+    s.battery_power_saver = battery;
+    s.modes_migrated_boot = true; // the caller nudges an immediate save
+    Some(mode)
+}
+
+/// A version's FEATURE number — major and minor, with the patch dropped — so "1.0.15" and "1.0.16"
+/// are the same feature release and "1.1.0" is a new one. An empty or unreadable value is 1.0: the
+/// last feature release before the guide recorded which one showed it.
+#[must_use]
+pub(crate) fn feature_version(v: &str) -> (u32, u32) {
+    let mut parts = v.trim().split('.').map(|p| p.trim().parse::<u32>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor),
+        _ => (1, 0),
+    }
+}
+
+/// The running build's feature version as the guide records it ("1.1").
+#[must_use]
+pub(crate) fn feature_version_text(v: &str) -> String {
+    let (major, minor) = feature_version(v);
+    format!("{major}.{minor}")
+}
+
+/// 2026-10-26 (round 2a): **DOES THE WELCOME GUIDE OPEN AT BOOT, AND IN WHICH WORDING?** Returns
+/// `(open, updating)`. A first run opens it with the first-run wording (`onboarding_boot`'s rule);
+/// an install whose guide last showed for an older FEATURE version opens it once with the wording for
+/// people who already use Falcon. A patch update (1.0.15 → 1.0.16) does not.
+///
+/// FALSIFIER (L28): compare whole version strings instead of [`feature_version`] and the patch row
+/// of `the_guide_returns_once_per_feature_update` reddens with a guide at every patch.
+#[must_use]
+pub(crate) fn guide_boot(onboarding_shown: bool, seen_feature: &str, running: &str) -> (bool, bool) {
+    if !onboarding_shown {
+        return (true, false);
+    }
+    let updated = feature_version(seen_feature) < feature_version(running);
+    (updated, updated)
 }
 
 #[cfg(test)]
@@ -12503,9 +12862,28 @@ impl Default for Settings {
         // v1.0.0-rc (queue item 31, sheet 2.5a): the third-of-a-second rest is the default cell.
         hover_preview_instant: false,
 
-        // v0.8.195 (OWNER RULING, option c): AUTO. Zero on purpose — see the field's own doc: the
-        // serde default IS the ruled default, so no install needs migrating.
+        // Retired (round 2a); read only by the migration, so its default is the old Auto.
         efficiency_mode: EFFICIENCY_AUTO,
+        // 2026-10-26 (round 2a): new installs start on Balanced with Power saver on battery, and
+        // are already on the new schema (the `panels_default_v1` rule).
+        mode: MODE_BALANCED,
+        battery_power_saver: true,
+        bg_wait_s: BG_WAIT_DEFAULT_S,
+        guide_seen_feature: String::new(),
+        modes_migrated_v1: true,
+        // 2026-10-27 (round 2b): Custom starts as a copy of Balanced (`CustomLimits::BALANCED_COPY`,
+        // the one spelling of it; `custom_starts_as_balanced_and_keeps_its_own_numbers` pins the two).
+        custom_fps: CustomLimits::BALANCED_COPY.fps,
+        custom_previews_ahead: CustomLimits::BALANCED_COPY.previews.0 as u32,
+        custom_previews_behind: CustomLimits::BALANCED_COPY.previews.1 as u32,
+        custom_sharp_ahead: CustomLimits::BALANCED_COPY.sharp.0 as u32,
+        custom_sharp_behind: CustomLimits::BALANCED_COPY.sharp.1 as u32,
+        custom_zoomed_ahead: CustomLimits::BALANCED_COPY.zoomed.0 as u32,
+        custom_zoomed_behind: CustomLimits::BALANCED_COPY.zoomed.1 as u32,
+        custom_thumbs: 2, // ThumbScope::WholeFolder, Balanced's (a `const` cannot call `index`)
+        custom_thumbs_mb: CustomLimits::BALANCED_COPY.thumbs_mb,
+        custom_bg_keep: CustomLimits::BALANCED_COPY.bg_keep,
+        custom_bg_release_s: CustomLimits::BALANCED_COPY.bg_release_s,
         // v0.8.171 (OWNER RULING): ABSENT, which is the whole point — `None` is not "uncapped",
         // it is "this install has never touched the control", and `heic_lane_cap_from_settings`
         // turns it into HEIC_LANE_CAP_DEFAULT. v0.8.169 wrote `0` here and that is what made the
@@ -12625,6 +13003,7 @@ impl Default for Settings {
             panels_default_v1: true, // fresh install / corrupt-file reset = already new-schema (the info_open_v2 rule)
             raw_open: true, // the develop panel starts visible (its pre-v0.8.97 behaviour, which had no hidden state)
             panels_migrated_boot: false, // v0.8.97: transient migration signal — never persisted
+            modes_migrated_boot: false, // 2026-10-26: the same, for the mode migration
         }
     }
 }
@@ -15601,7 +15980,7 @@ mod cold_thumbnail_queue_tests {
         let (tx,rx) = std::sync::mpsc::channel();
         let mut queue = ThumbQueue::new(rx);
         let mut waits = 0;
-        let result = queue.take_with_idle_hook(|| {
+        let result = queue.take_with_idle_hook(ThumbQueue::try_take, || {
             waits += 1;
             tx.send(if waits == 1 { ThumbReq::promote(1,7,0) } else { ThumbReq::explicit(2,7,0) }).unwrap();
         }).unwrap();
@@ -15623,6 +16002,11 @@ mod cold_thumbnail_queue_tests {
         assert!(queue.try_take().is_none(),"a promotion cannot duplicate an in-flight job");
         crate::tick::feed_visible_thumb(&tx,&mut pending,3,7,0,2);
         assert!(queue.try_take().is_none(),"new requests still obey the pending cap");
+        // 2026-10-27 (round 2b): a whole-folder job a tile on screen promotes follows the tiles' rule.
+        assert_eq!(ThumbReq::whole_folder(5,7,0),ThumbReq { local_only: true, ..ThumbReq::speculative(5,7,0) });
+        tx.send(ThumbReq::whole_folder(5,7,0)).unwrap();
+        tx.send(ThumbReq::promote(5,7,0)).unwrap();
+        assert_eq!(queue.try_take(),Some(ThumbReq::explicit(5,7,0)),"promoted: on screen, not local-only");
     }
     /// A retirement removes only that shot's still-queued job, from either lane. It cannot stop a
     /// running job, cross a folder generation, or drop a re-request sent after it.
@@ -15649,7 +16033,7 @@ mod cold_thumbnail_queue_tests {
         let (tx,rx) = std::sync::mpsc::channel();
         let mut queue = ThumbQueue::new(rx);
         let mut waits = 0;
-        let result = queue.take_with_idle_hook(|| {
+        let result = queue.take_with_idle_hook(ThumbQueue::try_take, || {
             waits += 1;
             tx.send(if waits == 1 { ThumbReq::retire(1,7) } else { ThumbReq::explicit(2,7,0) }).unwrap();
         }).unwrap();
@@ -17048,6 +17432,12 @@ pub(crate) fn detail_c_dispatch(
 /// `compare_never_deepens_the_detail_window` reddens on its first compare row. Drop the
 /// `!efficiency` term and `the_efficiency_posture_withholds_the_idle_deepened_window` reddens on
 /// its first row.
+///
+/// **2026-10-25 (graphics-memory sharing, round 1) — THE SEVENTH TERM.** While the background release
+/// holds (`background_memory`), the widened window would refill exactly what the release is giving
+/// back. The caller also restarts the stillness interval when the user comes back, so the fill waits
+/// its usual pause after a return. FALSIFIER: drop `!background` and
+/// `the_background_release_withholds_the_idle_deepened_window` reddens.
 #[inline]
 #[must_use]
 pub(crate) fn idle_deepen_allowed(
@@ -17057,8 +17447,9 @@ pub(crate) fn idle_deepen_allowed(
     film_dragging: bool,
     still_long_enough: bool,
     efficiency: bool,
+    background: bool,
 ) -> bool {
-    !efficiency && !compare && !zoomed && !scrubbing && !film_dragging && still_long_enough
+    !background && !efficiency && !compare && !zoomed && !scrubbing && !film_dragging && still_long_enough
 }
 
 /// v0.8.182 (2026-08-13 owner report) — **HOW MANY FULL-RES FRAMES THE WANT LIST MAY NAME.**
@@ -17125,7 +17516,7 @@ mod cmp_drag_churn_tests {
     fn compare_never_deepens_the_detail_window() {
         // THE DEEPEN CASE, unchanged: single view, unzoomed, no gesture, still for long enough.
         assert!(
-            idle_deepen_allowed(false, false, false, false, true, false),
+            idle_deepen_allowed(false, false, false, false, true, false, false),
             "E3's own arm still fires — a quiet single-view stop banks its deep neighbourhood"
         );
         // COMPARE REFUSES IT WHATEVER THE OTHER FOUR SAY. Exhaustive, because the defect was not a
@@ -17135,7 +17526,7 @@ mod cmp_drag_churn_tests {
                 for dragging in [false, true] {
                     for still in [false, true] {
                         assert!(
-                            !idle_deepen_allowed(zoomed, true, scrubbing, dragging, still, false),
+                            !idle_deepen_allowed(zoomed, true, scrubbing, dragging, still, false, false),
                             "compare never deepens (zoomed {zoomed} scrub {scrubbing} \
                              drag {dragging} still {still})"
                         );
@@ -17144,10 +17535,10 @@ mod cmp_drag_churn_tests {
             }
         }
         // …AND THE OTHER FOUR TERMS ARE THE SHIPPED ONES. Each alone refuses.
-        assert!(!idle_deepen_allowed(true, false, false, false, true, false), "zoomed has its own window");
-        assert!(!idle_deepen_allowed(false, false, true, false, true, false), "a key-hold scrub is motion");
-        assert!(!idle_deepen_allowed(false, false, false, true, true, false), "a strip drag is motion");
-        assert!(!idle_deepen_allowed(false, false, false, false, false, false), "…and it must be STILL");
+        assert!(!idle_deepen_allowed(true, false, false, false, true, false, false), "zoomed has its own window");
+        assert!(!idle_deepen_allowed(false, false, true, false, true, false, false), "a key-hold scrub is motion");
+        assert!(!idle_deepen_allowed(false, false, false, true, true, false, false), "a strip drag is motion");
+        assert!(!idle_deepen_allowed(false, false, false, false, false, false, false), "…and it must be STILL");
     }
 
     /// v0.8.195 (EFFICIENCY MODE, consumer 1) — **THE POSTURE WITHHOLDS THE WIDENED WINDOW, AND
@@ -17165,7 +17556,7 @@ mod cmp_drag_churn_tests {
     #[test]
     fn the_efficiency_posture_withholds_the_idle_deepened_window() {
         assert!(
-            !idle_deepen_allowed(false, false, false, false, true, true),
+            !idle_deepen_allowed(false, false, false, false, true, true, false),
             "the posture withholds the deepened window — the state E3 would otherwise widen in"
         );
         // ENGAGED refuses every combination; RELEASED answers exactly as the pre-v0.8.195 arm did.
@@ -17175,17 +17566,34 @@ mod cmp_drag_churn_tests {
                     for dragging in [false, true] {
                         for still in [false, true] {
                             assert!(
-                                !idle_deepen_allowed(zoomed, compare, scrubbing, dragging, still, true),
+                                !idle_deepen_allowed(zoomed, compare, scrubbing, dragging, still, true, false),
                                 "engaged never deepens (zoomed {zoomed} cmp {compare} \
                                  scrub {scrubbing} drag {dragging} still {still})"
                             );
                             assert_eq!(
-                                idle_deepen_allowed(zoomed, compare, scrubbing, dragging, still, false),
+                                idle_deepen_allowed(zoomed, compare, scrubbing, dragging, still, false, false),
                                 !compare && !zoomed && !scrubbing && !dragging && still,
                                 "released is byte-for-byte the shipped five-term arm"
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// 2026-10-25: the background release withholds the widened window in every state, and lets
+    /// the shipped arm decide alone once it ends.
+    #[test]
+    fn the_background_release_withholds_the_idle_deepened_window() {
+        assert!(!idle_deepen_allowed(false, false, false, false, true, false, true),
+            "a still, unzoomed single view in the background must not widen");
+        for zoomed in [false, true] {
+            for compare in [false, true] {
+                for still in [false, true] {
+                    assert!(!idle_deepen_allowed(zoomed, compare, false, false, still, false, true));
+                    assert_eq!(idle_deepen_allowed(zoomed, compare, false, false, still, false, false),
+                        !compare && !zoomed && still);
                 }
             }
         }
@@ -18230,7 +18638,7 @@ pub(crate) enum PowerSource {
     /// **A desktop's honest answer, and a real one** — `255`, which is what a machine with no
     /// battery and most VMs report (the dev box included). Auto must NEVER engage on it: a desktop
     /// that silently browsed at a battery posture would be the L17 class, a control whose label
-    /// promises to follow the power source doing something else entirely. See [`efficiency_engaged`].
+    /// promises to follow the power source doing something else entirely. See [`mode_in_effect`].
     Unknown,
 }
 
@@ -18280,7 +18688,7 @@ pub(crate) fn power_snapshot_from_raw(ac_line_status: u8, system_status_flag: u8
 /// The merge's first macOS `power_probe` arm answered `on_battery_power()` alone, i.e. `Dc` or `Ac`
 /// and nothing else. `IOPSGetProvidingPowerSourceType` on a Mac mini / Studio / iMac / Mac Pro
 /// returns `"AC Power"`, so that arm answered `Ac` on a machine with NO BATTERY — and the Auto
-/// branch of [`efficiency_status_line`] then reads **"Waiting for battery power."** for ever, on a
+/// branch of the Efficiency card's status line then read **"Waiting for battery power."** for ever, on a
 /// computer where the wait can never end and the sentence offers no next step. Windows has always
 /// distinguished this (`ACLineStatus == 255` ⇒ `Unknown`) and owns the honest sentence for it,
 /// **"No battery detected — Auto never activates on this computer."**, with its own rig row. The
@@ -18289,7 +18697,7 @@ pub(crate) fn power_snapshot_from_raw(ac_line_status: u8, system_status_flag: u8
 /// The information is in the same IOKit blob the arm already copies: `IOPSCopyPowerSourcesList`
 /// returns an EMPTY array when the machine has no internal power source. So:
 ///
-/// * `count == 0` ⇒ `Unknown` — a desktop. `efficiency_engaged`'s "Unknown NEVER engages" rule
+/// * `count == 0` ⇒ `Unknown` — a desktop. [`mode_in_effect`]'s "Unknown never forces it" rule
 ///   already handles it, and the honest desktop sentence fires.
 /// * `"Battery Power"` ⇒ `Dc` (the `kIOPMBatteryPowerKey` string; `"AC Power"` and `"UPS Power"`
 ///   are both mains — a UPS is wall power that happens to have a battery behind it).
@@ -18377,39 +18785,15 @@ pub(crate) fn power_sim() -> Option<PowerSim> {
     *S.get_or_init(|| power_sim_from_env(std::env::var("FALCON_POWER_SIM").ok().as_deref()))
 }
 
-/// The setting's three states. `0` is the DEFAULT and the absent-key answer, which is why Auto is
-/// zero: a fresh install, a settings.json from any older build, and a hand-edited file with the key
-/// deleted all land on the ruled default without a migration.
+/// The retired Efficiency setting's three states (`Settings::efficiency_mode`). Since round 2a
+/// (26 October 2026) they are read once, by the migration to the mode control ([`migrate_modes`]),
+/// and by nothing else. `0` was the default and the absent-key answer.
 pub(crate) const EFFICIENCY_AUTO: u8 = 0;
 pub(crate) const EFFICIENCY_ON: u8 = 1;
 pub(crate) const EFFICIENCY_OFF: u8 = 2;
 
-/// The setting's LIVE copy — written by the Settings row and by the boot seed, and by nothing else.
-///
-/// L43 — WHAT UN-SETS IT: the control itself, and nothing else. Read FRESH on every consult and
-/// never memoised (the [`heic_speed_priority`] discipline), so a click applies on the next tick with
-/// no restart, no folder reopen and no armed posture to stand down.
-static EFFICIENCY_MODE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(EFFICIENCY_AUTO);
-
-/// The mode in force right now. Never memoised by any caller.
-#[inline]
-#[must_use]
-pub(crate) fn efficiency_mode() -> u8 {
-    EFFICIENCY_MODE.load(Ordering::Relaxed)
-}
-
-/// Apply the setting (the boot seed from settings.json, and every click on the control). Returns the
-/// value that actually went live, so the caller mirrors the number the app is using rather than the
-/// number the file held.
-pub(crate) fn set_efficiency_mode(stored: i32) -> u8 {
-    let m = efficiency_mode_from_settings(stored);
-    EFFICIENCY_MODE.store(m, Ordering::Relaxed);
-    m
-}
-
-/// What an install's stored value MEANS. Out of range — a hand-edited file, a future build's fourth
-/// state read by an older one — is Auto, the ruled default, never an unmountable index.
+/// What a stored Efficiency value MEANT. Out of range — a hand-edited file — is Auto, the old
+/// default, so the migration has exactly three rows.
 #[inline]
 #[must_use]
 pub(crate) fn efficiency_mode_from_settings(stored: i32) -> u8 {
@@ -18420,9 +18804,9 @@ pub(crate) fn efficiency_mode_from_settings(stored: i32) -> u8 {
     }
 }
 
-/// `FALCON_EFFICIENCY=0` — the whole feature's one-switch revert for the session. The posture never
-/// engages; the control still mounts and still persists, deliberately, so one binary can be A/B'd
-/// against itself in a measurement pass without a settings edit between the arms.
+/// `FALCON_EFFICIENCY=0` — since round 2a, the session switch that turns "Use Power saver on battery
+/// power" off for this run, so one binary can be compared on battery with and without the battery
+/// rule. The setting still mounts and still persists; the Settings line says the switch is off.
 ///
 /// **Default ON**, disabled by an explicit zero and by nothing else — the
 /// [`settings_throttle_from_env`] convention, for its stated reason.
@@ -18438,57 +18822,212 @@ pub(crate) fn efficiency_enabled_from_env(v: Option<&str>) -> bool {
     v != Some("0")
 }
 
-/// **THE POSTURE DECISION.** Pure over three inputs, evaluated ONCE per tick at the call site, and
-/// read from that one local by every consumer — no consumer calls Windows, and no two consumers can
-/// disagree about what posture this tick is in.
-///
-/// * `env_disabled` wins over everything: a dev lever that could be out-voted by a setting is not a
-///   revert.
-/// * `Off` is false, `On` is true, and neither consults the power state at all — which is what
-///   makes the labels contracts (L17). "Off" is byte-for-byte the pre-v0.8.195 app; "On" is a quiet
-///   mode you can hold on a desktop that reports no battery.
-/// * `Auto` is `battery OR Windows' Battery saver`. **`Unknown` NEVER engages** — see
-///   [`PowerSource::Unknown`]. An out-of-range mode reads as Auto, matching
-///   [`efficiency_mode_from_settings`] so the file and the atomic cannot disagree.
-///
-/// FALSIFIER (L28): make `Unknown` engage and `a_desktops_unknown_power_source_never_engages_auto`
-/// reddens; drop the `saver` term and the AC-with-Battery-saver row of
-/// `the_efficiency_truth_table_is_auto_on_off` reddens; let the mode be consulted before
-/// `env_disabled` and the env row reddens on `On`.
+// ── 2026-10-26 (round 2a): THE MODE CONTROL ─────────────────────────────────────────────────────
+//
+// One choice shapes how hard Falcon works: **Performance**, **Balanced** or **Power saver**. It
+// replaces Efficiency mode; Power saver keeps everything engaged Efficiency did. The saved choice is
+// `Settings::mode`. "Use Power saver on battery power" (`Settings::battery_power_saver`, on by
+// default) puts Power saver in effect on battery, or with Windows' Battery saver on, WITHOUT changing
+// the saved mode: back on mains the saved mode returns on the next tick (L43 — nothing here latches
+// except the one override below, and that one clears on any power change).
+//
+// [`mode_in_effect`] decides once per tick; [`mode_limits`] turns its answer into the numbers every
+// consumer reads. Nothing in this block ever writes the saved mode: the Settings row and the ask
+// toast's "Switch to …" pill are the only writers (L44 — the change-check save stores what the user
+// chose, never what the battery imposed).
+
+/// The saved mode's values, in the Settings control's order.
+pub(crate) const MODE_PERFORMANCE: u8 = 0;
+pub(crate) const MODE_BALANCED: u8 = 1;
+pub(crate) const MODE_POWER_SAVER: u8 = 2;
+/// Round 2b: the user's own numbers ([`CustomLimits`]), starting as a copy of Balanced. For the
+/// battery switch it is like Balanced: on battery Power saver is in effect and Custom's numbers are
+/// untouched (L44).
+pub(crate) const MODE_CUSTOM: u8 = 3;
+
+/// The saved mode's LIVE copy — written by the boot seed, the Settings row and the ask toast's
+/// "Switch to …" pill, and by nothing else. Read fresh on every tick (the [`heic_speed_priority`]
+/// discipline), so a click applies on the next tick with no restart.
+static SAVED_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(MODE_BALANCED);
+/// …and the battery switch's.
+static BATTERY_POWER_SAVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The mode the user chose. Never memoised by any caller.
 #[inline]
 #[must_use]
-pub(crate) fn efficiency_engaged(snap: PowerSnapshot, mode: u8, env_disabled: bool) -> bool {
-    if env_disabled {
-        return false;
-    }
-    match mode {
-        EFFICIENCY_OFF => false,
-        EFFICIENCY_ON => true,
-        _ => snap.source == PowerSource::Dc || snap.saver,
+pub(crate) fn saved_mode() -> u8 {
+    SAVED_MODE.load(Ordering::Relaxed)
+}
+
+/// Apply the saved mode (the boot seed, a Settings click, a "Switch to …" pill). Returns the value
+/// that went live, so the caller mirrors the number the app is using rather than the file's.
+pub(crate) fn set_saved_mode(stored: i32) -> u8 {
+    let m = mode_from_settings(stored);
+    SAVED_MODE.store(m, Ordering::Relaxed);
+    m
+}
+
+/// What a stored mode MEANS. Out of range — a hand-edited file — is Balanced, the default, never an
+/// unmountable index.
+#[inline]
+#[must_use]
+pub(crate) fn mode_from_settings(stored: i32) -> u8 {
+    match stored {
+        0 => MODE_PERFORMANCE,
+        2 => MODE_POWER_SAVER,
+        3 => MODE_CUSTOM,
+        _ => MODE_BALANCED,
     }
 }
 
-/// The browse-rate ceiling the posture imposes (consumer 4). **20 fps.**
-///
-/// It is the ONE feel-visible arm of the whole round and it is flagged for the owner's own ruling.
-/// The reasoning: the measured browse baseline (INVESTIGATION_2026-08-30, bracket D2) runs at
-/// `gap p50 = 8 ms` with `late>20ms = 0` on 40 of 41 profiler windows — the browse is nowhere near
-/// frame-limited — so a 20 fps step rate still delivers a new photograph every 50 ms while cutting
-/// the decode + upload + present work per second by a third against the default 30. A user who has
-/// already chosen a rate BELOW 20 is untouched: this can only ever take rate away.
-pub(crate) const EFFICIENCY_SCRUB_FPS_MAX: f32 = 20.0;
+/// "Use Power saver on battery power", live.
+#[inline]
+#[must_use]
+pub(crate) fn battery_power_saver() -> bool {
+    BATTERY_POWER_SAVER.load(Ordering::Relaxed)
+}
 
-/// One `min()` term, and it is the whole of consumer 4 — pure so the "a user below the ceiling is
-/// untouched" half is a row rather than a promise.
+pub(crate) fn set_battery_power_saver(on: bool) {
+    BATTERY_POWER_SAVER.store(on, Ordering::Relaxed);
+}
+
+/// Why the mode in effect is what it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModeReason {
+    /// The saved mode — the user's own choice.
+    Chosen,
+    /// Power saver, because Falcon is running on battery and the battery switch is on.
+    Battery,
+    /// Power saver, because Windows' Battery saver is on (on mains or not) and the switch is on.
+    BatterySaver,
+}
+
+/// The mode in effect this tick and the reason for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModeInEffect {
+    pub(crate) mode: u8,
+    pub(crate) reason: ModeReason,
+}
+
+impl ModeInEffect {
+    /// Power saver imposed by the power state rather than chosen.
+    #[inline]
+    #[must_use]
+    pub(crate) fn forced(self) -> bool {
+        self.reason != ModeReason::Chosen
+    }
+}
+
+/// **THE MODE DECISION.** Pure over five inputs, evaluated once per tick, and read from that one
+/// local by every consumer.
 ///
-/// v0.8.196 (WAVE 2, §A): the ceiling is no longer the constant above — it is
-/// [`EfficiencyLimits::ceiling_fps`], derived per tick from what this machine's decoder is actually
-/// sustaining. `EFFICIENCY_SCRUB_FPS_MAX` survives as the CAP ON THE CEILING (the derivation `min`s
-/// with it), so the "can only ever take rate away" property is unchanged and this stays one `min()`.
+/// * A saved Power saver is Power saver, on any power source.
+/// * Otherwise the battery switch decides: on battery (`Dc`) or with Windows' Battery saver on, Power
+///   saver is in effect and the saved mode is untouched. **`Unknown` never forces it** — a desktop
+///   that reports no battery honestly runs its saved mode (L15/L17).
+/// * `env_disabled` (`FALCON_EFFICIENCY=0`) and `held` (the "until the power source changes"
+///   override, [`mode_override_step`]) each turn the battery rule off; neither touches a chosen mode.
+///
+/// FALSIFIER (L28): let `Unknown` force Power saver and the desktop rows of
+/// `the_mode_in_effect_truth_table` redden; drop the `saver` term and the Battery-saver-on-mains row
+/// reddens; consult the switch before the saved Power saver and the switch-off row reddens.
+#[inline]
+#[must_use]
+pub(crate) fn mode_in_effect(
+    saved: u8,
+    battery_switch: bool,
+    snap: PowerSnapshot,
+    env_disabled: bool,
+    held: bool,
+) -> ModeInEffect {
+    let chosen = ModeInEffect { mode: saved, reason: ModeReason::Chosen };
+    if saved == MODE_POWER_SAVER || !battery_switch || env_disabled || held {
+        return chosen;
+    }
+    match (snap.source, snap.saver) {
+        (PowerSource::Dc, _) => ModeInEffect { mode: MODE_POWER_SAVER, reason: ModeReason::Battery },
+        (_, true) => ModeInEffect { mode: MODE_POWER_SAVER, reason: ModeReason::BatterySaver },
+        _ => chosen,
+    }
+}
+
+/// **THE OVERRIDE, ONE TICK AT A TIME.** The ask toast's battery pill ("Use Balanced until the power
+/// source changes") stores the power reading it was chosen under; this keeps it only while that
+/// reading is unchanged. L43 — WHAT UN-SETS IT: any power change (source or Battery saver), and once
+/// cleared it never comes back on its own, so mains → battery → mains → battery is Power saver again.
+///
+/// FALSIFIER (L28): compare only `source` and the Battery-saver row of
+/// `use_balanced_until_the_power_source_changes_clears_on_any_change` reddens; return `at` unchanged
+/// when it differs and the override survives the round trip.
+#[inline]
+#[must_use]
+pub(crate) fn mode_override_step(at: Option<PowerSnapshot>, now: PowerSnapshot) -> Option<PowerSnapshot> {
+    at.filter(|s| *s == now)
+}
+
+/// What the speed panel does with a speed above the mode's own limit (round 2a, owner's design).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModeAsk {
+    /// "{fps} photos/s needs {target}." — [Switch to {target}] [Keep {the mode in effect}].
+    Switch { target: u8 },
+    /// Power saver is in effect only because of the power state — [Use {saved} until the power
+    /// source changes] [Keep Power saver].
+    Hold { saved: u8 },
+}
+
+/// **THE SPEED PANEL'S ASK, PURE.** `None` commits the pick (it is within the mode's limit, or the
+/// mode has none). Above it, a Power saver the power state imposed offers the saved mode until the
+/// power source changes; otherwise the lightest mode whose own limit allows the pick is offered —
+/// Balanced from Power saver when Balanced's limit allows it, else Performance, which has none.
+///
+/// FALSIFIER (L28): drop the Balanced arm and the Power-saver-to-20 row of
+/// `the_speed_panel_asks_for_the_lightest_mode_that_allows_the_pick` reddens with "needs Performance";
+/// ask before the `forced` arm and the battery row offers a switch the battery would overrule.
+#[must_use]
+pub(crate) fn mode_ask(fps: f32, limit: f32, in_effect: u8, forced: bool, saved: u8, balanced_limit: f32) -> Option<ModeAsk> {
+    if !(limit > 0.0 && fps > limit + 0.01) {
+        return None;
+    }
+    if forced {
+        return Some(ModeAsk::Hold { saved });
+    }
+    let target = if in_effect == MODE_POWER_SAVER && fps <= balanced_limit + 0.01 {
+        MODE_BALANCED
+    } else {
+        MODE_PERFORMANCE
+    };
+    Some(ModeAsk::Switch { target })
+}
+
+/// The mode's name as the interface prints it.
+#[must_use]
+pub(crate) fn mode_name(mode: u8) -> &'static str {
+    match mode {
+        MODE_PERFORMANCE => i18n::tr("Turbo"),
+        MODE_POWER_SAVER => i18n::tr("Eco"),
+        MODE_CUSTOM => i18n::tr("Custom"),
+        _ => i18n::tr("Balanced"),
+    }
+}
+
+/// …and as the log prints it (always English, so a log reads the same in every language).
+#[must_use]
+pub(crate) fn mode_log_name(mode: u8) -> &'static str {
+    match mode {
+        MODE_PERFORMANCE => "Turbo",
+        MODE_POWER_SAVER => "Eco",
+        MODE_CUSTOM => "Custom",
+        _ => "Balanced",
+    }
+}
+
+/// One `min()` term, and it is the whole of the browse-rate cut — pure so the "a user below the
+/// ceiling is untouched" half is a row rather than a promise. The ceiling is
+/// [`EfficiencyLimits::ceiling_fps`], derived per tick by [`mode_limits`]; Performance's is infinite.
 ///
 /// FALSIFIER (L28): return `limits.ceiling_fps` unconditionally when engaged and the
 /// user-below-the-ceiling row of `the_efficiency_browse_ceiling_only_ever_takes_rate_away` reddens —
-/// a 5 fps setting would be SPED UP by a posture whose entire job is to slow things down.
+/// a 5 fps setting would be SPED UP by a mode whose job is to slow things down.
 #[inline]
 #[must_use]
 pub(crate) fn efficiency_scrub_cap(fps: f32, limits: EfficiencyLimits) -> f32 {
@@ -18499,8 +19038,7 @@ pub(crate) fn efficiency_scrub_cap(fps: f32, limits: EfficiencyLimits) -> f32 {
     }
 }
 
-/// The parenthetical every efficiency line carries: WHY the verdict is what it is, in the app's own
-/// vocabulary and never in more certainty than the snapshot supports.
+/// The power reading in the app's own words, never in more certainty than the snapshot supports.
 ///
 /// A simulated run says so, and quotes the exported token. `Unknown` says "no battery reported",
 /// which is the honest thing to print on a desktop (L15: a fresh install on a desktop must read
@@ -18520,65 +19058,73 @@ fn power_phrase(snap: PowerSnapshot, sim: Option<PowerSim>) -> String {
     }
 }
 
-/// **THE ONE BOOT LINE**, and it states the VERDICT ACTUALLY DERIVED FROM THE SNAPSHOT rather than
-/// the fact that a watcher started (L30). Said once, at the watcher's first event — which is the
-/// only moment at which there IS a measured snapshot to say it about.
+/// **THE ONE BOOT LINE**, and it states the mode IN EFFECT derived from the measured snapshot, not
+/// the fact that a watcher started (L30). Said once, at the watcher's first event.
 ///
-/// FALSIFIER (L28): print the mode without the verdict and the "a desktop's Auto reads OFF" row of
-/// `the_efficiency_boot_line_states_the_verdict_not_the_watcher` reddens; drop the `simulated`
-/// prefix and the sim row reddens, which is a simulated run's log becoming indistinguishable from a
-/// measured one.
+/// FALSIFIER (L28): print the saved mode without the mode in effect and the battery row of
+/// `the_mode_boot_line_states_the_mode_in_effect` reddens; drop the `simulated` prefix and the sim
+/// row reddens.
 #[must_use]
-pub(crate) fn efficiency_boot_line(
-    mode: u8,
+pub(crate) fn mode_boot_line(
+    saved: u8,
+    battery_switch: bool,
+    eff: ModeInEffect,
     snap: PowerSnapshot,
     sim: Option<PowerSim>,
     env_disabled: bool,
 ) -> String {
-    if env_disabled {
-        return "efficiency: disabled (FALCON_EFFICIENCY=0)".to_string();
-    }
-    let verdict = if efficiency_engaged(snap, mode, false) { "ON" } else { "off" };
-    match mode {
-        EFFICIENCY_ON => format!("efficiency: On (manual) — {verdict}"),
-        EFFICIENCY_OFF => format!("efficiency: Off — {verdict}"),
-        _ => format!("efficiency: Auto ({}) — {verdict}", power_phrase(snap, sim)),
-    }
+    let switch = if !battery_switch {
+        "off"
+    } else if env_disabled {
+        "off for this session (FALCON_EFFICIENCY=0)"
+    } else {
+        "on"
+    };
+    format!(
+        "mode: {} saved, Eco on battery {switch} ({}) — in effect: {}",
+        mode_log_name(saved),
+        power_phrase(snap, sim),
+        mode_log_name(eff.mode)
+    )
 }
 
-/// ONE line per TRANSITION, both directions, change-only — never per tick (U15). Keyed on the
-/// VERDICT, so a setting change and a power change both print, and neither prints twice.
+/// ONE line per change of the mode in effect, change-only — never per tick (U15). Keyed on the mode
+/// in effect AND its reason, so a setting change and a power change both print, neither twice.
 #[must_use]
-pub(crate) fn efficiency_transition_line(
-    engaged: bool,
-    mode: u8,
+pub(crate) fn mode_transition_line(
+    eff: ModeInEffect,
+    saved: u8,
     snap: PowerSnapshot,
     sim: Option<PowerSim>,
 ) -> String {
-    let why = match mode {
-        EFFICIENCY_ON => "manual".to_string(),
-        EFFICIENCY_OFF => "the Off setting".to_string(),
-        _ => power_phrase(snap, sim),
+    let why = match eff.reason {
+        ModeReason::Chosen => "chosen".to_string(),
+        ModeReason::Battery | ModeReason::BatterySaver => {
+            format!("{}; saved {}", power_phrase(snap, sim), mode_log_name(saved))
+        }
     };
-    format!("efficiency: {} ({why})", if engaged { "engaged" } else { "released" })
+    format!("mode: in effect {} ({why})", mode_log_name(eff.mode))
 }
 
-/// The transient toast an **Auto** engage raises. Not a warning, so no persisted `NotifEntry` — the
-/// app is doing what its own control says it will do, and the toast is a courtesy that says so once.
-///
-/// TWO SENTENCES, because Auto has two reasons and only one of them is the battery. The owner's
-/// proposed copy is the battery arm verbatim; the saver arm exists because printing "On battery" at
-/// a laptop sitting on mains with Battery saver forced on would be a plain untruth (L17/U15), and it
-/// is flagged for veto beside the first.
+/// The toast a POWER change raises when it moves Power saver in or out (owner's wording, 26 October:
+/// "On battery — Power saver" / "Back on mains — Balanced"). Not a warning, so no persisted
+/// `NotifEntry`. Battery saver gets its own sentence, because "On battery" said to a laptop on mains
+/// with Battery saver on would be untrue (L17).
 #[must_use]
-pub(crate) fn efficiency_auto_toast(snap: PowerSnapshot) -> String {
-    if snap.source == PowerSource::Dc {
-        i18n::tr("On battery — reducing background work.").to_string()
-    } else {
-        i18n::tr("Battery saver is on — reducing background work.").to_string()
+pub(crate) fn mode_power_toast(prev: ModeInEffect, now: ModeInEffect, saved: u8) -> String {
+    match (now.reason, prev.reason) {
+        (ModeReason::Battery, _) => {
+            tr_format!("On battery — {mode}", mode = mode_name(MODE_POWER_SAVER))
+        }
+        (ModeReason::BatterySaver, _) => {
+            tr_format!("Battery saver is on — {mode}", mode = mode_name(MODE_POWER_SAVER))
+        }
+        (ModeReason::Chosen, ModeReason::BatterySaver) => {
+            tr_format!("Battery saver is off — {mode}", mode = mode_name(saved))
+        }
+        (ModeReason::Chosen, _) => tr_format!("Back on mains — {mode}", mode = mode_name(saved)),
     }
 }
-
 
 // ── v0.8.195 FIX TAIL (architect ruling on skeptics A + B) ────────────────────────────
 
@@ -18595,139 +19141,91 @@ pub(crate) fn efficiency_boot_suffix(probe_us: Option<u128>) -> String {
     }
 }
 
-/// **THE BROWSE-SPEED POPUP'S OWN SENTENCE** (skeptic B, R1c — CONFIRMED).
+/// **THE BROWSE-SPEED POPUP'S OWN SENTENCE.** The popup's title IS the user's number and its pill
+/// sits on the user's stop, so while a mode holds the browse below it the popup must say so.
 ///
-/// The popup's TITLE *is* the number (`fps-text`), its segmented control's pill sits on the user's
-/// stop, and it already owns a purpose-built affordance for "this stop is not reachable on this
-/// machine" (the `limit-frac` device-max veil). Engaged with a setting above the ceiling, all three
-/// of those said 30 while the browse stepped at 20 — which is the v0.8.123 defect ("built from a
-/// JPEG benchmark figure and said nothing about lanes that cannot reach it") re-cut on the popup's
-/// title one hundred versions later.
-///
-/// EMPTY unless it is BINDING: released, or a setting already at or below the ceiling, and there is
-/// nothing to say and nothing mounts (L4 — the mount is the `if`, and the emptiness is what drives
-/// it). A user who has chosen 12 fps is not being limited by anything and must not be told he is.
+/// EMPTY unless it is BINDING: Performance, or a setting already at or below the ceiling, and there
+/// is nothing to say and nothing mounts (L4 — the mount is the `if`, and the emptiness drives it).
 ///
 /// FALSIFIER (L28): return the sentence unconditionally and the released / at-the-ceiling /
-/// below-the-ceiling rows of `the_browse_popup_speaks_only_when_the_posture_is_binding` redden —
-/// a note that is always there is furniture, not feedback.
+/// below-the-ceiling rows of `the_browse_popup_speaks_only_when_the_posture_is_binding` redden.
 #[must_use]
-pub(crate) fn scrub_fps_efficiency_note(
-    limits: EfficiencyLimits,
-    user_fps: f32,
-    mode: u8,
-    snap: PowerSnapshot,
-    sim: Option<PowerSim>,
-) -> String {
-    // v0.8.196 fix tail: the popup was the ONE surface that asked the binding question correctly, so
-    // it keeps its behaviour exactly and gains only the reason clause the other two now share. The
-    // "what this machine sustains on battery" wording it shipped with is GONE — see R2 above.
-    efficiency_rate_sentence(limits, user_fps, mode, snap, sim)
+pub(crate) fn scrub_fps_mode_note(limits: EfficiencyLimits, user_fps: f32) -> String {
+    efficiency_rate_sentence(limits, user_fps)
 }
 
-/// **THE CONTROL'S LIVE-STATE LINE** (skeptic B, R2 + O1 — CONFIRMED).
-///
-/// Before this, every state of the control rendered as the identical lit "Auto" pill under a caption
-/// about a battery: a desktop where the posture can NEVER engage, a laptop engaged right now, a
-/// laptop released, and a session vetoed by `FALCON_EFFICIENCY=0` were indistinguishable on the one
-/// surface built for the feature. The verdict existed only in `falcon.log` and in a six-second toast,
-/// neither of which a photographer reads. That is the VISUAL-THINKERS lens and the spec's own L15
-/// line ("a desktop's Auto must read honestly, not look broken").
-///
-/// ONE composer, because the sheet already owns two worked answers to exactly this and both are
-/// Rust-composed state-derived Texts in this card's own grammar: `heic_lane_cap_note` and the nvJPEG
-/// row's inline reason line. The vocabulary is [`power_phrase`]'s, so the note and the log can never
-/// describe two different machines.
-///
-/// The env arm is the OTHER half of the lane-cap precedent — *"Dev levers win; the UI says so rather
-/// than pretending otherwise"* — and the caller unmounts the Seg beneath it, exactly as
-/// `heic-lane-cap-env` does. §1B's ruling that the control still PERSISTS is untouched: what the
-/// lever takes away is the ability to act this session, and that is what the sentence says.
+/// **THE MODE ROW'S STATUS LINE** (round 2a): what is in effect and why, then what it is doing to
+/// the browse right now. Every state the row can be in reads differently: a chosen mode, Power saver
+/// on battery, on Battery saver, the "until the power source changes" override, a desktop with no
+/// battery (the switch can never act there, and must not look broken — L15), and the session switch.
 ///
 /// FALSIFIER (L28): drop the `Unknown` arm and the desktop row of
-/// `the_efficiency_note_answers_every_state_the_control_can_be_in` reddens with a note promising a
-/// battery the machine does not have; drop the env arm and the `FALCON_EFFICIENCY=0` row reddens;
-/// return the same string for engaged and released and the two Auto rows collapse.
+/// `the_mode_note_answers_every_state_the_row_can_be_in` reddens; return the chosen sentence for a
+/// forced Power saver and the battery row reddens.
+#[allow(clippy::too_many_arguments)]
 #[must_use]
-pub(crate) fn efficiency_note(
-    mode: u8,
+pub(crate) fn mode_note(
+    saved: u8,
+    battery_switch: bool,
+    eff: ModeInEffect,
     snap: PowerSnapshot,
     sim: Option<PowerSim>,
     env_disabled: bool,
-    // v0.8.196 (WAVE 2, §E): the derived limits, so the one surface built for this feature quotes
-    // the number the browse is ACTUALLY stepping at rather than a constant that stopped being one.
-    // Appended to the three ACTIVE arms only — the inactive arms have no ceiling to name, and the
-    // arm decides that, not the caller.
+    held: bool,
     limits: EfficiencyLimits,
-    // v0.8.196 fix tail (skeptic B, R4/R5): the user's own browse stop and his own Fast View tier.
-    // The card may only speak about the rate when the posture is actually taking it away, and it
-    // names the SAMPLING in the Fast View card's own word so the two cards agree.
     user_fps: f32,
     user_super: bool,
 ) -> String {
-    if env_disabled {
-        return i18n::tr(
-            "Turned off for this session by FALCON_EFFICIENCY=0 — the control resumes on the next launch without it.",
-        )
-        .to_string();
-    }
-    // A simulated run must not read as a measured one on the SHEET either (the B-O3 principle, one
-    // surface over). Dev levers are visible where they act.
-    let sim_note = if sim.is_some() { format!(" {}", i18n::tr("(simulated)")) } else { String::new() };
-    // v0.8.196 fix tail: what "Active" is actually DOING right now — composed, never re-worded, and
-    // SILENT about a rate the posture is not taking away (skeptic B, R5).
-    let rate = efficiency_rate_sentence(limits, user_fps, mode, snap, sim);
-    let sampling = efficiency_sampling_sentence(limits, user_super);
-    let live = match (rate.is_empty(), sampling.is_empty()) {
-        (true, true) => String::new(),
-        (true, false) => format!(" {sampling}"),
-        (false, true) => format!(" {rate}"),
-        (false, false) => format!(" {rate} {sampling}"),
+    let mode = mode_name(eff.mode);
+    let head = match eff.reason {
+        ModeReason::Battery => tr_format!("On battery: {mode}.", mode = mode),
+        ModeReason::BatterySaver => tr_format!("Battery saver is on: {mode}.", mode = mode),
+        ModeReason::Chosen if held => tr_format!("Until the power source changes: {mode}.", mode = mode),
+        ModeReason::Chosen => tr_format!("In effect: {mode}.", mode = mode),
     };
-    // Each verdict is one whole sentence; the simulated mark and the live sentences follow it.
-    match mode {
-        EFFICIENCY_ON => format!("{}{sim_note}{live}", i18n::tr("Active — turned on.")),
-        EFFICIENCY_OFF => format!("{}{sim_note}", i18n::tr("Not active — this setting is switched off.")),
-        _ => match (snap.source, snap.saver) {
-            (PowerSource::Dc, _) => format!("{}{sim_note}{live}", i18n::tr("Active — on battery.")),
-            (_, true) => format!("{}{sim_note}{live}", i18n::tr("Active — Battery saver is on.")),
-            (PowerSource::Unknown, false) => format!(
-                "{}{sim_note}",
-                i18n::tr("No battery detected — Auto never activates on this computer.")
-            ),
-            (PowerSource::Ac, false) => format!("{}{sim_note}", i18n::tr("Waiting for battery power.")),
-        },
-    }
+    // Why the battery switch is not acting, when it is on and could have.
+    let switch = if !battery_switch || saved == MODE_POWER_SAVER {
+        String::new()
+    } else if env_disabled {
+        format!(
+            " {}",
+            i18n::tr("Eco on battery is turned off for this session by FALCON_EFFICIENCY=0.")
+        )
+    } else if snap.source == PowerSource::Unknown && !snap.saver {
+        format!(" {}", i18n::tr("No battery detected, so this computer never switches to Eco by itself."))
+    } else {
+        String::new()
+    };
+    // A simulated run must not read as a measured one on the sheet either (the B-O3 principle).
+    let sim_note = if sim.is_some() { format!(" {}", i18n::tr("(simulated)")) } else { String::new() };
+    let rate = efficiency_rate_sentence(limits, user_fps);
+    let sampling = efficiency_sampling_sentence(limits, user_super);
+    let live: String = [rate, sampling].into_iter().filter(|s| !s.is_empty()).map(|s| format!(" {s}")).collect();
+    format!("{head}{switch}{sim_note}{live}")
 }
 
 /// **WHAT THE `scrub res →` LINE'S SUFFIX SAYS** (skeptic A, O3 — CONFIRMED).
 ///
 /// Three outcomes were already distinguished in the log because a clear is a full re-decode and the
 /// 2026-07-06 lag hunt chased invisible flips. v0.8.195 added a FOURTH — a grow whose re-decode
-/// sweep is being withheld by the posture — and shipped it unasserted and unobserved: §C.8 claimed
-/// it was "rig-asserted", and `grep` found the literal in no test at all. It is also the only
-/// surface that distinguishes "the posture is holding the sweep" from "the cache happened to be
-/// warm", which is the exact confusion its own comment says it exists to prevent, so a measurement
-/// pass would rely on a line nothing pins.
+/// sweep is being withheld (by Power saver since round 2a) — and it is the only surface that
+/// distinguishes "the sweep is held" from "the cache happened to be warm".
 ///
-/// v0.8.196 fix tail (skeptic B, R6): the first term is **`cleared`**, not `tier_flip`. Those used to
-/// be the same fact and are not any more — a POSTURE-driven tier flip keeps both caches (see
-/// `step_adaptive_res`), so a line that said "cache cleared" on it would be describing work the app
-/// deliberately did not do, which is this suffix's whole reason to exist.
+/// v0.8.196 fix tail (skeptic B, R6): the first term is **`cleared`**, not `tier_flip`. A
+/// mode-driven tier flip keeps both caches (see `step_adaptive_res`), so a line that said "cache
+/// cleared" on it would be describing work the app deliberately did not do.
 ///
-/// FALSIFIER (L28): swap the `grew && efficiency` arm for the plain `grew` arm and the held row of
+/// FALSIFIER (L28): swap the `grew && power_saver` arm for the plain `grew` arm and the held row of
 /// `the_scrub_res_suffix_names_a_withheld_sweep` reddens; feed it `tier_flip` instead of `cleared`
 /// and the posture-edge rows of `a_posture_tier_flip_never_clears_a_cache` redden.
 #[must_use]
-pub(crate) fn adaptive_res_suffix(cleared: bool, grew: bool, efficiency: bool) -> &'static str {
+pub(crate) fn adaptive_res_suffix(cleared: bool, grew: bool, power_saver: bool) -> &'static str {
     if cleared {
         " — cache cleared"
-    } else if grew && efficiency {
+    } else if grew && power_saver {
         // The frames are kept and still displaying, exactly as on the row below; what is different
-        // is that the re-decode sweep is not being dispatched while the posture holds. Naming it
-        // here is what stops a measurement pass reading the quiet `dec=` that follows as a cache
-        // that happened to be warm.
-        " — grow, stale kept (held — efficiency)"
+        // is that the re-decode sweep is not being dispatched while Power saver holds.
+        " — grow, stale kept (held — Eco)"
     } else if grew {
         " — grow, stale kept for re-decode"
     } else {
@@ -18735,49 +19233,44 @@ pub(crate) fn adaptive_res_suffix(cleared: bool, grew: bool, efficiency: bool) -
     }
 }
 
-/// **WHAT THE TICK DOES ABOUT A POSTURE EDGE** (skeptic A, O4 — CONFIRMED), and it is where
-/// deviation D4 lives.
+/// **WHAT THE TICK DOES ABOUT A CHANGE OF THE MODE IN EFFECT** — a pure verdict on the
+/// [`ColourWatchVerdict`] pattern, so the edge is a table.
 ///
-/// The round's whole observability behaviour was four inline conditions inside the tick closure:
-/// the boot-line-once gate, the baseline ADOPTION, the change-only edge with its `first`
-/// suppression, and the Auto-only toast. None of it was reachable from the rig, so the one
-/// deviation the round asked the architect to accept was the one thing with no falsifier — a future
-/// edit that dropped the `first` guard, moved the adoption out of the drain, or fired the toast on
-/// release would have reddened nothing. The repo already owns the right shape for exactly this:
-/// [`ColourWatchVerdict`] is a pure verdict enum precisely so the colour watcher's edge is a table.
-///
-/// **D4 IS THE `(None, _) => Adopt` ROW.** A session that OPENS engaged has not transitioned:
-/// announcing one would be the v0.8.178 (W4 tail) seeding defect — a log line for a change that
-/// never happened — and would pop the toast at every launch on a laptop on battery. The boot line
-/// states that session's verdict; the edge cell adopts it silently.
+/// **`(None, _) => Adopt`.** A session that OPENS on battery has not transitioned: announcing one
+/// would be the v0.8.178 (W4 tail) seeding defect and would pop the toast at every battery launch.
+/// The boot line states that session's mode; the edge cell adopts it silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EfficiencyEdge {
-    /// Nothing changed — say nothing. The overwhelmingly common answer, 62.5 times a second.
+pub(crate) enum ModeEdge {
+    /// Nothing changed — say nothing.
     Nothing,
-    /// No state observed yet: record it and say nothing. This is D4.
+    /// No state observed yet: record it and say nothing.
     Adopt,
-    /// A real change — log one line, both directions.
+    /// A real change — log one line.
     Log,
-    /// …and it is an AUTO engage, which is the only edge the user did not perform himself, so it is
-    /// the only one that also raises a toast.
+    /// …and a POWER change moved Power saver in or out, which is the only edge the user did not
+    /// perform himself, so it is the only one that also raises a toast.
     LogAndToast,
 }
 
-/// The edge, PURE. See [`EfficiencyEdge`], which is this function's doc.
+/// The edge, PURE. `prev` is last tick's mode in effect and power reading; the toast needs both to
+/// tell a power change (toast) from a click on the switch, the row or the override pill (no toast).
 ///
-/// FALSIFIER (L28): return `Log` for a `None` previous state and the two D4 rows of
-/// `the_efficiency_edge_adopts_a_boot_baseline_and_toasts_only_an_auto_engage` redden (the session
-/// would announce a transition that never happened, and toast at every battery launch); drop the
-/// `mode == EFFICIENCY_AUTO` term and the manual-On row reddens with a toast for something the user
-/// just clicked; toast on the release edge and the released row reddens.
+/// FALSIFIER (L28): return `Log` for a `None` previous state and the adopt rows of
+/// `the_mode_edge_adopts_a_boot_baseline_and_toasts_only_a_power_change` redden; drop the
+/// `prev_snap != snap` term and the switch-click row reddens with a toast for something the user
+/// just did.
 #[inline]
 #[must_use]
-pub(crate) fn efficiency_edge(prev: Option<bool>, now: bool, mode: u8) -> EfficiencyEdge {
+pub(crate) fn mode_edge(
+    prev: Option<(ModeInEffect, PowerSnapshot)>,
+    now: ModeInEffect,
+    snap: PowerSnapshot,
+) -> ModeEdge {
     match prev {
-        None => EfficiencyEdge::Adopt,
-        Some(p) if p == now => EfficiencyEdge::Nothing,
-        Some(_) if now && mode == EFFICIENCY_AUTO => EfficiencyEdge::LogAndToast,
-        Some(_) => EfficiencyEdge::Log,
+        None => ModeEdge::Adopt,
+        Some((p, _)) if p == now => ModeEdge::Nothing,
+        Some((p, prev_snap)) if p.forced() != now.forced() && prev_snap != snap => ModeEdge::LogAndToast,
+        Some(_) => ModeEdge::Log,
     }
 }
 
@@ -18785,15 +19278,11 @@ pub(crate) fn efficiency_edge(prev: Option<bool>, now: bool, mode: u8) -> Effici
 /// has to name is a string a test can read.
 ///
 /// `FALCON_CLASSIC_POSTURE=1` promises *"v0.8.110 restored: full prefetch window for every format,
-/// no costly-decode pool cap"*. With efficiency mode engaged — Auto on a laptop on battery, i.e. the
-/// SHIPPED DEFAULT — both clauses are false: `is_costly` narrows the runway to the costly window for
-/// every format, and while `interactive_busy` the budget is zero and every non-displayed index is
-/// refused. An owner bisecting a browse regression with the documented revert would not get v0.8.110
-/// and nothing would tell him.
-///
-/// The RULING keeps efficiency ungated on this switch — classic posture reverts the v0.8.111 posture,
-/// not every later feature, and one lever per concern is the repo's own rule — so the fix is the
-/// other branch: the line names the exception and names the lever that closes it.
+/// no costly-decode pool cap"*. With Balanced or Power saver in effect — Balanced is the SHIPPED
+/// DEFAULT — both clauses are false: every format takes the mode's runway and concurrency, and the
+/// kept window is the mode's. The RULING keeps the modes ungated on this switch — classic posture
+/// reverts the v0.8.111 posture, not every later feature — so the line names the exception and how
+/// to close it.
 ///
 /// FALSIFIER (L28): drop the exception clause and
 /// `the_classic_revert_names_the_one_posture_it_does_not_revert` reddens on both of its asserts.
@@ -18801,11 +19290,11 @@ pub(crate) fn efficiency_edge(prev: Option<bool>, now: bool, mode: u8) -> Effici
 pub(crate) fn classic_posture_boot_line() -> &'static str {
     "pool posture: CLASSIC (FALCON_CLASSIC_POSTURE=1) — v0.8.110 restored: full prefetch window for \
      every format, no costly-decode pool cap, no folder-open detail priming, and every tier decodes \
-     its own frame (no derive-from-full-res). ONE EXCEPTION, v0.8.195: this switch does NOT revert \
-     EFFICIENCY MODE, which is not part of v0.8.110 and carries its own lever — while that posture is \
-     ENGAGED the runway narrows to the costly window for every format and speculative publishes \
-     pace, whatever the clauses above say. Export FALCON_EFFICIENCY=0 alongside this for the full \
-     v0.8.110 browse."
+     its own frame (no derive-from-full-res). ONE EXCEPTION, round 2a: this switch does NOT revert \
+     THE MODE CONTROL, which is not part of v0.8.110 — while Balanced, Eco or Custom is IN EFFECT \
+     every format takes the mode's runway, concurrency and kept window, and Eco also paces \
+     speculative publishes, whatever the clauses above say. Choose Turbo (and set \
+     FALCON_EFFICIENCY=0 on battery) for the full v0.8.110 browse."
 }
 
 // ── v0.8.196 (EFFICIENCY WAVE 2, §A): THE LIMITS THE POSTURE DERIVES FROM MEASUREMENT ───────────
@@ -18868,10 +19357,349 @@ pub(crate) const EFFICIENCY_SAFETY: f32 = 0.8;
 /// the derivation asks for less, the ceiling holds here and [`EfficiencyLimits::floored`] says so in
 /// the log. **Owner veto item.**
 pub(crate) const EFFICIENCY_CEILING_FLOOR_FPS: f32 = 5.0;
-/// The ceiling with NO measurement of any kind — no live median, no benchmark on record. Conservative
-/// on purpose: it is the first second of the first folder on a machine we know nothing about.
-/// **Owner veto item.**
-pub(crate) const EFFICIENCY_DEFAULT_CEILING_FPS: f32 = 12.0;
+/// Round 2a (owner rulings, 25–26 October 2026): each limited mode's browse speed limit, and the
+/// share of the benchmark's measured best it may never exceed. Without a benchmark the limit is the
+/// number itself; with no measurement of any kind the ceiling is that limit, so a benchmark seed can
+/// only ever lower it (L31). Performance has no limit from the mode.
+pub(crate) const BALANCED_FPS_MAX: f32 = 20.0;
+pub(crate) const POWER_SAVER_FPS_MAX: f32 = 12.0;
+pub(crate) const BALANCED_BENCH_SHARE: f32 = 2.0 / 3.0;
+pub(crate) const POWER_SAVER_BENCH_SHARE: f32 = 0.4;
+/// Balanced keeps about two seconds of browsing ready at its limit (40 ahead, 10 behind at 20/s), and
+/// decodes ahead over the same time at the live ceiling. Owner-approved starting points (26 October),
+/// to be tuned after measuring.
+pub(crate) const BALANCED_KEEP_SECONDS: (f32, f32) = (2.0, 0.5);
+/// Power saver's kept window: 24 ahead, 6 behind — deliberately below the old 22 + 8 minimum
+/// (owner's starting point, 26 October). Balanced never keeps less than this.
+pub(crate) const POWER_SAVER_KEEP: (usize, usize) = (24, 6);
+/// Zoomed browsing (and Balanced's settled fill): the sharp photos kept ready may use at most about
+/// this much graphics memory (owner's starting points, 26 October). The out-of-memory ladder's
+/// halving still applies; the smaller of the two wins.
+pub(crate) const BALANCED_DETAIL_BYTES_MAX: u64 = 2 << 30;
+pub(crate) const POWER_SAVER_DETAIL_BYTES_MAX: u64 = 1 << 30;
+/// …and Power saver's zoomed window is never wider than the ordinary 3 ahead, 1 behind.
+pub(crate) const POWER_SAVER_DETAIL_ZOOM_MAX: (usize, usize) = (3, 1);
+
+// ── 2026-10-27 (round 2b, owner rulings 25–26 October): CUSTOM ──────────────────────────────────
+//
+// The fourth mode: the user's own numbers, in a Custom card that Settings shows while Custom is
+// selected. It starts as a copy of Balanced. Every number is the MOST Falcon prepares (the card says
+// so): the graphics-memory budget and its out-of-memory ladder, the windows' capacity clamps
+// (`fast_window_split`, [`custom_detail_window`], `detail_wanted_cap`), Power saver on battery and
+// the background release can all lower what is kept, and none of them ever writes the saved numbers
+// (L44). A high number on a small card is clamped to what the cache holds, so it cannot decode
+// photos straight into eviction (L29).
+
+/// Custom's browsing speed as stored: Unlimited (no limit from the mode, as in Performance, with
+/// Balanced's workers: every one but the displayed photo's slot), or a typed limit in photos a second.
+/// Until the user picks one, Custom follows Balanced's own limit (20/s, or two-thirds of the
+/// benchmark's best): that is what makes it start as a copy of Balanced.
+pub(crate) const CUSTOM_FPS_UNLIMITED: i32 = 0;
+pub(crate) const CUSTOM_FPS_AS_BALANCED: i32 = -1;
+/// A typed limit's top when no benchmark speaks for this folder: the speed panel's own maximum.
+pub(crate) const CUSTOM_FPS_PANEL_MAX: f32 = 120.0;
+/// The ranges a typed count is brought into, (lowest, highest) (owner answer 3, 26 October).
+pub(crate) const CUSTOM_PREVIEWS_AHEAD: (usize, usize) = (6, 200);
+pub(crate) const CUSTOM_PREVIEWS_BEHIND: (usize, usize) = (2, 64);
+pub(crate) const CUSTOM_SHARP_AHEAD: (usize, usize) = (0, 16);
+pub(crate) const CUSTOM_SHARP_BEHIND: (usize, usize) = (0, 8);
+pub(crate) const CUSTOM_ZOOMED_AHEAD: (usize, usize) = (1, 32);
+pub(crate) const CUSTOM_ZOOMED_BEHIND: (usize, usize) = (0, 8);
+/// In the background, keep: a share of the graphics card, in percent; 0 is "Only the photos in use".
+pub(crate) const CUSTOM_BG_KEEP: [u8; 4] = [0, 10, 25, 50];
+/// Release over, in seconds; 0 is "At once".
+pub(crate) const CUSTOM_BG_RELEASE_S: [u32; 3] = [0, 10, 30];
+/// About 175 KB a thumbnail in memory: a 256 × 171 RGBA tile. ([`crate::THUMB_CACHE_MAX`]'s 400 is
+/// about 70 MB.)
+pub(crate) const THUMB_BYTES_EST: u64 = 256 * 171 * 4;
+/// Whole-folder thumbnails in Balanced stop at about 500 MB (owner answer 5 and its confirmation,
+/// 26 October): about 2,900 thumbnails, the ones nearest the current photo kept. Custom starts there
+/// too, on its own control ([`CUSTOM_THUMB_MB_RANGE`]).
+pub(crate) const WHOLE_FOLDER_THUMB_BYTES: u64 = 500_000_000;
+pub(crate) const WHOLE_FOLDER_THUMBS: usize = (WHOLE_FOLDER_THUMB_BYTES / THUMB_BYTES_EST) as usize;
+/// …and nothing prepares more than about 2 GB of them (owner, 27 October: "a hidden cap which limits
+/// to 2GB"; a camera's numbering stops at 9,999 photos, and 2 GB is about 11,400 thumbnails). It is
+/// Performance's cap, not shown in the interface, and the top of Custom's control.
+pub(crate) const WHOLE_FOLDER_THUMB_BYTES_MAX: u64 = 2_000_000_000;
+pub(crate) const WHOLE_FOLDER_THUMBS_MAX: usize = (WHOLE_FOLDER_THUMB_BYTES_MAX / THUMB_BYTES_EST) as usize;
+/// Custom's whole-folder cap, in MB (owner, 27 October: adjustable, starting at 500 MB; the stops
+/// 250 / 500 / 1000 / 2000 in the markup plus a typed value): the range every value is brought into.
+/// The top is [`WHOLE_FOLDER_THUMB_BYTES_MAX`].
+pub(crate) const CUSTOM_THUMB_MB_RANGE: (u32, u32) = (100, 2000);
+
+/// How many thumbnails `mb` megabytes hold ([`THUMB_BYTES_EST`] each), never more than the hidden
+/// cap's.
+#[must_use]
+pub(crate) fn whole_folder_thumbs_in(mb: u32) -> usize {
+    ((u64::from(mb) * 1_000_000 / THUMB_BYTES_EST) as usize).min(WHOLE_FOLDER_THUMBS_MAX)
+}
+
+/// Which thumbnails Falcon prepares (round 2b). The tiles on screen are always served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThumbScope {
+    /// Only the tiles on screen: no thumbnails for the filmstrip's extra cells or the grid's extra
+    /// rows, and none for the frosted backdrop (each new preview then makes its own blur source, about
+    /// 20% more decode work — `main.rs`'s `frost_thumb` note).
+    VisibleOnly,
+    /// The tiles on screen, the filmstrip's two cells and the grid's two rows either side, and the
+    /// thumbnails over the preview window the frosted backdrop takes its blur from (Falcon before
+    /// round 2b, and Power saver's).
+    Nearby,
+    /// All of that, then the rest of the folder, nearest the current photo first, only while nothing
+    /// else is asked for, never a cloud-only file (the scan's tags, then a check just before each read),
+    /// up to the mode's cap
+    /// ([`EfficiencyLimits::thumbs_max`]). `tick::step_whole_folder_thumbs`.
+    WholeFolder,
+}
+
+impl ThumbScope {
+    /// From the stored and on-screen value: 0 Visible only, 1 Visible and nearby, 2 Whole folder.
+    /// Anything else reads as Visible and nearby.
+    #[must_use]
+    pub(crate) fn from_index(v: i32) -> ThumbScope {
+        match v {
+            0 => ThumbScope::VisibleOnly,
+            2 => ThumbScope::WholeFolder,
+            _ => ThumbScope::Nearby,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn index(self) -> i32 {
+        match self {
+            ThumbScope::VisibleOnly => 0,
+            ThumbScope::Nearby => 1,
+            ThumbScope::WholeFolder => 2,
+        }
+    }
+
+    /// As the log names it (always English).
+    #[must_use]
+    pub(crate) fn log_name(self) -> &'static str {
+        match self {
+            ThumbScope::VisibleOnly => "visible only",
+            ThumbScope::Nearby => "visible and nearby",
+            ThumbScope::WholeFolder => "whole folder",
+        }
+    }
+}
+
+/// **CUSTOM'S NUMBERS** (round 2b), as the Settings card holds them. The tick reads them off the card
+/// every pass (the background wait's discipline), so a change applies on the next tick with nothing
+/// latched (L43); [`mode_limits`] turns them into the numbers every consumer reads, and
+/// `background_memory::Policy::for_mode` into the background release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CustomLimits {
+    /// [`CUSTOM_FPS_UNLIMITED`], [`CUSTOM_FPS_AS_BALANCED`], or a typed limit (5 up to the machine's
+    /// best, which binds at the tick — [`custom_ceiling`]).
+    pub(crate) fps: i32,
+    /// Previews kept ready, (ahead, behind) in the browsing direction.
+    pub(crate) previews: (usize, usize),
+    /// Sharp photos kept ready when not zoomed in, (ahead, behind).
+    pub(crate) sharp: (usize, usize),
+    /// Sharp photos kept ready while zoomed in, (ahead, behind).
+    pub(crate) zoomed: (usize, usize),
+    pub(crate) thumbs: ThumbScope,
+    /// …and how much of them the whole folder may keep, in MB ([`CUSTOM_THUMB_MB_RANGE`]).
+    pub(crate) thumbs_mb: u32,
+    /// In the background, keep this share of the card, in percent; 0 = only the photos in use.
+    pub(crate) bg_keep: u8,
+    /// …released over this many seconds; 0 = at once.
+    pub(crate) bg_release_s: u32,
+}
+
+impl CustomLimits {
+    /// **A COPY OF BALANCED** — a new install's Custom, and the Custom of a settings file from before
+    /// round 2b: Balanced's own speed limit, its kept window at 20/s (40 + 10), the ordinary 3 + 1
+    /// sharp photos, 8 + 2 while zoomed (Balanced's 2 GB at 45 MP), the whole folder's thumbnails
+    /// within about 500 MB, and in the background only the photos in use, released over 10 s.
+    pub(crate) const BALANCED_COPY: CustomLimits = CustomLimits {
+        fps: CUSTOM_FPS_AS_BALANCED,
+        previews: (40, 10),
+        sharp: (crate::DETAIL_AHEAD, crate::DETAIL_BEHIND),
+        zoomed: (8, 2),
+        thumbs: ThumbScope::WholeFolder,
+        thumbs_mb: 500,
+        bg_keep: 0,
+        bg_release_s: 10,
+    };
+
+    /// Into range: a typed speed to 5–120 (the benchmark's best binds later, at the tick), each count
+    /// and the whole-folder cap to its range, and a background choice that is not one of the stops to
+    /// Balanced's.
+    #[must_use]
+    pub(crate) fn clamped(self) -> CustomLimits {
+        let r = |v: usize, (lo, hi): (usize, usize)| v.clamp(lo, hi);
+        let copy = CustomLimits::BALANCED_COPY;
+        CustomLimits {
+            fps: match self.fps {
+                f if f < 0 => CUSTOM_FPS_AS_BALANCED,
+                CUSTOM_FPS_UNLIMITED => CUSTOM_FPS_UNLIMITED,
+                f => f.clamp(EFFICIENCY_CEILING_FLOOR_FPS as i32, CUSTOM_FPS_PANEL_MAX as i32),
+            },
+            previews: (r(self.previews.0, CUSTOM_PREVIEWS_AHEAD), r(self.previews.1, CUSTOM_PREVIEWS_BEHIND)),
+            sharp: (r(self.sharp.0, CUSTOM_SHARP_AHEAD), r(self.sharp.1, CUSTOM_SHARP_BEHIND)),
+            zoomed: (r(self.zoomed.0, CUSTOM_ZOOMED_AHEAD), r(self.zoomed.1, CUSTOM_ZOOMED_BEHIND)),
+            thumbs: self.thumbs,
+            thumbs_mb: self.thumbs_mb.clamp(CUSTOM_THUMB_MB_RANGE.0, CUSTOM_THUMB_MB_RANGE.1),
+            bg_keep: if CUSTOM_BG_KEEP.contains(&self.bg_keep) { self.bg_keep } else { copy.bg_keep },
+            bg_release_s: if CUSTOM_BG_RELEASE_S.contains(&self.bg_release_s) {
+                self.bg_release_s
+            } else {
+                copy.bg_release_s
+            },
+        }
+    }
+}
+
+/// Custom's numbers off the Settings card's properties, in range — what the tick spends every pass
+/// and what [`build_settings`] saves (the card is where the user's choice lives, L44).
+#[must_use]
+pub(crate) fn custom_limits_of(app: &MainWindow) -> CustomLimits {
+    let n = |v: i32| v.max(0) as usize;
+    CustomLimits {
+        fps: app.get_custom_fps(),
+        previews: (n(app.get_custom_previews_ahead()), n(app.get_custom_previews_behind())),
+        sharp: (n(app.get_custom_sharp_ahead()), n(app.get_custom_sharp_behind())),
+        zoomed: (n(app.get_custom_zoomed_ahead()), n(app.get_custom_zoomed_behind())),
+        thumbs: ThumbScope::from_index(app.get_custom_thumbs()),
+        thumbs_mb: app.get_custom_thumbs_mb().max(0) as u32,
+        bg_keep: app.get_custom_bg_keep().clamp(0, 100) as u8,
+        bg_release_s: app.get_custom_bg_release_s().max(0) as u32,
+    }
+    .clamped()
+}
+
+/// …and onto them (the settings apply at boot, and a typed value brought into range).
+pub(crate) fn set_custom_limits_on(app: &MainWindow, c: CustomLimits) {
+    let n = |v: usize| v as i32;
+    app.set_custom_fps(c.fps);
+    app.set_custom_previews_ahead(n(c.previews.0));
+    app.set_custom_previews_behind(n(c.previews.1));
+    app.set_custom_sharp_ahead(n(c.sharp.0));
+    app.set_custom_sharp_behind(n(c.sharp.1));
+    app.set_custom_zoomed_ahead(n(c.zoomed.0));
+    app.set_custom_zoomed_behind(n(c.zoomed.1));
+    app.set_custom_thumbs(c.thumbs.index());
+    app.set_custom_thumbs_mb(c.thumbs_mb as i32);
+    app.set_custom_bg_keep(i32::from(c.bg_keep));
+    app.set_custom_bg_release_s(c.bg_release_s as i32);
+}
+
+/// **A NUMBER TYPED ON CUSTOM'S CARD**, into the row's range: row 0 the speed (5 up to this machine's
+/// best, [`custom_ceiling`]), rows 1–6 previews / sharp photos / sharp photos while zoomed, ahead then
+/// behind, row 7 the whole folder's cap in MB. `None` leaves the card as it is: not a number, or a row
+/// the card does not have.
+///
+/// FALSIFIER (L28): drop the `clamped()` and the out-of-range rows of
+/// `custom_numbers_are_clamped_and_capacity_bound` redden with 900 previews ahead.
+#[must_use]
+pub(crate) fn custom_typed(c: CustomLimits, row: i32, text: &str, bench_fps: Option<f32>) -> Option<CustomLimits> {
+    let v: f32 = text.trim().parse().ok().filter(|v: &f32| v.is_finite())?;
+    // Clamped before the cast, so a huge number cannot wrap into the "Balanced's limit" value.
+    let n = v.round().clamp(0.0, 100_000.0) as usize;
+    let mut c = c;
+    match row {
+        0 => {
+            let typed = (n as i32).max(EFFICIENCY_CEILING_FLOOR_FPS as i32);
+            c.fps = custom_ceiling(typed, bench_fps).0.round() as i32;
+        }
+        1 => c.previews.0 = n,
+        2 => c.previews.1 = n,
+        3 => c.sharp.0 = n,
+        4 => c.sharp.1 = n,
+        5 => c.zoomed.0 = n,
+        6 => c.zoomed.1 = n,
+        7 => c.thumbs_mb = n as u32,
+        _ => return None,
+    }
+    Some(c.clamped())
+}
+
+/// The one line a change of Custom's numbers logs (always English, like every `mode:` line), with the
+/// speed as the card shows it.
+#[must_use]
+pub(crate) fn custom_log_line(c: CustomLimits, shown_fps: i32) -> String {
+    let speed = match c.fps {
+        CUSTOM_FPS_UNLIMITED => "unlimited".to_string(),
+        f if f < 0 => format!("Balanced's limit ({shown_fps} fps)"),
+        _ => format!("{shown_fps} fps"),
+    };
+    let keep = if c.bg_keep == 0 { "only the photos in use".to_string() } else { format!("{}% of the card", c.bg_keep) };
+    let release = if c.bg_release_s == 0 { "at once".to_string() } else { format!("over {} s", c.bg_release_s) };
+    let thumbs = match c.thumbs {
+        ThumbScope::WholeFolder => format!("whole folder up to {} MB", c.thumbs_mb),
+        other => other.log_name().to_string(),
+    };
+    format!(
+        "mode: Custom set — speed {speed}, previews {}+{}, sharp photos {}+{}, zoomed {}+{}, thumbnails {thumbs}, in the background keep {keep}, released {release}",
+        c.previews.0,
+        c.previews.1,
+        c.sharp.0,
+        c.sharp.1,
+        c.zoomed.0,
+        c.zoomed.1,
+    )
+}
+
+/// **CUSTOM'S SPEED LIMIT** (owner answer 2, 26 October). Unlimited has none. A typed limit is the
+/// user's number, never above what this machine has shown it can do — the benchmark's sustained rate
+/// at the preview tier the mode browses at, when one speaks for this folder, else the speed panel's
+/// 120 — and never below the 5 fps floor. Before the user picks one, Balanced's own limit.
+///
+/// FALSIFIER (L28): drop the benchmark term and the benchmarked row of
+/// `custom_maps_its_numbers_to_the_limits` reddens with a 90 fps limit on a machine whose best is 40.
+#[must_use]
+pub(crate) fn custom_ceiling(fps: i32, bench_fps: Option<f32>) -> (f32, LimitBound) {
+    match fps {
+        CUSTOM_FPS_UNLIMITED => (f32::INFINITY, LimitBound::ModeMax),
+        f if f < 0 => mode_ceiling(MODE_BALANCED, bench_fps),
+        f => {
+            let best = bench_fps.filter(|b| b.is_finite() && *b > 0.0).unwrap_or(CUSTOM_FPS_PANEL_MAX);
+            ((f as f32).min(best).max(EFFICIENCY_CEILING_FLOOR_FPS), LimitBound::ModeMax)
+        }
+    }
+}
+
+/// **CUSTOM'S SHARP WINDOW, FITTED TO WHAT THE BUDGET HOLDS** (round 2b). `frames` is how many
+/// full-resolution photos the byte budget holds at this folder's frame size. The window and the photo
+/// on screen take at most `frames − 1` of them (the want list's own slack, [`detail_wanted_cap`]),
+/// ahead first; a window that asks for photos ahead keeps at least one, as every mode's zoomed window
+/// does.
+///
+/// FALSIFIER (L28): return `want` unfitted and the small-card row of
+/// `custom_numbers_are_clamped_and_capacity_bound` reddens with 32 + 8 sharp photos asked of a budget
+/// that holds 6.
+#[inline]
+#[must_use]
+pub(crate) fn custom_detail_window(want: (usize, usize), frames: usize) -> (usize, usize) {
+    let room = frames.saturating_sub(2);
+    let ahead = want.0.min(room.max(want.0.min(1)));
+    (ahead, want.1.min(room.saturating_sub(ahead)))
+}
+
+/// …and how far from the photo on screen a sharp photo may be before the tier gives it up as "jumped
+/// away" (the detail worker before and after decoding, the HEIC lane's supersession watch, and the two
+/// upload checks): the wider side of the window. Custom may keep more behind than ahead, and a radius
+/// narrower than the window drops what the window asked for and asks for it again on every tick (round
+/// 2b review A1). In the other modes ahead is never below behind, so this is `ahead`, as before.
+#[inline]
+#[must_use]
+pub(crate) fn detail_jump_radius(ahead: usize, behind: usize) -> usize {
+    ahead.max(behind)
+}
+
+/// …and the full-resolution cache's count limit in Custom: the wider of its two windows and the photo
+/// on screen with one slack, never below the shipped [`crate::DETAIL_CACHE_MAX`]. Taken over BOTH
+/// windows so zooming in and out never tears down what the other one kept (E3's rule, as the other
+/// modes' `wide`-based limit keeps it).
+#[inline]
+#[must_use]
+pub(crate) fn custom_detail_cache_cap(limits: EfficiencyLimits, frames: usize) -> usize {
+    let (za, zb) = custom_detail_window(limits.detail_zoom_max, frames);
+    let (sa, sb) = custom_detail_window(limits.detail_keep, frames);
+    crate::DETAIL_CACHE_MAX.max(za + zb + 2).max(sa + sb + 2)
+}
 /// How much browsing the forward runway holds, in SECONDS. **Owner veto item.**
 pub(crate) const EFFICIENCY_AHEAD_SECONDS: f32 = 1.0;
 /// …and backward. Asymmetric for the reason [`COSTLY_PREFETCH_BEHIND`] is: browse runs forward, and a
@@ -19116,19 +19944,43 @@ pub(crate) fn efficiency_seed(
     })
 }
 
-/// **THE WHOLE OF THE POSTURE'S ADAPTIVE ARITHMETIC, IN ONE VALUE.** Derived once per tick beside
-/// [`efficiency_engaged`] and threaded to every consumer, so no two consumers can be looking at
-/// different numbers and nothing has to be recomposed at a surface.
+/// What set the browse ceiling, so every sentence about it can name the right cause (L30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LimitBound {
+    /// The mode's own limit (20/s Balanced, 12/s Power saver), or nothing at all in Performance.
+    ModeMax,
+    /// The mode's share of the benchmark's measured best (two-thirds, 40%).
+    Benchmark,
+    /// What this folder's decodes are keeping up with, measured live.
+    Measured,
+    /// The benchmark seed's implied latency, before anything in this folder was decoded.
+    Seed,
+    /// The dev lever's simulated latency.
+    Sim,
+    /// The 5 fps floor: the derivation asked for less.
+    Floor,
+}
+
+/// **THE WHOLE OF A MODE'S ARITHMETIC, IN ONE VALUE.** Derived once per tick from the mode in effect
+/// ([`mode_limits`]) and threaded to every consumer, so no two consumers can be looking at different
+/// numbers and nothing has to be recomposed at a surface. (The name is Efficiency mode's, whose
+/// limits these were; since round 2a every mode produces one.)
 ///
-/// `engaged` rides IN the struct — a deviation from §1A's five-field sketch, and a deliberate one:
-/// it is what lets `step_prefetch_fast`, the three browse-rate executors and the meter take ONE
-/// argument instead of a bool plus four numbers that a later edit could pair up wrongly (L26).
-/// `latency_ms` and `floored` ride for the same reason: every sentence the app says about this
-/// posture is derivable from this value alone (L30).
+/// `engaged` rides IN the struct: it is what lets `step_prefetch_fast`, the three browse-rate
+/// executors and the meter take ONE argument instead of a bool plus four numbers that a later edit
+/// could pair up wrongly (L26). Every sentence the app says about a mode is derivable from this value
+/// alone (L30).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct EfficiencyLimits {
-    /// The posture bit itself — [`efficiency_engaged`]'s answer for this tick.
+    /// The mode in effect.
+    pub(crate) mode: u8,
+    /// A mode limits work ahead: Balanced or Power saver. False in Performance, whose every term is
+    /// inert.
     pub(crate) engaged: bool,
+    /// Power saver's extra cuts (Efficiency mode's): Faster preview, paced speculative publishes, no
+    /// widened sharp window when settled, the stale-upgrade sweep held, the leaf in the title bar, and
+    /// the costly budget's pause while the on-screen photo's full-resolution decode is pending.
+    pub(crate) quiet: bool,
     /// Speculative fast decodes that may be in flight at once. Replaces the fixed
     /// [`costly_prefetch_cap`] while engaged.
     pub(crate) concurrency: usize,
@@ -19137,10 +19989,36 @@ pub(crate) struct EfficiencyLimits {
     pub(crate) ahead: usize,
     /// …and backward.
     pub(crate) behind: usize,
-    /// The browse-rate ceiling. Already `min`'d with the user's own setting and with
-    /// [`EFFICIENCY_SCRUB_FPS_MAX`], so it can only ever take rate away.
+    /// The previews the mode keeps ready, (lead, trail) in the browsing direction — see
+    /// [`mode_window`]. `usize::MAX` in Performance; Custom's own numbers in Custom.
+    pub(crate) keep: (usize, usize),
+    /// The browse-rate ceiling. Already `min`'d with the user's own setting and with the mode's
+    /// limit, so it can only ever take rate away.
     pub(crate) ceiling_fps: f32,
-    /// The latency the three numbers above were derived from, or `None` for the Default arm.
+    /// The mode's own limit before the live measurement: the speed panel greys the stops above it
+    /// and asks before using one. Infinite in Performance.
+    pub(crate) limit_fps: f32,
+    /// What set `ceiling_fps`.
+    pub(crate) bound: LimitBound,
+    /// The graphics memory the sharp photos kept ready may use while zoomed or settled; the
+    /// out-of-memory ladder's budget still applies (the smaller wins). `u64::MAX` in Performance and
+    /// Custom, whose counts are the user's and are fitted to the ladder's budget alone.
+    pub(crate) detail_bytes_max: u64,
+    /// The zoomed sharp window's (ahead, behind) ceiling. `usize::MAX` except in Power saver (3 + 1)
+    /// and Custom (its own numbers, [`custom_detail_window`]).
+    pub(crate) detail_zoom_max: (usize, usize),
+    /// Round 2b: the sharp photos kept ready when not zoomed in, (ahead, behind) — the shipped 3 + 1
+    /// in every mode but Custom, whose own numbers they are.
+    pub(crate) detail_keep: (usize, usize),
+    /// Round 2b: which thumbnails are prepared — the whole folder in Performance and Balanced,
+    /// visible and nearby in Power saver, Custom's choice in Custom.
+    pub(crate) thumbs: ThumbScope,
+    /// …and the most the thumbnail cache keeps, in thumbnails, the ones nearest what is on screen
+    /// kept: [`crate::THUMB_CACHE_MAX`] (400) unless the whole folder is prepared — then about 500 MB
+    /// ([`WHOLE_FOLDER_THUMBS`]) in Balanced, Custom's own cap in Custom, and the hidden 2 GB
+    /// ([`WHOLE_FOLDER_THUMBS_MAX`]) in Performance.
+    pub(crate) thumbs_max: usize,
+    /// The latency the numbers above were derived from, or `None` before any measurement.
     pub(crate) latency_ms: Option<f32>,
     /// Where that latency came from.
     pub(crate) source: LimitSource,
@@ -19149,69 +20027,160 @@ pub(crate) struct EfficiencyLimits {
 }
 
 impl EfficiencyLimits {
-    /// The RELEASED posture, and every term is inert BY CONSTRUCTION rather than by a caller
-    /// remembering to check `engaged`: an infinite ceiling `min()`s to nothing and the two window
-    /// terms are `usize::MAX`, which is what [`costly_prefetch_window`]'s own `.min(full)` idiom
-    /// treats as "nothing narrowed". This is the value every pre-v0.8.196 code path must see.
+    /// PERFORMANCE, and every term is inert BY CONSTRUCTION rather than by a caller remembering to
+    /// check `engaged`: an infinite ceiling `min()`s to nothing and the window terms are `usize::MAX`,
+    /// which is what [`costly_prefetch_window`]'s own `.min(full)` idiom treats as "nothing narrowed".
+    /// This is the value every pre-v0.8.196 code path must see.
     pub(crate) const RELEASED: Self = Self {
+        mode: MODE_PERFORMANCE,
         engaged: false,
+        quiet: false,
         concurrency: usize::MAX,
         ahead: usize::MAX,
         behind: usize::MAX,
+        keep: (usize::MAX, usize::MAX),
         ceiling_fps: f32::INFINITY,
+        limit_fps: f32::INFINITY,
+        bound: LimitBound::ModeMax,
+        detail_bytes_max: u64::MAX,
+        detail_zoom_max: (usize::MAX, usize::MAX),
+        detail_keep: (crate::DETAIL_AHEAD, crate::DETAIL_BEHIND),
+        thumbs: ThumbScope::WholeFolder,
+        // The whole folder within the hidden 2 GB (owner, 27 October), not unbounded.
+        thumbs_max: WHOLE_FOLDER_THUMBS_MAX,
         latency_ms: None,
         source: LimitSource::Default,
         floored: false,
     };
 
-    /// A hand-built ENGAGED posture at a named ceiling, for rig rows that drive one arm at a time.
-    /// Production never builds one of these — it goes through [`efficiency_limits`] — so this is
-    /// `#[cfg(test)]` and cannot become a second source of truth. The three window numbers are
-    /// v0.8.195's fixed ones, so a row that only cares about the ceiling reads exactly as it did.
+    /// A hand-built Power saver at a named ceiling, for rig rows that drive one arm at a time.
+    /// Production never builds one of these — it goes through [`mode_limits`] — so this is
+    /// `#[cfg(test)]` and cannot become a second source of truth. The runway numbers are v0.8.195's
+    /// fixed ones, so a row that only cares about the ceiling reads exactly as it did.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn test_ceiling(ceiling_fps: f32) -> Self {
         Self {
+            mode: MODE_POWER_SAVER,
             engaged: true,
+            quiet: true,
             concurrency: 4,
             ahead: COSTLY_PREFETCH_AHEAD,
             behind: COSTLY_PREFETCH_BEHIND,
+            keep: POWER_SAVER_KEEP,
             ceiling_fps,
-            // v0.8.196 fix tail: a hand-built ceiling is a MEASURED one — the reason clause is per
-            // source now, and `Default` would make every row read as "run a benchmark".
+            limit_fps: ceiling_fps,
+            // A hand-built ceiling is a MEASURED one, so the sentences take their measured arm.
+            bound: LimitBound::Measured,
+            detail_bytes_max: POWER_SAVER_DETAIL_BYTES_MAX,
+            detail_zoom_max: POWER_SAVER_DETAIL_ZOOM_MAX,
+            detail_keep: (crate::DETAIL_AHEAD, crate::DETAIL_BEHIND),
+            thumbs: ThumbScope::Nearby,
+            thumbs_max: crate::THUMB_CACHE_MAX,
             latency_ms: Some(100.0),
             source: LimitSource::Live,
             floored: false,
         }
     }
+
+    /// The fast cache's count limit in this mode: the kept window, the current photo, and a little
+    /// room for the photos that are never evicted (both Compare halves, the hovered Review tile, the
+    /// awaited frame). `None` in Performance, which keeps today's limits.
+    #[must_use]
+    pub(crate) fn keep_count(&self) -> Option<usize> {
+        self.engaged.then(|| self.keep.0.saturating_add(self.keep.1).saturating_add(1 + 4))
+    }
+
+    /// The settled fill — sharp photos widened to the zoomed window after a pause, unzoomed — runs in
+    /// Performance and Balanced. Power saver withholds it, and in Custom the "Sharp photos kept ready"
+    /// numbers are already the most it prepares (round 2b).
+    #[must_use]
+    pub(crate) fn settled_fill(&self) -> bool {
+        !self.quiet && self.mode != MODE_CUSTOM
+    }
 }
 
-/// §A — **THE DERIVATION.** Pure over six live inputs, no state, no latch, evaluated once per tick.
-/// See the banner above this block for the mechanism and for the one recorded deviation (`N_max`).
+/// The benchmark's measured best for a mode's limit: the browse-sustained rate at the preview tier
+/// the mode browses at, from a result that may speak for this folder. `None` without one.
+#[inline]
+#[must_use]
+pub(crate) fn mode_bench_fps(governs: bool, bench_sub_fps: i32, bench_super_fps: i32, tier_super: bool) -> Option<f32> {
+    let fps = if tier_super { bench_super_fps } else { bench_sub_fps };
+    (governs && fps > 0).then_some(fps as f32)
+}
+
+/// **A MODE'S OWN LIMIT**, before anything this folder measures: its number (20/s Balanced, 12/s
+/// Power saver), never above its share of the benchmark's best (two-thirds, 40%), and never below the
+/// 5 fps floor. Performance has none.
+///
+/// FALSIFIER (L28): drop the share term and the benchmarked rows of `each_mode_maps_to_its_limits`
+/// redden — Balanced would ignore the two-thirds cap and Power saver the 40% one.
+#[must_use]
+pub(crate) fn mode_ceiling(mode: u8, bench_fps: Option<f32>) -> (f32, LimitBound) {
+    let (max, share) = match mode {
+        MODE_BALANCED => (BALANCED_FPS_MAX, BALANCED_BENCH_SHARE),
+        MODE_POWER_SAVER => (POWER_SAVER_FPS_MAX, POWER_SAVER_BENCH_SHARE),
+        _ => return (f32::INFINITY, LimitBound::ModeMax),
+    };
+    match bench_fps.filter(|b| b.is_finite() && *b > 0.0) {
+        Some(b) if b * share < max => ((b * share).max(EFFICIENCY_CEILING_FLOOR_FPS), LimitBound::Benchmark),
+        _ => (max, LimitBound::ModeMax),
+    }
+}
+
+/// §A — **THE DERIVATION, PER MODE.** Pure over eight live inputs, no state, no latch, evaluated
+/// once per tick. Performance returns [`EfficiencyLimits::RELEASED`]. Balanced, Power saver and
+/// (round 2b) Custom share Efficiency mode's arithmetic with their own numbers:
+///
+/// | | Balanced | Power saver | Custom |
+/// | --- | --- | --- | --- |
+/// | limit | 20/s, ≤ ⅔ of the benchmark | 12/s, ≤ 40% of the benchmark | Unlimited, or typed ([`custom_ceiling`]) |
+/// | decodes at once (`N_max`) | all workers but the displayed slot | half of them | as Balanced |
+/// | decode reach | 2 s ahead, 0.5 s behind, within the kept window | 1 s, 0.25 s; at most 12 + 4 | as Balanced; Unlimited: the kept window |
+/// | kept window | 2 s / 0.5 s at its limit, at least 24 + 6 | 24 + 6 | its previews ahead / behind |
+/// | sharp photos | 3 + 1; zoomed about 2 GB | 3 + 1; zoomed about 1 GB, 3 + 1 | its numbers, fitted to the budget |
+/// | thumbnails | whole folder, about 500 MB | visible and nearby | its choice |
+///
+/// `custom` is read only in Custom (the Settings card's numbers, [`CustomLimits`]). Custom's
+/// Unlimited is Performance's rule for speed — no limit from the mode and no live measurement
+/// lowering it — inside Custom's own windows.
 ///
 /// PRECEDENCE, and it is the whole of §B's honesty rule: the SIM lever (a dev lever is visible where
-/// it acts) > the live median > the benchmark seed > the conservative default. **A seed can never
-/// out-rank live data** — L31, and the reason is stated on [`efficiency_seed`].
+/// it acts) > the live median > the benchmark seed > nothing. **A seed can never out-rank live data,
+/// and never raise a ceiling** (L31): with no measurement at all the ceiling is the mode's limit, and
+/// every derived ceiling is `min`'d with it.
 ///
 /// FALSIFIER (L28): let the seed arm run when `median_fast_ms` is `Some` and the precedence row of
 /// `the_benchmark_seed_never_out_ranks_a_live_median` reddens; drop the `user_fps` term from the
-/// ceiling `min` and the user-below-the-ceiling row of
-/// `the_efficiency_ceiling_never_lets_the_clock_outrun_production` reddens (a 5 fps setting would be
-/// SPED UP by a posture whose job is to slow things down); drop the `.max(FLOOR)` and the floor row
-/// reddens with a 2 fps browse.
+/// ceiling `min` and `a_mode_limit_only_takes_speed_away` reddens; drop the `.min(limit)` and
+/// `a_seed_never_raises_a_mode_ceiling` reddens; drop the `.max(FLOOR)` and the floor row reddens.
 #[must_use]
-pub(crate) fn efficiency_limits(
-    engaged: bool,
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mode_limits(
+    mode: u8,
+    custom: CustomLimits,
     median_fast_ms: Option<f32>,
     workers: usize,
     user_fps: f32,
     seed: Option<EfficiencySeed>,
     sim_latency_ms: Option<f32>,
+    bench_fps: Option<f32>,
 ) -> EfficiencyLimits {
-    if !engaged {
-        return EfficiencyLimits::RELEASED;
-    }
-    let n_max = efficiency_worker_share(workers);
+    let quiet = match mode {
+        MODE_BALANCED | MODE_CUSTOM => false,
+        MODE_POWER_SAVER => true,
+        _ => return EfficiencyLimits::RELEASED,
+    };
+    let custom = (mode == MODE_CUSTOM).then(|| custom.clamped());
+    let (limit, limit_bound) = match custom {
+        Some(c) => custom_ceiling(c.fps, bench_fps),
+        None => mode_ceiling(mode, bench_fps),
+    };
+    let n_max = if quiet {
+        efficiency_worker_share(workers)
+    } else {
+        workers.saturating_sub(1).max(EFFICIENCY_CONCURRENCY_MIN)
+    };
     let user = user_fps.max(1.0);
     let usable = |v: f32| v.is_finite() && v > 0.0;
     let (latency_ms, source) = match (
@@ -19224,52 +20193,122 @@ pub(crate) fn efficiency_limits(
         (None, None, Some(s)) => (Some(s.latency_ms), LimitSource::Seed),
         (None, None, None) => (None, LimitSource::Default),
     };
-    let (ceiling, concurrency, floored) = match latency_ms {
+    let (ceiling, concurrency, floored, bound) = match latency_ms {
+        // Custom's Unlimited: no ceiling and all its workers (every one but the displayed photo's
+        // slot, Balanced's count), whatever the folder measures.
+        _ if !limit.is_finite() => (f32::INFINITY, n_max, false, limit_bound),
         Some(ms) => {
             let l = (ms / 1000.0).max(0.001);
             let sustainable = EFFICIENCY_SAFETY * n_max as f32 / l;
-            // v0.8.196 fix tail (skeptic A, O6 — RULED): **A SEED MAY LOWER THE CEILING AND MAY NEVER
-            // RAISE IT ABOVE `Default`.** The round honoured live > seed > default as a PRECEDENCE and
-            // missed the MAGNITUDE half: `1000·workers/S` on a bench of `S > 33.8 fps` (an 18-worker
-            // box on MAINS — any modern laptop) implies `L < 533 ms`, which puts `sustainable` over 12
-            // and the ceiling at the full 20 — so the first second on battery would promise 20 fps on
-            // a box that may be paying 800 ms a frame, where the un-benched `Default` would honestly
-            // have promised 12. That is L31 exactly, quoted on `efficiency_seed` itself. Live data
-            // still may raise the ceiling to 20: it was measured on the power source in force.
-            let seed_capped = if matches!(source, LimitSource::Seed) {
-                sustainable.min(EFFICIENCY_DEFAULT_CEILING_FPS)
-            } else {
-                sustainable
-            };
-            let ceiling = user
-                .min(EFFICIENCY_SCRUB_FPS_MAX)
-                .min(seed_capped.max(EFFICIENCY_CEILING_FLOOR_FPS));
+            let lifted = sustainable.max(EFFICIENCY_CEILING_FLOOR_FPS);
+            let ceiling = user.min(limit).min(lifted);
             // Little's law, and the ONLY place a concurrency number is produced while engaged.
             let n = (ceiling * l).ceil().max(1.0) as usize;
             // The floor is only what BOUND if it survived the outer `min` — a user on a 3 fps stop is
             // held by his own setting, not by the floor, and the log must not say otherwise (Y1).
-            let floored = seed_capped < EFFICIENCY_CEILING_FLOOR_FPS
+            let floored = sustainable < EFFICIENCY_CEILING_FLOOR_FPS
                 && (ceiling - EFFICIENCY_CEILING_FLOOR_FPS).abs() < 1e-4;
-            (ceiling, n.clamp(EFFICIENCY_CONCURRENCY_MIN, n_max), floored)
+            let bound = if lifted >= limit {
+                limit_bound
+            } else if floored {
+                LimitBound::Floor
+            } else {
+                match source {
+                    LimitSource::Sim => LimitBound::Sim,
+                    LimitSource::Seed => LimitBound::Seed,
+                    _ => LimitBound::Measured,
+                }
+            };
+            (ceiling, n.clamp(EFFICIENCY_CONCURRENCY_MIN, n_max), floored, bound)
         }
+        None => (user.min(limit), n_max, false, limit_bound),
+    };
+    let keep = match custom {
+        Some(c) => c.previews,
+        None if quiet => POWER_SAVER_KEEP,
         None => (
-            user.min(EFFICIENCY_SCRUB_FPS_MAX).min(EFFICIENCY_DEFAULT_CEILING_FPS),
-            n_max,
-            false,
+            ((limit * BALANCED_KEEP_SECONDS.0).ceil() as usize).max(POWER_SAVER_KEEP.0),
+            ((limit * BALANCED_KEEP_SECONDS.1).ceil() as usize).max(POWER_SAVER_KEEP.1),
         ),
     };
+    // Round 2b: the thumbnails each mode prepares (owner answer 5): the whole folder within about
+    // 500 MB in Balanced, Custom's choice within its own cap in Custom, visible and nearby in Power
+    // saver.
+    let thumbs = match custom {
+        Some(c) => c.thumbs,
+        None if quiet => ThumbScope::Nearby,
+        None => ThumbScope::WholeFolder,
+    };
+    let (reach, reach_max) = if quiet {
+        ((EFFICIENCY_AHEAD_SECONDS, EFFICIENCY_BEHIND_SECONDS), (EFFICIENCY_AHEAD_MAX, EFFICIENCY_BEHIND_MAX))
+    } else {
+        (BALANCED_KEEP_SECONDS, keep)
+    };
     EfficiencyLimits {
+        mode,
         engaged: true,
+        quiet,
         concurrency,
-        ahead: ((ceiling * EFFICIENCY_AHEAD_SECONDS).ceil() as usize)
-            .clamp(EFFICIENCY_AHEAD_MIN, EFFICIENCY_AHEAD_MAX),
-        behind: ((ceiling * EFFICIENCY_BEHIND_SECONDS).ceil() as usize)
-            .clamp(EFFICIENCY_BEHIND_MIN, EFFICIENCY_BEHIND_MAX),
+        // Custom's Unlimited ceiling is infinite, so its reach saturates to the kept window.
+        ahead: ((ceiling * reach.0).ceil() as usize).clamp(EFFICIENCY_AHEAD_MIN, reach_max.0),
+        behind: ((ceiling * reach.1).ceil() as usize).clamp(EFFICIENCY_BEHIND_MIN, reach_max.1),
+        keep,
         ceiling_fps: ceiling,
+        limit_fps: limit,
+        bound,
+        // Custom's counts are fitted to the ladder's budget alone ([`custom_detail_window`]).
+        detail_bytes_max: match custom {
+            Some(_) => u64::MAX,
+            None if quiet => POWER_SAVER_DETAIL_BYTES_MAX,
+            None => BALANCED_DETAIL_BYTES_MAX,
+        },
+        detail_zoom_max: match custom {
+            Some(c) => c.zoomed,
+            None if quiet => POWER_SAVER_DETAIL_ZOOM_MAX,
+            None => (usize::MAX, usize::MAX),
+        },
+        detail_keep: custom.map_or((crate::DETAIL_AHEAD, crate::DETAIL_BEHIND), |c| c.sharp),
+        thumbs,
+        thumbs_max: match (thumbs, custom) {
+            (ThumbScope::WholeFolder, Some(c)) => whole_folder_thumbs_in(c.thumbs_mb),
+            (ThumbScope::WholeFolder, None) => WHOLE_FOLDER_THUMBS,
+            _ => crate::THUMB_CACHE_MAX,
+        },
         latency_ms,
         source,
         floored,
     }
+}
+
+/// **THE KEPT WINDOW A MODE ALLOWS.** `fast_window_split` sizes the preview window from the graphics
+/// memory budget and splits it by browsing direction; a limited mode then bounds the side the browse
+/// is heading toward by `keep.0` and the other side by `keep.1`. At rest the split leans forward, so
+/// forward is the lead. Performance passes through untouched, and a mode never widens a side (the
+/// `min`), so a small card's window stays its own.
+///
+/// FALSIFIER (L28): bound `pa` by `keep.0` regardless of direction and the backward row of
+/// `power_saver_keeps_24_ahead_6_behind_and_the_scheduler_runs_there` reddens.
+#[inline]
+#[must_use]
+pub(crate) fn mode_window(win: (usize, usize), split_ahead: f32, limits: EfficiencyLimits) -> (usize, usize) {
+    if !limits.engaged {
+        return win;
+    }
+    let (lead, trail) = limits.keep;
+    if split_ahead >= 0.5 {
+        (win.0.min(lead), win.1.min(trail))
+    } else {
+        (win.0.min(trail), win.1.min(lead))
+    }
+}
+
+/// The sharp photos kept ready while zoomed or settled, after the mode's caps: the window sized from
+/// the smaller of the ladder's budget and the mode's bytes (`capacity`, computed by the caller), and
+/// Power saver's 3 + 1 ceiling.
+#[inline]
+#[must_use]
+pub(crate) fn mode_detail_window(capacity: usize, behind: usize, limits: EfficiencyLimits) -> (usize, usize) {
+    (capacity.min(limits.detail_zoom_max.0), behind.min(limits.detail_zoom_max.1))
 }
 
 /// **THE DECODE RUNWAY IN FORCE THIS TICK**, and the one place the posture's depth and genuine
@@ -19283,20 +20322,29 @@ pub(crate) fn efficiency_limits(
 /// finding stands untouched — and on a cheap folder it is never wider than the live capacity clamp
 /// either (`.min(full)`, the same one-way rule `costly_prefetch_window` documents).
 ///
+/// Round 2b review R2 (Codex): `limits.ahead` / `limits.behind` are the browse's lead and trail, and
+/// `full` is in index sides (up, down), so the lead goes where [`mode_window`] puts it: up while the
+/// split leans forward, down while it leans back. Before, a backward browse kept its lead's window
+/// (Custom Unlimited: 40 down) but decoded only the trail's reach there (10).
+///
 /// FALSIFIER (L28): drop the `any_genuinely_costly` arm and the HEIC row of
 /// `the_efficiency_runway_follows_the_rate_but_never_widens_a_costly_folder` reddens with a 20-frame
-/// runway of 48 MP HEVC decodes.
+/// runway of 48 MP HEVC decodes; drop the direction and its backward row reddens, and so does
+/// `custom_unlimited_prepares_its_kept_window_in_either_direction` (60–89 never asked for).
 #[inline]
 #[must_use]
 pub(crate) fn efficiency_runway_window(
     limits: EfficiencyLimits,
     full: (usize, usize),
+    split_ahead: f32,
     any_genuinely_costly: bool,
 ) -> (usize, usize) {
     if !limits.engaged || any_genuinely_costly {
         return costly_prefetch_window(full);
     }
-    (limits.ahead.min(full.0), limits.behind.min(full.1))
+    let (up, down) =
+        if split_ahead >= 0.5 { (limits.ahead, limits.behind) } else { (limits.behind, limits.ahead) };
+    (up.min(full.0), down.min(full.1))
 }
 
 /// §A + v0.8.196 fix tail (skeptic A, R1 — CONFIRMED, the headline) — **THE SPECULATIVE
@@ -19437,15 +20485,12 @@ pub(crate) fn efficiency_binding(limits: EfficiencyLimits, user_fps: f32) -> boo
     limits.engaged && user_fps > limits.ceiling_fps
 }
 
-/// WHY the ceiling is what it is, in one sentence a photographer can act on. Derived from the
-/// provenance of THE NUMBER, not of the latency — which is what R5 caught the round doing.
+/// WHY the ceiling is what it is, in one sentence a photographer can act on. Derived from what SET
+/// THE NUMBER ([`LimitBound`]), not from where the latency came from — which is what R5 caught the
+/// Efficiency round doing. Only the measured arms need one: the mode's own limit and its benchmark
+/// share are named by the rate sentence itself.
 #[must_use]
-fn efficiency_reason_sentence(
-    limits: EfficiencyLimits,
-    mode: u8,
-    snap: PowerSnapshot,
-    sim: Option<PowerSim>,
-) -> String {
+fn efficiency_reason_sentence(limits: EfficiencyLimits) -> String {
     // R3: at the floor the number is not a measurement of anything the machine can do.
     if limits.floored {
         return tr_format!(
@@ -19453,88 +20498,66 @@ fn efficiency_reason_sentence(
             fps = fps_text(EFFICIENCY_CEILING_FLOOR_FPS)
         );
     }
-    if sim.is_some() || limits.source == LimitSource::Sim {
-        return i18n::tr("The rate comes from a SIMULATED latency (a dev lever), not from this machine.")
-            .to_string();
-    }
-    match limits.source {
-        // Y3: the Default arm is the one state that can be improved by an action, and the sibling
-        // note in this very popup already points at it.
-        LimitSource::Default => i18n::tr(
-            "That is the default until this machine has been measured — run a benchmark (Settings → Fast View) for a rate fitted to it.",
-        )
-        .to_string(),
-        LimitSource::Seed => {
+    match limits.bound {
+        LimitBound::Sim => {
+            i18n::tr("The rate comes from a SIMULATED latency (a dev lever), not from this machine.").to_string()
+        }
+        LimitBound::Seed => {
             i18n::tr("That comes from this machine's benchmark, and follows the live rate as you browse.")
                 .to_string()
         }
-        // R2: a live measurement is the only arm entitled to say what the machine is doing, and WHY
-        // the posture is on is the mode's own question, never the ceiling's. One whole sentence per
-        // reason.
-        _ => match mode {
-            EFFICIENCY_ON => i18n::tr("That is the rate this machine is keeping up with."),
-            _ => match (snap.source, snap.saver) {
-                (PowerSource::Dc, _) => i18n::tr("That is the rate this machine is keeping up with on battery."),
-                (_, true) => i18n::tr("That is the rate this machine is keeping up with while Battery saver is on."),
-                _ => i18n::tr("That is the rate this machine is keeping up with."),
-            },
-        }
-        .to_string(),
+        _ => i18n::tr("That is the rate this machine is keeping up with in this folder.").to_string(),
     }
 }
 
-/// **THE ONE RATE SENTENCE.** Empty unless the posture is actually taking rate away — which is what
+/// **THE ONE RATE SENTENCE.** Empty unless the mode is actually taking rate away — which is what
 /// makes every surface's silence a fact rather than an omission.
+///
+/// FALSIFIER (L28): print the measured sentence for a `Benchmark` bound and the benchmark rows of
+/// `every_efficiency_sentence_asks_the_binding_question_once` redden with a machine "keeping up with"
+/// a number that came from its benchmark.
 #[must_use]
-pub(crate) fn efficiency_rate_sentence(
-    limits: EfficiencyLimits,
-    user_fps: f32,
-    mode: u8,
-    snap: PowerSnapshot,
-    sim: Option<PowerSim>,
-) -> String {
-    match efficiency_rate_parts(limits, user_fps, mode, snap, sim) {
-        Some((fps, reason)) => tr_format!(
-            "Efficiency mode is limiting browsing to {fps} fps right now. {reason}",
-            fps = fps,
-            reason = reason
-        ),
-        None => String::new(),
-    }
-}
-
-/// The rate sentence's two values — the ceiling as printed and its reason sentence — or `None`
-/// while the posture is not taking rate away. The leaf's tip builds its own sentence from these
-/// rather than trimming the rate sentence, which a language pack translates.
-fn efficiency_rate_parts(
-    limits: EfficiencyLimits,
-    user_fps: f32,
-    mode: u8,
-    snap: PowerSnapshot,
-    sim: Option<PowerSim>,
-) -> Option<(String, String)> {
+pub(crate) fn efficiency_rate_sentence(limits: EfficiencyLimits, user_fps: f32) -> String {
     if !efficiency_binding(limits, user_fps) {
-        return None;
-    }
-    Some((fps_text(limits.ceiling_fps), efficiency_reason_sentence(limits, mode, snap, sim)))
-}
-
-/// The sampling half, in the FAST VIEW CARD'S OWN WORDS (skeptic B, R4 — CONFIRMED). The round said
-/// "a lighter sampling" on one card while the Seg forty lines below sat on **Supersample** with the
-/// app decoding **Subsample** and nothing anywhere connecting the two. Three vocabularies for one
-/// thing (L11/L20) when the app already prints the word on a control the user has touched.
-#[must_use]
-pub(crate) fn efficiency_sampling_sentence(limits: EfficiencyLimits, user_super: bool) -> String {
-    if !limits.engaged || !user_super {
-        // A user already on Subsample sees no change, so there is nothing to say to him.
         return String::new();
     }
-    i18n::tr("Efficiency mode is using Faster preview right now — your setting is kept.").to_string()
+    let fps = fps_text(limits.ceiling_fps);
+    let mode = mode_name(limits.mode);
+    match (limits.bound, limits.mode) {
+        (LimitBound::ModeMax, _) => tr_format!("{mode} limits browsing to {fps} fps.", mode = mode, fps = fps),
+        (LimitBound::Benchmark, MODE_POWER_SAVER) => tr_format!(
+            "{mode} limits browsing to {fps} fps, 40% of this machine's benchmark speed.",
+            mode = mode,
+            fps = fps
+        ),
+        (LimitBound::Benchmark, _) => tr_format!(
+            "{mode} limits browsing to {fps} fps, two-thirds of this machine's benchmark speed.",
+            mode = mode,
+            fps = fps
+        ),
+        _ => tr_format!(
+            "{mode} is limiting browsing to {fps} fps right now. {reason}",
+            mode = mode,
+            fps = fps,
+            reason = efficiency_reason_sentence(limits)
+        ),
+    }
 }
 
-/// §E — **THE CLAUSE EVERY `efficiency:` LOG LINE GROWS WHILE ENGAGED.** It states the three derived
+/// The sampling half, in the FAST VIEW CARD'S OWN WORDS (skeptic B, R4 — CONFIRMED): while Power
+/// saver holds Faster preview, the Seg below sits on the user's own choice, and this connects the two.
+#[must_use]
+pub(crate) fn efficiency_sampling_sentence(limits: EfficiencyLimits, user_super: bool) -> String {
+    if !limits.quiet || !user_super {
+        // A user already on Faster preview sees no change, so there is nothing to say to him.
+        return String::new();
+    }
+    i18n::tr("Eco is using Faster preview right now — your setting is kept.").to_string()
+}
+
+/// §E — **THE CLAUSE EVERY `mode:` LOG LINE GROWS WHILE A MODE LIMITS WORK.** It states the derived
 /// numbers AND what they were derived from, so a field log can be re-derived by hand rather than
-/// believed (L30). Empty while released: there are no limits to state.
+/// believed (L30). Empty in Performance: there are no limits to state.
 ///
 /// FALSIFIER (L28): drop the source parenthetical and the four provenance rows of
 /// `the_limits_clause_states_the_numbers_and_where_they_came_from` redden — the shipped and the
@@ -19550,42 +20573,60 @@ pub(crate) fn efficiency_limits_clause(limits: EfficiencyLimits) -> String {
         (LimitSource::Sim, Some(ms)) => format!("SIMULATED {} ms", ms.round() as i64),
         _ => "no measurement yet".to_string(),
     };
+    let bound = match limits.bound {
+        LimitBound::ModeMax => "the mode's limit",
+        LimitBound::Benchmark => "the benchmark share",
+        LimitBound::Measured => "measured",
+        LimitBound::Seed => "seeded",
+        LimitBound::Sim => "simulated",
+        LimitBound::Floor => "held at the 5 fps floor",
+    };
+    // Round 2b: Custom also states its sharp-photo numbers; every mode states its thumbnails; and
+    // Custom's Unlimited has no ceiling to print.
+    let custom = if limits.mode == MODE_CUSTOM {
+        format!(
+            " sharp={}+{} zoomed={}+{}",
+            limits.detail_keep.0, limits.detail_keep.1, limits.detail_zoom_max.0, limits.detail_zoom_max.1
+        )
+    } else {
+        String::new()
+    };
+    let ceiling = if limits.limit_fps.is_finite() {
+        format!("{} fps of {}", fps_text(limits.ceiling_fps), fps_text(limits.limit_fps))
+    } else {
+        "none".to_string()
+    };
     format!(
-        " · limits: N={} ahead={} behind={} ceiling={} fps ({src}{}) [{}]",
+        " · limits: {} N={} ahead={} behind={} keep={}+{}{custom} thumbs={} ceiling={ceiling} ({src}; {bound}) [{}]",
+        mode_log_name(limits.mode),
         limits.concurrency,
         limits.ahead,
         limits.behind,
-        fps_text(limits.ceiling_fps),
-        if limits.floored { ", held at the 5 fps floor" } else { "" },
+        limits.keep.0,
+        limits.keep.1,
+        limits.thumbs.log_name(),
         // v0.8.196 fix tail (skeptic B, Y6): DERIVED from the fn that decides it, not a literal that
-        // is true only until someone changes the bias. `true` is a Supersample install, i.e. the one
-        // whose tier the posture actually moves.
-        if efficiency_quality_super(true, limits.engaged) { "Supersample" } else { "Subsample" },
+        // is true only until someone changes the bias. `true` is a Sharper-preview install, i.e. the
+        // one whose tier the mode actually moves.
+        if efficiency_quality_super(true, limits.quiet) { "Supersample" } else { "Subsample" },
     )
 }
 
-/// §C — **THE LEAF'S OWN SENTENCE.** State-derived, quoting the LIVE ceiling and its provenance.
-/// Empty while released, which is also what unmounts the glyph.
+/// §C — **THE LEAF'S OWN SENTENCE.** The leaf shows while Power saver is in effect, whatever the
+/// reason; empty otherwise, which is also what unmounts the glyph.
 #[must_use]
-pub(crate) fn efficiency_leaf_tip(
-    limits: EfficiencyLimits,
-    user_fps: f32,
-    mode: u8,
-    snap: PowerSnapshot,
-    sim: Option<PowerSim>,
-) -> String {
-    if !limits.engaged {
+pub(crate) fn efficiency_leaf_tip(limits: EfficiencyLimits, user_fps: f32) -> String {
+    if !limits.quiet {
         return String::new();
     }
-    let Some((fps, reason)) = efficiency_rate_parts(limits, user_fps, mode, snap, sim) else {
-        // ENGAGED BUT NOT BINDING (skeptic B, R5): the badge still has to explain itself, and what
-        // it must NOT do is claim a throttle the user's own setting is already below. The posture is
-        // doing its other four cuts; the browse rate is his.
-        return i18n::tr("Efficiency mode — background loading is reduced; your browsing speed is unchanged.")
+    let rate = efficiency_rate_sentence(limits, user_fps);
+    if rate.is_empty() {
+        // IN EFFECT BUT NOT BINDING (skeptic B, R5): the badge still has to explain itself, and what
+        // it must NOT do is claim a throttle the user's own setting is already below.
+        return i18n::tr("Eco — background loading is reduced; your browsing speed is unchanged.")
             .to_string();
-    };
-    // Built from the rate's parts, never by trimming the rate sentence's (translated) words.
-    tr_format!("Efficiency mode — limiting browsing to {fps} fps right now. {reason}", fps = fps, reason = reason)
+    }
+    rate
 }
 
 /// §D — **WHAT THE TICK DOES ABOUT A PUBLISH-GATE EDGE**, after the field log showed the honest
@@ -19708,8 +20749,15 @@ mod efficiency_wave2_tests {
         LATENCY_ROWS.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Round 2a: these rows were Efficiency mode's and are Power saver's now, which keeps all of
+    /// Efficiency's arithmetic with a 12/s limit in place of its 20.
     fn lim(median_ms: Option<f32>, user_fps: f32) -> EfficiencyLimits {
-        efficiency_limits(true, median_ms, W, user_fps, None, None)
+        mode_limits(MODE_POWER_SAVER, CustomLimits::BALANCED_COPY, median_ms, W, user_fps, None, None, None)
+    }
+
+    /// Power saver with every other input spelled out (the seed, the dev lever).
+    fn ps(median_ms: Option<f32>, seed: Option<EfficiencySeed>, sim: Option<f32>) -> EfficiencyLimits {
+        mode_limits(MODE_POWER_SAVER, CustomLimits::BALANCED_COPY, median_ms, W, 30.0, seed, sim, None)
     }
 
     /// §A — **LITTLE'S LAW, AND THE FIXED 4 IS GONE IN BOTH DIRECTIONS.**
@@ -19733,10 +20781,11 @@ mod efficiency_wave2_tests {
         assert_eq!(efficiency_worker_share(1), 2, "…and cannot underflow");
         assert_eq!(efficiency_worker_share(64), 31, "a huge box scales");
 
-        // THE OWNER'S LAPTOP: ~500 ms a frame, the browse setting at 30.
+        // THE OWNER'S LAPTOP: ~500 ms a frame, the browse setting at 30 (Power saver's 12/s limit
+        // binds: N = ceil(12 × 0.5)).
         let slow = lim(Some(500.0), 30.0);
         assert_eq!(
-            slow.concurrency, 7,
+            slow.concurrency, 6,
             "the laptop's own latency must lift the cap off its fixed 4: {slow:?}"
         );
         assert!(
@@ -19758,8 +20807,8 @@ mod efficiency_wave2_tests {
                 "{ms} ms → {l:?}"
             );
         }
-        // RELEASED is inert by construction — not "engaged with big numbers".
-        let off = efficiency_limits(false, Some(500.0), W, 30.0, None, None);
+        // PERFORMANCE is inert by construction — not "engaged with big numbers".
+        let off = mode_limits(MODE_PERFORMANCE, CustomLimits::BALANCED_COPY, Some(500.0), W, 30.0, None, None, None);
         assert!(!off.engaged);
         assert_eq!(off, EfficiencyLimits::RELEASED);
     }
@@ -19771,16 +20820,19 @@ mod efficiency_wave2_tests {
     /// `user_fps` term deleted from the `min` the slow-user row reads `left: 12.8 / right: 5.0`.
     #[test]
     fn the_efficiency_ceiling_never_lets_the_clock_outrun_production() {
-        // The field case: 500 ms a frame over 8 slots at 0.8 headroom = 12.8 fps, not 20.
-        let slow = lim(Some(500.0), 30.0);
-        assert!((slow.ceiling_fps - 12.8).abs() < 1e-4, "{slow:?}");
+        // A slow box: 640 ms a frame over 8 slots at 0.8 headroom = 10 fps, under Power saver's 12.
+        let slow = lim(Some(640.0), 30.0);
+        assert!((slow.ceiling_fps - 10.0).abs() < 1e-4, "{slow:?}");
         assert!(!slow.floored);
+        assert_eq!(slow.bound, LimitBound::Measured, "production, not the mode, set it: {slow:?}");
         assert!(
-            slow.ceiling_fps < EFFICIENCY_SCRUB_FPS_MAX,
-            "the 20 fps cap is not the binding term on this machine — production is"
+            slow.ceiling_fps < POWER_SAVER_FPS_MAX,
+            "the 12 fps limit is not the binding term on this machine — production is"
         );
-        // A fast box is held by the 20 fps cap, exactly as v0.8.195 was.
-        assert!((lim(Some(10.0), 30.0).ceiling_fps - EFFICIENCY_SCRUB_FPS_MAX).abs() < 1e-4);
+        // A fast box is held by the mode's own limit.
+        let quick = lim(Some(10.0), 30.0);
+        assert!((quick.ceiling_fps - POWER_SAVER_FPS_MAX).abs() < 1e-4);
+        assert_eq!(quick.bound, LimitBound::ModeMax);
         // A USER BELOW THE CEILING IS UNTOUCHED — the posture only ever takes rate away.
         let user_slow = lim(Some(10.0), 5.0);
         assert!((user_slow.ceiling_fps - 5.0).abs() < 1e-4, "{user_slow:?}");
@@ -19796,7 +20848,7 @@ mod efficiency_wave2_tests {
             for fps in [1.0f32, 4.0, 12.0, 20.0, 30.0, 120.0] {
                 let l = lim(Some(ms), fps);
                 assert!(l.ceiling_fps <= fps + 1e-4, "{ms} ms @ {fps} fps → {l:?}");
-                assert!(l.ceiling_fps <= EFFICIENCY_SCRUB_FPS_MAX + 1e-4, "{l:?}");
+                assert!(l.ceiling_fps <= POWER_SAVER_FPS_MAX + 1e-4, "{l:?}");
                 assert!(l.ceiling_fps >= 1.0, "{l:?}");
             }
         }
@@ -19810,12 +20862,12 @@ mod efficiency_wave2_tests {
     /// exists to replace.
     #[test]
     fn the_efficiency_depth_is_seconds_of_browsing_not_a_frame_count() {
-        let slow = lim(Some(500.0), 30.0); // ceiling 12.8
-        assert_eq!(slow.ahead, EFFICIENCY_AHEAD_MAX, "1 s of browsing at 12.8 fps, capped: {slow:?}");
-        assert_eq!(slow.behind, 4, "…and 0.25 s the other way: {slow:?}");
-        let fast = lim(Some(10.0), 30.0); // ceiling 20
-        assert_eq!(fast.ahead, EFFICIENCY_AHEAD_MAX, "clamped by the posture's own cap: {fast:?}");
-        assert_eq!(fast.behind, EFFICIENCY_BEHIND_MAX, "{fast:?}");
+        let slow = lim(Some(640.0), 30.0); // ceiling 10
+        assert_eq!(slow.ahead, 10, "1 s of browsing at 10 fps: {slow:?}");
+        assert_eq!(slow.behind, 3, "…and 0.25 s the other way: {slow:?}");
+        let fast = lim(Some(10.0), 30.0); // ceiling 12, Power saver's limit
+        assert_eq!(fast.ahead, EFFICIENCY_AHEAD_MAX, "clamped by the mode's own cap: {fast:?}");
+        assert_eq!(fast.behind, 3, "{fast:?}");
         let crawl = lim(Some(3_000.0), 30.0); // ceiling 5 (floored)
         assert_eq!(crawl.ahead, 5, "{crawl:?}");
         assert_eq!(crawl.behind, 2, "{crawl:?}");
@@ -19837,7 +20889,7 @@ mod efficiency_wave2_tests {
                 );
             }
         }
-        let bare = efficiency_limits(true, None, W, 30.0, None, None);
+        let bare = ps(None, None, None);
         assert!(bare.ahead < crate::PREFETCH_AHEAD, "…the Default arm too: {bare:?}");
     }
 
@@ -19845,26 +20897,28 @@ mod efficiency_wave2_tests {
     #[test]
     fn the_efficiency_runway_follows_the_rate_but_never_widens_a_costly_folder() {
         let full = (78, 26);
-        let l = lim(Some(500.0), 30.0); // ahead 12, behind 4
+        let l = lim(Some(500.0), 30.0); // ahead 12, behind 3
         assert_eq!(
-            efficiency_runway_window(l, full, false),
-            (12, 4),
+            efficiency_runway_window(l, full, 0.67, false),
+            (12, 3),
             "a CHEAP window takes the posture's rate-derived depth"
         );
+        // Browsing backward the lead is down, as in the kept window (round 2b review R2).
+        assert_eq!(efficiency_runway_window(l, (26, 78), 0.3, false), (3, 12), "the lead follows the browse");
         assert_eq!(
-            efficiency_runway_window(l, full, true),
+            efficiency_runway_window(l, full, 0.67, true),
             costly_prefetch_window(full),
             "a window that genuinely carries a costly format keeps the runway it always had — the \
              posture may never widen a folder of 48 MP HEVC frames"
         );
         assert_eq!(
-            efficiency_runway_window(EfficiencyLimits::RELEASED, full, false),
+            efficiency_runway_window(EfficiencyLimits::RELEASED, full, 0.67, false),
             costly_prefetch_window(full),
             "released is byte-identical to v0.8.194"
         );
         // …and it can never exceed the live capacity clamp either (the one-way rule).
         let tight = (4, 1);
-        assert_eq!(efficiency_runway_window(l, tight, false), (4, 1), "never WIDER than the window");
+        assert_eq!(efficiency_runway_window(l, tight, 0.67, false), (4, 1), "never WIDER than the window");
     }
 
     /// §A — **THE EWMA SEEDS ON ITS FIRST SAMPLE AND SMOOTHS AFTER.**
@@ -19901,20 +20955,20 @@ mod efficiency_wave2_tests {
         assert!(efficiency_seed(true, 0, 0, false, W).is_none(), "…and neither is a zeroed record");
 
         // PRECEDENCE.
-        let live = efficiency_limits(true, Some(100.0), W, 30.0, Some(seed), None);
+        let live = ps(Some(100.0), Some(seed), None);
         assert_eq!(
             live.source,
             LimitSource::Live,
             "the folder's own decodes outrank a bench taken on mains"
         );
         assert!((live.latency_ms.unwrap() - 100.0).abs() < 1e-3);
-        let seeded = efficiency_limits(true, None, W, 30.0, Some(seed), None);
+        let seeded = ps(None, Some(seed), None);
         assert_eq!(seeded.source, LimitSource::Seed);
         assert!((seeded.latency_ms.unwrap() - 450.0).abs() < 1e-3);
-        let bare = efficiency_limits(true, None, W, 30.0, None, None);
+        let bare = ps(None, None, None);
         assert_eq!(bare.source, LimitSource::Default);
         assert_eq!(bare.latency_ms, None);
-        assert!((bare.ceiling_fps - EFFICIENCY_DEFAULT_CEILING_FPS).abs() < 1e-4, "{bare:?}");
+        assert!((bare.ceiling_fps - POWER_SAVER_FPS_MAX).abs() < 1e-4, "{bare:?}");
         assert_eq!(bare.concurrency, efficiency_worker_share(W), "Default N is the share: {bare:?}");
         assert_eq!((bare.ahead, bare.behind), (12, 3), "…and its depth follows its own ceiling");
         // v0.8.196 fix tail (skeptic A, O6 — RULED): **A SEED MAY LOWER THE CEILING AND MAY NEVER
@@ -19922,23 +20976,23 @@ mod efficiency_wave2_tests {
         // `L < 533 ms`, which puts `sustainable` over 12 and the ceiling at the full 20 — promised on
         // a battery the bench never saw. L31, quoted on `efficiency_seed` itself.
         let mains = efficiency_seed(true, 60, 60, false, W).unwrap();
-        let from_mains = efficiency_limits(true, None, W, 30.0, Some(mains), None);
+        let from_mains = ps(None, Some(mains), None);
         assert!(
-            from_mains.ceiling_fps <= EFFICIENCY_DEFAULT_CEILING_FPS + 1e-4,
+            from_mains.ceiling_fps <= POWER_SAVER_FPS_MAX + 1e-4,
             "a mains benchmark may never lift the battery ceiling above the Default: {from_mains:?}"
         );
         assert_eq!(from_mains.source, LimitSource::Seed);
-        // …while LIVE data still may: it was measured on the power source in force.
-        assert!((lim(Some(10.0), 30.0).ceiling_fps - EFFICIENCY_SCRUB_FPS_MAX).abs() < 1e-4);
+        // …while LIVE data still may reach a mode's own limit: Balanced's is 20.
+        let live_balanced = mode_limits(MODE_BALANCED, CustomLimits::BALANCED_COPY, Some(10.0), W, 30.0, None, None, None);
+        assert!((live_balanced.ceiling_fps - BALANCED_FPS_MAX).abs() < 1e-4, "{live_balanced:?}");
         // A slow bench still lowers it, which is the half the rule keeps.
         let slow_bench = efficiency_seed(true, 12, 12, false, W).unwrap();
         assert!(
-            efficiency_limits(true, None, W, 30.0, Some(slow_bench), None).ceiling_fps
-                < EFFICIENCY_DEFAULT_CEILING_FPS,
+            ps(None, Some(slow_bench), None).ceiling_fps < POWER_SAVER_FPS_MAX,
             "a seed may still be MORE conservative than the default"
         );
         // THE SIM LEVER OUT-RANKS EVERYTHING, and is never called a measurement.
-        let simmed = efficiency_limits(true, Some(100.0), W, 30.0, Some(seed), Some(500.0));
+        let simmed = ps(Some(100.0), Some(seed), Some(500.0));
         assert_eq!(simmed.source, LimitSource::Sim);
         assert!((simmed.latency_ms.unwrap() - 500.0).abs() < 1e-3);
         assert_eq!(simmed.concurrency, lim(Some(500.0), 30.0).concurrency, "…and it really is used");
@@ -19974,17 +21028,25 @@ mod efficiency_wave2_tests {
         assert_eq!(efficiency_limits_clause(EfficiencyLimits::RELEASED), "", "released says nothing");
         let live = lim(Some(500.0), 30.0);
         let c = efficiency_limits_clause(live);
-        for part in ["N=7", "ahead=12", "behind=4", "ceiling=12.8 fps", "live median 500 ms", "[Subsample]"]
-        {
+        for part in [
+            "Eco",
+            "N=6",
+            "ahead=12",
+            "behind=3",
+            "keep=24+6",
+            "ceiling=12 fps",
+            "live median 500 ms",
+            "[Subsample]",
+        ] {
             assert!(c.contains(part), "the clause must state {part}: {c}");
         }
-        let bare = efficiency_limits_clause(efficiency_limits(true, None, W, 30.0, None, None));
+        let bare = efficiency_limits_clause(ps(None, None, None));
         assert!(bare.contains("ceiling=12 fps"), "a whole number prints whole: {bare}");
         assert!(bare.contains("no measurement yet"), "{bare}");
         let seed = efficiency_seed(true, 40, 25, false, W).unwrap();
-        let sc = efficiency_limits_clause(efficiency_limits(true, None, W, 30.0, Some(seed), None));
+        let sc = efficiency_limits_clause(ps(None, Some(seed), None));
         assert!(sc.contains("benchmark seed"), "{sc}");
-        let sim = efficiency_limits_clause(efficiency_limits(true, None, W, 30.0, None, Some(500.0)));
+        let sim = efficiency_limits_clause(ps(None, None, Some(500.0)));
         assert!(sim.contains("SIMULATED"), "a simulated run may never read as a measured one: {sim}");
         assert!(!sim.contains("live median"), "{sim}");
         let floored = efficiency_limits_clause(lim(Some(3_000.0), 30.0));
@@ -19995,17 +21057,18 @@ mod efficiency_wave2_tests {
     /// §C — **THE LEAF'S SENTENCE QUOTES THE LIVE CEILING AND ITS PROVENANCE.**
     #[test]
     fn the_leaf_tip_quotes_the_live_ceiling_and_its_provenance() {
-        let dc = PowerSnapshot { source: PowerSource::Dc, saver: false };
-        let tip = |l: EfficiencyLimits, fps: f32| efficiency_leaf_tip(l, fps, EFFICIENCY_AUTO, dc, None);
-        assert_eq!(tip(EfficiencyLimits::RELEASED, 30.0), "", "released ⇒ no leaf, no tip");
-        let t = tip(lim(Some(500.0), 30.0), 30.0);
-        assert!(t.contains("Efficiency mode"), "{t}");
-        assert!(t.contains("12.8 fps"), "the LIVE ceiling: {t}");
-        assert!(t.contains("keeping up with on battery"), "…and why it is what it is: {t}");
-        let simmed = tip(efficiency_limits(true, None, W, 30.0, None, Some(500.0)), 30.0);
+        let tip = efficiency_leaf_tip;
+        assert_eq!(tip(EfficiencyLimits::RELEASED, 30.0), "", "Turbo ⇒ no leaf, no tip");
+        let balanced = mode_limits(MODE_BALANCED, CustomLimits::BALANCED_COPY, Some(640.0), W, 30.0, None, None, None);
+        assert_eq!(tip(balanced, 30.0), "", "Balanced ⇒ no leaf either: the leaf is Eco's");
+        let t = tip(lim(Some(640.0), 30.0), 30.0);
+        assert!(t.contains("Eco"), "{t}");
+        assert!(t.contains("10 fps"), "the LIVE ceiling: {t}");
+        assert!(t.contains("keeping up with"), "…and why it is what it is: {t}");
+        let simmed = tip(ps(None, None, Some(640.0)), 30.0);
         assert!(simmed.contains("SIMULATED"), "a dev lever is visible where it acts: {simmed}");
-        let bare = tip(efficiency_limits(true, None, W, 30.0, None, None), 30.0);
-        assert!(bare.contains("benchmark"), "the Default arm names the action that fixes it: {bare}");
+        let bare = tip(ps(None, None, None), 30.0);
+        assert!(bare.contains("limits browsing to 12 fps"), "the mode's own limit, named: {bare}");
         // v0.8.196 fix tail (skeptic B, R5): ENGAGED but NOT BINDING — the badge explains itself and
         // claims no throttle, because the number the user is browsing at is his own.
         let his = tip(lim(Some(10.0), 5.0), 5.0);
@@ -20098,27 +21161,20 @@ mod efficiency_wave2_tests {
         const G: u64 = 77;
         reset_fast_latency(G);
         assert_eq!(fast_latency_ewma(None), None, "a fresh folder has measured nothing");
-        assert_eq!(
-            efficiency_limits(true, fast_latency_ewma(None), W, 30.0, None, None).source,
-            LimitSource::Default
-        );
+        let at = |mode: u8| mode_limits(mode, CustomLimits::BALANCED_COPY, fast_latency_ewma(Some(SrcKind::Jpeg)), W, 30.0, None, None, None);
+        assert_eq!(at(MODE_POWER_SAVER).source, LimitSource::Default);
         note_fast_latency(SrcKind::Jpeg, 500, G);
         assert_eq!(fast_latency_ewma(Some(SrcKind::Jpeg)), Some(500.0));
-        let engaged =
-            efficiency_limits(true, fast_latency_ewma(Some(SrcKind::Jpeg)), W, 30.0, None, None);
+        let engaged = at(MODE_POWER_SAVER);
         assert_eq!(engaged.source, LimitSource::Live);
-        assert_eq!(engaged.concurrency, 7);
-        // RELEASE — the same inputs, the bit flipped, and every term is the released one in the
+        assert_eq!(engaged.concurrency, 6);
+        // PERFORMANCE — the same inputs, the mode changed, and every term is the released one in the
         // SAME evaluation. There is no second state to unwind.
-        let released =
-            efficiency_limits(false, fast_latency_ewma(Some(SrcKind::Jpeg)), W, 30.0, None, None);
+        let released = at(MODE_PERFORMANCE);
         assert_eq!(released, EfficiencyLimits::RELEASED);
         assert_eq!(efficiency_scrub_cap(30.0, released), 30.0, "…and the clock is the user's again");
-        // …and re-engaging on the very next evaluation gives the identical value back.
-        assert_eq!(
-            efficiency_limits(true, fast_latency_ewma(Some(SrcKind::Jpeg)), W, 30.0, None, None),
-            engaged
-        );
+        // …and going back on the very next evaluation gives the identical value back.
+        assert_eq!(at(MODE_POWER_SAVER), engaged);
         // The folder swap forgets, which is the other half: a folder is judged by its own frames.
         reset_fast_latency(G + 1);
         assert_eq!(fast_latency_ewma(None), None);
@@ -20217,50 +21273,49 @@ mod efficiency_wave2_tests {
     #[test]
     fn every_efficiency_sentence_asks_the_binding_question_once() {
         let dc = PowerSnapshot { source: PowerSource::Dc, saver: false };
-        let fast_box = lim(Some(10.0), 12.0); // ceiling = the USER's 12, not a measurement
-        assert!(!efficiency_binding(fast_box, 12.0), "premise: his own stop is what binds");
+        let on_battery = ModeInEffect { mode: MODE_POWER_SAVER, reason: ModeReason::Battery };
+        let card = |l: EfficiencyLimits, fps: f32, sup: bool| {
+            mode_note(MODE_BALANCED, true, on_battery, dc, None, false, false, l, fps, sup)
+        };
+        let fast_box = lim(Some(10.0), 5.0); // ceiling = the USER's 5, not a measurement
+        assert!(!efficiency_binding(fast_box, 5.0), "premise: his own stop is what binds");
         // ALL THREE SURFACES SILENT ABOUT A THROTTLE.
-        assert_eq!(
-            scrub_fps_efficiency_note(fast_box, 12.0, EFFICIENCY_AUTO, dc, None),
-            "",
-            "the popup was always right and stays right"
-        );
-        let card = efficiency_note(EFFICIENCY_AUTO, dc, None, false, fast_box, 12.0, false);
-        assert!(
-            !card.contains("limiting"),
-            "the posture may not claim credit for the user's own 12 fps: {card}"
-        );
-        let leaf = efficiency_leaf_tip(fast_box, 12.0, EFFICIENCY_AUTO, dc, None);
+        assert_eq!(scrub_fps_mode_note(fast_box, 5.0), "", "the popup was always right and stays right");
+        let c0 = card(fast_box, 5.0, false);
+        assert!(!c0.contains("limit"), "the mode may not claim credit for the user's own 5 fps: {c0}");
+        let leaf = efficiency_leaf_tip(fast_box, 5.0);
         assert!(!leaf.is_empty(), "the badge is mounted, so it explains itself");
         assert!(!leaf.contains("limiting"), "…without claiming a throttle: {leaf}");
         // AND WHEN IT REALLY IS BINDING, all three say the same number and the same reason.
-        let binding = lim(Some(500.0), 30.0); // ceiling 12.8
-        let p = scrub_fps_efficiency_note(binding, 30.0, EFFICIENCY_AUTO, dc, None);
-        let c = efficiency_note(EFFICIENCY_AUTO, dc, None, false, binding, 30.0, true);
-        let l = efficiency_leaf_tip(binding, 30.0, EFFICIENCY_AUTO, dc, None);
+        let binding = lim(Some(640.0), 30.0); // ceiling 10, measured
+        let p = scrub_fps_mode_note(binding, 30.0);
+        let c = card(binding, 30.0, true);
+        let l = efficiency_leaf_tip(binding, 30.0);
         for t in [&p, &c, &l] {
-            assert!(t.contains("12.8 fps"), "one number, everywhere: {t}");
-            assert!(t.contains("keeping up with on battery"), "one reason, everywhere: {t}");
+            assert!(t.contains("10 fps"), "one number, everywhere: {t}");
+            assert!(t.contains("keeping up with"), "one reason, everywhere: {t}");
         }
         assert!(c.contains("Faster preview"), "…and the card names the tier in its own word: {c}");
+        // The mode's own limit and its benchmark share are named as what they are, never as a
+        // machine "keeping up with" anything.
+        let own = scrub_fps_mode_note(lim(Some(10.0), 30.0), 30.0);
+        assert!(own.contains("limits browsing to 12 fps") && !own.contains("keeping up"), "{own}");
+        let benched = mode_limits(MODE_BALANCED, CustomLimits::BALANCED_COPY, Some(10.0), W, 30.0, None, None, Some(24.0));
+        let b = scrub_fps_mode_note(benched, 30.0);
+        assert!(b.contains("16 fps") && b.contains("two-thirds of this machine's benchmark"), "{b}");
 
         // v0.8.196 tail 2 (verifier 8-i): THE `Seed` AND `Default` REASONS ARE DIFFERENT SENTENCES.
         // Both contain the word "benchmark", so the round's only assert on the Default arm would
         // have stayed green through a swap — and the Seed wording is what the boot-verify's own `dc`
         // arm actually produces (a 10.3 fps seed against a 30 fps stop, i.e. binding).
-        let seed = efficiency_seed(true, 29, 29, false, W).expect("a benched box seeds");
-        let from_seed = efficiency_limits(true, None, W, 30.0, Some(seed), None);
-        let seeded = scrub_fps_efficiency_note(from_seed, 30.0, EFFICIENCY_AUTO, dc, None);
-        let bare = scrub_fps_efficiency_note(
-            efficiency_limits(true, None, W, 30.0, None, None),
-            30.0,
-            EFFICIENCY_AUTO,
-            dc,
-            None,
-        );
+        let seed = efficiency_seed(true, 20, 20, false, W).expect("a benched box seeds");
+        let from_seed = ps(None, Some(seed), None);
+        let seeded = scrub_fps_mode_note(from_seed, 30.0);
+        let bare = scrub_fps_mode_note(ps(None, None, None), 30.0);
+        assert_eq!(from_seed.bound, LimitBound::Seed, "{from_seed:?}");
         assert!(seeded.contains("follows the live rate"), "the Seed arm's own words: {seeded}");
-        assert!(!seeded.contains("has been measured"), "…and not the Default's: {seeded}");
-        assert!(bare.contains("has been measured"), "the Default arm's own words: {bare}");
+        assert!(!seeded.contains("limits browsing to 12"), "…and not the mode limit's: {seeded}");
+        assert!(bare.contains("limits browsing to 12 fps"), "the mode limit's own words: {bare}");
         assert!(!bare.contains("follows the live rate"), "…and not the Seed's: {bare}");
     }
 }
@@ -20283,166 +21338,110 @@ mod efficiency_tail_tests {
         assert!(!sim.chars().any(|c| c.is_ascii_digit()), "…nor any number at all: {sim}");
     }
 
-    /// B-R1c — **THE POPUP SPEAKS ONLY WHEN THE POSTURE IS ACTUALLY TAKING RATE AWAY.**
+    /// B-R1c — **THE POPUP SPEAKS ONLY WHEN THE MODE IS ACTUALLY TAKING RATE AWAY.**
     #[test]
     fn the_browse_popup_speaks_only_when_the_posture_is_binding() {
-        // BINDING: engaged, and the user has asked for more than the ceiling.
-        let at20 = EfficiencyLimits::test_ceiling(EFFICIENCY_SCRUB_FPS_MAX);
+        // BINDING: a limited mode, and the user has asked for more than the ceiling.
         let at12 = EfficiencyLimits::test_ceiling(12.0);
-        // v0.8.196 fix tail: the composer takes the mode and the power snapshot too, because the
-        // REASON clause is per state now (skeptic B, R2). The rate half is unchanged, which is
-        // what these three shims keep readable.
-        let dcs = PowerSnapshot { source: PowerSource::Dc, saver: false };
-        let note20 = |fps: f32| scrub_fps_efficiency_note(at20, fps, EFFICIENCY_AUTO, dcs, None);
-        let note12 = |fps: f32| scrub_fps_efficiency_note(at12, fps, EFFICIENCY_AUTO, dcs, None);
-        let noteoff = |fps: f32| {
-            scrub_fps_efficiency_note(EfficiencyLimits::RELEASED, fps, EFFICIENCY_AUTO, dcs, None)
-        };
-        let n = note20(30.0);
-        assert!(n.contains("20 fps"), "the note names the ceiling the browse is actually held to: {n}");
-        assert!(n.contains("Efficiency mode"), "…and names what is doing it: {n}");
-        assert_eq!(note20(120.0), n, "every stop above the ceiling, one line");
+        let at8 = EfficiencyLimits::test_ceiling(8.0);
+        let n = scrub_fps_mode_note(at12, 30.0);
+        assert!(n.contains("12 fps"), "the note names the ceiling the browse is actually held to: {n}");
+        assert!(n.contains("Eco"), "…and names what is doing it: {n}");
+        assert_eq!(scrub_fps_mode_note(at12, 120.0), n, "every stop above the ceiling, one line");
         // NOT BINDING — three ways, and each must render nothing at all (the mount is the emptiness).
-        assert_eq!(
-            noteoff(30.0),
-            "",
-            "released → nothing to say"
-        );
-        assert_eq!(
-            note20(EFFICIENCY_SCRUB_FPS_MAX),
-            "",
-            "exactly AT the ceiling is not being limited"
-        );
-        assert_eq!(note20(12.0), "", "a slower setting is untouched");
-        assert_eq!(note20(5.0), "");
-        // v0.8.196 (WAVE 2): the sentence follows the DERIVED ceiling, not the constant — this is
-        // the row that reddens if the note ever goes back to quoting `EFFICIENCY_SCRUB_FPS_MAX`.
-        let live = note12(30.0);
-        assert!(live.contains("12 fps"), "the LIVE ceiling, not the 20 fps cap on it: {live}");
-        // v0.8.196 fix tail (skeptic B, R2): the "what this machine sustains ON BATTERY" clause the
-        // round shipped is GONE — `efficiency_engaged` has a manual `On` arm with no power term at
-        // all, so a desktop was being told what it sustains on a battery it does not have. The reason
-        // now comes off the state.
-        assert!(live.contains("keeping up with on battery"), "…and says why, honestly: {live}");
-        let on_a_desktop =
-            scrub_fps_efficiency_note(at12, 30.0, EFFICIENCY_ON, PowerSnapshot::UNKNOWN, None);
-        assert!(on_a_desktop.contains("12 fps"), "{on_a_desktop}");
-        assert!(
-            !on_a_desktop.contains("battery"),
-            "a machine with no battery may never be told what it does on one: {on_a_desktop}"
-        );
-        let saver_on_mains = scrub_fps_efficiency_note(
-            at12,
-            30.0,
-            EFFICIENCY_AUTO,
-            PowerSnapshot { source: PowerSource::Ac, saver: true },
-            None,
-        );
-        assert!(saver_on_mains.contains("Battery saver"), "{saver_on_mains}");
-        assert!(!saver_on_mains.contains("on battery"), "{saver_on_mains}");
+        assert_eq!(scrub_fps_mode_note(EfficiencyLimits::RELEASED, 30.0), "", "Turbo → nothing to say");
+        assert_eq!(scrub_fps_mode_note(at12, 12.0), "", "exactly AT the ceiling is not being limited");
+        assert_eq!(scrub_fps_mode_note(at12, 5.0), "", "a slower setting is untouched");
+        // The sentence follows the DERIVED ceiling, not a constant.
+        let live = scrub_fps_mode_note(at8, 30.0);
+        assert!(live.contains("8 fps"), "the LIVE ceiling: {live}");
+        assert!(live.contains("keeping up with"), "…and says why, honestly: {live}");
+        assert!(!live.contains("battery"), "the reason is the measurement, never a battery it guesses at: {live}");
         // …and at the FLOOR the number is by construction what the machine does NOT sustain (R3).
-        let floored = scrub_fps_efficiency_note(
-            efficiency_limits(true, Some(3_000.0), 18, 30.0, None, None),
+        let floored = scrub_fps_mode_note(
+            mode_limits(MODE_POWER_SAVER, CustomLimits::BALANCED_COPY, Some(3_000.0), 18, 30.0, None, None, None),
             30.0,
-            EFFICIENCY_AUTO,
-            dcs,
-            None,
         );
         assert!(floored.contains("slowest step"), "the floor says what it is: {floored}");
-        assert!(
-            !floored.contains("keeping up with"),
-            "…and never presents itself as a measurement: {floored}"
-        );
-        assert_eq!(note12(12.0), "", "at the live ceiling, nothing to say");
+        assert!(!floored.contains("keeping up with"), "…and never presents itself as a measurement: {floored}");
         // …and the sentence agrees with the arithmetic that produces the behaviour it describes.
-        assert_eq!(efficiency_scrub_cap(30.0, at20), EFFICIENCY_SCRUB_FPS_MAX);
         assert_eq!(efficiency_scrub_cap(30.0, at12), 12.0);
+        assert_eq!(efficiency_scrub_cap(30.0, at8), 8.0);
     }
 
-    /// B-R2 + B-O1 — **THE NOTE ANSWERS EVERY STATE THE CONTROL CAN BE IN**, and the four the
-    /// shipped sheet could not tell apart are four different sentences.
+    /// Round 2a (B-R2 + B-O1's successor) — **THE STATUS LINE ANSWERS EVERY STATE THE ROW CAN BE IN**,
+    /// and the states that must not read alike are different sentences.
     #[test]
-    fn the_efficiency_note_answers_every_state_the_control_can_be_in() {
+    fn the_mode_note_answers_every_state_the_row_can_be_in() {
         let ac = snap(PowerSource::Ac, false);
         let dc = snap(PowerSource::Dc, false);
         let saver = snap(PowerSource::Ac, true);
         let desktop = PowerSnapshot::UNKNOWN;
-
         let lim = EfficiencyLimits::test_ceiling(12.0);
-        let on_battery = efficiency_note(EFFICIENCY_AUTO, dc, None, false, lim, 30.0, true);
-        let on_mains = efficiency_note(EFFICIENCY_AUTO, ac, None, false, lim, 30.0, true);
-        let on_saver = efficiency_note(EFFICIENCY_AUTO, saver, None, false, lim, 30.0, true);
-        let on_desktop = efficiency_note(EFFICIENCY_AUTO, desktop, None, false, lim, 30.0, true);
-        let manual = efficiency_note(EFFICIENCY_ON, ac, None, false, lim, 30.0, true);
-        let off = efficiency_note(EFFICIENCY_OFF, dc, None, false, lim, 30.0, true);
-        let vetoed = efficiency_note(EFFICIENCY_AUTO, dc, None, true, lim, 30.0, true);
-        // v0.8.196 (WAVE 2, §E): the ACTIVE arms — and only those — name the live ceiling and the
-        // sampling bias, so the one surface built for this feature stops quoting a constant.
-        for a in [&on_battery, &on_saver, &manual] {
-            assert!(a.contains("12 fps"), "an active arm names the live ceiling: {a}");
-            assert!(a.contains("Faster preview"), "…and the bias, in the Fast View card's own word: {a}");
-        }
-        for a in [&on_mains, &on_desktop, &off, &vetoed] {
-            assert!(!a.contains("fps"), "an INACTIVE arm has no ceiling to name: {a}");
-        }
+        // (saved, switch, snapshot, env, held) → the decision, then the sentence it gets.
+        let note = |saved: u8, switch: bool, s: PowerSnapshot, env: bool, held: bool| {
+            let eff = mode_in_effect(saved, switch, s, env, held);
+            let l = mode_limits(eff.mode, CustomLimits::BALANCED_COPY, Some(10.0), 18, 30.0, None, None, None);
+            mode_note(saved, switch, eff, s, None, env, held, if eff.mode == MODE_POWER_SAVER { lim } else { l }, 30.0, true)
+        };
+        let on_battery = note(MODE_BALANCED, true, dc, false, false);
+        let on_saver = note(MODE_BALANCED, true, saver, false, false);
+        let on_mains = note(MODE_BALANCED, true, ac, false, false);
+        let on_desktop = note(MODE_BALANCED, true, desktop, false, false);
+        let held = note(MODE_BALANCED, true, dc, false, true);
+        let switched_off = note(MODE_BALANCED, false, dc, false, false);
+        let vetoed = note(MODE_BALANCED, true, dc, true, false);
+        let chosen_ps = note(MODE_POWER_SAVER, true, ac, false, false);
+        let performance = note(MODE_PERFORMANCE, true, ac, false, false);
 
-        // THE FOUR STATES THAT USED TO RENDER IDENTICALLY — pairwise, by index, so the row fails on
-        // the PAIR that collapsed rather than on a set-length count nobody can read.
-        let four = [&on_battery, &on_mains, &on_desktop, &vetoed];
-        for (i, a) in four.iter().enumerate() {
-            for (j, b) in four.iter().enumerate() {
+        assert!(on_battery.starts_with("On battery: Eco."), "{on_battery}");
+        assert!(on_saver.starts_with("Battery saver is on: Eco."), "{on_saver}");
+        assert!(!on_saver.contains("On battery"), "a laptop on mains is not on battery: {on_saver}");
+        assert!(on_mains.starts_with("In effect: Balanced."), "{on_mains}");
+        // L15: the desktop must read honestly rather than look broken.
+        assert!(on_desktop.contains("No battery detected"), "{on_desktop}");
+        assert!(!on_mains.contains("No battery"), "…and only there: {on_mains}");
+        assert!(held.starts_with("Until the power source changes: Balanced."), "{held}");
+        assert!(switched_off.starts_with("In effect: Balanced."), "the switch off: the saved mode, on battery too: {switched_off}");
+        assert!(vetoed.contains("FALCON_EFFICIENCY=0"), "the session switch says so: {vetoed}");
+        assert!(chosen_ps.starts_with("In effect: Eco."), "{chosen_ps}");
+        assert!(!chosen_ps.contains("No battery"), "a chosen Eco needs no battery note: {chosen_ps}");
+        assert!(performance.starts_with("In effect: Turbo."), "{performance}");
+        assert!(!performance.contains("fps"), "Turbo has no limit to name: {performance}");
+        // Power saver in effect names its live ceiling and Faster preview, whatever the reason.
+        for a in [&on_battery, &on_saver, &chosen_ps] {
+            assert!(a.contains("12 fps"), "{a}");
+            assert!(a.contains("Faster preview"), "{a}");
+        }
+        // The states that used to collapse are pairwise different.
+        let distinct = [&on_battery, &on_saver, &on_mains, &on_desktop, &held, &vetoed];
+        for (i, a) in distinct.iter().enumerate() {
+            for (j, b) in distinct.iter().enumerate() {
                 if i != j {
                     assert_ne!(a, b, "these two states must not read alike: {a:?} vs {b:?}");
                 }
             }
         }
-        // …and each says the true thing.
-        assert!(on_battery.starts_with("Active"), "{on_battery}");
-        assert!(on_battery.contains("battery"), "{on_battery}");
-        assert!(!on_mains.starts_with("Active"), "mains with Auto is NOT active: {on_mains}");
-        assert!(on_saver.contains("Battery saver"), "{on_saver}");
-        assert!(on_saver.starts_with("Active"), "the saver arm engages on mains: {on_saver}");
-        // L15: the desktop must read honestly rather than look broken.
-        assert!(on_desktop.contains("No battery"), "{on_desktop}");
-        assert!(on_desktop.contains("never"), "…and say that Auto can never fire here: {on_desktop}");
-        assert!(!efficiency_engaged(desktop, EFFICIENCY_AUTO, false), "…which is the truth");
-        assert!(manual.starts_with("Active"), "On engages on any power source: {manual}");
-        assert!(!off.starts_with("Active"), "{off}");
-        // O1: the env lever's OTHER half — the UI says so rather than pretending.
-        assert!(vetoed.contains("FALCON_EFFICIENCY=0"), "{vetoed}");
-        assert!(vetoed.contains("next launch"), "…and says the setting comes back: {vetoed}");
-        // The env arm outranks every mode, exactly as `efficiency_engaged` does.
-        for m in [EFFICIENCY_AUTO, EFFICIENCY_ON, EFFICIENCY_OFF] {
-            assert_eq!(
-                efficiency_note(m, dc, None, true, lim, 30.0, true),
-                vetoed,
-                "the lever speaks for all three"
-            );
-        }
         // A simulated run says so on the SHEET too (the B-O3 principle, one surface over).
-        assert!(
-            efficiency_note(EFFICIENCY_AUTO, dc, Some(PowerSim::Dc), false, lim, 30.0, true).contains("simulated"),
-            "a dev lever must be visible where it acts"
-        );
-        assert!(!on_battery.contains("simulated"), "…and invisible where it does not");
+        let eff = mode_in_effect(MODE_BALANCED, true, dc, false, false);
+        assert!(mode_note(MODE_BALANCED, true, eff, dc, Some(PowerSim::Dc), false, false, lim, 30.0, true)
+            .contains("simulated"));
+        assert!(!on_battery.contains("simulated"), "…and invisible where it does not act");
     }
 
     /// A-O3 — **THE `scrub res →` SUFFIX, ALL FOUR OUTCOMES.**
     #[test]
     fn the_scrub_res_suffix_names_a_withheld_sweep() {
-        assert_eq!(adaptive_res_suffix(false, true, true), " — grow, stale kept (held — efficiency)");
+        assert_eq!(adaptive_res_suffix(false, true, true), " — grow, stale kept (held — Eco)");
         assert_eq!(adaptive_res_suffix(false, true, false), " — grow, stale kept for re-decode");
         assert_eq!(adaptive_res_suffix(false, false, true), " — shrink, cache kept");
         assert_eq!(adaptive_res_suffix(false, false, false), " — shrink, cache kept");
-        // A CLEAR IS A CLEAR ON ANY POSTURE — the tier flip wins over both other terms, because the
-        // caches really are gone and no posture changes that.
+        // A CLEAR IS A CLEAR IN ANY MODE — the caches really are gone.
         for grew in [false, true] {
-            for eff in [false, true] {
-                assert_eq!(adaptive_res_suffix(true, grew, eff), " — cache cleared");
+            for ps in [false, true] {
+                assert_eq!(adaptive_res_suffix(true, grew, ps), " — cache cleared");
             }
         }
-        // The four outcomes are four DIFFERENT sentences — the whole reason the line exists is that
-        // a reader can tell a held sweep from a warm cache.
         let all = [
             adaptive_res_suffix(true, true, true),
             adaptive_res_suffix(false, true, true),
@@ -20458,51 +21457,55 @@ mod efficiency_tail_tests {
         }
     }
 
-    /// A-O4 — **THE EDGE, AND D4 AS A ROW.**
+    /// Round 2a (A-O4's successor) — **THE EDGE: ADOPT THE BOOT BASELINE, TOAST ONLY A POWER CHANGE.**
     #[test]
-    fn the_efficiency_edge_adopts_a_boot_baseline_and_toasts_only_an_auto_engage() {
-        use EfficiencyEdge as E;
-        // D4, both directions: a session that OPENS in either posture adopts silently.
-        assert_eq!(efficiency_edge(None, false, EFFICIENCY_AUTO), E::Adopt);
-        assert_eq!(efficiency_edge(None, true, EFFICIENCY_AUTO), E::Adopt, "D4: no line, no toast");
-        assert_eq!(efficiency_edge(None, true, EFFICIENCY_ON), E::Adopt);
-        // Steady state — 62.5 times a second, and it says nothing.
-        assert_eq!(efficiency_edge(Some(false), false, EFFICIENCY_AUTO), E::Nothing);
-        assert_eq!(efficiency_edge(Some(true), true, EFFICIENCY_AUTO), E::Nothing);
-        assert_eq!(efficiency_edge(Some(true), true, EFFICIENCY_ON), E::Nothing);
-        // THE ONE EDGE THE USER DID NOT PERFORM: the power source moved under an Auto setting.
-        assert_eq!(efficiency_edge(Some(false), true, EFFICIENCY_AUTO), E::LogAndToast);
-        // …every other real edge is a log line and nothing else.
-        assert_eq!(efficiency_edge(Some(false), true, EFFICIENCY_ON), E::Log, "the user just clicked On");
-        assert_eq!(efficiency_edge(Some(true), false, EFFICIENCY_AUTO), E::Log, "a release is quiet");
-        assert_eq!(efficiency_edge(Some(true), false, EFFICIENCY_OFF), E::Log);
-        // Only ONE arm may ever toast, on any input.
-        let mut toasts = 0;
-        for prev in [None, Some(false), Some(true)] {
-            for now in [false, true] {
-                for mode in [EFFICIENCY_AUTO, EFFICIENCY_ON, EFFICIENCY_OFF] {
-                    if efficiency_edge(prev, now, mode) == E::LogAndToast {
-                        toasts += 1;
-                        assert_eq!((prev, now, mode), (Some(false), true, EFFICIENCY_AUTO));
-                    }
-                }
-            }
-        }
-        assert_eq!(toasts, 1, "exactly one of the eighteen states raises a toast");
+    fn the_mode_edge_adopts_a_boot_baseline_and_toasts_only_a_power_change() {
+        use ModeEdge as E;
+        let ac = snap(PowerSource::Ac, false);
+        let dc = snap(PowerSource::Dc, false);
+        let balanced = ModeInEffect { mode: MODE_BALANCED, reason: ModeReason::Chosen };
+        let forced = ModeInEffect { mode: MODE_POWER_SAVER, reason: ModeReason::Battery };
+        let chosen_ps = ModeInEffect { mode: MODE_POWER_SAVER, reason: ModeReason::Chosen };
+        // A session that OPENS in either state adopts silently: no line, no toast.
+        assert_eq!(mode_edge(None, balanced, ac), E::Adopt);
+        assert_eq!(mode_edge(None, forced, dc), E::Adopt);
+        // Steady state says nothing.
+        assert_eq!(mode_edge(Some((balanced, ac)), balanced, ac), E::Nothing);
+        assert_eq!(mode_edge(Some((forced, dc)), forced, dc), E::Nothing);
+        // THE EDGES THE USER DID NOT PERFORM: the power source moved Power saver in or out.
+        assert_eq!(mode_edge(Some((balanced, ac)), forced, dc), E::LogAndToast, "unplugged");
+        assert_eq!(mode_edge(Some((forced, dc)), balanced, ac), E::LogAndToast, "plugged back in");
+        // …the user's own clicks are a log line and nothing else: the switch turned on while on
+        // battery (no power change), the override pill, choosing a mode.
+        assert_eq!(mode_edge(Some((balanced, dc)), forced, dc), E::Log, "the switch, clicked on battery");
+        assert_eq!(mode_edge(Some((forced, dc)), balanced, dc), E::Log, "the override pill");
+        assert_eq!(mode_edge(Some((balanced, ac)), chosen_ps, ac), E::Log, "Eco chosen");
+        // A power change that moves nothing forced stays quiet (a chosen Power saver, unplugged).
+        assert_eq!(mode_edge(Some((chosen_ps, ac)), chosen_ps, dc), E::Nothing);
+        // The toast's words follow the reason, both ways.
+        assert_eq!(mode_power_toast(balanced, forced, MODE_BALANCED), "On battery — Eco");
+        assert_eq!(mode_power_toast(forced, balanced, MODE_BALANCED), "Back on mains — Balanced");
+        let saver_on = ModeInEffect { mode: MODE_POWER_SAVER, reason: ModeReason::BatterySaver };
+        assert_eq!(mode_power_toast(balanced, saver_on, MODE_BALANCED), "Battery saver is on — Eco");
+        assert_eq!(mode_power_toast(saver_on, balanced, MODE_BALANCED), "Battery saver is off — Balanced");
+        let perf = ModeInEffect { mode: MODE_PERFORMANCE, reason: ModeReason::Chosen };
+        assert_eq!(mode_power_toast(forced, perf, MODE_PERFORMANCE), "Back on mains — Turbo");
+        let custom = ModeInEffect { mode: MODE_CUSTOM, reason: ModeReason::Chosen };
+        assert_eq!(mode_power_toast(forced, custom, MODE_CUSTOM), "Back on mains — Custom", "round 2b");
     }
 
-    /// A-O2 — **THE CLASSIC REVERT NAMES THE ONE POSTURE IT DOES NOT REVERT.**
+    /// A-O2 — **THE CLASSIC REVERT NAMES THE ONE THING IT DOES NOT REVERT.**
     #[test]
     fn the_classic_revert_names_the_one_posture_it_does_not_revert() {
         let line = classic_posture_boot_line();
         assert!(line.contains("v0.8.110 restored"), "the shipped promise is still made: {line}");
         assert!(
-            line.contains("does NOT revert") && line.contains("EFFICIENCY MODE"),
-            "…and the exception is named, or the line over-claims on every battery: {line}"
+            line.contains("does NOT revert") && line.contains("THE MODE CONTROL"),
+            "…and the exception is named, or the line over-claims on the default mode: {line}"
         );
         assert!(
-            line.contains("FALCON_EFFICIENCY=0"),
-            "…together with the lever that closes it, so the reader has a next step: {line}"
+            line.contains("Choose Turbo"),
+            "…together with what closes it, so the reader has a next step: {line}"
         );
     }
 }
@@ -20533,112 +21536,106 @@ mod efficiency_tests {
         assert!(power_snapshot_from_raw(0, 0b0000_0011).saver);
     }
 
-    /// A2 — **THE TRUTH TABLE.** Auto / On / Off across every power state, plus the env revert.
+    /// Round 2a (A2's successor) — **THE MODE IN EFFECT, EVERY ROW.** The saved mode, the battery
+    /// switch across every power state, the session switch and the override.
     ///
-    /// FALSIFIER (L28): consult `mode` before `env_disabled` and the last block reddens on `On`;
-    /// drop the `saver` term and the AC-with-saver row reddens; make an out-of-range mode anything
-    /// but Auto and the last row reddens.
+    /// FALSIFIER (L28): let `Unknown` force Power saver and the desktop rows redden; drop the `saver`
+    /// term and the Battery-saver-on-mains row reddens; consult the switch before a saved Power
+    /// saver and the switch-off row reddens.
     #[test]
-    fn the_efficiency_truth_table_is_auto_on_off() {
+    fn the_mode_in_effect_truth_table() {
         let ac = snap(PowerSource::Ac, false);
         let dc = snap(PowerSource::Dc, false);
         let ac_saver = snap(PowerSource::Ac, true);
         let unk = PowerSnapshot::UNKNOWN;
-
-        // AUTO — the power source (or Windows' own saver) decides, and nothing else does.
-        assert!(!efficiency_engaged(ac, EFFICIENCY_AUTO, false), "mains ⇒ today's behaviour");
-        assert!(efficiency_engaged(dc, EFFICIENCY_AUTO, false), "battery ⇒ the posture");
-        assert!(
-            efficiency_engaged(ac_saver, EFFICIENCY_AUTO, false),
-            "Windows' own Battery saver is the user asking for less power, on mains or not"
-        );
-        assert!(efficiency_engaged(snap(PowerSource::Unknown, true), EFFICIENCY_AUTO, false));
-
-        // ON / OFF — manual, and they do not read the power state at all (L17: the label is a
-        // contract, and "Off" must be byte-identical to the app before this round).
-        for p in [ac, dc, ac_saver, unk] {
-            assert!(efficiency_engaged(p, EFFICIENCY_ON, false), "On is On, on any power source");
-            assert!(!efficiency_engaged(p, EFFICIENCY_OFF, false), "Off is Off, on any power source");
-        }
-
-        // THE ENV REVERT wins over all three modes — a lever a setting can out-vote is not a revert.
-        for m in [EFFICIENCY_AUTO, EFFICIENCY_ON, EFFICIENCY_OFF] {
-            for p in [ac, dc, ac_saver, unk] {
-                assert!(!efficiency_engaged(p, m, true), "FALCON_EFFICIENCY=0 disables everything");
+        let m = |saved, switch, s, env, held| mode_in_effect(saved, switch, s, env, held);
+        for saved in [MODE_PERFORMANCE, MODE_BALANCED, MODE_CUSTOM] {
+            // THE SWITCH ON: battery or Windows' Battery saver puts Power saver in effect…
+            assert_eq!(m(saved, true, dc, false, false), ModeInEffect { mode: MODE_POWER_SAVER, reason: ModeReason::Battery });
+            assert_eq!(
+                m(saved, true, ac_saver, false, false),
+                ModeInEffect { mode: MODE_POWER_SAVER, reason: ModeReason::BatterySaver },
+                "Windows' own Battery saver is the user asking for less power, on mains or not"
+            );
+            assert_eq!(m(saved, true, snap(PowerSource::Unknown, true), false, false).reason, ModeReason::BatterySaver);
+            // …mains and a desktop's Unknown keep the saved mode.
+            assert_eq!(m(saved, true, ac, false, false), ModeInEffect { mode: saved, reason: ModeReason::Chosen });
+            assert_eq!(m(saved, true, unk, false, false), ModeInEffect { mode: saved, reason: ModeReason::Chosen });
+            // THE SWITCH OFF, the SESSION SWITCH and the OVERRIDE each keep the saved mode on battery.
+            for (switch, env, held) in [(false, false, false), (true, true, false), (true, false, true)] {
+                for s in [ac, dc, ac_saver, unk] {
+                    assert_eq!(m(saved, switch, s, env, held), ModeInEffect { mode: saved, reason: ModeReason::Chosen });
+                }
             }
         }
-
-        // An out-of-range mode is Auto, exactly as a stored one is.
-        assert!(efficiency_engaged(dc, 9, false));
-        assert!(!efficiency_engaged(ac, 9, false));
+        // A SAVED POWER SAVER is Power saver on every row, chosen.
+        for switch in [false, true] {
+            for s in [ac, dc, ac_saver, unk] {
+                for env in [false, true] {
+                    assert_eq!(
+                        m(MODE_POWER_SAVER, switch, s, env, false),
+                        ModeInEffect { mode: MODE_POWER_SAVER, reason: ModeReason::Chosen }
+                    );
+                }
+            }
+        }
+        // An out-of-range stored mode is Balanced, exactly as the file reads it.
+        assert_eq!(mode_from_settings(9), MODE_BALANCED);
+        assert_eq!(mode_from_settings(-1), MODE_BALANCED);
+        assert_eq!(mode_from_settings(0), MODE_PERFORMANCE);
+        assert_eq!(mode_from_settings(1), MODE_BALANCED);
+        assert_eq!(mode_from_settings(2), MODE_POWER_SAVER);
+        assert_eq!(mode_from_settings(3), MODE_CUSTOM, "round 2b");
+        assert_eq!(mode_from_settings(4), MODE_BALANCED);
+        // …and the retired Efficiency values still read as they did, for the migration.
         assert_eq!(efficiency_mode_from_settings(9), EFFICIENCY_AUTO);
-        assert_eq!(efficiency_mode_from_settings(-1), EFFICIENCY_AUTO);
-        assert_eq!(efficiency_mode_from_settings(0), EFFICIENCY_AUTO);
         assert_eq!(efficiency_mode_from_settings(1), EFFICIENCY_ON);
         assert_eq!(efficiency_mode_from_settings(2), EFFICIENCY_OFF);
     }
 
-    /// A3 — **THE DESKTOP ROW, ON ITS OWN**, because it is the one that decides whether Auto is a
-    /// silent adaptation or a silent defect. `ACLineStatus == 255` is what the dev box and every VM
-    /// answer; if that engaged, every desktop in the world would browse at the battery posture with
-    /// nothing on screen saying so, and the first-run state (L15: no folder, no settings key ⇒ Auto)
-    /// is exactly where it would land.
+    /// A3 — **THE DESKTOP ROW, ON ITS OWN**: `ACLineStatus == 255` is what the dev box and every VM
+    /// answer; if that forced Power saver, every desktop in the world would browse at Power saver
+    /// with nothing on screen saying so, and the first-run state (no settings key ⇒ Balanced with the
+    /// switch on) is exactly where it would land.
     ///
-    /// FALSIFIER (L28, RED-FIRST — RUN): map `_ => PowerSource::Dc` in `power_snapshot_from_raw`,
-    /// or add `|| snap.source == PowerSource::Unknown` to the Auto arm, and this reddens on its
-    /// first assert.
+    /// FALSIFIER (L28, RED-FIRST): map `_ => PowerSource::Dc` in `power_snapshot_from_raw`, or
+    /// match `Unknown` in `mode_in_effect`'s battery arm, and this reddens on its first assert.
     #[test]
     fn a_desktops_unknown_power_source_never_engages_auto() {
         let desktop = power_snapshot_from_raw(255, 0);
         assert_eq!(desktop.source, PowerSource::Unknown);
-        assert!(
-            !efficiency_engaged(desktop, EFFICIENCY_AUTO, false),
-            "a desktop reports 255 — Auto on a desktop must be a NO-OP, not a permanent posture"
+        let eff = mode_in_effect(MODE_BALANCED, true, desktop, false, false);
+        assert_eq!(eff.mode, MODE_BALANCED, "a desktop reports 255 — the switch must be a NO-OP there");
+        // The boot line has to READ honestly there too.
+        assert_eq!(
+            mode_boot_line(MODE_BALANCED, true, eff, desktop, None, false),
+            "mode: Balanced saved, Eco on battery on (no battery reported) — in effect: Balanced"
         );
-        // …and the first-run state is precisely this one: the default mode over the default snapshot.
-        assert!(!efficiency_engaged(PowerSnapshot::UNKNOWN, EFFICIENCY_AUTO, false));
-        // The boot line has to READ honestly there too, or the no-op looks like a broken control.
-        let line = efficiency_boot_line(EFFICIENCY_AUTO, desktop, None, false);
-        assert_eq!(line, "efficiency: Auto (no battery reported) — off");
     }
 
     /// v1.0 MERGE TAIL [B-R2, L15] — **THE SAME ROW, FOR THE PLATFORM THE MERGE CREATED.**
     ///
-    /// The Windows sibling above is the reason this exists: `ACLineStatus == 255` has always meant
-    /// "no battery" and has always owned the honest sentence. The merge's first macOS arm could
-    /// return only `Dc` or `Ac`, so on a Mac mini / Studio / iMac / Mac Pro Auto read
-    /// "Waiting for battery power." for ever. `IOPSCopyPowerSourcesList` is empty on exactly those
-    /// machines, and [`mac_power_from_sources`] is where that becomes `Unknown`.
+    /// `IOPSCopyPowerSourcesList` is empty on a desktop Mac, and [`mac_power_from_sources`] is where
+    /// that becomes `Unknown`. It runs on ANY host — the FFI itself only ever runs on the mac CI.
     ///
-    /// It runs on ANY host — which is the whole point of extracting the mapping out of the FFI,
-    /// because the FFI itself only ever runs on the mac CI.
-    ///
-    /// FALSIFIER (L28, RED-FIRST — RUN): drop the `count == 0` arm from `mac_power_from_sources`
-    /// (i.e. the merge's first cut) and the first two asserts red, then the boot line reads
-    /// "Auto (AC) — off" instead of naming the missing battery.
+    /// FALSIFIER (L28, RED-FIRST): drop the `count == 0` arm from `mac_power_from_sources` and the
+    /// first two asserts red.
     #[test]
     fn a_battery_less_mac_reads_unknown_and_never_engages_auto() {
-        // A desktop Mac: the list is empty and the providing type still says "AC Power".
         let desktop = mac_power_from_sources(0, "AC Power");
         assert_eq!(desktop, PowerSnapshot::UNKNOWN, "no power source is not the same as mains");
-        assert!(
-            !efficiency_engaged(desktop, EFFICIENCY_AUTO, false),
-            "a desktop Mac must be a NO-OP on Auto, exactly as a desktop PC is"
-        );
-        // …and it READS honestly, in the same words Windows already uses for the same machine.
-        assert_eq!(
-            efficiency_boot_line(EFFICIENCY_AUTO, desktop, None, false),
-            "efficiency: Auto (no battery reported) — off"
-        );
+        let eff = mode_in_effect(MODE_BALANCED, true, desktop, false, false);
+        assert_eq!(eff.mode, MODE_BALANCED, "a desktop Mac must be a NO-OP, exactly as a desktop PC is");
+        assert!(mode_boot_line(MODE_BALANCED, true, eff, desktop, None, false).contains("(no battery reported)"));
         // A laptop, both ways round. "UPS Power" is mains with a battery behind it, not battery.
         assert_eq!(mac_power_from_sources(1, "Battery Power").source, PowerSource::Dc);
         assert_eq!(mac_power_from_sources(1, "AC Power").source, PowerSource::Ac);
         assert_eq!(mac_power_from_sources(2, "UPS Power").source, PowerSource::Ac);
         // An unreadable type string with a source present is mains — the unthrottled degrade.
         assert_eq!(mac_power_from_sources(1, "").source, PowerSource::Ac);
-        // `saver` is out of scope for v1.0 on this platform, in EVERY arm, and says so.
+        // `saver` is out of scope on this platform, in EVERY arm, and says so.
         for (c, k) in [(0usize, "AC Power"), (1, "Battery Power"), (1, "AC Power"), (3, "")] {
-            assert!(!mac_power_from_sources(c, k).saver, "macOS Low Power Mode is not read at v1.0");
+            assert!(!mac_power_from_sources(c, k).saver, "macOS Low Power Mode is not read");
         }
     }
 
@@ -20646,7 +21643,7 @@ mod efficiency_tests {
     ///
     /// FALSIFIER (L28): make `power_sim_from_env` case-insensitive or prefix-matching and the "DC"
     /// row reddens; mirror `efficiency_enabled_from_env` on the default-OFF convention
-    /// (`v == Some("1")`) and the UNSET row reddens — the feature would ship disabled.
+    /// (`v == Some("1")`) and the UNSET row reddens — the battery switch would ship disabled.
     #[test]
     fn the_efficiency_levers_parse_exactly() {
         assert_eq!(power_sim_from_env(None), None, "unset means no simulation");
@@ -20656,12 +21653,10 @@ mod efficiency_tests {
         for junk in ["DC", "Dc", "", "1", "battery", "dc ", " dc", "acdc"] {
             assert_eq!(power_sim_from_env(Some(junk)), None, "{junk:?} is not one of the three");
         }
-        // …and each token means what the boot line will say it means.
         assert_eq!(power_sim_from_env(Some("dc")).unwrap().snapshot().source, PowerSource::Dc);
         assert!(power_sim_from_env(Some("saver")).unwrap().snapshot().saver);
         assert_eq!(power_sim_from_env(Some("saver")).unwrap().snapshot().source, PowerSource::Ac);
         assert_eq!(power_sim_from_env(Some("ac")).unwrap().token(), "ac");
-
         // The DEFAULT-ON lever: disabled by an explicit zero and by nothing else.
         assert!(efficiency_enabled_from_env(None), "UNSET means the ruled behaviour is in force");
         assert!(efficiency_enabled_from_env(Some("1")));
@@ -20669,102 +21664,721 @@ mod efficiency_tests {
         assert!(!efficiency_enabled_from_env(Some("0")), "the dev revert, and only this");
     }
 
-    /// A5 — **THE BOOT LINE STATES THE VERDICT, NOT THE WATCHER** (L30), and a simulated run says so.
+    /// Round 2a (A5's successor) — **THE BOOT LINE STATES THE MODE IN EFFECT, NOT THE WATCHER**
+    /// (L30), and a simulated run says so.
     ///
-    /// FALSIFIER (L28): drop the verdict half and every row's `— ON` / `— off` assert reddens; drop
-    /// the `simulated` prefix and the sim rows redden, which is a simulated log becoming
-    /// indistinguishable from a measured one.
+    /// FALSIFIER (L28): print the saved mode as the mode in effect and the battery row reddens; drop
+    /// the `simulated` prefix and the sim row reddens.
     #[test]
-    fn the_efficiency_boot_line_states_the_verdict_not_the_watcher() {
+    fn the_mode_boot_line_states_the_mode_in_effect() {
         let ac = snap(PowerSource::Ac, false);
         let dc = snap(PowerSource::Dc, false);
+        let line = |saved, switch, s, sim: Option<PowerSim>, env| {
+            mode_boot_line(saved, switch, mode_in_effect(saved, switch, s, env, false), s, sim, env)
+        };
         assert_eq!(
-            efficiency_boot_line(EFFICIENCY_AUTO, ac, None, false),
-            "efficiency: Auto (AC) — off"
-        );
-        assert_eq!(
-            efficiency_boot_line(EFFICIENCY_AUTO, dc, None, false),
-            "efficiency: Auto (battery) — ON"
-        );
-        assert_eq!(
-            efficiency_boot_line(EFFICIENCY_ON, ac, None, false),
-            "efficiency: On (manual) — ON"
+            line(MODE_BALANCED, true, ac, None, false),
+            "mode: Balanced saved, Eco on battery on (AC) — in effect: Balanced"
         );
         assert_eq!(
-            efficiency_boot_line(EFFICIENCY_OFF, dc, None, false),
-            "efficiency: Off — off"
+            line(MODE_BALANCED, true, dc, None, false),
+            "mode: Balanced saved, Eco on battery on (battery) — in effect: Eco"
         );
         assert_eq!(
-            efficiency_boot_line(EFFICIENCY_AUTO, PowerSim::Dc.snapshot(), Some(PowerSim::Dc), false),
-            "efficiency: Auto (simulated dc) — ON"
+            line(MODE_PERFORMANCE, false, dc, None, false),
+            "mode: Turbo saved, Eco on battery off (battery) — in effect: Turbo"
         );
         assert_eq!(
-            efficiency_boot_line(EFFICIENCY_AUTO, PowerSim::Saver.snapshot(), Some(PowerSim::Saver), false),
-            "efficiency: Auto (simulated saver) — ON"
+            line(MODE_BALANCED, true, PowerSim::Dc.snapshot(), Some(PowerSim::Dc), false),
+            "mode: Balanced saved, Eco on battery on (simulated dc) — in effect: Eco"
         );
-        // The revert names the variable that produced it, and says nothing about power at all.
-        let off = efficiency_boot_line(EFFICIENCY_AUTO, dc, None, true);
-        assert_eq!(off, "efficiency: disabled (FALCON_EFFICIENCY=0)");
-        assert!(!off.contains("battery"), "a disabled feature must not report a posture it is not in");
-
-        // TRANSITIONS: both directions, and the reason travels with the verdict.
+        let vetoed = line(MODE_BALANCED, true, dc, None, true);
+        assert!(vetoed.contains("FALCON_EFFICIENCY=0") && vetoed.ends_with("in effect: Balanced"), "{vetoed}");
+        // TRANSITIONS: the reason travels with the mode.
+        let forced = mode_in_effect(MODE_BALANCED, true, dc, false, false);
         assert_eq!(
-            efficiency_transition_line(true, EFFICIENCY_AUTO, dc, None),
-            "efficiency: engaged (battery)"
+            mode_transition_line(forced, MODE_BALANCED, dc, None),
+            "mode: in effect Eco (battery; saved Balanced)"
         );
-        assert_eq!(
-            efficiency_transition_line(false, EFFICIENCY_AUTO, ac, None),
-            "efficiency: released (AC)"
-        );
-        assert_eq!(
-            efficiency_transition_line(true, EFFICIENCY_ON, ac, None),
-            "efficiency: engaged (manual)"
-        );
-
-        // THE TOAST is honest about WHICH of Auto's two reasons fired.
-        assert_eq!(efficiency_auto_toast(dc), "On battery — reducing background work.");
-        assert!(efficiency_auto_toast(snap(PowerSource::Ac, true)).contains("Battery saver"));
-        assert!(
-            !efficiency_auto_toast(snap(PowerSource::Ac, true)).contains("On battery"),
-            "a laptop on mains with Battery saver on is not on battery"
-        );
+        let back = mode_in_effect(MODE_BALANCED, true, ac, false, false);
+        assert_eq!(mode_transition_line(back, MODE_BALANCED, ac, None), "mode: in effect Balanced (chosen)");
     }
 
-    /// A6 — **THE BROWSE CEILING ONLY EVER TAKES RATE AWAY** (consumer 4).
+    /// A6 — **THE BROWSE CEILING ONLY EVER TAKES RATE AWAY.**
     ///
-    /// FALSIFIER (L28): return the constant unconditionally when engaged and the 5 fps row reddens —
-    /// a user who has chosen a slow browse would be SPED UP by the power-saving posture. Drop the
-    /// `engaged` guard and the disengaged rows redden, which is the posture applying with the
-    /// control on Off.
+    /// FALSIFIER (L28): return the ceiling unconditionally when engaged and the 5 fps row reddens —
+    /// a user who has chosen a slow browse would be SPED UP. Drop the `engaged` guard and the
+    /// Performance rows redden.
     #[test]
     fn the_efficiency_browse_ceiling_only_ever_takes_rate_away() {
-        let at20 = EfficiencyLimits::test_ceiling(EFFICIENCY_SCRUB_FPS_MAX);
-        assert_eq!(efficiency_scrub_cap(30.0, at20), EFFICIENCY_SCRUB_FPS_MAX);
-        assert_eq!(efficiency_scrub_cap(120.0, at20), EFFICIENCY_SCRUB_FPS_MAX);
-        assert_eq!(efficiency_scrub_cap(20.0, at20), 20.0, "exactly at the ceiling is untouched");
-        assert_eq!(efficiency_scrub_cap(12.0, at20), 12.0, "a user below the ceiling is untouched");
-        assert_eq!(efficiency_scrub_cap(5.0, at20), 5.0);
+        let at12 = EfficiencyLimits::test_ceiling(POWER_SAVER_FPS_MAX);
+        assert_eq!(efficiency_scrub_cap(30.0, at12), POWER_SAVER_FPS_MAX);
+        assert_eq!(efficiency_scrub_cap(120.0, at12), POWER_SAVER_FPS_MAX);
+        assert_eq!(efficiency_scrub_cap(12.0, at12), 12.0, "exactly at the ceiling is untouched");
+        assert_eq!(efficiency_scrub_cap(5.0, at12), 5.0, "a user below the ceiling is untouched");
         for fps in [5.0f32, 12.0, 20.0, 30.0, 120.0] {
-            assert_eq!(
-                efficiency_scrub_cap(fps, EfficiencyLimits::RELEASED),
-                fps,
-                "disengaged is byte-identical"
-            );
-            assert!(efficiency_scrub_cap(fps, at20) <= fps, "the posture can only take rate away");
+            assert_eq!(efficiency_scrub_cap(fps, EfficiencyLimits::RELEASED), fps, "Turbo is byte-identical");
+            assert!(efficiency_scrub_cap(fps, at12) <= fps, "a mode can only take rate away");
         }
     }
 
-    /// A7 — **THE SETTING IS READ FRESH, NEVER MEMOISED** (L43), against the live static.
+    /// Round 2a (A7's successor) — **THE SAVED MODE AND THE SWITCH ARE READ FRESH, NEVER MEMOISED**
+    /// (L43), against the live statics.
     #[test]
-    fn the_efficiency_setting_is_live_and_returns_what_went_live() {
-        let before = efficiency_mode();
-        assert_eq!(set_efficiency_mode(1), EFFICIENCY_ON);
-        assert_eq!(efficiency_mode(), EFFICIENCY_ON, "asking again is the whole mechanism");
-        assert_eq!(set_efficiency_mode(2), EFFICIENCY_OFF);
-        assert_eq!(efficiency_mode(), EFFICIENCY_OFF);
-        assert_eq!(set_efficiency_mode(77), EFFICIENCY_AUTO, "a hand-edited file cannot mount a 4th state");
-        assert_eq!(efficiency_mode(), EFFICIENCY_AUTO);
-        EFFICIENCY_MODE.store(before, Ordering::Relaxed); // leave the process as we found it
+    fn the_saved_mode_is_live_and_returns_what_went_live() {
+        let (before, switch) = (saved_mode(), battery_power_saver());
+        assert_eq!(set_saved_mode(0), MODE_PERFORMANCE);
+        assert_eq!(saved_mode(), MODE_PERFORMANCE, "asking again is the whole mechanism");
+        assert_eq!(set_saved_mode(2), MODE_POWER_SAVER);
+        assert_eq!(saved_mode(), MODE_POWER_SAVER);
+        assert_eq!(set_saved_mode(77), MODE_BALANCED, "a hand-edited file cannot mount a 4th state");
+        assert_eq!(saved_mode(), MODE_BALANCED);
+        set_battery_power_saver(false);
+        assert!(!battery_power_saver());
+        SAVED_MODE.store(before, Ordering::Relaxed); // leave the process as we found it
+        set_battery_power_saver(switch);
+    }
+}
+
+/// 2026-10-26 (round 2a): the mode control's own rows — the plan's unit tests 1–11, each named in
+/// `memory_archive/rounds/2026-10-26_mode_control/PLAN.md` with the edit that makes it fail.
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    const W: usize = 18;
+
+    fn at(mode: u8, median_ms: Option<f32>, user_fps: f32, bench: Option<f32>) -> EfficiencyLimits {
+        mode_limits(mode, CustomLimits::BALANCED_COPY, median_ms, W, user_fps, None, None, bench)
+    }
+
+    /// Plan test 1. FALSIFIER: drop the share term in `mode_ceiling` and the benchmarked rows redden;
+    /// give Performance a limit and its first row reddens.
+    #[test]
+    fn each_mode_maps_to_its_limits() {
+        // PERFORMANCE: today's behaviour, every term inert.
+        assert_eq!(at(MODE_PERFORMANCE, Some(40.0), 30.0, Some(24.0)), EfficiencyLimits::RELEASED);
+        assert_eq!(mode_ceiling(MODE_PERFORMANCE, Some(24.0)).0, f32::INFINITY, "Max included");
+        // BALANCED: 20/s without a benchmark, two-thirds of its best with one; 40 + 10 kept ready.
+        let b = at(MODE_BALANCED, None, 30.0, None);
+        assert!(b.engaged && !b.quiet, "{b:?}");
+        assert_eq!((b.limit_fps, b.ceiling_fps), (BALANCED_FPS_MAX, BALANCED_FPS_MAX));
+        assert_eq!(b.keep, (40, 10), "about 2 s of browsing at 20/s");
+        assert_eq!((b.ahead, b.behind), (40, 10), "decodes ahead over the same time");
+        assert_eq!(b.concurrency, W - 1, "no measurement: up to all workers but the displayed slot");
+        assert_eq!(b.detail_bytes_max, BALANCED_DETAIL_BYTES_MAX);
+        assert_eq!(b.detail_zoom_max, (usize::MAX, usize::MAX));
+        let bb = at(MODE_BALANCED, None, 30.0, Some(24.0));
+        assert!((bb.limit_fps - 16.0).abs() < 1e-4, "two-thirds of a 24/s benchmark: {bb:?}");
+        assert_eq!(bb.bound, LimitBound::Benchmark);
+        assert_eq!(bb.keep, (32, 8), "the kept window follows the limit");
+        assert_eq!(at(MODE_BALANCED, None, 30.0, Some(60.0)).limit_fps, BALANCED_FPS_MAX, "never above 20/s");
+        // A slow benchmark keeps Balanced at least Power saver's window, never less.
+        assert_eq!(at(MODE_BALANCED, None, 30.0, Some(12.0)).keep, POWER_SAVER_KEEP);
+        // POWER SAVER: 12/s, 40% of the best; 24 + 6 kept, decodes 12 + 4 at most; Efficiency's cuts.
+        let p = at(MODE_POWER_SAVER, None, 30.0, None);
+        assert!(p.engaged && p.quiet, "{p:?}");
+        assert_eq!((p.limit_fps, p.ceiling_fps), (POWER_SAVER_FPS_MAX, POWER_SAVER_FPS_MAX));
+        assert_eq!(p.keep, (24, 6));
+        assert!(p.ahead <= EFFICIENCY_AHEAD_MAX && p.behind <= EFFICIENCY_BEHIND_MAX, "{p:?}");
+        assert_eq!(p.concurrency, efficiency_worker_share(W), "at most half the workers");
+        assert_eq!(p.detail_bytes_max, POWER_SAVER_DETAIL_BYTES_MAX);
+        assert_eq!(p.detail_zoom_max, (3, 1));
+        let pb = at(MODE_POWER_SAVER, None, 30.0, Some(20.0));
+        assert!((pb.limit_fps - 8.0).abs() < 1e-4, "40% of a 20/s benchmark: {pb:?}");
+        assert_eq!(pb.bound, LimitBound::Benchmark);
+        assert_eq!(at(MODE_POWER_SAVER, None, 30.0, Some(6.0)).limit_fps, EFFICIENCY_CEILING_FLOOR_FPS, "the 5/s floor");
+        // The benchmark's best only reaches a mode through `mode_bench_fps`'s gate.
+        assert_eq!(mode_bench_fps(true, 24, 18, false), Some(24.0));
+        assert_eq!(mode_bench_fps(true, 24, 18, true), Some(18.0), "the tier the mode browses at");
+        assert_eq!(mode_bench_fps(false, 24, 18, false), None, "a result that cannot speak for this folder");
+        assert_eq!(mode_bench_fps(true, 0, 0, false), None);
+        // The keep count is the kept window plus the never-evicted photos, and it reaches the fast
+        // cache's eviction (the insert and the per-tick retention share one body) as its count limit.
+        assert_eq!(b.keep_count(), Some(40 + 10 + 5));
+        assert_eq!(EfficiencyLimits::RELEASED.keep_count(), None);
+        let main = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        assert_eq!(main.matches("limits.keep_count().map_or(FAST_CACHE_MAX, |n| n.min(FAST_CACHE_MAX)),").count(), 1);
+        let tick = std::fs::read_to_string(format!("{}/src/tick.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        assert!(tick.contains("if bytes <= budget && cache.len() <= keep_max {"), "the eviction's trigger");
+        assert!(tick.contains("if (bytes <= budget && cache.len() <= keep_max) || evicted >= max_evictions {"), "…and its stop");
+    }
+
+    /// Plan test 2. FALSIFIER: return `limit` instead of `user.min(limit)` and the 5/s rows redden.
+    #[test]
+    fn a_mode_limit_only_takes_speed_away() {
+        for mode in [MODE_PERFORMANCE, MODE_BALANCED, MODE_POWER_SAVER] {
+            for median in [None, Some(10.0), Some(400.0)] {
+                for bench in [None, Some(24.0)] {
+                    let l = at(mode, median, 5.0, bench);
+                    assert_eq!(efficiency_scrub_cap(5.0, l), 5.0, "a user's 5/s stays 5/s: {l:?}");
+                    // The ceiling the decodes at once and the decode reach are sized from is the
+                    // user's speed too, never the mode's limit in its place.
+                    assert!(!l.engaged || l.ceiling_fps <= 5.0, "{l:?}");
+                    for fps in [12.0f32, 20.0, 30.0, 120.0] {
+                        let l = at(mode, median, fps, bench);
+                        assert!(efficiency_scrub_cap(fps, l) <= fps, "{l:?}");
+                        assert!(!l.engaged || l.ceiling_fps <= fps, "{l:?}");
+                    }
+                }
+            }
+        }
+        assert_eq!(efficiency_scrub_cap(120.0, at(MODE_PERFORMANCE, Some(10.0), 120.0, None)), 120.0, "Max stays Max");
+    }
+
+    /// Plan test 3. FALSIFIER: let Performance derive limits and its row reddens; skip the live term
+    /// in Balanced and its row reddens.
+    #[test]
+    fn the_live_folder_measurement_lowers_balanced_and_power_saver_only() {
+        // 1500 ms a frame: Balanced's 17 slots sustain 0.8 × 17 / 1.5 ≈ 9.1/s; Power saver's 8, 4.3 → 5.
+        let b = at(MODE_BALANCED, Some(1_500.0), 30.0, None);
+        assert!((b.ceiling_fps - 0.8 * 17.0 / 1.5).abs() < 1e-3, "{b:?}");
+        assert_eq!(b.bound, LimitBound::Measured);
+        assert!(b.ceiling_fps < b.limit_fps, "the folder lowered a limit it cannot keep up with");
+        let p = at(MODE_POWER_SAVER, Some(1_500.0), 30.0, None);
+        assert_eq!(p.ceiling_fps, EFFICIENCY_CEILING_FLOOR_FPS, "{p:?}");
+        assert!(p.floored);
+        // PERFORMANCE: no live cap at all, however slow the folder.
+        let perf = at(MODE_PERFORMANCE, Some(1_500.0), 30.0, None);
+        assert_eq!(efficiency_scrub_cap(30.0, perf), 30.0);
+        // A fast folder never raises a mode above its own limit.
+        assert_eq!(at(MODE_BALANCED, Some(5.0), 30.0, None).ceiling_fps, BALANCED_FPS_MAX);
+    }
+
+    /// Plan test 4 (L31). FALSIFIER: drop `.min(limit)` from the ceiling and the fast-seed rows redden.
+    #[test]
+    fn a_seed_never_raises_a_mode_ceiling() {
+        let fast_bench = efficiency_seed(true, 200, 200, false, W).expect("seeds");
+        for mode in [MODE_BALANCED, MODE_POWER_SAVER] {
+            let seeded = mode_limits(mode, CustomLimits::BALANCED_COPY, None, W, 30.0, Some(fast_bench), None, None);
+            let bare = mode_limits(mode, CustomLimits::BALANCED_COPY, None, W, 30.0, None, None, None);
+            assert!(seeded.ceiling_fps <= bare.ceiling_fps + 1e-4, "{seeded:?} vs {bare:?}");
+        }
+        let ps = mode_limits(MODE_POWER_SAVER, CustomLimits::BALANCED_COPY, None, W, 30.0, Some(fast_bench), None, None);
+        assert!(ps.ceiling_fps <= POWER_SAVER_FPS_MAX + 1e-4, "a fast benchmark never lifts Eco above 12");
+        // …and a slow seed may still lower it.
+        let slow = efficiency_seed(true, 10, 10, false, W).unwrap();
+        assert!(mode_limits(MODE_BALANCED, CustomLimits::BALANCED_COPY, None, W, 30.0, Some(slow), None, None).ceiling_fps < BALANCED_FPS_MAX);
+    }
+
+    fn old_file(efficiency: Option<u8>) -> Settings {
+        let json = match efficiency {
+            Some(v) => format!("{{\"efficiency_mode\": {v}}}"),
+            None => "{}".to_string(),
+        };
+        serde_json::from_str(&json).expect("an older settings.json deserialises")
+    }
+
+    /// Plan test 5. FALSIFIER: drop the marker's early return and the second-load row reddens; swap
+    /// the On and Off arms and the mapping rows redden.
+    #[test]
+    fn efficiency_settings_migrate_once() {
+        for (stored, mode, battery) in [
+            (Some(EFFICIENCY_AUTO), MODE_BALANCED, true),
+            (Some(EFFICIENCY_ON), MODE_POWER_SAVER, true),
+            (Some(EFFICIENCY_OFF), MODE_BALANCED, false),
+            (None, MODE_BALANCED, true),
+            (Some(9), MODE_BALANCED, true),
+        ] {
+            let s = normalize_loaded_settings(old_file(stored));
+            assert_eq!((s.mode, s.battery_power_saver), (mode, battery), "Efficiency {stored:?}");
+            assert!(s.modes_migrated_v1 && s.modes_migrated_boot, "the marker and the save nudge");
+            // The second load (and every later one) migrates nothing, whatever the old key says.
+            let mut again = s.clone();
+            again.modes_migrated_boot = false;
+            again.mode = MODE_PERFORMANCE;
+            let again = normalize_loaded_settings(again);
+            assert_eq!(again.mode, MODE_PERFORMANCE, "the user's later choice is never re-derived");
+            assert!(!again.modes_migrated_boot);
+        }
+        // A fresh install is already on the new schema: Balanced, the switch on, nothing migrated.
+        let fresh = normalize_loaded_settings(Settings::default());
+        assert_eq!((fresh.mode, fresh.battery_power_saver, fresh.bg_wait_s), (MODE_BALANCED, true, 20));
+        assert!(!fresh.modes_migrated_boot);
+        // The retired key is never written again, and the new ones round-trip.
+        let saved = serde_json::to_string(&Settings { mode: MODE_POWER_SAVER, ..Settings::default() }).unwrap();
+        assert!(!saved.contains("efficiency_mode"), "{saved}");
+        let back: Settings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(back.mode, MODE_POWER_SAVER);
+        assert!(back.modes_migrated_v1);
+        // Hand-edited values land in range.
+        let edited: Settings = serde_json::from_str(r#"{"modes_migrated_v1": true, "mode": 7, "bg_wait_s": 900}"#).unwrap();
+        let edited = normalize_loaded_settings(edited);
+        assert_eq!((edited.mode, edited.bg_wait_s), (MODE_BALANCED, BG_WAIT_MAX_S));
+    }
+
+    /// Plan test 6 (L44). The decision never writes the saved mode, and the settings a battery
+    /// session saves carry the user's choice. FALSIFIER: store `mode_eff.mode` into the saved mode
+    /// in the tick and the mains row reddens.
+    #[test]
+    fn battery_power_saver_never_overwrites_the_saved_mode() {
+        let dc = PowerSnapshot { source: PowerSource::Dc, saver: false };
+        let ac = PowerSnapshot { source: PowerSource::Ac, saver: false };
+        let saved = MODE_BALANCED;
+        let on_battery = mode_in_effect(saved, true, dc, false, false);
+        assert_eq!(on_battery.mode, MODE_POWER_SAVER);
+        assert!(on_battery.forced(), "imposed, not chosen");
+        // Back on mains the saved mode returns, from the same saved value — nothing was written.
+        assert_eq!(mode_in_effect(saved, true, ac, false, false).mode, MODE_BALANCED);
+        // The tick's source: the mode in effect is a local; the only writes to the saved mode are
+        // the Settings row, the guide and the ask toast's pill (all user actions).
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let writes = prod.matches("support::set_saved_mode(").count();
+        assert_eq!(writes, 4, "boot seed, boot apply, the Settings/guide row, the ask toast's pill — and nothing else");
+        assert!(!prod.contains("set_saved_mode(i32::from(mode_eff"), "the decision is never saved");
+    }
+
+    /// Plan test 7 (L43). FALSIFIER: keep `at` when it differs and the round trip reddens.
+    #[test]
+    fn use_balanced_until_the_power_source_changes_clears_on_any_change() {
+        let dc = PowerSnapshot { source: PowerSource::Dc, saver: false };
+        let ac = PowerSnapshot { source: PowerSource::Ac, saver: false };
+        let dc_saver = PowerSnapshot { source: PowerSource::Dc, saver: true };
+        // Chosen on battery: it holds while on battery…
+        let mut hold = Some(dc);
+        for _ in 0..3 {
+            hold = mode_override_step(hold, dc);
+            assert_eq!(hold, Some(dc));
+            assert_eq!(mode_in_effect(MODE_BALANCED, true, dc, false, hold.is_some()).mode, MODE_BALANCED);
+        }
+        // …mains clears it, and back on battery it is Power saver again (it never returns by itself).
+        for now in [ac, dc] {
+            hold = mode_override_step(hold, now);
+        }
+        assert_eq!(hold, None, "mains → battery → mains: the override is gone");
+        assert_eq!(mode_in_effect(MODE_BALANCED, true, dc, false, hold.is_some()).mode, MODE_POWER_SAVER);
+        // A Battery saver change is a power change too.
+        assert_eq!(mode_override_step(Some(dc), dc_saver), None);
+    }
+
+    /// Plan test 9. FALSIFIER: size the zoomed window from the mode's bytes alone (ignoring the
+    /// ladder's halved budget) and the halved row reddens.
+    #[test]
+    fn zoomed_caps_take_the_smaller_of_mode_and_ladder() {
+        let frame: u64 = 179_000_000;
+        let wide = |budget: u64, l: EfficiencyLimits| {
+            mode_detail_window(crate::tick::zoomed_detail_ahead(budget.min(l.detail_bytes_max), frame), 2, l)
+        };
+        let perf = EfficiencyLimits::RELEASED;
+        let bal = at(MODE_BALANCED, None, 30.0, None);
+        let ps = at(MODE_POWER_SAVER, None, 30.0, None);
+        let big: u64 = 6_000_000_000;
+        assert_eq!(wide(big, perf).0, 16, "Turbo: today's 16 ahead within the budget");
+        assert_eq!(wide(big, bal).0, (2_147_483_648 / frame) as usize - 3, "Balanced: about 2 GB");
+        assert_eq!(wide(big, ps), (2, 1), "Eco: about 1 GB, and never past 3 + 1");
+        // The out-of-memory ladder halved the budget below the mode's bytes: the ladder wins.
+        let halved: u64 = 1_200_000_000;
+        assert_eq!(wide(halved, bal).0, (halved / frame) as usize - 3, "the smaller of the two");
+        assert_eq!(wide(halved, perf).0, wide(halved, bal).0);
+        // The tick sizes the zoomed and settled window exactly this way.
+        let main = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        assert_eq!(
+            main.matches("let wide = zoomed_detail_ahead(detail_budget_t.get().min(limits.detail_bytes_max), est_frame);").count(),
+            1
+        );
+        assert_eq!(main.matches("support::mode_detail_window(wide, if wide >= 4 { 2 } else { DETAIL_BEHIND }, limits)").count(), 1);
+    }
+
+    /// Plan test 10. FALSIFIER: keep the boot policy instead of `Policy::for_mode` and the mode rows
+    /// redden; let a mode change rewrite a running release's end and the mid-release row reddens.
+    #[test]
+    fn the_background_policy_follows_the_mode_in_effect() {
+        use background_memory::{Background, Observation, Policy, Target};
+        let perf = Policy::for_mode(MODE_PERFORMANCE, &CustomLimits::BALANCED_COPY, None, 20);
+        assert_eq!(perf.target, Target::CardShare(background_memory::PERFORMANCE_CARD_SHARE));
+        assert_eq!(Policy::for_mode(MODE_BALANCED, &CustomLimits::BALANCED_COPY, None, 20).target, Target::RequestedOnly);
+        assert_eq!(Policy::for_mode(MODE_POWER_SAVER, &CustomLimits::BALANCED_COPY, None, 20).target, Target::RequestedOnly);
+        assert_eq!(Policy::for_mode(MODE_POWER_SAVER, &CustomLimits::BALANCED_COPY, None, 45).wait, Duration::from_secs(45), "the user's wait");
+        // FALCON_BACKGROUND_TIER wins over the mode.
+        assert_eq!(Policy::for_mode(MODE_BALANCED, &CustomLimits::BALANCED_COPY, Some(perf.target), 20).target, perf.target);
+        // A release in progress keeps the start and end it began with when the mode changes.
+        let t0 = Instant::now();
+        let away = Observation { active: Some(false), minimised: false };
+        let mut bg = Background::new();
+        let _ = bg.step(t0, away, &perf, 8_000, 4_000);
+        let _ = bg.step(t0 + Duration::from_secs(21), away, &perf, 8_000, 4_000);
+        let balanced = Policy::for_mode(MODE_BALANCED, &CustomLimits::BALANCED_COPY, None, 20);
+        // The next tick is on battery: Balanced's policy, and its end would be 0 — not this release's.
+        let _ = bg.step(t0 + Duration::from_secs(22), away, &balanced, 8_000, 0);
+        assert_eq!(bg.final_bytes(), 4_000, "the end this release began with");
+        assert_eq!(bg.allowed_bytes(t0 + Duration::from_secs(60)), Some(4_000));
+        // …and the release time it began with (review E1): Custom over 30 s, then Eco (10 s) comes
+        // into effect 5 s in; at 15 s the release is half-way, not finished.
+        let slow = Policy::for_mode(MODE_CUSTOM, &CustomLimits { bg_release_s: 30, ..CustomLimits::BALANCED_COPY }, None, 20);
+        let eco = Policy::for_mode(MODE_POWER_SAVER, &CustomLimits::BALANCED_COPY, None, 20);
+        let mut bg = Background::new();
+        let _ = bg.step(t0, away, &slow, 8_000, 0);
+        let _ = bg.step(t0 + Duration::from_secs(20), away, &slow, 8_000, 0);
+        let _ = bg.step(t0 + Duration::from_secs(25), away, &eco, 8_000, 0);
+        assert_eq!(bg.allowed_bytes(t0 + Duration::from_secs(35)), Some(4_000), "the time this release began with");
+    }
+
+    /// Plan test 14's decision half. FALSIFIER: see `mode_ask`.
+    #[test]
+    fn the_speed_panel_asks_for_the_lightest_mode_that_allows_the_pick() {
+        use ModeAsk::*;
+        let (b, p, ps) = (MODE_BALANCED, MODE_PERFORMANCE, MODE_POWER_SAVER);
+        // Within the limit, or no limit: commit.
+        assert_eq!(mode_ask(20.0, 20.0, b, false, b, 20.0), None, "exactly at the limit commits");
+        assert_eq!(mode_ask(12.0, 20.0, b, false, b, 20.0), None);
+        assert_eq!(mode_ask(120.0, -1.0, p, false, p, 20.0), None, "Turbo has no limit: Max commits");
+        // Above Balanced's: Performance.
+        assert_eq!(mode_ask(30.0, 20.0, b, false, b, 20.0), Some(Switch { target: p }));
+        assert_eq!(mode_ask(120.0, 20.0, b, false, b, 20.0), Some(Switch { target: p }));
+        // Above a chosen Power saver's: Balanced when it allows the pick, else Performance.
+        assert_eq!(mode_ask(20.0, 12.0, ps, false, ps, 20.0), Some(Switch { target: b }));
+        assert_eq!(mode_ask(20.0, 12.0, ps, false, ps, 16.0), Some(Switch { target: p }), "a benchmark-limited Balanced");
+        assert_eq!(mode_ask(30.0, 12.0, ps, false, ps, 20.0), Some(Switch { target: p }));
+        // Power saver imposed by the battery: the saved mode, until the power source changes.
+        assert_eq!(mode_ask(20.0, 12.0, ps, true, b, 20.0), Some(Hold { saved: b }));
+        assert_eq!(mode_ask(30.0, 12.0, ps, true, p, 20.0), Some(Hold { saved: p }));
+        // The speed panel's greying and this decision share one threshold.
+        let src = std::fs::read_to_string(format!("{}/ui/main_window.slint", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        assert!(src.contains("grey-from: root.mode-limit-fps <= 0 ? -1"), "the panel greys from the same limit");
+    }
+
+    // ── 2026-10-27 (round 2b): CUSTOM ─────────────────────────────────────────────────────────────
+
+    fn custom(fps: i32) -> CustomLimits {
+        CustomLimits {
+            fps,
+            previews: (50, 7),
+            sharp: (6, 3),
+            zoomed: (20, 5),
+            thumbs: ThumbScope::VisibleOnly,
+            thumbs_mb: 1000,
+            bg_keep: 25,
+            bg_release_s: 30,
+        }
+    }
+
+    fn cust(c: CustomLimits, median_ms: Option<f32>, user_fps: f32, bench: Option<f32>) -> EfficiencyLimits {
+        mode_limits(MODE_CUSTOM, c, median_ms, W, user_fps, None, None, bench)
+    }
+
+    /// Round 2b plan test 1: **EACH OF CUSTOM'S NUMBERS REACHES THE LIMITS**, ahead and behind the
+    /// right way round, and its speed follows owner answer 2 — a typed limit never above the machine's
+    /// best, Unlimited Performance's (Turbo's) rule, and Balanced's own limit until the user picks.
+    ///
+    /// FALSIFIER (L28): read `c.previews` as (behind, ahead) and the keep row reddens; drop the
+    /// benchmark term in `custom_ceiling` and the benchmarked row reddens with 90; let Unlimited take
+    /// the measured arm and its row reddens with a finite ceiling.
+    #[test]
+    fn custom_maps_its_numbers_to_the_limits() {
+        let l = cust(custom(30), None, 60.0, None);
+        assert!(l.engaged && !l.quiet && l.mode == MODE_CUSTOM, "{l:?}");
+        assert_eq!(l.keep, (50, 7), "previews kept ready, ahead then behind");
+        assert_eq!(l.keep_count(), Some(50 + 7 + 5));
+        assert_eq!(l.detail_keep, (6, 3), "sharp photos kept ready");
+        assert_eq!(l.detail_zoom_max, (20, 5), "sharp photos while zoomed");
+        assert_eq!(l.detail_bytes_max, u64::MAX, "Custom's counts are fitted to the ladder's budget alone");
+        assert_eq!((l.thumbs, l.thumbs_max), (ThumbScope::VisibleOnly, crate::THUMB_CACHE_MAX));
+        assert!(!l.settled_fill(), "Custom's kept-ready numbers are the most it prepares");
+        assert!(at(MODE_BALANCED, None, 30.0, None).settled_fill() && EfficiencyLimits::RELEASED.settled_fill());
+        assert!(!at(MODE_POWER_SAVER, None, 30.0, None).settled_fill());
+        // A typed speed is the limit (Balanced's method at the user's speed)…
+        assert_eq!((l.limit_fps, l.ceiling_fps, l.bound), (30.0, 30.0, LimitBound::ModeMax));
+        // …never above this machine's measured best, never below the floor…
+        assert_eq!(cust(custom(90), None, 120.0, Some(40.0)).limit_fps, 40.0, "the benchmark's best binds");
+        assert_eq!(cust(custom(90), None, 120.0, None).limit_fps, 90.0, "without one, up to the panel's 120");
+        assert_eq!(cust(custom(2), None, 30.0, None).limit_fps, EFFICIENCY_CEILING_FLOOR_FPS);
+        // …and the live measurement lowers it, as in Balanced.
+        let slow = cust(custom(30), Some(2_000.0), 60.0, None);
+        assert!(slow.ceiling_fps < 30.0 && slow.bound == LimitBound::Measured, "{slow:?}");
+        // UNLIMITED: no limit from the mode, all its workers, the whole kept window — inside Custom's
+        // own windows, whatever the folder measures.
+        let u = cust(custom(CUSTOM_FPS_UNLIMITED), Some(2_000.0), 60.0, Some(40.0));
+        assert!(u.limit_fps.is_infinite() && u.ceiling_fps.is_infinite(), "{u:?}");
+        assert_eq!(u.concurrency, W - 1, "every worker but the displayed photo's slot");
+        assert_eq!((u.ahead, u.behind), u.keep, "decodes reach the whole kept window");
+        assert_eq!(efficiency_scrub_cap(60.0, u), 60.0, "no speed taken away");
+        assert!(!efficiency_binding(u, 120.0) && efficiency_rate_sentence(u, 120.0).is_empty());
+        // Before the user picks a speed, Custom's is Balanced's own.
+        for bench in [None, Some(24.0), Some(90.0)] {
+            assert_eq!(
+                cust(CustomLimits::BALANCED_COPY, None, 30.0, bench).limit_fps,
+                at(MODE_BALANCED, None, 30.0, bench).limit_fps,
+                "{bench:?}"
+            );
+        }
+        // Only Custom reads the card: every other mode is the same whatever it says.
+        for m in [MODE_PERFORMANCE, MODE_BALANCED, MODE_POWER_SAVER] {
+            assert_eq!(
+                mode_limits(m, custom(7), Some(80.0), W, 30.0, None, None, Some(50.0)),
+                mode_limits(m, CustomLimits::BALANCED_COPY, Some(80.0), W, 30.0, None, None, Some(50.0)),
+            );
+        }
+        // The log states Custom's numbers.
+        let c = efficiency_limits_clause(u);
+        for part in ["Custom", "keep=50+7", "sharp=6+3", "zoomed=20+5", "thumbs=visible only", "ceiling=none"] {
+            assert!(c.contains(part), "{part}: {c}");
+        }
+        assert_eq!(mode_name(MODE_CUSTOM), "Custom");
+        assert_eq!(mode_log_name(MODE_CUSTOM), "Custom");
+        // The tick hands the card's numbers to the derivation (a census: it needs the whole tick).
+        let main = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap().replace("\r\n", "\n");
+        assert_eq!(main.matches("let custom_now = support::custom_limits_of(&app);").count(), 1);
+        assert_eq!(main.matches("            support::mode_limits(\n                mode,\n                custom_now,\n").count(), 1);
+    }
+
+    /// Round 2b plan test 2 (L29): **TYPED NUMBERS LAND IN THEIR RANGES, AND THE WINDOWS NEVER ASK
+    /// FOR MORE THAN THE CACHES HOLD.**
+    ///
+    /// FALSIFIER (L28): drop `clamped()` from `custom_typed` and the out-of-range rows redden with 900
+    /// previews ahead; return `want` from `custom_detail_window` and the small-card row reddens with
+    /// 32 + 8; drop the `.max(...)` over the zoomed window in `custom_detail_cache_cap` and the
+    /// count-limit rows redden.
+    #[test]
+    fn custom_numbers_are_clamped_and_capacity_bound() {
+        let wild = CustomLimits {
+            fps: 500,
+            previews: (900, 1),
+            sharp: (40, 99),
+            zoomed: (0, 50),
+            thumbs: ThumbScope::Nearby,
+            thumbs_mb: 5_000,
+            bg_keep: 33,
+            bg_release_s: 7,
+        }
+        .clamped();
+        assert_eq!(wild.fps, CUSTOM_FPS_PANEL_MAX as i32);
+        assert_eq!((wild.previews, wild.sharp, wild.zoomed), ((200, 2), (16, 8), (1, 8)));
+        assert_eq!((wild.bg_keep, wild.bg_release_s), (0, 10), "not a stop: Balanced's");
+        assert_eq!(wild.thumbs_mb, 2_000, "the whole folder's cap tops out at the hidden 2 GB");
+        assert_eq!(CustomLimits { thumbs_mb: 3, ..wild }.clamped().thumbs_mb, 100, "…and starts at 100 MB");
+        assert_eq!(CustomLimits { fps: -9, ..wild }.clamped().fps, CUSTOM_FPS_AS_BALANCED);
+        // Typing: each row into its range, the speed to this machine's best; junk changes nothing.
+        let c = CustomLimits::BALANCED_COPY;
+        assert_eq!(custom_typed(c, 1, "900", None).map(|c| c.previews.0), Some(200));
+        assert_eq!(custom_typed(c, 2, "1", None).map(|c| c.previews.1), Some(2));
+        assert_eq!(custom_typed(c, 3, "0", None).map(|c| c.sharp.0), Some(0), "none ahead is a choice");
+        assert_eq!(custom_typed(c, 6, " 8.6 ", None).map(|c| c.zoomed.1), Some(8));
+        assert_eq!(custom_typed(c, 0, "90", Some(40.0)).map(|c| c.fps), Some(40), "held to this machine's best");
+        assert_eq!(custom_typed(c, 7, "750", None).map(|c| c.thumbs_mb), Some(750), "a typed cap between the stops");
+        assert_eq!(custom_typed(c, 7, "9000", None).map(|c| c.thumbs_mb), Some(2_000));
+        assert_eq!(custom_typed(c, 7, "20", None).map(|c| c.thumbs_mb), Some(100));
+        assert_eq!(custom_typed(c, 8, "20", None), None, "a row the card does not have");
+        assert_eq!(custom_typed(c, 0, "3", None).map(|c| c.fps), Some(5), "the floor");
+        assert_eq!(custom_typed(c, 0, "1e12", None).map(|c| c.fps), Some(120), "a huge number never wraps");
+        assert_eq!(custom_typed(c, 1, "abc", None), None);
+        assert_eq!(custom_typed(c, 1, "NaN", None), None);
+        assert_eq!(custom_typed(c, 9, "5", None), None, "no such row");
+        // The sharp windows fit the budget: at most frames − 1 with the photo on screen, ahead first.
+        assert_eq!(custom_detail_window((32, 8), 160), (32, 8), "a big budget: the user's numbers");
+        assert_eq!(custom_detail_window((32, 8), 6), (4, 0), "a budget of 6: 4 ahead, the photo, one slack");
+        assert_eq!(custom_detail_window((0, 2), 12), (0, 2), "none ahead stays none");
+        assert_eq!(custom_detail_window((8, 2), 1), (1, 0), "a window that asks ahead keeps one");
+        // Every photo a window asks for lies inside the jump-away radius, so none is dropped as
+        // "jumped away" and asked for again (review A1): behind wider than ahead included.
+        for want in [(1, 2), (1, 4), (3, 4), (0, 2), (0, 0), (8, 1), (32, 8)] {
+            let (a, b) = custom_detail_window(want, 160);
+            let r = detail_jump_radius(a, b);
+            assert!(a <= r && b <= r, "{want:?}: the window {a} + {b} within the radius {r}");
+        }
+        assert_eq!(detail_jump_radius(3, 1), 3, "ahead the wider: as before");
+        // The cache's count limit holds both windows, and the want list's ceiling (what the tier may
+        // ask for) is never below the window it asks for: retention and admission agree (2a's R2).
+        let l = cust(CustomLimits { sharp: (16, 8), zoomed: (32, 8), ..c }, None, 30.0, None);
+        let est: u64 = 50_000_000;
+        for frames in [3usize, 6, 12, 40, 160] {
+            let cap = custom_detail_cache_cap(l, frames);
+            assert!(cap >= crate::DETAIL_CACHE_MAX);
+            for want in [l.detail_keep, l.detail_zoom_max] {
+                let (a, b) = custom_detail_window(want, frames);
+                assert!(a + b + 2 <= cap, "{frames} frames: {a} + {b} within the count limit {cap}");
+                let wanted = detail_wanted_cap(frames as u64 * est, est, cap, false);
+                assert!(1 + a + b <= wanted, "{frames} frames: the want list ({wanted}) holds 1 + {a} + {b}");
+            }
+        }
+        // Previews: a high count on a small card stays the card's window (a mode only narrows).
+        let big = cust(CustomLimits { previews: (200, 64), ..c }, None, 30.0, None);
+        assert_eq!(mode_window((20, 8), 0.75, big), (20, 8), "never wider than the card's own window");
+        assert_eq!(mode_window((300, 100), 0.75, big), (200, 64));
+        assert_eq!(mode_window((300, 100), 0.25, big), (64, 100), "browsing backwards, the lead flips");
+        // The tick sizes Custom's windows and count limit this way, from the ladder's own budget (a
+        // census: it needs the whole tick).
+        let main = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        for needle in [
+            "let det_frames = (detail_budget_t.get() / est_frame.max(1)) as usize;",
+            "support::custom_detail_window(if zoomed { limits.detail_zoom_max } else { limits.detail_keep }, det_frames)",
+            "support::custom_detail_cache_cap(limits, det_frames)",
+            // …and every jump-away check reads the window's radius (review A1).
+            "let det_reach = support::detail_jump_radius(det_ahead, det_behind);",
+            "detail_ahead_atomic_t.store(det_reach, Ordering::Relaxed);",
+            "c, len, gen_now, det_reach, &det_rx,",
+        ] {
+            assert_eq!(main.matches(needle).count(), 1, "{needle}");
+        }
+        let tick = std::fs::read_to_string(format!("{}/src/tick.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        assert_eq!(tick.matches("> support::detail_jump_radius(det_ahead, det_behind) as i64").count(), 1, "the drain");
+        assert_eq!(tick.matches("> det_reach as i64").count(), 1, "the upload step");
+    }
+
+    /// Round 2b plan test 3 (L44): **A NEW INSTALL'S CUSTOM IS A COPY OF BALANCED, A SAVED CUSTOM
+    /// COMES BACK AS SAVED, AND NOTHING BUT THE USER WRITES IT.**
+    ///
+    /// FALSIFIER (L28): change a field of the Default without `BALANCED_COPY` and the first row
+    /// reddens; drop the load-time clamp and the hand-edited row reddens; write Custom's numbers from
+    /// the tick and the census reddens.
+    #[test]
+    fn custom_starts_as_balanced_and_keeps_its_own_numbers() {
+        assert_eq!(Settings::default().custom_limits(), CustomLimits::BALANCED_COPY);
+        let old: Settings = serde_json::from_str(r#"{"modes_migrated_v1": true, "mode": 1}"#).unwrap();
+        assert_eq!(normalize_loaded_settings(old).custom_limits(), CustomLimits::BALANCED_COPY, "a file from before round 2b");
+        // The copy matches Balanced wherever the two are the same thing.
+        let (cb, b) = (at(MODE_CUSTOM, None, 30.0, None), at(MODE_BALANCED, None, 30.0, None));
+        assert_eq!(
+            (cb.limit_fps, cb.ceiling_fps, cb.keep, cb.detail_keep, cb.thumbs, cb.thumbs_max),
+            (b.limit_fps, b.ceiling_fps, b.keep, b.detail_keep, b.thumbs, b.thumbs_max)
+        );
+        assert_eq!((cb.concurrency, cb.ahead, cb.behind), (b.concurrency, b.ahead, b.behind));
+        // A saved Custom round-trips, out-of-the-ordinary numbers and all.
+        let mine = CustomLimits {
+            fps: CUSTOM_FPS_UNLIMITED,
+            previews: (80, 20),
+            sharp: (0, 4),
+            zoomed: (32, 8),
+            thumbs: ThumbScope::VisibleOnly,
+            thumbs_mb: 750,
+            bg_keep: 50,
+            bg_release_s: 0,
+        };
+        let mut s = Settings { mode: MODE_CUSTOM, ..Settings::default() };
+        s.set_custom_limits(mine);
+        let back = normalize_loaded_settings(serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap());
+        assert_eq!((back.mode, back.custom_limits()), (MODE_CUSTOM, mine));
+        // Hand-edited numbers land in range.
+        let edited: Settings = serde_json::from_str(
+            r#"{"modes_migrated_v1": true, "custom_previews_ahead": 900, "custom_bg_keep": 33, "custom_thumbs": 7, "custom_thumbs_mb": 9000}"#,
+        )
+        .unwrap();
+        let edited = normalize_loaded_settings(edited);
+        assert_eq!((edited.custom_previews_ahead, edited.custom_bg_keep, edited.custom_thumbs), (200, 0, 1));
+        assert_eq!(edited.custom_thumbs_mb, 2_000);
+        // A file from before the cap had a control starts it at 500 MB.
+        let older = normalize_loaded_settings(serde_json::from_str(r#"{"modes_migrated_v1": true, "custom_thumbs": 2}"#).unwrap());
+        assert_eq!(older.custom_thumbs_mb, 500);
+        // On battery Eco is in effect over Custom; back on mains Custom returns.
+        let dc = PowerSnapshot { source: PowerSource::Dc, saver: false };
+        let ac = PowerSnapshot { source: PowerSource::Ac, saver: false };
+        assert_eq!(
+            mode_in_effect(MODE_CUSTOM, true, dc, false, false),
+            ModeInEffect { mode: MODE_POWER_SAVER, reason: ModeReason::Battery }
+        );
+        assert_eq!(mode_in_effect(MODE_CUSTOM, true, ac, false, false).mode, MODE_CUSTOM);
+        // Only the user writes the numbers: the settings apply and a typed value in Rust (the card's
+        // stops write their own properties in the markup) — never the tick.
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        assert_eq!(prod.matches("support::set_custom_limits_on(").count(), 2, "the settings apply and a typed value");
+        for setter in ["app.set_custom_fps(", "app.set_custom_previews_", "app.set_custom_sharp_",
+            "app.set_custom_zoomed_", "app.set_custom_thumbs(", "app.set_custom_thumbs_mb(", "app.set_custom_bg_"] {
+            assert_eq!(prod.matches(setter).count(), 0, "main.rs never writes Custom's numbers itself: {setter}");
+        }
+    }
+
+    /// Round 2b plan test 5: **CUSTOM KEEPS THE SHARE ITS CARD SAYS AND RELEASES OVER ITS OWN TIME;
+    /// "AT ONCE" RELEASES ON THE TICK THE RELEASE STARTS.**
+    ///
+    /// FALSIFIER (L28): keep `RAMP` for Custom and the at-once row reddens; map "Only the photos in
+    /// use" to a card share and its row reddens.
+    #[test]
+    fn custom_background_keeps_its_share_and_releases_at_its_speed() {
+        use background_memory::{Background, Observation, Policy, Target, RAMP};
+        let c = CustomLimits::BALANCED_COPY;
+        for (keep, target) in [
+            (0, Target::RequestedOnly),
+            (10, Target::CardShare(10)),
+            (25, Target::CardShare(25)),
+            (50, Target::CardShare(50)),
+        ] {
+            assert_eq!(Policy::for_mode(MODE_CUSTOM, &CustomLimits { bg_keep: keep, ..c }, None, 20).target, target);
+        }
+        for s in [0u32, 10, 30] {
+            let p = Policy::for_mode(MODE_CUSTOM, &CustomLimits { bg_release_s: s, ..c }, None, 20);
+            assert_eq!((p.ramp, p.wait), (Duration::from_secs(u64::from(s)), Duration::from_secs(20)), "the wait is the shared one");
+        }
+        // Another mode ignores Custom's card; FALCON_BACKGROUND_TIER still wins.
+        let odd = CustomLimits { bg_keep: 50, bg_release_s: 0, ..c };
+        assert_eq!(Policy::for_mode(MODE_BALANCED, &odd, None, 20), Policy::for_mode(MODE_BALANCED, &c, None, 20));
+        assert_eq!(Policy::for_mode(MODE_PERFORMANCE, &odd, None, 20).ramp, RAMP);
+        assert_eq!(Policy::for_mode(MODE_CUSTOM, &odd, Some(Target::RequestedOnly), 20).target, Target::RequestedOnly);
+        // At once: the release is at its target on the tick it starts.
+        let t0 = Instant::now();
+        let away = Observation { active: Some(false), minimised: false };
+        let at_once = Policy::for_mode(MODE_CUSTOM, &CustomLimits { bg_release_s: 0, ..c }, None, 20);
+        let mut bg = Background::new();
+        let _ = bg.step(t0, away, &at_once, 8_000, 1_000);
+        let _ = bg.step(t0 + Duration::from_secs(21), away, &at_once, 8_000, 1_000);
+        assert_eq!(bg.allowed_bytes(t0 + Duration::from_secs(21)), Some(1_000), "nothing to ramp");
+        // Over 30 s it is half-way at 15 s.
+        let slow = Policy::for_mode(MODE_CUSTOM, &CustomLimits { bg_release_s: 30, ..c }, None, 20);
+        let mut bg = Background::new();
+        let _ = bg.step(t0, away, &slow, 8_000, 0);
+        let _ = bg.step(t0 + Duration::from_secs(20), away, &slow, 8_000, 0);
+        assert_eq!(bg.allowed_bytes(t0 + Duration::from_secs(35)), Some(4_000));
+        // The tick's policy reads the card (a census).
+        let main = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap().replace("\r\n", "\n");
+        assert_eq!(main.matches("background_memory::Policy::for_mode(\n            mode_eff.mode,\n            &custom_now,\n").count(), 1);
+    }
+
+    /// Round 2b (owner answer 5 and its confirmation): **WHICH THUMBNAILS EACH MODE PREPARES.**
+    ///
+    /// FALSIFIER (L28): give Balanced `Nearby` and its row reddens; give Eco the whole folder and its
+    /// row reddens (on battery, whole-folder preparation must stop); leave Turbo uncapped, or give
+    /// Custom Balanced's fixed cap, and their cap rows redden (owner, 27 October).
+    #[test]
+    fn each_mode_prepares_its_thumbnails() {
+        let r = EfficiencyLimits::RELEASED;
+        assert_eq!((r.thumbs, r.thumbs_max), (ThumbScope::WholeFolder, WHOLE_FOLDER_THUMBS_MAX), "Turbo: within the hidden 2 GB");
+        assert!(WHOLE_FOLDER_THUMBS_MAX as u64 * THUMB_BYTES_EST <= 2_000_000_000 && WHOLE_FOLDER_THUMBS_MAX > 11_000);
+        const { assert!(WHOLE_FOLDER_THUMBS_MAX > 9_999, "above a camera's numbering") };
+        let b = at(MODE_BALANCED, None, 30.0, None);
+        assert_eq!((b.thumbs, b.thumbs_max), (ThumbScope::WholeFolder, WHOLE_FOLDER_THUMBS), "Balanced: about 500 MB");
+        assert!(WHOLE_FOLDER_THUMBS as u64 * THUMB_BYTES_EST <= 500_000_000 && WHOLE_FOLDER_THUMBS > 2_800);
+        let e = at(MODE_POWER_SAVER, None, 30.0, None);
+        assert_eq!((e.thumbs, e.thumbs_max), (ThumbScope::Nearby, crate::THUMB_CACHE_MAX), "Eco: visible and nearby");
+        for (scope, cap) in [
+            (ThumbScope::VisibleOnly, crate::THUMB_CACHE_MAX),
+            (ThumbScope::Nearby, crate::THUMB_CACHE_MAX),
+            (ThumbScope::WholeFolder, WHOLE_FOLDER_THUMBS),
+        ] {
+            let l = cust(CustomLimits { thumbs: scope, ..CustomLimits::BALANCED_COPY }, None, 30.0, None);
+            assert_eq!((l.thumbs, l.thumbs_max), (scope, cap), "Custom: its choice");
+            assert_eq!(ThumbScope::from_index(scope.index()), scope);
+        }
+        // Custom's whole folder keeps its own cap: 500 MB to start, its top Turbo's hidden 2 GB.
+        for (mb, cap) in [(250, 1_427), (500, WHOLE_FOLDER_THUMBS), (750, 4_283), (2_000, WHOLE_FOLDER_THUMBS_MAX)] {
+            let l = cust(CustomLimits { thumbs_mb: mb, ..CustomLimits::BALANCED_COPY }, None, 30.0, None);
+            assert_eq!(l.thumbs_max, cap, "Custom up to {mb} MB");
+        }
+        let nearby = cust(CustomLimits { thumbs: ThumbScope::Nearby, thumbs_mb: 2_000, ..CustomLimits::BALANCED_COPY }, None, 30.0, None);
+        assert_eq!(nearby.thumbs_max, crate::THUMB_CACHE_MAX, "the cap is the whole folder's only");
+        assert_eq!(whole_folder_thumbs_in(9_000), WHOLE_FOLDER_THUMBS_MAX, "nothing above the hidden cap");
+        assert_eq!(ThumbScope::from_index(9), ThumbScope::Nearby);
+    }
+
+    /// Plan test 11 (L12). FALSIFIER: compare whole version strings and the patch row reddens.
+    #[test]
+    fn the_guide_returns_once_per_feature_update() {
+        assert_eq!(guide_boot(false, "", "1.1.0"), (true, false), "a first run: the first-run wording");
+        assert_eq!(guide_boot(true, "", "1.1.0"), (true, true), "1.0 → 1.1 returns once, updating wording");
+        assert_eq!(guide_boot(true, "1.0", "1.1.2"), (true, true));
+        assert_eq!(guide_boot(true, "", "1.0.16"), (false, false), "1.0.15 → 1.0.16 does not");
+        assert_eq!(guide_boot(true, "1.1", "1.1.5"), (false, false), "…nor a patch after the return");
+        assert_eq!(guide_boot(true, "1.1", "1.0.20"), (false, false), "nor an older build");
+        assert_eq!(guide_boot(true, "1.1", "2.0.0"), (true, true));
+        assert_eq!(feature_version("1.1.0"), (1, 1));
+        assert_eq!(feature_version("garbage"), (1, 0));
+        assert_eq!(feature_version_text("1.0.15"), "1.0");
+        // It is saved at SHOW: the boot writes the running feature version into the property the
+        // save reads, and nudges a save on the launch that showed it.
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let show = src.find("let (welcome_open_at_boot, guide_updating) = support::guide_boot(").expect("boot decision");
+        let record = src.find("app.set_guide_seen_feature(if welcome_open_at_boot {").expect("recorded at show");
+        let nudge = src.find("|| guide_updating").expect("saved at once");
+        assert!(show < record && record < nudge);
     }
 }
 
@@ -27106,6 +28720,10 @@ pub(crate) fn arm_bulk_ask(a: &MainWindow, ask: BulkAsk) {
 /// one verb for every dismissal), which is exactly what the owner's ruling leaves untouched.
 pub(crate) fn clear_bulk_ask(a: &MainWindow) -> Option<BulkAsk> {
     a.set_toast_bulk_ask(false);
+    // 2026-10-26 (round 2a): …and the speed panel's mode question rides the same teardown, so every
+    // raise and every dismissal that ends the rating question also ends it (a stale [Switch to …]
+    // can never act). It has no captured subject beyond the card's own properties.
+    a.set_toast_mode_ask(0);
     BULK_ASK.with(|c| c.borrow_mut().take())
 }
 
@@ -33394,6 +35012,25 @@ pub(crate) fn normalize_loaded_settings(mut s: Settings) -> Settings {
             ));
         }
     }
+    // 2026-10-26 (round 2a): Efficiency mode becomes the mode control, ONCE (the marker), then the
+    // stored mode and wait are clamped into range (a hand-edited 9 is Balanced; a wait outside 5–300 s
+    // lands on its nearest end). LOGGED ONCE PER PROCESS for the two-reads-at-boot reason above.
+    if let Some(mode) = migrate_modes(&mut s) {
+        static MODES_MIGRATION_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !MODES_MIGRATION_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log_event(&format!(
+                "settings: Efficiency mode migrated to the mode control — {}, Eco on battery {}",
+                mode_log_name(mode),
+                if s.battery_power_saver { "on" } else { "off" }
+            ));
+        }
+    }
+    s.mode = mode_from_settings(i32::from(s.mode));
+    s.bg_wait_s = s.bg_wait_s.clamp(BG_WAIT_MIN_S, BG_WAIT_MAX_S);
+    // Round 2b: Custom's numbers, into their ranges (a hand-edited 900 previews ahead is 200).
+    let custom = s.custom_limits();
+    s.set_custom_limits(custom);
     s
 }
 pub(crate) fn save_settings(s: &Settings) {
@@ -35695,6 +37332,7 @@ pub(crate) fn build_settings(
     // honest when ONLY the memo changed (e.g. an adapter-name refresh) so that write isn't skipped.
     let memo = gpu_memo_snapshot();
     let assoc_prev = assoc_prev_snapshot(); // v0.9.16: the captured incumbents' live slot
+    let custom = custom_limits_of(app); // round 2b
     Settings {
         scrub_fps: app.get_scrub_fps(),
         wheel_nav: app.get_wheel_nav(),
@@ -35719,11 +37357,31 @@ pub(crate) fn build_settings(
         // dirty-compare writes the click about a second later (ledger L12: persisted at CHANGE).
         hover_to_preview: app.get_hover_to_preview(),
         hover_preview_instant: app.get_hover_preview_instant(),
-        // v0.8.195: straight off the live Slint property, like the two rows around it. The property
-        // is the CONTROL's value; the atomic the tick reads is written by the same click through
-        // `set_efficiency_mode`, and the boot apply routes both through that one setter so the file,
-        // the property and the atomic cannot drift.
-        efficiency_mode: efficiency_mode_from_settings(app.get_efficiency_mode()),
+        // Retired (round 2a): never serialized; the value here is only what the struct needs.
+        efficiency_mode: EFFICIENCY_AUTO,
+        // 2026-10-26 (round 2a): straight off the live Slint properties, like the rows around them —
+        // the controls the user clicked are where the choices live (L44: Power saver on battery
+        // never writes `mode`, so a battery session saves the user's own choice). The marker is
+        // stamped on every save (the `panels_default_v1` rule).
+        mode: mode_from_settings(app.get_mode()),
+        battery_power_saver: app.get_battery_power_saver(),
+        bg_wait_s: (app.get_bg_wait_s().max(0) as u32).clamp(BG_WAIT_MIN_S, BG_WAIT_MAX_S),
+        guide_seen_feature: app.get_guide_seen_feature().to_string(),
+        modes_migrated_v1: true,
+        // Round 2b: Custom's numbers, straight off the card's properties (`custom_limits_of`), the
+        // rows' own discipline above — the user's numbers, never what a battery or a release lowered
+        // them to (L44).
+        custom_fps: custom.fps,
+        custom_previews_ahead: custom.previews.0 as u32,
+        custom_previews_behind: custom.previews.1 as u32,
+        custom_sharp_ahead: custom.sharp.0 as u32,
+        custom_sharp_behind: custom.sharp.1 as u32,
+        custom_zoomed_ahead: custom.zoomed.0 as u32,
+        custom_zoomed_behind: custom.zoomed.1 as u32,
+        custom_thumbs: custom.thumbs.index() as u8,
+        custom_thumbs_mb: custom.thumbs_mb,
+        custom_bg_keep: custom.bg_keep,
+        custom_bg_release_s: custom.bg_release_s,
         // v0.8.171: ALWAYS `Some`. Writing the live value unconditionally is what makes the
         // absent-key default a ONE-SHOT migration: after the first save this install has an
         // explicit choice on disk — 4 if it never moved the control, whatever it moved it to
@@ -35918,6 +37576,7 @@ pub(crate) fn build_settings(
         assoc_prev_default_jxl: assoc_prev[7].clone(),
         assoc_prev_default_raw: assoc_prev[8].clone(),
         panels_migrated_boot: false, // v0.8.97: transient — a rebuilt Settings never re-signals a migration
+        modes_migrated_boot: false, // 2026-10-26: the same, for the mode migration
         // v0.8.97: the floating-panels LAUNCH PREFERENCE + the develop panel's own open flag, both
         // straight off their Slint properties (the motion_ui pattern). `panels_default` is written
         // ONLY by the Settings seg — no live panel control touches it — which is what keeps the
@@ -38496,7 +40155,7 @@ fn power_probe() -> Option<PowerSnapshot> {
 ///
 /// Without this arm the v1.0 trunk would ship a user-visible tri-state EFFICIENCY control that can
 /// never engage on Auto on a Mac: `power_probe` answered `None`, the snapshot stayed
-/// [`PowerSnapshot::UNKNOWN`], and [`efficiency_engaged`]'s documented rule is that Unknown NEVER
+/// [`PowerSnapshot::UNKNOWN`], and [`mode_in_effect`]'s documented rule is that Unknown NEVER
 /// engages. The probe it needed was already in this file — IOKit's `IOPSCopyPowerSourcesInfo` +
 /// `IOPSGetProvidingPowerSourceType`, shipped and tester-proven on the branch since v0.9.60.
 ///

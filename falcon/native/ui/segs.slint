@@ -161,10 +161,25 @@ import { Theme } from "theme.slint";
         property <color> lbl-off: root.enabled ? Theme.text-dim : Theme.text-dim.with-alpha(0.35);
         callback changed(int);
         property <int> n: max(1, root.opts.length);
+        // 2026-10-27 (round 2b, owner rule): a row whose first cell is TEXT and the rest NUMBERS
+        // ("In use | 10% | 25% | 50%") gives the text cell 1.5 times a number cell's width, the
+        // CustomSeg proportion; the number cells stay equal. False (every other Seg): equal cells,
+        // byte-for-byte the geometry below.
+        in property <bool> wide-first: false;
         // v0.8.40 (FIX 3): the 3px rule (as CustomSeg) — track edges 3px, inter-pill gaps 3px. segw is
         // the pill STRIDE (pill width + one 3px gap): pill i = [i*segw + 3px, +(segw - 3px)]; the strides
         // tile width - 3px, leaving exactly 3px at each edge. Hit boundaries sit at the gap centres.
         property <length> segw: (root.width - 3px) / root.n;
+        // With `wide-first`: a number pill is `numw`, the text pill 1.5 times that, and the tiling is
+        // 3 + 1.5·numw + 3 + (n−1)·(numw + 3) = width.
+        property <length> numw: (root.width - 3px - 3px * root.n) / (root.n + 0.5);
+        pure function cell-x(i: int) -> length {
+            return !root.wide-first ? i * root.segw + 3px
+                : i == 0 ? 3px : 6px + 1.5 * root.numw + (i - 1) * (root.numw + 3px);
+        }
+        pure function cell-w(i: int) -> length {
+            return !root.wide-first ? root.segw - 3px : i == 0 ? 1.5 * root.numw : root.numw;
+        }
         property <int> drag-seg: -1;   // last segment emitted this drag (dedup)
         property <int> press-seg: -1;  // segment under the press (committed on a clean tap)
         property <bool> committed: false; // a horizontal drag-select already fired this gesture
@@ -201,7 +216,9 @@ import { Theme } from "theme.slint";
         property <int> shown-sel: (root.enabled && root.deferred-commit && ta.pressed) ? root.drag-seg : root.sel;
         property <int> hov-seg: (root.enabled && ta.has-hover) ? root.seg-at(ta.mouse-x) : -1;
         function seg-at(mx: length) -> int {
-            return Math.max(0, Math.min(root.n - 1, Math.floor((mx - 1.5px) / root.segw)));
+            return !root.wide-first ? Math.max(0, Math.min(root.n - 1, Math.floor((mx - 1.5px) / root.segw)))
+                : mx < 4.5px + 1.5 * root.numw ? 0
+                : Math.max(1, Math.min(root.n - 1, 1 + Math.floor((mx - 4.5px - 1.5 * root.numw) / (root.numw + 3px))));
         }
         height: 34px;
         // Square outer clipping uses a scissor, not a resampled text layer.
@@ -220,18 +237,22 @@ import { Theme } from "theme.slint";
             // is the only observable proof a deferred-commit drag still moves the highlight under the
             // finger (nothing is written until release, so no Rust-side property can show it).
             pill := Rectangle {
-                width: root.segw - 3px; height: parent.height - 6px; border-radius: Theme.radius-ctrl - 3px;
-                x: root.shown-sel * root.segw + 3px; // v0.8.40 (FIX 3): 3px edges AND 3px inter-pill gaps (segw = pill + gap stride)
+                width: root.cell-w(root.shown-sel); height: parent.height - 6px; border-radius: Theme.radius-ctrl - 3px;
+                x: root.cell-x(root.shown-sel); // v0.8.40 (FIX 3): 3px edges AND 3px inter-pill gaps (segw = pill + gap stride)
                 y: 3px;
                 background: root.enabled ? Theme.accent : Theme.accent.with-alpha(0.35);
                 animate x { duration: Theme.anim-fast; easing: ease-out; }
+                // Round 2b: with `wide-first` the pill's width changes between cells too, so it
+                // animates with the glide (as CustomSeg's). Equal cells keep today's instant width,
+                // so a resize still sets it at once.
+                animate width { duration: root.wide-first ? Theme.anim-fast : 0ms; easing: ease-out; }
             }
             // v0.8.40 (FIX 3): washes + labels positioned ABSOLUTELY on the pill geometry (as CustomSeg) —
             // equal-stretch layout cells couldn't give the EDGE pills their 3px track gap while keeping the
             // 3px inter-pill gaps. Each wash is its pill's exact rect; each label centres on its pill.
             for o[i] in root.opts : Rectangle {
-                x: i * root.segw + 3px; y: 3px;
-                width: root.segw - 3px; height: parent.height - 6px; border-radius: Theme.radius-ctrl - 3px;
+                x: root.cell-x(i); y: 3px;
+                width: root.cell-w(i); height: parent.height - 6px; border-radius: Theme.radius-ctrl - 3px;
                 background: (root.hov-seg == i && root.shown-sel != i) ? Theme.hover : transparent; // P4: instant hover (unified with SegPill + CustomSeg)
             }
         }
@@ -241,7 +262,7 @@ import { Theme } from "theme.slint";
             // SemiBold on the accent-filled active cell (user rule: text on a blue/purple fill = 600);
             // inactive cells are already 600, so the row reads uniformly SemiBold.
             font-size: Theme.font-md; font-weight: 600;
-            x: i * root.segw + 3px + (root.segw - 3px - self.width) / 2; y: (parent.height - self.height) / 2;
+            x: root.cell-x(i) + (root.cell-w(i) - self.width) / 2; y: (parent.height - self.height) / 2;
         }
         // Commit on a clean TAP (up) or a HORIZONTAL drag-select — NOT on raw pointer-down. Committing
         // on down let a vertical scroll gesture that merely STARTED on this row silently flip the value
@@ -312,12 +333,27 @@ import { Theme } from "theme.slint";
         in property <[string]> stops;          // the named stop labels (Custom is built in)
         in property <int> index;               // active named stop (when custom == 0)
         in property <int> custom: 0;           // > 0 = custom value active
+        // 2026-10-27 (round 2b): whether the typed cell is the active one. By default a value above 0
+        // (every caller before round 2b); the Custom card's counts set it themselves, because 0 is a
+        // valid typed count there ("no sharp photos ahead").
+        in property <bool> custom-active: root.custom > 0;
+        // 2026-10-27 (round 2b, owner rule): the LAST stop is text among number stops (Custom's
+        // "12 | 20 | 30 | Unlimited"), so it takes the typed cell's width and the number stops share
+        // the rest equally. The value-line, device-max and mode veils below assume equal stops; no
+        // caller sets them together with this.
+        in property <bool> wide-last: false;
         in property <string> suffix: "";       // rendered after the custom value, e.g. "%"
         in property <brush> bg: Theme.well; // recessed track (H2, v0.7.2) — visible on base AND block
         // OPTIONAL slider overlay (used by the speed popup; -1 = off so every other CustomSeg is unchanged):
         in property <float> indicator-frac: -1.0; // blue value-line at this frac over the stop CENTERS (a custom value's position)
         in property <float> limit-frac: -1.0;     // device-max: light veil beyond this frac + a marker line (v0.7.5 restore; -1 = off)
         in property <bool> instant: false;        // commit on pointer-DOWN (snappier) — only safe OUTSIDE a Flickable
+        // 2026-10-26 (round 2a): the first stop the current MODE does not allow (-1 = none). From it to
+        // the right edge the stops are GREYED: their labels take the dead-state colour and a dark veil
+        // covers them — distinct from the light device-max frost above, which marks what the hardware
+        // cannot sustain. The stops still pick: the caller decides what a pick on one means (the speed
+        // panel asks before changing the mode). Only the speed panel sets it.
+        in property <int> grey-from: -1;
         // v1.0.0-rc EXPORT FORMAT tail (§R-B B-O1): THE P5 MUTE, WITH THE REFUSAL THAT BELONGS TO IT.
         // `IconBtn`'s doc defines the app's vocabulary — "`enabled`, the P5 mute, which dims and still
         // swallows" — and this component had no such property, so the export sheet's first attempt to
@@ -369,15 +405,20 @@ import { Theme } from "theme.slint";
         // per-cell background crossfade lacked: dragging now visibly pulls a single handle across
         // the row, like SegPill). While editing it parks on the Custom cell and morphs into a
         // RAISED block input chip behind the inline TextInput (the track itself is the dark well now).
-        property <int> active-seg: root.editing ? 0 : (root.custom > 0 ? 0 : root.index + 1);
+        property <int> active-seg: root.editing ? 0 : (root.custom-active ? 0 : root.index + 1);
         // v0.8.40 (FIX 3): THE 3px RULE on every boundary (user-annotated screenshot): track-edge ->
         // pill = 3px on ALL FOUR sides AND pill -> pill = 3px. Pill widths are explicit. The Custom pill
         // keeps its v0.8.38 weighting (1.5x a stop pill; still deliberately wider — it holds the 6-char
         // "Custom" label AND typed values like "500"/"7.5%"), floored at 55px (= the old 58px cell minus
         // its side insets) so the label never clips; the stop pills share the remainder equally.
         // Tiling: 3 + custom-pw + 3 + N*stop-pw + (N-1)*3 + 3 == width  (N = stops.length).
-        property <length> custom-pw: max(55px, (root.width - 6px - 3px * root.stops.length) * 1.5 / (root.stops.length + 1.5));
-        property <length> stop-pw: (root.width - 6px - 3px * root.stops.length - root.custom-pw) / max(1, root.stops.length);
+        property <length> custom-pw: max(55px, (root.width - 6px - 3px * root.stops.length) * 1.5 / (root.stops.length + (root.wide-last ? 2 : 1.5)));
+        property <length> stop-pw: (root.width - 6px - 3px * root.stops.length - root.custom-pw * (root.wide-last ? 2 : 1))
+            / max(1, root.stops.length - (root.wide-last ? 1 : 0));
+        // Stop i's pill width: `stop-pw`, except a wide last stop, which matches the typed cell.
+        pure function pill-w(i: int) -> length {
+            return root.wide-last && i == root.stops.length - 1 ? root.custom-pw : root.stop-pw;
+        }
         // Hit CELLS keep the old names (seg-at + every stride below is unchanged) and put their
         // boundaries at the gap CENTRES: custom cell = 3px edge + pill + half-gap; stop cell = half-gap
         // + pill + half-gap. A stop pill's centre == its cell centre, so the indicator/limit overlays'
@@ -389,10 +430,11 @@ import { Theme } from "theme.slint";
             border-radius: Theme.radius-ctrl;
             background: root.bg;
             clip: true;
-            Rectangle {
+            // Round 2b: named for the rig, which measures the text and number cells' widths with it.
+            cpill := Rectangle {
                 // v0.8.40 (FIX 3): 3px on every boundary - track edge -> pill 3px (all four sides), pill ->
                 // pill 3px; radius-ctrl 9 - 3 = 6. Custom + stop pills differ in width, so the WIDTH animates too.
-                width: root.active-seg == 0 ? root.custom-pw : root.stop-pw;
+                width: root.active-seg == 0 ? root.custom-pw : root.pill-w(root.active-seg - 1);
                 height: parent.height - 6px; border-radius: Theme.radius-ctrl - 3px;
                 x: root.active-seg == 0 ? 3px : root.custom-w + (root.active-seg - 1) * root.stopw + 1.5px;
                 y: 3px;
@@ -418,25 +460,26 @@ import { Theme } from "theme.slint";
             }
             for s[i] in root.stops : Rectangle { // stop-cell hover wash
                 x: root.custom-w + i * root.stopw + 1.5px; y: 3px;
-                width: root.stop-pw; height: parent.height - 6px; border-radius: Theme.radius-ctrl - 3px;
+                width: root.pill-w(i); height: parent.height - 6px; border-radius: Theme.radius-ctrl - 3px;
                 background: (root.hov-seg == i + 1 && root.active-seg != i + 1) ? Theme.hover : transparent;
             }
         }
         Text { // Custom label (or the committed custom value)
             visible: !root.editing;
-            text: root.custom > 0 ? root.custom + root.suffix : @tr("falcon" => "Custom");
-            color: root.custom > 0 ? root.lbl-on : root.lbl-off;
+            text: root.custom-active ? root.custom + root.suffix : @tr("falcon" => "Custom");
+            color: root.custom-active ? root.lbl-on : root.lbl-off;
             font-size: Theme.font-md; font-weight: 600;
             x: 3px + (root.custom-pw - self.width) / 2; y: (parent.height - self.height) / 2;
         }
         for s[i] in root.stops : Text { // stop label, centred on its pill
             text: s;
-            color: root.active-seg == i + 1 ? root.lbl-on : root.lbl-off;
+            color: root.active-seg == i + 1 ? root.lbl-on
+                : (root.grey-from >= 0 && i >= root.grey-from) ? root.lbl-off.with-alpha(0.35) : root.lbl-off;
             font-size: Theme.font-md; font-weight: 600;
-            x: root.custom-w + i * root.stopw + 1.5px + (root.stop-pw - self.width) / 2; y: (parent.height - self.height) / 2;
+            x: root.custom-w + i * root.stopw + 1.5px + (root.pill-w(i) - self.width) / 2; y: (parent.height - self.height) / 2;
         }
         // blue value-line — where a CUSTOM fps lands among the number stops (the continuous position indicator)
-        if root.indicator-frac >= 0.0 || root.limit-frac >= 0.0 : Rectangle {
+        if root.indicator-frac >= 0.0 || root.limit-frac >= 0.0 || root.grey-from >= 0 : Rectangle {
             width: 100%; height: 100%;
             border-radius: Theme.radius-ctrl;
             clip: true;
@@ -459,6 +502,14 @@ import { Theme } from "theme.slint";
                 width: 2px; height: 100%;
                 background: Theme.text-mute;
             }
+            // round 2a: the MODE's veil — from the cell boundary before the first greyed stop to the
+            // right edge, a dark wash (the frost above is a light one). Named for the rig's geometry
+            // check (L49: a greyed stop is proved by where this starts, never by `visible:`).
+            if root.grey-from >= 0 : greyveil := Rectangle {
+                x: root.custom-w + root.grey-from * root.stopw;
+                width: root.width - self.x; height: 100%;
+                background: Theme.scrim-light;
+            }
             // ONE surface: press a segment OR drag across the stops (slider-like — this is the fix for
             // "the sliders aren't draggable"). `ci` sits ON TOP over the Custom segment so text editing
             // still works while this stays live for the stop segments. Commit on a clean TAP (up) or a
@@ -473,7 +524,7 @@ import { Theme } from "theme.slint";
             if (!root.enabled) { return; }
             if (seg == 0) {
                 // Custom → inline edit (ci is layered above this surface)
-                ci.text = root.custom > 0 ? root.custom + "" : "";
+                ci.text = root.custom-active ? root.custom + "" : "";
                 root.editing = true;
                 ci.focus();
             } else {
@@ -525,5 +576,47 @@ import { Theme } from "theme.slint";
             accepted => { root.custom-committed(self.text); root.editing = false; }
             // losing focus cancels an abandoned edit so a later Enter can't re-commit it (audit fix)
             changed has-focus => { if (!self.has-focus) { root.editing = false; } }
+        }
+    }
+
+    // 2026-10-27 (round 2b, owner rulings): ONE ROW OF THE CUSTOM CARD — a short label ("Ahead" /
+    // "Behind") and a CustomSeg over four count stops plus the typed cell. `value` is the row's
+    // number. A stop sends its count through `pick`; a typed value goes to the caller through `typed`
+    // (Rust brings it into the row's range, and the caller restores keyboard focus). The typed cell
+    // lights for any value that is not a stop, 0 included (`custom-active`), so the card always shows
+    // the number in effect. `seg` is named for the rig.
+    export component CountRow inherits HorizontalLayout {
+        in property <string> label;
+        // 2026-10-27 (round 2b, owner): a unit after the control ("MB" on the whole folder's cap);
+        // empty on the count rows, which mount nothing for it.
+        in property <string> unit;
+        in property <int> value;
+        in property <int> s0;
+        in property <int> s1;
+        in property <int> s2;
+        in property <int> s3;
+        callback pick(int);
+        callback typed(string);
+        property <bool> on-stop: root.value == root.s0 || root.value == root.s1 || root.value == root.s2 || root.value == root.s3;
+        spacing: 8px;
+        Text {
+            width: 48px;
+            text: root.label;
+            color: Theme.text-mute; font-size: Theme.font-md;
+            vertical-alignment: center;
+        }
+        seg := CustomSeg {
+            horizontal-stretch: 1;
+            stops: [root.s0 + "", root.s1 + "", root.s2 + "", root.s3 + ""];
+            index: root.value == root.s0 ? 0 : root.value == root.s1 ? 1 : root.value == root.s2 ? 2 : 3;
+            custom: root.on-stop ? 0 : root.value;
+            custom-active: !root.on-stop;
+            picked(i) => { root.pick(i == 0 ? root.s0 : i == 1 ? root.s1 : i == 2 ? root.s2 : root.s3); }
+            custom-committed(t) => { root.typed(t); }
+        }
+        if root.unit != "" : Text {
+            text: root.unit;
+            color: Theme.text-mute; font-size: Theme.font-md;
+            vertical-alignment: center;
         }
     }
