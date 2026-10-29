@@ -13,6 +13,9 @@
 //! are the part that runs everywhere, and they are written to carry the invariants that CAN be
 //! stated without pixels.
 
+#[path = "../../test-support/hw_child.rs"]
+mod hw_child;
+
 #[path = "../../test-support/fixture_paths.rs"]
 mod fixture_paths;
 
@@ -162,6 +165,7 @@ const DERIVE_STOP_TOLERANCE: f64 = 14.0;
 /// means the ladder did not take the door it was handed.
 #[test]
 fn s2_scaled_decode_matches_the_full_decode_in_size_and_picture() {
+    if !hw_child::run_here(module_path!(), "s2_scaled_decode_matches_the_full_decode_in_size_and_picture") { return; }
     let Some(shots) = heic_shots_or_skip("S2 scaled decode") else { return };
     let mut worst = 0.0f64;
     let mut engaged = 0usize;
@@ -334,6 +338,7 @@ fn s2_scaled_decode_matches_the_full_decode_in_size_and_picture() {
 /// rows measured here are the derivable regime.
 #[test]
 fn a_derive_from_a_res_limited_master_is_the_same_picture() {
+    if !hw_child::run_here(module_path!(), "a_derive_from_a_res_limited_master_is_the_same_picture") { return; }
     let Some(shots) = heic_shots_or_skip("res-limited derive") else { return };
     const RES_LIMIT: u32 = 4096; // a shipping res-limit value, above the fast ask and below the masters
     let mut worst = 0.0f64;
@@ -419,6 +424,7 @@ fn a_derive_from_a_res_limited_master_is_the_same_picture() {
 /// filter and the mean|Δ| rows go from ~0 to well past the tolerance on every file.
 #[test]
 fn a_derived_fast_frame_is_the_same_picture_as_a_decoded_one() {
+    if !hw_child::run_here(module_path!(), "a_derived_fast_frame_is_the_same_picture_as_a_decoded_one") { return; }
     let Some(shots) = heic_shots_or_skip("derived fast frame") else { return };
     let mut worst = 0.0f64;
     let mut same_size_rows = 0usize;
@@ -539,6 +545,7 @@ fn a_derived_fast_frame_is_the_same_picture_as_a_decoded_one() {
 /// landscape passes the dims row but blows the mean|Δ| row apart.
 #[test]
 fn s1_embedded_preview_thumb_matches_the_full_decode() {
+    if !hw_child::run_here(module_path!(), "s1_embedded_preview_thumb_matches_the_full_decode") { return; }
     let Some(shots) = heic_shots_or_skip("S1 preview thumb") else { return };
     let mut previews = 0usize;
     for s in &shots {
@@ -613,6 +620,7 @@ fn s1_embedded_preview_thumb_matches_the_full_decode() {
 /// reach the scaled path at all.
 #[test]
 fn p3_heic_keeps_its_source_gamut_through_the_scaled_path() {
+    if !hw_child::run_here(module_path!(), "p3_heic_keeps_its_source_gamut_through_the_scaled_path") { return; }
     let Some(shots) = heic_shots_or_skip("P3 colour guard") else { return };
     let mut p3 = 0usize;
     let mut scaled_rows = 0usize;
@@ -681,6 +689,7 @@ fn p3_heic_keeps_its_source_gamut_through_the_scaled_path() {
 /// master", and that is now literally what it asks, of the two functions the app actually calls.
 #[test]
 fn the_embedded_preview_declares_the_masters_colour_space() {
+    if !hw_child::run_here(module_path!(), "the_embedded_preview_declares_the_masters_colour_space") { return; }
     let Some(shots) = heic_shots_or_skip("preview/master colour agreement") else { return };
     let mut attributed = 0usize;
     let mut multi = 0usize;
@@ -726,6 +735,7 @@ fn the_embedded_preview_declares_the_masters_colour_space() {
 /// its own lane rather than sharing the fast tier's.
 #[test]
 fn the_detail_lane_still_decodes_natively() {
+    if !hw_child::run_here(module_path!(), "the_detail_lane_still_decodes_natively") { return; }
     let Some(shots) = heic_shots_or_skip("detail lane") else { return };
     for s in &shots {
         let (nw, nh) = source_dimensions(s).expect("HEIC header dims");
@@ -761,6 +771,7 @@ fn the_detail_lane_still_decodes_natively() {
 /// agreement fails on this file while every other test in this file still passes.
 #[test]
 fn a_portrait_heic_is_portrait_on_every_tier() {
+    if !hw_child::run_here(module_path!(), "a_portrait_heic_is_portrait_on_every_tier") { return; }
     let Some(shots) = heic_shots_or_skip("S4 orientation") else { return };
     let mut portraits = 0usize;
     for s in &shots {
@@ -1044,6 +1055,7 @@ fn heic_copy_shot(what: &str) -> Option<(std::path::PathBuf, std::path::PathBuf,
 /// half of the same defect.
 #[test]
 fn a_heic_rotate_then_apply_round_trips_to_exactly_what_the_user_saw() {
+    if !hw_child::run_here(module_path!(), "a_heic_rotate_then_apply_round_trips_to_exactly_what_the_user_saw") { return; }
     let src = heic_dir().join("IMG_2814.HEIC");
     let untouched = std::fs::metadata(&src).ok().map(|m| (m.len(), m.modified().ok()));
     let Some((dir, copy, shot)) = heic_copy_shot("heic_apply_roundtrip") else { return };
@@ -1490,6 +1502,7 @@ fn the_hardware_lane_serves_fast_and_native_and_never_the_thumb_tier() {
 /// route rows redden while the pixels still arrive, which is why the two are asserted apart.
 #[test]
 fn a_declined_file_still_decodes_through_wic_and_says_so() {
+    if !hw_child::run_here(module_path!(), "a_declined_file_still_decodes_through_wic_and_says_so") { return; }
     arm_test_hook();
     let Some(shots) = heic_shots_or_skip("hardware-lane decline") else { return };
     let shot = &shots[0];

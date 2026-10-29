@@ -34,6 +34,8 @@ impl Pressure {
 
 /// Run before the upload/dispatch steps on every held tick, not just on entry: work already
 /// in flight can land after the initial shed. Never remove a running job's accounting marks.
+/// Returns the previews removed: the tick hands it to `background_memory::release_after_trim`, so the
+/// panels that are not refreshing let go of the stand-ins their rows still hold (round 2c review P1).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn shed(
     explicit: &support::ExplicitSet,
@@ -44,15 +46,17 @@ pub(crate) fn shed(
     parked_full: &RefCell<Option<Detail>>,
     sent: &RefCell<HashSet<usize>>,
     parked_done: &RefCell<Vec<support::UploadDone>>,
-) {
+) -> usize {
     let mut cache = fast.cache.borrow_mut();
     let before = cache.len();
     cache.retain(|&id, _| explicit.holds(id));
-    if cache.len() != before { fast_gen.set(fast_gen.get().wrapping_add(1)); }
+    let shed_previews = before - cache.len();
+    if shed_previews > 0 { fast_gen.set(fast_gen.get().wrapping_add(1)); }
     drop(cache);
     detail.cache.borrow_mut().retain(|&id, _| explicit.holds(id));
     detail.order.borrow_mut().retain(|&id| explicit.holds(id));
     shed_work(explicit, fast, detail, drain, parked_full, sent, parked_done);
+    shed_previews
 }
 
 /// The queued, parked and drained half of [`shed`]: speculative work that has not reached a cache.

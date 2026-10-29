@@ -401,7 +401,9 @@ pub(crate) fn release_unrefreshed_models(sel_refreshes: bool, sel_model: &slint:
 /// without them. A closed Review panel or a grid hidden by immersive mode cannot rebuild, and its
 /// rows still hold the stopgap previews `tick::lookup_thumb` gave them: the ownership edge the
 /// background release closes on every held tick, closed here on every tick a trim released
-/// anything. The panels that are refreshing are left to their own rebuild, as there.
+/// anything. The panels that are refreshing are left to their own rebuild, as there. The Mac's
+/// foreground pressure hold uses it too, with the count `memory_pressure::shed` removed (round 2c
+/// review P1).
 #[allow(clippy::type_complexity)]
 pub(crate) fn release_after_trim(previews_released: usize, sel_refreshes: bool,
     sel_model: &slint::VecModel<SelTileRow>, last_sel_key: &Cell<(u64, i32, u64, u64, u64, u64)>,

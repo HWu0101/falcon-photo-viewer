@@ -1228,6 +1228,30 @@ pub fn apply_rotation(plan: &RotApplyPlan) -> RotApplyReport {
 }
 
 /// Map a sidecar write result to a `SideAction`.
+/// 2026-10-28 (the cloud-only round, owner answer 10) — **THE PHOTO FILES [`apply_rotation`] WILL READ
+/// FOR `plan`**, so Apply rotations can ask first when any is only in the cloud (reading one downloads
+/// it). It mirrors the orchestrator's reads exactly: a finished JPEG is always read (the preflight and
+/// the in-place patch); a finished non-JPEG only when its `fullname.xmp` gives no orientation (the
+/// embedded EXIF fallback); a RAW only when its `basename.xmp` gives none (`raw_orientation`). Reads
+/// only metadata and the small sidecars, never an original. The sidecars themselves are out of the
+/// round's scope (owner answer 12).
+///
+/// FALSIFIER (L28): drop a sidecar test and `rotation_reads_mirrors_apply_rotation` reddens.
+pub fn rotation_reads(plan: &RotApplyPlan) -> Vec<&Path> {
+    let mut reads = Vec::new();
+    if let Some(f) = plan.finished.as_deref() {
+        if plan.finished_is_jpeg || sidecar_orientation(f, false).is_none() {
+            reads.push(f);
+        }
+    }
+    if let Some(r) = plan.raw.as_deref() {
+        if sidecar_orientation(r, true).is_none() {
+            reads.push(r);
+        }
+    }
+    reads
+}
+
 fn sidecar_action(path: &Path, target: u8) -> SideAction {
     match write_xmp_sidecar(path, target) {
         Ok(SidecarKind::CreatedFresh) => SideAction::SidecarCreated,

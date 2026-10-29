@@ -1,6 +1,6 @@
-# macOS source-candidate checks
+# macOS release checks
 
-This local source candidate is not an approved public release. Licensing materials and final package checks remain pending.
+Falcon Photo Viewer for Mac.
 Mac packages use free ad-hoc signing. Paid Developer ID signing/notarization is not planned;
 Gatekeeper approval is an accepted limitation, not unfinished paid-signing work.
 
@@ -10,8 +10,9 @@ See [Apple's instructions](https://support.apple.com/en-ie/102445); device-manag
 prevent overrides.
 
 Replace an older installed Falcon.app when checking normal file associations; several copies with
-the same app identity can make macOS open the wrong one. Keep a backup of the prior app and use
-copied or synthetic photos for tests that change review state or files.
+the same app identity can make macOS open the wrong one. To update, replace the old Falcon.app in
+Applications instead of keeping both copies, and open the new version once before double-clicking
+photos. Use copied or synthetic photos for tests that change review state or files.
 
 Check ordinary-window and green-button full-screen toolbar placement, repeated entry/exit, top-edge
 hover, resizing and moving between displays. Test F immersive mode, English and Pinyin input,

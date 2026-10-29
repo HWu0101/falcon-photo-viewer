@@ -4,7 +4,7 @@
 
 import { Theme } from "theme.slint";
 import { Star, Chip, ChipRole } from "widgets.slint";
-import { AaHairline, FlagGlyph, ArchiveGlyph, RotateGlyph, UnsupportedGlyph } from "glyphs.slint";
+import { AaHairline, FlagGlyph, ArchiveGlyph, RotateGlyph, UnsupportedGlyph, CloudGlyph } from "glyphs.slint";
 import { FilmItem } from "structs.slint";
 
     // Shared flag/reject corner badge — a rounded square with the FLAG (pick) or FILE-ARCHIVE (reject)
@@ -57,6 +57,8 @@ import { FilmItem } from "structs.slint";
         // in-property like its siblings — this component takes the model row's fields one by one,
         // not the row itself.
         in property <bool> failed: false;
+        // 2026-10-28 (the cloud-only round): only in the cloud, not downloaded (FilmItem.cloud).
+        in property <bool> cloud: false;
         in property <int> rating: 0;     // 0..5 — drawn as a proportional gold bar
         in property <bool> flag: false;  // pick (blue corner dot)
         in property <bool> reject: false; // reject (red corner dot)
@@ -128,10 +130,17 @@ import { FilmItem } from "structs.slint";
                 width: 22px; height: 22px;
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
             }
+            // 2026-10-28 (the cloud-only round, owner answer 1): the main view's cloud outline, at
+            // the broken-image mark's place, size and grey, and no words.
+            if root.cloud && !root.valid : CloudGlyph {
+                tint: Theme.text-mute;
+                width: 22px; height: 22px;
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            }
             // G6: a cell with no thumbnail yet reads as LOADING (quiet dots), not broken/black.
             // badge != "" excludes the strip's VOID edge slots (FilmItem::default() before the
             // first / after the last shot) — those must stay blank, not "forever loading".
-            if !root.valid && !root.unsupported && !root.failed && root.badge != "" : Text {
+            if !root.valid && !root.unsupported && !root.failed && !root.cloud && root.badge != "" : Text {
                 text: "···"; color: Theme.text-mute; font-size: Theme.font-md; font-weight: 700;
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
             }
@@ -355,9 +364,15 @@ import { FilmItem } from "structs.slint";
                     width: 30px; height: 30px;
                     x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 }
+                // 2026-10-28 (the cloud-only round): the cloud outline, as the filmstrip draws it.
+                if root.item.cloud && !root.item.valid : CloudGlyph {
+                    tint: Theme.text-mute;
+                    width: 30px; height: 30px;
+                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                }
                 // G6: not-yet-decoded tile reads as LOADING (quiet dots), not broken/black.
                 // badge != "" excludes a default-item HALF-ROW slot (odd tile count) — stays blank.
-                if !root.item.valid && !root.item.unsupported && !root.item.failed && root.item.badge != "" : Text {
+                if !root.item.valid && !root.item.unsupported && !root.item.failed && !root.item.cloud && root.item.badge != "" : Text {
                     text: "···"; color: Theme.text-mute; font-size: Theme.font-lg; font-weight: 700;
                     x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 }

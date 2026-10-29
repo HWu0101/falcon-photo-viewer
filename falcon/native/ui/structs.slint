@@ -20,6 +20,11 @@
         // nothing retrying and nothing saying so. Rendered as the same broken-image glyph
         // `unsupported` uses, which is the honest shared meaning: no picture here.
         failed: bool,
+        // 2026-10-28 (the cloud-only round, owner answer 1): this tile's file is only in the cloud and
+        // Falcon has not downloaded it (`film.cloud_skipped`, the workers' notes). `make_film_item` sets
+        // it only while the tile has no picture and no failure, so a landed picture always wins and a
+        // real failure keeps its mark. The three tile surfaces draw the main view's cloud outline.
+        cloud: bool,
         rating: int,
         flag: bool,
         reject: bool,

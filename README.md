@@ -223,10 +223,18 @@ first launch:
 
 - **Windows:** extract the package to the folder where you want to keep Falcon and open
   `Falcon.exe`. If SmartScreen blocks it, choose **More info → Run anyway**. To open photos with
-  Falcon from Explorer, use **Settings → File associations → Update**.
+  Falcon from Explorer, use **Settings → File associations → Add to Open With**, then right-click a
+  photo → **Open with** → Falcon → **Always**. **To update,** close Falcon, then extract the new zip
+  into the folder that *contains* your existing `Falcon Photo Viewer` folder and let it replace the
+  files. Extract All suggests a new, versioned folder; change the destination to that parent folder,
+  not to `Falcon Photo Viewer` itself. If you keep the new version somewhere else, open it and choose
+  **Update** when it asks, so your photos open in the new version.
 - **macOS:** move `Falcon.app` to Applications and open it. If macOS blocks it, go to
   **System Settings → Privacy & Security**, choose **Open Anyway** for Falcon and confirm. macOS
   remembers this choice. See [Apple's instructions](https://support.apple.com/en-ie/102445).
+  **To update,** replace `Falcon.app` in Applications with the new one rather than keeping both:
+  with two copies, macOS chooses which one opens your photos. Open the new version once (approve
+  **Open Anyway** if asked) before double-clicking photos.
 
 Keep your system's security checks switched on; work computers may not allow these exceptions. The
 checksum confirms the download is intact, but it is not a publisher's signature.
@@ -282,7 +290,8 @@ Under the hood, the interface is built with [Slint](https://slint.dev) on wgpu: 
 on Windows, Metal on Mac. Decoding, colour and graphics work live in Falcon's own crates. NVIDIA
 nvJPEG and DirectX hardware HEVC decoding are optional accelerators detected at runtime, with
 fallbacks that need no NVIDIA software; CUDA and HEVC software decoders are not bundled. The
-repository includes modified copies of the winit window library and zune-jpeg decoder, which the build requires.
+repository includes modified copies of the winit window library, the zune-jpeg decoder and the
+FemtoVG renderer, which the build requires.
 Private camera test files are not included, and the tests say when they skip those checks.
 
 The detailed technical guide and architecture diagrams are in [logic.md](logic.md).

@@ -964,47 +964,150 @@ pub(crate) struct ThumbReq {
     /// a decode: the interface has already released the request's pending slot
     /// (`tick::step_retire_thumbs`), and a job that is already running lands as usual.
     pub(crate) retire: bool,
-    /// 2026-10-27 (round 2b, owner): the whole folder's request — the worker reads the file only if
-    /// it is still on this device, checked just before the read (metadata only), and answers a
-    /// file made online-only since the scan with an empty marker and no failure
-    /// (`main.rs::run_thumb_job_with`). Cleared when a tile on screen promotes the job.
-    pub(crate) local_only: bool,
+    // 2026-10-28 (the cloud-only round): no request kind may download. Round 2b's `local_only` (the
+    // whole folder's request only, cleared when a tile promoted it) is gone: the worker checks EVERY
+    // job's file just before the read (`main.rs::run_thumb_job_with`), so no lane can opt back in.
 }
 impl ThumbReq {
     /// A tile the user is looking at — the strip's window, the Review panel's visible tiles, the
     /// folder dock's visible cells.
     pub(crate) fn explicit(idx: usize, gen: u64, delta: u8) -> ThumbReq {
-        ThumbReq { idx, gen, delta, explicit: true, promote_only: false, retire: false, local_only: false }
+        ThumbReq { idx, gen, delta, explicit: true, promote_only: false, retire: false }
     }
-    /// The frost feeder's mip coverage: nobody is waiting for it.
+    /// The frost feeder's mip coverage and the whole folder's preparation: nobody is waiting for it.
     pub(crate) fn speculative(idx: usize, gen: u64, delta: u8) -> ThumbReq {
-        ThumbReq { idx, gen, delta, explicit: false, promote_only: false, retire: false, local_only: false }
-    }
-    /// The whole folder's preparation (round 2b): speculative, and only for a file still on this
-    /// device ([`ThumbReq::local_only`]).
-    pub(crate) fn whole_folder(idx: usize, gen: u64, delta: u8) -> ThumbReq {
-        ThumbReq { local_only: true, ..ThumbReq::speculative(idx, gen, delta) }
+        ThumbReq { idx, gen, delta, explicit: false, promote_only: false, retire: false }
     }
 
     pub(crate) fn promote(idx: usize, gen: u64, delta: u8) -> ThumbReq {
-        ThumbReq { idx, gen, delta, explicit: true, promote_only: true, retire: false, local_only: false }
+        ThumbReq { idx, gen, delta, explicit: true, promote_only: true, retire: false }
     }
 
     /// The tile scrolled out of every visible window before its decode started.
     pub(crate) fn retire(idx: usize, gen: u64) -> ThumbReq {
-        ThumbReq { idx, gen, delta: 0, explicit: false, promote_only: false, retire: true, local_only: false }
+        ThumbReq { idx, gen, delta: 0, explicit: false, promote_only: false, retire: true }
     }
 }
 
-/// 2026-10-27 (round 2b, owner: "do the check") — **IS THIS SHOT'S FILE ONLY IN THE CLOUD NOW?** The
-/// folder scan's rule (either file of a pair; `falcon_decode`'s scan tags a pair the same way), asked
-/// again through `probe` (in production `falcon_decode::file_is_cloud_placeholder`, metadata only:
-/// it never downloads). The scan's tags miss a file made online-only during the session (Free up
-/// space, Storage Sense, Optimise Mac Storage); the whole folder's worker asks this just before it
-/// would read one.
+/// 2026-10-27 (round 2b, owner: "do the check") — **IS EITHER OF THIS SHOT'S FILES ONLY IN THE CLOUD
+/// NOW?** The folder scan's rule (either file of a pair; `falcon_decode`'s scan tags a pair the same
+/// way), asked again through `probe` (in production `falcon_decode::file_is_cloud_placeholder`,
+/// metadata only: it never downloads). Since the cloud-only round (28 October) the workers ask about
+/// [`read_file`]'s one file instead; this either-file answer decides only whether the scan's tag
+/// (`meta.cloud_tagged`, `Shot::cloud_placeholder`) may be dropped (`tick::step_cloud_landed_with`).
 #[must_use]
 pub(crate) fn shot_is_cloud_only(shot: &Shot, probe: impl Fn(&std::path::Path) -> bool) -> bool {
     shot.raw.as_deref().is_some_and(&probe) || shot.jpg.as_deref().is_some_and(&probe)
+}
+
+/// 2026-10-28 (the cloud-only round, owner: "stop the downloads") — **WHICH OF A PHOTO'S TWO FILES A
+/// READ TAKES.** `Finished` is `shot.jpg` (the JPEG, PNG, TIFF, HEIC… beside a RAW, or alone); `Raw`
+/// is `shot.raw`. A RAW+JPEG pair can have one on this device and the other only in the cloud (in
+/// JPEG mode, viewing downloads only the JPEG), so a note says which (owner answer 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum CloudFile {
+    Finished,
+    Raw,
+}
+
+/// …and the kind of work reading it: a thumbnail, a browse preview (the fast tier) or a
+/// full-resolution frame (the detail tier, which develops the RAW in RAW mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadTier {
+    Thumb,
+    Fast,
+    Detail { raw_mode: bool },
+}
+
+/// The files found only in the cloud just before a read, `(generation, photo, file)`: written by the
+/// three workers ([`note_cloud`]), read by every producer that would ask for that file again
+/// ([`cloud_noted`], [`cloud_noted_in`]). It is `Film::cloud_skipped`, cleared on a folder swap; a
+/// file that is on this device again leaves it (`tick::step_cloud_landed_with`,
+/// `tick::step_cloud_retry_with`).
+pub(crate) type CloudNotes = Mutex<HashSet<(u64, usize, CloudFile)>>;
+
+/// **THE FILE `tier` READS FOR `shot`**, mirroring the decoders' own choice: the finished file when
+/// the shot has one that is its picture (`has_jpg`; a passenger is not), else the RAW (its embedded
+/// preview); and in RAW mode the detail tier develops the RAW. Thumbnails and browse previews always
+/// read the finished file of a pair (`falcon_decode::jpeg_source`, `read_orientation(shot, false)`,
+/// `shot_source_gamut`), so a pair whose RAW alone is in the cloud still shows its picture. `None`
+/// = nothing is read (an undecodable sole source).
+///
+/// FALSIFIER (L28): return the RAW for a pair and `read_file_follows_the_decoders_choice` reddens.
+#[must_use]
+pub(crate) fn read_file(shot: &Shot, tier: ReadTier) -> Option<(CloudFile, &std::path::Path)> {
+    if matches!(tier, ReadTier::Detail { raw_mode: true }) && shot.has_raw {
+        return shot.raw.as_deref().map(|p| (CloudFile::Raw, p));
+    }
+    if shot.has_jpg {
+        shot.jpg.as_deref().map(|p| (CloudFile::Finished, p))
+    } else {
+        shot.raw.as_deref().map(|p| (CloudFile::Raw, p))
+    }
+}
+
+/// A worker found `(idx, file)` only in the cloud just before reading it: note it for the folder
+/// still open. Asked under the lock, round 2b's rule: a swap moves the generation before
+/// `Film::on_folder_swap` clears this set under the same lock, so an old folder's find never lands in
+/// the new folder's set. Returns whether it is the folder's FIRST note (one log line per folder).
+pub(crate) fn note_cloud(notes: &CloudNotes, generation: &AtomicU64, gen: u64, idx: usize, file: CloudFile) -> bool {
+    let mut s = notes.lock().unwrap_or_else(|e| e.into_inner());
+    generation.load(Ordering::Relaxed) == gen && s.insert((gen, idx, file)) && s.len() == 1
+}
+
+/// Has the file `tier` reads for `shot` (photo `idx`) been found only in the cloud this folder?
+#[must_use]
+pub(crate) fn cloud_noted(notes: &HashSet<(u64, usize, CloudFile)>, gen: u64, idx: usize, shot: &Shot, tier: ReadTier) -> bool {
+    !notes.is_empty() && read_file(shot, tier).is_some_and(|(f, _)| notes.contains(&(gen, idx, f)))
+}
+
+/// [`cloud_noted`] for a window of photos, under ONE short lock (`tick::failed_thumbs_in`'s
+/// discipline); empty at once when nothing is noted, so a local folder pays one uncontended lock.
+pub(crate) fn cloud_noted_in(
+    notes: &CloudNotes, gen: u64, shots: &[Shot], tier: ReadTier, idxs: impl Iterator<Item = usize>,
+) -> HashSet<usize> {
+    let n = notes.lock().unwrap_or_else(|e| e.into_inner());
+    if n.is_empty() {
+        return HashSet::new();
+    }
+    idxs.filter(|&i| shots.get(i).is_some_and(|s| cloud_noted(&n, gen, i, s, tier))).collect()
+}
+
+/// **IS THIS PREVIEW OR FULL-RESOLUTION READ REFUSED?** The one rule the fast and detail workers
+/// share (design 4). Only work nobody is looking at is refused (`local_only`, set by the tick for
+/// anything but the photos on screen), never the current photo (`explicit_now`: the tick's answer
+/// can be a pop old), and only when the file this tier reads is online-only (`probe`, metadata
+/// only). Returns the file to note.
+///
+/// FALSIFIER (L28): drop either exemption and `the_refusal_rule_spares_what_is_on_screen` reddens.
+#[must_use]
+pub(crate) fn speculative_read_refused(
+    local_only: bool, explicit_now: bool, shot: &Shot, tier: ReadTier, probe: impl Fn(&std::path::Path) -> bool,
+) -> Option<CloudFile> {
+    if !local_only || explicit_now {
+        return None;
+    }
+    read_file(shot, tier).filter(|(_, p)| probe(p)).map(|(f, _)| f)
+}
+
+/// R1 (Codex's review, 29 October 2026) — **ONE FULL-RESOLUTION JOB, ONE READ OF THE RAW-MODE
+/// SWITCH.** The detail worker reads the switch here, once, and both the cloud check and the job's
+/// reads (orientation, development, the finished-file decode) take the answer. Read twice, an
+/// Image-to-RAW toggle landing between the two would pass a pair's local JPEG and then open its
+/// online-only RAW. A job that read the old mode still has its frame discarded by the RAW-mode epoch
+/// the worker read before this, so a toggle costs at worst a re-decode, never a download.
+/// `Ok(mode)` = go on in `mode`; `Err(file)` = refused, note `file`.
+///
+/// FALSIFIER (L28): read the switch again for the `Ok` and
+/// `a_raw_mode_toggle_mid_job_never_changes_the_file_read` reddens.
+pub(crate) fn detail_job_mode(
+    raw_mode: &AtomicBool, local_only: bool, explicit_now: bool, shot: &Shot, probe: impl Fn(&std::path::Path) -> bool,
+) -> Result<bool, CloudFile> {
+    let mode = raw_mode.load(Ordering::Relaxed);
+    match speculative_read_refused(local_only, explicit_now, shot, ReadTier::Detail { raw_mode: mode }, probe) {
+        Some(file) => Err(file),
+        None => Ok(mode),
+    }
 }
 
 /// v1.0.0-rc (FIX 2026-09-07, round X1 / F3) — **THE THUMB POOL'S DEQUEUE POINT, WITH TWO LANES.**
@@ -1061,8 +1164,6 @@ impl ThumbQueue {
             if let Some(i) = self.speculative.iter().position(|q| (q.gen, q.idx, q.delta) == (r.gen, r.idx, r.delta)) {
                 if let Some(mut job) = self.speculative.remove(i) {
                     job.explicit = true;
-                    // A tile on screen now: the visible tiles' rule, not the whole folder's.
-                    job.local_only = false;
                     self.explicit.push_back(job);
                 }
             }
@@ -1135,6 +1236,12 @@ pub(crate) struct Pump {
     /// the worker's pop (from `costly_q`), cleared wherever `inflight` is cleared, so it is
     /// generation-independent and immune to the shot list changing underneath it.
     pub(crate) costly_inflight: HashSet<usize>,
+    /// 2026-10-28 (the cloud-only round): the queued ids NOBODY IS LOOKING AT — the tick's admission
+    /// marks every id but the photos on screen (`support::displayed_shot`), the hover ask is marked
+    /// too (`pump_push_front(.., true)`), `prime_jump`'s jump target is not. Moved to the job at
+    /// [`pump_pop`], cleared with the queue. The worker reads only an unmarked job's file when it is
+    /// online-only (`main.rs::run_fast_job_with`, [`speculative_read_refused`]).
+    pub(crate) local_only_q: HashSet<usize>,
 }
 
 impl Pump {
@@ -1146,26 +1253,29 @@ impl Pump {
     pub(crate) fn clear_queue(&mut self) {
         self.queue.clear();
         self.costly_q.clear();
+        self.local_only_q.clear();
     }
 }
 
 /// v0.8.114 (V9): THE pop hand-off, in one place. A worker takes the nearest-first head, marks it
 /// in flight, and moves the tick's cost mark from "queued" to "decoding" — no format lookup, so
 /// nothing here can go stale against a shot list that was swapped under it. Returns the index and
-/// the COSTLY concurrency at this instant (itself included) — the sample's regime annotation.
+/// the COSTLY concurrency at this instant (itself included) — the sample's regime annotation, and
+/// whether nobody is looking at it (the cloud-only round's mark, [`Pump::local_only_q`]).
 ///
 /// WHY IT IS A FUNCTION: v0.8.112 wrote this body once in the pool worker and once again in the
 /// test rig, and the rig's copy made ROW 1's stated falsifier ("drop the `costly_inflight` bump at
 /// the worker's pop and the second-tick row fails") vacuous — deleting the production bump left
 /// every integration row green. With one function and three callers (the fixed pool, the mac
 /// elastic pool's `try_fast`, and `Rig::pop_all`) the falsifier bites on all three shapes at once.
-pub(crate) fn pump_pop(p: &mut Pump) -> Option<(usize, u32)> {
+pub(crate) fn pump_pop(p: &mut Pump) -> Option<(usize, u32, bool)> {
     let i = p.queue.pop_front()?;
     p.inflight.insert(i);
     if p.costly_q.remove(&i) {
         p.costly_inflight.insert(i);
     }
-    Some((i, p.costly_inflight.len() as u32))
+    let local_only = p.local_only_q.remove(&i);
+    Some((i, p.costly_inflight.len() as u32, local_only))
 }
 
 /// Panic-safe reset for a worker-threaded cull file op (copy/move/export). Constructed at the
@@ -3560,7 +3670,7 @@ mod publish_tests {
     /// `idle_reclaim` and the staging buffer is still in the allocator after the GPU went idle —
     /// the 25 October shape (polling alone frees nothing). Self-skips without a GPU adapter, or on a
     /// backend that gives no allocator report. Runs in its own process, with a time limit
-    /// ([`GPU_ROW_LIMIT`]): on 27 October a driver call in this row spun for over an hour.
+    /// (`crate::hw_child::ROW_LIMIT`): on 27 October a driver call in this row spun for over an hour.
     #[test]
     fn going_idle_hands_staged_uploads_to_the_gpu_so_their_staging_is_freed() {
         if !live_gpu_row("going_idle_hands_staged_uploads_to_the_gpu_so_their_staging_is_freed") {
@@ -3607,134 +3717,118 @@ mod publish_tests {
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
     }
 
-    /// Round 2b follow-up (owner, 27 October: "add the time limit"). The live-GPU rows run in a
-    /// child copy of this test binary, and the child is ended if it has not finished within this
-    /// limit. On 27 October a graphics-driver call inside `going_idle_…` spun for over an hour, and
-    /// the tests that started after it stalled with it, so the run never finished: the stuck call
-    /// held up more than its own row, which is why a limit inside the same process would not be
-    /// enough. In its own process the hung call holds nothing the other tests use, and ending the
-    /// process ends the hang: the row fails, naming the limit, and the run goes on. Both rows
-    /// normally finish in a few seconds, child start included.
-    const GPU_ROW_LIMIT: Duration = Duration::from_secs(120);
-    /// Set in the child, so a row runs its body there instead of starting another child.
-    const GPU_CHILD: &str = "FALCON_LIVE_GPU_CHILD";
-
-    #[derive(Debug, PartialEq)]
-    enum RowEnd {
-        Passed,
-        /// It failed, or it exited without running this row (a misspelt name runs no row).
-        Failed,
-        /// Not finished at the limit; `ended` says whether its process could then be ended.
-        TimedOut { ended: bool },
-    }
-
-    /// Runs this module's `row` alone in a child copy of the test binary, and ends the child at
-    /// `limit`. Returns how it ended, its stdout (without libtest's tally lines, so a run's totals
-    /// never count the child twice), its stderr, and how long the parent waited. The output goes to
-    /// files rather than pipes, so nothing the child leaves behind can keep the parent reading.
-    fn run_row_in_child(row: &str, limit: Duration, env: &[(&str, &str)]) -> (RowEnd, String, String, Duration) {
-        let module = module_path!().split_once("::").map_or(module_path!(), |(_, m)| m);
-        let path = format!("{module}::{row}");
-        let base = std::env::temp_dir().join(format!("falcon_child_row_{}_{row}", std::process::id()));
-        let (out_file, err_file) = (base.with_extension("out"), base.with_extension("err"));
-        let mut cmd = std::process::Command::new(std::env::current_exe().expect("the test binary"));
-        cmd.args([path.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-            .env(GPU_CHILD, "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::fs::File::create(&out_file).expect("the child's stdout file"))
-            .stderr(std::fs::File::create(&err_file).expect("the child's stderr file"));
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        let start = Instant::now();
-        let mut child = cmd.spawn().expect("start the child");
-        // `Ok` with the child's exit status, or `Err(ended)` at the limit.
-        let status = loop {
-            if let Some(status) = child.try_wait().expect("the child's status") {
-                break Ok(status);
-            }
-            if start.elapsed() >= limit {
-                let _ = child.kill();
-                // A child stuck in a kernel-mode driver call cannot exit until that call returns, so
-                // the parent never waits on it without a limit: reaped if it goes within the grace
-                // period, otherwise left (the row still fails, and says so).
-                let grace = Instant::now();
-                let ended = loop {
-                    if matches!(child.try_wait(), Ok(Some(_))) {
-                        break true;
-                    }
-                    if grace.elapsed() >= Duration::from_secs(10) {
-                        break false;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                };
-                break Err(ended);
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let waited = start.elapsed();
-        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
-        let (out, err) = (read(&out_file), read(&err_file));
-        let _ = std::fs::remove_file(&out_file);
-        let _ = std::fs::remove_file(&err_file);
-        let ran = out.contains(&format!("test {path} ...")) && out.contains("test result: ok. 1 passed");
-        let end = match status {
-            Err(ended) => RowEnd::TimedOut { ended },
-            Ok(s) if s.success() && ran => RowEnd::Passed,
-            Ok(_) => RowEnd::Failed,
-        };
-        let out = out.lines().filter(|l| !l.starts_with("test result:")).map(|l| format!("{l}\n")).collect();
-        (end, out, err, waited)
-    }
-
-    /// The live-GPU rows' first line. In the child it says "run the body here"; in the parent it
-    /// runs the row in a child ([`GPU_ROW_LIMIT`]), fails the row if the child failed or hung, and
-    /// says "done" (the child's skip lines are passed on).
+    /// The live-GPU rows' first line: each runs in its own process with a time limit
+    /// (`crate::hw_child`, shared since 28 October with the other crates' hardware tests; round 2b
+    /// follow-up, owner 27 October: "add the time limit").
     fn live_gpu_row(row: &str) -> bool {
-        if std::env::var_os(GPU_CHILD).is_some() {
-            return true;
-        }
-        let (end, out, err, waited) = run_row_in_child(row, GPU_ROW_LIMIT, &[]);
-        match end {
-            RowEnd::Passed => eprint!("{err}"),
-            RowEnd::Failed => panic!("{row} failed in its own process (or ran no row by that name):\n{out}{err}"),
-            RowEnd::TimedOut { ended } => panic!(
-                "{row} did not finish within {GPU_ROW_LIMIT:?} (waited {waited:?}), and {}: most likely a \
-                 graphics-driver hang, as on 27 October; the other tests were not held up.\n{out}{err}",
-                if ended { "its process was ended" } else { "its process could not be ended (stuck in the driver), so it was left" }
-            ),
-        }
-        false
+        crate::hw_child::run_here(module_path!(), row)
     }
 
-    /// The time limit's own row. A child that never finishes is ended at its limit and reported as
-    /// timed out, and the parent is not kept waiting; a name that matches no row is a failure, not
-    /// a pass; and every live-GPU row in this file goes through [`live_gpu_row`]. The child's half
-    /// sleeps 60 s, far past the 2 s limit, and only when the parent asks for it. FALSIFIERS: drop
-    /// the `kill` and the sleeping child outlives the grace period (`ended` reddens); drop the
-    /// deadline and the child sleeps its 60 s and passes (the `TimedOut` assert reddens); drop
-    /// `&& ran` and the misspelt name passes; remove a row's `live_gpu_row` and the census reddens.
+    /// The time limit's own row (it drives `crate::hw_child`, the module every crate's hardware rows
+    /// share). A child that never finishes is ended at its limit and reported as timed out, and the
+    /// parent is not kept waiting; a name that matches no row is a failure, not a pass; libtest's
+    /// names are formed right for unit and integration tests; and every live-GPU row in this file goes
+    /// through [`live_gpu_row`]. The child's half sleeps 60 s, far past the 2 s limit, and only when
+    /// the parent asks for it. FALSIFIERS: drop the `kill` and the sleeping child outlives the grace
+    /// period (`ended` reddens); drop the deadline and the child sleeps its 60 s and passes (the
+    /// `TimedOut` assert reddens); drop `&& ran` and the misspelt name passes; keep the crate segment
+    /// for a bare module (the old shape) and the integration-test name row reddens; remove a row's
+    /// `live_gpu_row` and the census reddens.
     #[test]
     fn a_child_row_that_hangs_is_ended_at_its_limit() {
+        use crate::hw_child::{run_row_in_child, test_path, RowEnd, CHILD};
         const HANG: &str = "FALCON_CHILD_ROW_HANG_PROBE";
-        if std::env::var_os(GPU_CHILD).is_some() {
+        if std::env::var_os(CHILD).is_some() {
             if std::env::var_os(HANG).is_some() {
                 std::thread::sleep(Duration::from_secs(60));
             }
             return;
         }
+        let row = |name: &str| test_path(module_path!(), name);
         let (end, _, _, waited) =
-            run_row_in_child("a_child_row_that_hangs_is_ended_at_its_limit", Duration::from_secs(2), &[(HANG, "1")]);
+            run_row_in_child(&row("a_child_row_that_hangs_is_ended_at_its_limit"), Duration::from_secs(2), &[(HANG, "1")]);
         assert_eq!(end, RowEnd::TimedOut { ended: true }, "a child that does not finish is ended at its limit");
         assert!(waited < Duration::from_secs(30), "the parent waited {waited:?}: the child was not ended at its limit");
-        let (end, _, _, _) = run_row_in_child("no_row_has_this_name", Duration::from_secs(60), &[]);
+        let (end, _, _, _) = run_row_in_child(&row("no_row_has_this_name"), Duration::from_secs(60), &[]);
         assert_eq!(end, RowEnd::Failed, "a name that matches no row must not pass");
+        assert_eq!(test_path("rotation", "r"), "r", "an integration test's top-level row is its bare name");
+        assert_eq!(test_path("falcon_gpu::heic::tests", "r"), "heic::tests::r", "a unit test keeps its modules");
         // Every live-GPU row in this file asks the guard first (the needles are split so this row's
         // own text does not count). The other crates' GPU tests are not covered.
         let src = std::fs::read_to_string(format!("{}/src/support.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
         let rows = src.matches(["= test_gpu", "() else {"].concat().as_str()).count();
         assert!(rows >= 2, "the live-GPU rows are found");
         assert_eq!(src.matches(["if !live_gpu_", "row(\""].concat().as_str()).count(), rows, "every live-GPU row in support.rs runs in its own process");
+    }
+
+    /// 28 October (round 2b review P2, accepted): **EVERY OTHER TEST THAT REACHES THE GRAPHICS CARD OR
+    /// THE HARDWARE DECODER RUNS IN ITS OWN PROCESS, WITH THE TIME LIMIT.** Each row in these files
+    /// starts with the guard (`crate::hw_child`, included by each crate), unless it is on its file's
+    /// short list of pure rows (parsers, struct layouts, shader text, CPU-only code, a hook that
+    /// decodes nothing, a manual report), which never enter a driver. Reading the sources is the same
+    /// on every host, so this runs here even for the Windows-only decoder files.
+    ///
+    /// FALSIFIER: delete a row's guard (for example `rotation.rs`' or `hw_photo.rs`' `the_grid_has_no_seam`)
+    /// and this reddens, naming the file and the row.
+    #[test]
+    fn every_hardware_row_runs_in_its_own_process() {
+        const FILES: &[(&str, &[&str])] = &[
+            ("falcon-gpu/src/heic.rs", &[
+                "display_swaps_on_the_quarter_turns_and_only_those",
+                "output_dims_are_finish_sources",
+                "a_crop_outside_the_mosaic_is_refused",
+                "the_finish_shader_keeps_its_shape",
+            ]),
+            ("falcon-gpu/tests/rotation.rs", &[]),
+            ("falcon-gpu/tests/shader_compile.rs", &[]),
+            ("falcon-gpu/tests/yuv_kernel_twin.rs", &["the_twin_shader_stays_integer_only"]),
+            ("falcon-gpu/tests/develop.rs", &[]),
+            ("falcon-gpu/tests/raw_highlights.rs", &[]),
+            ("falcon-hwdec/tests/hw_tile_decode.rs", &[]),
+            ("falcon-hwdec/tests/hw_photo.rs", &[
+                "a_main10_primary_is_refused_before_it_can_enter_an_8_bit_session",
+                "the_bit_depth_gate_refuses_every_witness_that_is_not_eight",
+            ]),
+            ("falcon-hwdec/tests/heic_orientation.rs", &[]),
+            ("falcon-decode/tests/heic.rs", &[
+                "the_orientation_rule_only_drops_a_turn_the_decoder_already_made",
+                "the_consumed_turns_rule_is_format_blind_and_platform_derived",
+                "the_stop_acceptance_test_refuses_a_codec_that_cannot_really_shrink",
+                "manual_rotation_composes_from_the_corrected_heic_base",
+                "heic_stop_ladder_cost_report",
+                "the_stop_ladder_only_takes_stops_that_cover_and_pay",
+                "scaled_dims_matches_resize_to_long",
+                "classic_switch_reads_only_the_exact_flag",
+                "the_hardware_lane_serves_fast_and_native_and_never_the_thumb_tier",
+                "the_thumb_tier_is_not_a_hardware_lane_tier",
+            ]),
+        ];
+        // The guards' spellings: the shared one, from a unit test, `hw_photo.rs`' serialised one, and
+        // its audit row's own child half. Split so this row's own text is never one of them.
+        let guards = [
+            ["if !hw_child::", "run_here(module_path!(), \""].concat(),
+            ["if !crate::hw_child::", "run_here(module_path!(), \""].concat(),
+            ["if !run_", "here(\""].concat(),
+            ["if hw_child::", "in_child() {"].concat(),
+        ];
+        let mut guarded = 0;
+        for (file, pure) in FILES {
+            let src = std::fs::read_to_string(format!("{}/../crates/{file}", env!("CARGO_MANIFEST_DIR"))).unwrap().replace('\r', "");
+            let mut names = Vec::new();
+            for chunk in src.split("#[test]").skip(1) {
+                let after = &chunk[chunk.find("fn ").expect("a test fn") + 3..];
+                let name = &after[..after.find('(').expect("its name")];
+                let body = after[after.find('{').expect("its body") + 1..].trim_start();
+                let is_guarded = guards.iter().any(|g| body.starts_with(g.as_str()));
+                assert!(is_guarded || pure.contains(&name), "{file}: {name} reaches the driver without the time limit");
+                guarded += usize::from(is_guarded);
+                names.push(name.to_string());
+            }
+            for p in *pure {
+                assert!(names.iter().any(|n| n == p), "{file}: the pure row {p} is still there");
+            }
+        }
+        assert_eq!(guarded, 42, "the inventory's 42 hardware rows (28 October)");
     }
 }
 
@@ -7579,6 +7673,226 @@ pub(crate) fn guide_boot(onboarding_shown: bool, seen_feature: &str, running: &s
     (updated, updated)
 }
 
+/// 1.1.0-rc.1 (issue #11): orders two version strings by SemVer 2.0 precedence, so
+/// "1.1.0-rc.1" < "1.1.0-rc.2" < "1.1.0" < "1.1.1": major.minor.patch numerically, then a pre-release
+/// below its release, its dot-separated parts compared in turn (numbers numerically and below words;
+/// the shorter run lower). Build metadata (`+…`) is ignored. `None` when either is unreadable.
+#[must_use]
+pub(crate) fn version_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    fn parse(v: &str) -> Option<([u64; 3], Vec<&str>)> {
+        let v = v.trim();
+        let v = v.split_once('+').map_or(v, |(core, _)| core);
+        // The pre-release comes off first: "1.1.0-rc.1".split('.') would read "0-rc" as the patch.
+        let (core, pre) = v.split_once('-').map_or((v, None), |(core, pre)| (core, Some(pre)));
+        let mut nums = core.split('.').map(|p| p.parse::<u64>().ok());
+        let numbers = [nums.next()??, nums.next()??, nums.next()??];
+        if nums.next().is_some() { return None; }
+        let pre: Vec<&str> = pre.map_or_else(Vec::new, |p| p.split('.').collect());
+        if pre.iter().any(|id| id.is_empty()) { return None; }
+        Some((numbers, pre))
+    }
+    let ((na, pa), (nb, pb)) = (parse(a)?, parse(b)?);
+    Some(na.cmp(&nb).then_with(|| match (pa.is_empty(), pb.is_empty()) {
+        (true, true) => Equal,
+        (true, false) => Greater,
+        (false, true) => Less,
+        (false, false) => {
+            for (x, y) in pa.iter().zip(&pb) {
+                let order = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(x), Ok(y)) => x.cmp(&y),
+                    (Ok(_), Err(_)) => Less,
+                    (Err(_), Ok(_)) => Greater,
+                    (Err(_), Err(_)) => x.cmp(y),
+                };
+                if order != Equal { return order; }
+            }
+            pa.len().cmp(&pb.len())
+        }
+    }))
+}
+
+/// 1.1.0-rc.1 (issue #11): the folder beside settings.json that records every version that has run,
+/// one empty file named by its version. WRITE-ONCE: a launch only adds its own name and nothing
+/// rewrites or deletes one, so nothing can lower the newest — not a save from an older window still
+/// open, not a stale queued write, not another process, not a build from before this record.
+/// (Review R1, 28 October: it was a settings.json field first, which every save rewrites from the
+/// saving window's boot-time copy, so an older window's next save put its lower value back.)
+#[cfg_attr(not(windows), allow(dead_code))] // Windows-only consumer; pinned by tests on every host
+pub(crate) const VERSIONS_RUN_DIR: &str = "versions-run";
+
+/// 1.1.0-rc.1 (issue #11): is `running` older than a version that has already run? Then it never
+/// offers the update prompt (going back stays Settings' Update, owner, 27 October). By version
+/// precedence ([`version_cmp`]); an unreadable name is never newer.
+#[cfg_attr(not(windows), allow(dead_code))] // Windows-only consumer; pinned by tests on every host
+#[must_use]
+pub(crate) fn older_than_a_version_run<'a>(ran: impl IntoIterator<Item = &'a str>, running: &str) -> bool {
+    ran.into_iter().any(|v| version_cmp(running, v) == Some(std::cmp::Ordering::Less))
+}
+
+/// 1.1.0-rc.1 (issue #11): boot's read and record of [`VERSIONS_RUN_DIR`] (`dir`). Answers whether this
+/// build is older than one already run ([`older_than_a_version_run`]), and records `running` either way
+/// — this build's Cargo version, valid SemVer, so always a plain file name — at once, so a hard kill
+/// can't lose it; an existing record is never truncated or rewritten. A missing or unreadable folder
+/// reads as nothing run; a failed record is logged and retried at the next launch.
+#[cfg_attr(not(windows), allow(dead_code))] // Windows-only consumer; pinned by tests on every host
+#[must_use]
+pub(crate) fn newest_version_boot(dir: &Path, running: &str) -> bool {
+    let ran: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
+        .unwrap_or_default();
+    if !ran.iter().any(|v| v == running) {
+        let made = std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(dir.join(running)));
+        if let Err(e) = made {
+            log_event(&format!("assoc: couldn't record version {running} as run ({e})"));
+        }
+    }
+    older_than_a_version_run(ran.iter().map(String::as_str), running)
+}
+
+/// What the update prompt shows at this launch ([`update_prompt`]).
+#[cfg_attr(not(windows), allow(dead_code))] // Windows-only consumer; pinned by tests on every host
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UpdatePrompt {
+    /// Not set up for photos, already open here, or an older version than one already used.
+    Nothing,
+    /// Running from the temp folder (inside the zip): say to extract it first; no Update button.
+    ExtractFirst,
+    /// "Update to Falcon {version}" with Update and Not now.
+    Offer,
+}
+
+/// 1.1.0-rc.1 (issue #11): **DOES THE UPDATE PROMPT SHOW?** The owner's diagram (27 October): photos
+/// are set to open in Falcon (`registered`), but not in this exe (`opens_here`), and this build is not
+/// older than one already used. Running from the temp folder turns the offer into "extract it first".
+/// Nothing is remembered: Not now asks again at the next launch, until photos open here.
+#[cfg_attr(not(windows), allow(dead_code))] // Windows-only consumer; pinned by tests on every host
+#[must_use]
+pub(crate) fn update_prompt(registered: bool, opens_here: bool, older_than_newest: bool, from_temp: bool) -> UpdatePrompt {
+    if !registered || opens_here || older_than_newest {
+        UpdatePrompt::Nothing
+    } else if from_temp {
+        UpdatePrompt::ExtractFirst
+    } else {
+        UpdatePrompt::Offer
+    }
+}
+
+/// 1.1.0-rc.1 (issue #11): is `exe` inside `dir`? Both are resolved first (the temp folder can be a
+/// short 8.3 name or a link), then compared component by component. Unresolvable → false. Boot asks it
+/// with `std::env::temp_dir()`: Explorer runs an exe opened inside a zip from a temp copy.
+#[cfg_attr(not(windows), allow(dead_code))] // Windows-only consumer; pinned by tests on every host
+#[must_use]
+pub(crate) fn exe_under(dir: Option<&std::path::Path>, exe: &std::path::Path) -> bool {
+    let (Some(dir), Ok(exe)) = (dir.and_then(|d| d.canonicalize().ok()), exe.canonicalize()) else { return false };
+    exe.starts_with(dir)
+}
+
+#[cfg(test)]
+mod update_prompt_tests {
+    use super::*;
+    use std::cmp::Ordering::{Equal, Greater, Less};
+
+    /// Falsifier: compare whole strings or split the pre-release on '.', rank a pre-release above its
+    /// release, or compare numeric pre-release parts as text.
+    #[test]
+    fn versions_order_by_semver_precedence() {
+        let ascending = ["1.0.15", "1.1.0-alpha", "1.1.0-alpha.1", "1.1.0-alpha.beta", "1.1.0-rc.1", "1.1.0-rc.2",
+            "1.1.0-rc.10", "1.1.0", "1.1.1", "1.2.0", "1.10.0", "2.0.0"];
+        for (i, a) in ascending.iter().enumerate() {
+            for (j, b) in ascending.iter().enumerate() {
+                assert_eq!(version_cmp(a, b), Some(i.cmp(&j)), "{a} vs {b}");
+            }
+        }
+        assert_eq!(version_cmp("1.1.0+build.5", "1.1.0"), Some(Equal), "build metadata is ignored");
+        assert_eq!(version_cmp(" 1.1.0 ", "1.1.0"), Some(Equal));
+        for bad in ["", "1.1", "1.1.0.0", "1.x.0", "1.1.0-", "1.1.0-rc..1", "rc"] {
+            assert_eq!(version_cmp(bad, "1.1.0"), None, "{bad:?} is unreadable");
+            assert_eq!(version_cmp("1.1.0", bad), None);
+        }
+        assert_eq!(version_cmp("1.1.0-rc.1", "1.0.99"), Some(Greater));
+        assert_eq!(version_cmp("1.1.0-rc.1", "1.1.0"), Some(Less));
+    }
+
+    /// Falsifier: compare the wrong way round, or let an unreadable name or no record block the prompt.
+    #[test]
+    fn only_a_newer_version_that_has_run_blocks_the_prompt() {
+        assert!(!older_than_a_version_run([], "1.1.0-rc.1"), "nothing has run yet");
+        assert!(!older_than_a_version_run(["garbage", "1.0.15"], "1.1.0"));
+        assert!(!older_than_a_version_run(["1.1.0-rc.1"], "1.1.0"), "a newer build");
+        assert!(!older_than_a_version_run(["1.1.0"], "1.1.0"), "the same build asks again");
+        assert!(older_than_a_version_run(["1.1.0", "1.1.1"], "1.1.0"), "an older build: no prompt");
+        assert!(older_than_a_version_run(["1.1.0"], "1.1.0-rc.1"));
+    }
+
+    /// Review R1 (28 October): two windows of different 1.1.x versions, the older one still open
+    /// and saving after the newer one started; then each launches again, in both orders. Falsifier:
+    /// skip the record, or overwrite or delete other versions' records.
+    #[test]
+    fn an_older_window_still_open_never_lowers_the_newest_version() {
+        let base = std::env::temp_dir().join(format!("falcon-versions-run-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = base.join(VERSIONS_RUN_DIR);
+        std::fs::create_dir_all(&base).unwrap(); // the config folder; `versions-run` is left to boot
+        assert!(!newest_version_boot(&dir, "1.1.0-rc.1"), "A starts first: nothing newer has run");
+        assert!(!newest_version_boot(&dir, "1.1.0-rc.2"), "B starts while A is open");
+        // A, still open, saves a genuine settings edit through the real payload and atomic writer.
+        // The record is not part of settings, so nothing A saves can reach it.
+        let mut a = Settings::default();
+        a.wheel_nav = !a.wheel_nav;
+        let memo = GpuMemo { backend: String::new(), adapter: String::new(), timings: String::new() };
+        write_atomic(&base.join("settings.json"), &settings_payload(&a, &memo).unwrap()).unwrap();
+        assert!(newest_version_boot(&dir, "1.1.0-rc.1"), "A's next launch: older, no prompt");
+        assert!(!newest_version_boot(&dir, "1.1.0-rc.2"), "B's next launch can still ask");
+        assert!(newest_version_boot(&dir, "1.1.0-rc.1"), "A again: its own record never lowers it");
+        assert!(!newest_version_boot(&dir, "1.1.0"), "a newer release raises it");
+        assert!(newest_version_boot(&dir, "1.1.0-rc.2"));
+        let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["1.1.0", "1.1.0-rc.1", "1.1.0-rc.2"], "one record per version, none lost");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Falsifier: offer the update when photos aren't set to open in Falcon, already open here, or
+    /// this build is older; or offer Update from inside the zip.
+    #[test]
+    fn the_update_prompt_follows_the_owners_diagram() {
+        for registered in [false, true] { for here in [false, true] { for older in [false, true] { for temp in [false, true] {
+            let expected = if !registered || here || older { UpdatePrompt::Nothing }
+                else if temp { UpdatePrompt::ExtractFirst } else { UpdatePrompt::Offer };
+            assert_eq!(update_prompt(registered, here, older, temp), expected, "{registered} {here} {older} {temp}");
+        }}}}
+        assert_eq!(update_prompt(true, false, false, false), UpdatePrompt::Offer);
+        assert_eq!(update_prompt(true, false, false, true), UpdatePrompt::ExtractFirst);
+    }
+
+    /// Falsifier: compare raw path text (prefix of a sibling folder, another spelling) or treat an
+    /// unresolvable path as inside.
+    #[test]
+    fn exe_under_resolves_both_paths_and_compares_components() {
+        let base = std::env::temp_dir().join(format!("falcon-exe-under-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let (inside, sibling) = (base.join("Temp1_falcon.zip"), base.join("Temp1_falcon.zip-copy"));
+        std::fs::create_dir_all(inside.join("Falcon Photo Viewer")).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let exe = inside.join("Falcon Photo Viewer").join("Falcon.exe");
+        std::fs::write(&exe, []).unwrap();
+        let other = sibling.join("Falcon.exe");
+        std::fs::write(&other, []).unwrap();
+        assert!(exe_under(Some(&base), &exe));
+        assert!(exe_under(Some(&inside), &exe));
+        assert!(exe_under(Some(&sibling.join("..").join("Temp1_falcon.zip")), &exe), "another spelling of the folder");
+        assert!(!exe_under(Some(&inside), &other), "a sibling whose name starts the same is not inside");
+        assert!(!exe_under(Some(&sibling), &exe));
+        assert!(!exe_under(None, &exe));
+        assert!(!exe_under(Some(&base.join("missing")), &exe));
+        assert!(!exe_under(Some(&base), &base.join("missing.exe")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
 #[cfg(test)]
 mod info_panel_three_state_tests {
     use super::*;
@@ -8370,10 +8684,30 @@ fn taken_epoch_of(shot: &Shot) -> i64 {
 }
 
 fn taken_epoch_with_metadata(shot: &Shot, metadata: Option<&std::fs::Metadata>) -> i64 {
+    taken_epoch_with_metadata_with(
+        shot, metadata, falcon_decode::metadata_is_cloud_placeholder, falcon_decode::file_is_cloud_placeholder,
+    )
+}
+
+/// [`taken_epoch_with_metadata`] with the two cloud probes passed in (no test can make a real
+/// placeholder). 2026-10-28 (the cloud-only round, owner answer 12): the scan's tag is fresh only at
+/// the scan, so a re-sort (`warm_taken_dates`) also asks the metadata it already reads for the
+/// modified time (no extra call), and `falcon_decode::read_date_taken_with` asks before it falls back
+/// to the RAW: a file freed up during the session is never read, so never downloaded.
+///
+/// FALSIFIER (L28): drop the metadata term and `a_resort_never_reads_a_file_freed_up_since_the_scan`
+/// reddens with the date read.
+fn taken_epoch_with_metadata_with(
+    shot: &Shot,
+    metadata: Option<&std::fs::Metadata>,
+    meta_is_cloud: impl Fn(&std::fs::Metadata) -> bool,
+    path_is_cloud: impl Fn(&std::path::Path) -> bool,
+) -> i64 {
     let Some(p) = shot.jpg.as_ref().or(shot.raw.as_ref()) else { return 0 };
-    let mtime = metadata.cloned().or_else(|| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok());
+    let meta = metadata.cloned().or_else(|| std::fs::metadata(p).ok());
+    let mtime = meta.as_ref().and_then(|m| m.modified().ok());
     let mtime_epoch = mtime.map(systemtime_epoch).unwrap_or(0);
-    if shot.cloud_placeholder {
+    if shot.cloud_placeholder || meta.as_ref().is_some_and(&meta_is_cloud) {
         return mtime_epoch;
     }
     if let Some((mt, cached)) = TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(p) {
@@ -8382,7 +8716,9 @@ fn taken_epoch_with_metadata(shot: &Shot, metadata: Option<&std::fs::Metadata>) 
         }
     }
     // Read OUTSIDE the lock (two threads may duplicate a read — harmless; neither blocks the other).
-    let taken = falcon_decode::read_date_taken(shot).and_then(|s| exif_datetime_epoch(&s));
+    // `p` was just found local; only another file (a pair's RAW) needs asking.
+    let taken = falcon_decode::read_date_taken_with(shot, |q: &std::path::Path| q != p.as_path() && path_is_cloud(q))
+        .and_then(|s| exif_datetime_epoch(&s));
     {
         let mut g = TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         // v0.8.151: the bound. Say so once per clear — an unbounded collection that starts
@@ -8836,6 +9172,33 @@ mod sort_tests {
     /// FALSIFIER (L28): make `taken_cache_full` answer `false` unconditionally and the bound is
     /// gone again; make it clear per folder instead and a sort → swap → sort-back re-reads every
     /// file's EXIF, which is what the cache exists to prevent.
+    /// 2026-10-28 (the cloud-only round, owner answer 12) — **A RE-SORT NEVER READS A FILE FREED UP
+    /// SINCE THE SCAN.** The scan's tag is false (the file was here then); the metadata the sort
+    /// already reads for the modified time says the file is only in the cloud now (the probe stands
+    /// in for a placeholder). The key is the modified time and nothing is read: the date memo, which
+    /// every read fills, has no entry for it. On this device the file is read as before.
+    ///
+    /// FALSIFIER (L28): drop the metadata term in `taken_epoch_with_metadata_with` and the cloud row
+    /// fills the memo.
+    #[test]
+    fn a_resort_never_reads_a_file_freed_up_since_the_scan() {
+        let dir = std::env::temp_dir().join(format!("falcon_cloud_resort_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("freed.jpg");
+        std::fs::write(&p, b"not a real jpeg").unwrap();
+        let s = shot(0, "freed", Some(p.clone()), None);
+        let mtime = systemtime_epoch(std::fs::metadata(&p).unwrap().modified().unwrap());
+        let memo = || TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&p);
+        let key = taken_epoch_with_metadata_with(&s, None, |_| true, |_| false);
+        assert_eq!(key, mtime, "only in the cloud now: the modified time");
+        assert!(!memo(), "…and the file was not read");
+        let key = taken_epoch_with_metadata_with(&s, None, |_| false, |_| false);
+        assert_eq!(key, mtime, "no EXIF: the modified time");
+        assert!(memo(), "on this device it is read as before");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_date_taken_memo_is_bounded() {
         assert!(!taken_cache_full(0));
@@ -9356,6 +9719,106 @@ mod sort_tests {
         assert_eq!((result.0, result.1, result.2, result.4), (0, 0, 0, 1));
         assert_eq!(undo, (0, 0, 1)); assert!(bytes.is_empty());
         assert_eq!(part, b"unfinished"); assert_eq!(record, 99);
+    }
+
+    /// An interrupted copy's leftovers, as `refinement_recovery_unlink_failure_preserves_the_claim_and_record`
+    /// builds them: the source, the empty claim at the final name, a marker two minutes old, the old record.
+    #[cfg(windows)]
+    fn interrupted_copy(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("falcon_recover_{tag}_{}_{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("A.jpg"); std::fs::write(&source, b"complete source").unwrap();
+        let out = dir.join("Sel"); std::fs::create_dir_all(&out).unwrap();
+        let dest = out.join("A.jpg"); std::fs::write(&dest, []).unwrap();
+        let marker = part_marker(&dest); std::fs::write(&marker, b"unfinished").unwrap();
+        std::fs::File::options().write(true).open(&marker).unwrap().set_times(std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))).unwrap();
+        write_export_manifest(&out, &[("A.jpg".into(), ManifestOutcome::Ok, Some(ManifestRec { size: 99, mtime: None }))]);
+        (dir, source, dest, marker)
+    }
+
+    #[cfg(windows)]
+    fn remove_scratch(dir: &Path) {
+        assert!(dir.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 2026-09-28 review Y2 (accepted 27 October): **RECOVERY WAITS OUT AN EMPTY CLAIM HELD FOR A
+    /// BEAT.** Another program holds the leftover empty file (deletion denied) for about 60 ms when
+    /// recovery tries to remove it; the bounded retry removes it once it is let go, and the copy
+    /// completes instead of leaving the photo "needs attention".
+    ///
+    /// FALSIFIER: back to one `remove_file` in `part_blocks_claim` and this reddens (attention 1, the
+    /// destination still empty).
+    #[cfg(windows)]
+    #[test]
+    fn refinement_recovery_retries_a_briefly_held_empty_claim() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (dir, source, dest, marker) = interrupted_copy("held");
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&dest).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(held);
+        });
+        let result = export_marked(&dir, &[shot(0, "A", Some(source), None)], &[MARK_FLAG],
+            MARK_FLAG, "Sel", false, CopyContent::JpgOnly, &AtomicBool::new(false), true);
+        release.join().unwrap();
+        let bytes = std::fs::read(&dest).unwrap();
+        let marker_left = marker.exists();
+        let record = read_export_manifest(dest.parent().unwrap()).unwrap().files["A.jpg"].size;
+        remove_scratch(&dir);
+        assert_eq!((result.0, result.4), (1, 0), "copied, not \"needs attention\"");
+        assert_eq!(bytes, b"complete source");
+        assert!(!marker_left, "the marker is gone");
+        assert_eq!(record, 15, "the record is the finished copy's");
+    }
+
+    /// 2026-09-28 review Y2: **THE RETRY GIVES UP SAFELY.** (a) A claim held throughout is refused for
+    /// this run after the retries, in the documented state (the marker gone, the empty file kept), so a
+    /// later run still needs attention, as `logic.md` says. (b) A claim that gains bytes while held is
+    /// never removed: each retry first asks whether it is still empty.
+    ///
+    /// FALSIFIERS: drop the recheck in `remove_empty_claim_retry` and (b) reddens; report success after
+    /// giving up and (a) reddens; no retries and (a)'s wait reddens.
+    #[cfg(windows)]
+    #[test]
+    fn refinement_recovery_claim_removal_gives_up_safely() {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        // (a) Held throughout.
+        let (dir, source, dest, marker) = interrupted_copy("held_on");
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&dest).unwrap();
+        let t0 = std::time::Instant::now();
+        let blocked = part_blocks_claim(&source, &dest);
+        let waited = t0.elapsed();
+        let (len, marker_left) = (std::fs::metadata(&dest).unwrap().len(), marker.exists());
+        drop(held);
+        let later = export_marked(&dir, &[shot(0, "A", Some(source), None)], &[MARK_FLAG],
+            MARK_FLAG, "Sel", false, CopyContent::JpgOnly, &AtomicBool::new(false), true);
+        remove_scratch(&dir);
+        assert!(blocked, "held throughout: refused this run");
+        assert!(waited >= std::time::Duration::from_millis(300), "…after the retries: {waited:?}");
+        assert_eq!((len, marker_left), (0, false), "the documented state: the empty file kept, the marker gone");
+        assert_eq!(later.4, 1, "…so a later run still needs attention (the documented limit)");
+
+        // (b) Gains bytes while held.
+        let (dir, source, dest, marker) = interrupted_copy("grows");
+        let mut held = std::fs::OpenOptions::new().read(true).write(true).share_mode(0x1 | 0x2).open(&dest).unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            held.write_all(b"late").unwrap();
+            held.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+        let blocked = part_blocks_claim(&source, &dest);
+        writer.join().unwrap();
+        let (bytes, marker_left) = (std::fs::read(&dest).ok(), marker.exists());
+        remove_scratch(&dir);
+        assert!(blocked);
+        assert!(!marker_left, "premise: recovery got as far as the claim");
+        assert_eq!(bytes.as_deref(), Some(&b"late"[..]), "a claim that gained bytes is never removed");
     }
 
     #[cfg(unix)]
@@ -13584,6 +14047,10 @@ pub(crate) fn reap_stale_temps(dir: &Path) {
 
 pub(crate) enum WriteMsg {
     Write { target: PathBuf, data: Vec<u8> },
+    /// Issue #11 batch B1: settings.json, the same durable write as `Write`, whose outcome completes
+    /// attempt `ticket` in `saves` ([`SettingsSaves`]), so the shutdown save can tell an unchanged
+    /// saved state from one whose last save is pending or failed.
+    Settings { target: PathBuf, data: Vec<u8>, ticket: u64, saves: &'static SettingsSaves },
     /// v0.8.131 (F-P3 rule 6): a folder's review data, addressed by its FOLDER. The writer thread
     /// resolves the file name at WRITE time from on-disk facts ([`review_write_name`]) instead of
     /// the UI thread baking a path in at enqueue time. That kills two forks at once: the
@@ -13650,9 +14117,10 @@ fn writer_loop(
     mut log_sink: impl FnMut(&Path, &str, u64),
 ) {
     while let Ok(msg) = rx.recv() {
-        let (target, data, review) = match msg {
-            WriteMsg::Write { target, data } => (target, data, None),
-            WriteMsg::ReviewData { dir, data, ticket } => (resolve_review(&dir), data, Some((dir, ticket))),
+        let (target, data, review, settings) = match msg {
+            WriteMsg::Write { target, data } => (target, data, None, None),
+            WriteMsg::Settings { target, data, ticket, saves } => (target, data, None, Some((saves, ticket))),
+            WriteMsg::ReviewData { dir, data, ticket } => (resolve_review(&dir), data, Some((dir, ticket)), None),
             WriteMsg::Log { target, line, ticket } => {
                 log_sink(&target, &line, ticket);
                 continue;
@@ -13674,6 +14142,7 @@ fn writer_loop(
         // overwrite the state of a newer queued/successful save.
         let result = sink(&target, &data).or_else(|_| sink(&target, &data));
         if let Some((dir, ticket)) = review { review_save_complete(&dir, ticket, result.is_ok()); }
+        if let Some((saves, ticket)) = settings { saves.complete(ticket, result.is_ok()); }
         if result.is_ok() {
             save_failure_ended(&target); // 1.0.15 (review R2): this file saved — a later failure shows again
         }
@@ -13787,6 +14256,26 @@ fn review_save_complete(dir: &Path, ticket: u64, ok: bool) {
     if let Some(record) = REVIEW_SAVES.lock().unwrap_or_else(|e| e.into_inner()).get_mut(dir) {
         record.complete(ticket, ok);
     }
+    if let Some(record) = REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).get_mut(dir) {
+        record.complete(ticket, ok);
+    }
+}
+/// Issue #11 batch B1: each folder's newest save attempt in this process, OUTLIVING visits: the
+/// memory the final flushes ask ([`final_review_flush`]). [`REVIEW_SAVES`] is cleared at every swap,
+/// same-folder rescans (a sort pick, a delete) included, so a save that failed after one would read as
+/// clean and a gated exit flush would skip it, where the unconditional one used to retry it. Same
+/// tickets, same completion; forgotten only when the folder is freshly opened from disk
+/// ([`forget_review_attempts`]).
+static REVIEW_LATEST: std::sync::LazyLock<Mutex<HashMap<PathBuf, ReviewSaveRecord>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// B1: the newest save attempt for `dir` in this process, whichever visit made it.
+pub(crate) fn review_final_status(dir: &Path) -> Option<ReviewSaveStatus> {
+    REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).get(dir).map(|r| r.status)
+}
+/// B1: `dir` was freshly opened (not a same-folder rescan), so its live review state is what is on
+/// disk now and earlier attempts no longer say anything about it.
+pub(crate) fn forget_review_attempts(dir: &Path) {
+    REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).remove(dir);
 }
 pub(crate) fn review_save_status(dir: &Path) -> Option<ReviewSaveStatus> {
     REVIEW_SAVES.lock().unwrap_or_else(|e| e.into_inner()).get(dir).map(|r| r.status)
@@ -13798,15 +14287,26 @@ pub(crate) fn review_save_needs_retry(dir: &Path, has_photos: bool) -> bool {
 }
 
 pub(crate) fn enqueue_review_data(dir: &Path, data: Vec<u8>) -> std::io::Result<()> {
+    enqueue_review_data_via(WRITER.get().map(|h| &h.tx), dir, data)
+}
+/// [`enqueue_review_data`] with the writer's queue named (`None`: not started), so a test can hand it
+/// a channel the real [`writer_loop`] drains.
+fn enqueue_review_data_via(
+    tx: Option<&std::sync::mpsc::Sender<WriteMsg>>,
+    dir: &Path,
+    data: Vec<u8>,
+) -> std::io::Result<()> {
     let msg = {
         // Publish the ticket and send under the same lock: concurrent callers
         // must agree on which snapshot is last in the writer FIFO.
         let mut saves = REVIEW_SAVES.lock().unwrap_or_else(|e| e.into_inner());
         let ticket = REVIEW_TICKET.fetch_add(1, Ordering::Relaxed);
-        saves.insert(dir.to_owned(), ReviewSaveRecord { ticket, status: ReviewSaveStatus::Pending });
+        let record = ReviewSaveRecord { ticket, status: ReviewSaveStatus::Pending };
+        saves.insert(dir.to_owned(), record);
+        REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).insert(dir.to_owned(), record); // B1
         let msg = WriteMsg::ReviewData { dir: dir.to_path_buf(), data, ticket };
-        match WRITER.get() {
-            Some(h) => match h.tx.send(msg) { Ok(()) => return Ok(()), Err(e) => e.0 },
+        match tx {
+            Some(tx) => match tx.send(msg) { Ok(()) => return Ok(()), Err(e) => e.0 },
             None => msg,
         }
     };
@@ -16002,11 +16502,8 @@ mod cold_thumbnail_queue_tests {
         assert!(queue.try_take().is_none(),"a promotion cannot duplicate an in-flight job");
         crate::tick::feed_visible_thumb(&tx,&mut pending,3,7,0,2);
         assert!(queue.try_take().is_none(),"new requests still obey the pending cap");
-        // 2026-10-27 (round 2b): a whole-folder job a tile on screen promotes follows the tiles' rule.
-        assert_eq!(ThumbReq::whole_folder(5,7,0),ThumbReq { local_only: true, ..ThumbReq::speculative(5,7,0) });
-        tx.send(ThumbReq::whole_folder(5,7,0)).unwrap();
-        tx.send(ThumbReq::promote(5,7,0)).unwrap();
-        assert_eq!(queue.try_take(),Some(ThumbReq::explicit(5,7,0)),"promoted: on screen, not local-only");
+        // 2026-10-28 (the cloud-only round): round 2b's whole-folder request and its downgrade on
+        // promotion are gone. Every job is checked by the worker, whichever lane it is in.
     }
     /// A retirement removes only that shot's still-queued job, from either lane. It cannot stop a
     /// running job, cross a folder generation, or drop a re-request sent after it.
@@ -17064,7 +17561,11 @@ pub(crate) fn detail_fps_fold(ema: f32, sample: DetailPaceSample) -> Option<f32>
 /// FALSIFIER (L28): put back `queue.front() != Some(idx)` and the mid-queue row reddens with two
 /// copies of the id; drop the `retain` and the same row reddens; drop the `inflight` guard and the
 /// already-decoding row reddens.
-pub(crate) fn pump_push_front(p: &mut Pump, idx: usize, capped: bool) -> bool {
+///
+/// `local_only` (the cloud-only round): nobody is looking at this photo yet — the hover preview's ask
+/// (owner answer 5: a cloud-only Review tile downloads nothing). `prime_jump`'s target is the photo
+/// now on screen and passes `false`; an earlier mark for the same id is replaced.
+pub(crate) fn pump_push_front(p: &mut Pump, idx: usize, capped: bool, local_only: bool) -> bool {
     if p.inflight.contains(&idx) {
         return false;
     }
@@ -17072,6 +17573,11 @@ pub(crate) fn pump_push_front(p: &mut Pump, idx: usize, capped: bool) -> bool {
     p.queue.push_front(idx);
     if capped {
         p.costly_q.insert(idx);
+    }
+    if local_only {
+        p.local_only_q.insert(idx);
+    } else {
+        p.local_only_q.remove(&idx);
     }
     true
 }
@@ -19617,15 +20123,17 @@ pub(crate) fn custom_typed(c: CustomLimits, row: i32, text: &str, bench_fps: Opt
 }
 
 /// The one line a change of Custom's numbers logs (always English, like every `mode:` line), with the
-/// speed as the card shows it.
+/// speed as the card shows it. On the Mac the background share is of Apple's recommended graphics
+/// budget, as `background_memory`'s policy line says (`is_mac`, a parameter so both arms run here).
 #[must_use]
-pub(crate) fn custom_log_line(c: CustomLimits, shown_fps: i32) -> String {
+pub(crate) fn custom_log_line(c: CustomLimits, shown_fps: i32, is_mac: bool) -> String {
     let speed = match c.fps {
         CUSTOM_FPS_UNLIMITED => "unlimited".to_string(),
         f if f < 0 => format!("Balanced's limit ({shown_fps} fps)"),
         _ => format!("{shown_fps} fps"),
     };
-    let keep = if c.bg_keep == 0 { "only the photos in use".to_string() } else { format!("{}% of the card", c.bg_keep) };
+    let of = if is_mac { "Apple's recommended graphics budget" } else { "the card" };
+    let keep = if c.bg_keep == 0 { "only the photos in use".to_string() } else { format!("{}% of {of}", c.bg_keep) };
     let release = if c.bg_release_s == 0 { "at once".to_string() } else { format!("over {} s", c.bg_release_s) };
     let thumbs = match c.thumbs {
         ThumbScope::WholeFolder => format!("whole folder up to {} MB", c.thumbs_mb),
@@ -22321,6 +22829,29 @@ mod mode_tests {
         // The tick's policy reads the card (a census).
         let main = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap().replace("\r\n", "\n");
         assert_eq!(main.matches("background_memory::Policy::for_mode(\n            mode_eff.mode,\n            &custom_now,\n").count(), 1);
+    }
+
+    /// Round 2c BUILD note (accepted 27 October): **ON THE MAC, CUSTOM'S LOG LINE NAMES APPLE'S
+    /// RECOMMENDED GRAPHICS BUDGET, NOT "THE CARD".** Both arms run on every host, and this host's arm
+    /// agrees with the background policy's own name for the same share.
+    ///
+    /// FALSIFIERS: one literal for both platforms and the Mac row reddens; swap the two literals and
+    /// both platform rows redden.
+    #[test]
+    fn custom_log_line_names_the_mac_budget_not_the_card() {
+        let c = CustomLimits { bg_keep: 50, ..CustomLimits::BALANCED_COPY };
+        assert!(custom_log_line(c, 20, false).contains("keep 50% of the card,"), "{}", custom_log_line(c, 20, false));
+        assert!(
+            custom_log_line(c, 20, true).contains("keep 50% of Apple's recommended graphics budget,"),
+            "{}",
+            custom_log_line(c, 20, true)
+        );
+        // 50, not 25: the background line names Performance's quarter "performance".
+        let policy = background_memory::Policy::for_mode(MODE_CUSTOM, &c, None, 20).name();
+        let here = custom_log_line(c, 20, cfg!(target_os = "macos"));
+        assert!(here.contains(&format!("keep {policy},")), "{here} / {policy}");
+        let none = CustomLimits { bg_keep: 0, ..c };
+        assert_eq!(custom_log_line(none, 20, true), custom_log_line(none, 20, false), "no share, no platform word");
     }
 
     /// Round 2b (owner answer 5 and its confirmation): **WHICH THUMBNAILS EACH MODE PREPARES.**
@@ -25618,10 +26149,11 @@ mod decode_instrumentation_tests {
             inflight: HashSet::new(),
             costly_q: HashSet::from([7, 9]), // 8 is a JPEG: queued, never marked
             costly_inflight: HashSet::new(),
+            local_only_q: HashSet::new(),
         };
-        assert_eq!(pump_pop(&mut p), Some((7, 1)), "a marked pop counts itself");
-        assert_eq!(pump_pop(&mut p), Some((8, 1)), "a cheap pop does not raise the costly count");
-        assert_eq!(pump_pop(&mut p), Some((9, 2)));
+        assert_eq!(pump_pop(&mut p), Some((7, 1, false)), "a marked pop counts itself");
+        assert_eq!(pump_pop(&mut p), Some((8, 1, false)), "a cheap pop does not raise the costly count");
+        assert_eq!(pump_pop(&mut p), Some((9, 2, false)));
         assert_eq!(pump_pop(&mut p), None, "an empty queue pops nothing");
         assert_eq!(p.inflight, HashSet::from([7, 8, 9]), "every pop is in flight");
         assert_eq!(p.costly_inflight, HashSet::from([7, 9]), "…and only the marked ones are costly");
@@ -25790,26 +26322,170 @@ mod decode_instrumentation_tests {
             inflight: HashSet::new(),
             costly_q: HashSet::new(),
             costly_inflight: HashSet::new(),
+            local_only_q: HashSet::new(),
         };
         // Row 1: a target NOT in the queue — the plain front-push, unchanged.
-        assert!(pump_push_front(&mut p, 12, true));
+        assert!(pump_push_front(&mut p, 12, true, false));
         assert_eq!(p.queue.iter().copied().collect::<Vec<_>>(), vec![12, 7, 3, 9, 4]);
         // Row 2: a target already MID-queue — the case that used to double it. It moves to the head,
         // and there is exactly ONE of it.
-        assert!(pump_push_front(&mut p, 9, true));
+        assert!(pump_push_front(&mut p, 9, true, false));
         assert_eq!(p.queue.iter().copied().collect::<Vec<_>>(), vec![9, 12, 7, 3, 4]);
         assert_eq!(p.queue.iter().filter(|&&x| x == 9).count(), 1, "exactly once");
         // Row 3: …and the accounting that made the duplicate matter. Every pop of a marked id is
         // COUNTED; with a duplicate present the second pop was not, because the mark was gone.
-        let (i, n) = pump_pop(&mut p).expect("the head");
+        let (i, n, _) = pump_pop(&mut p).expect("the head");
         assert_eq!((i, n), (9, 1), "the jump target pops first and is counted as costly");
         assert!(p.costly_inflight.contains(&9));
         // Row 4: an already-DECODING target is left alone — re-queueing it could only duplicate it.
-        assert!(!pump_push_front(&mut p, 9, true), "in flight ⇒ nothing to do");
+        assert!(!pump_push_front(&mut p, 9, true, false), "in flight ⇒ nothing to do");
         assert!(!p.queue.contains(&9));
         // Row 5: a CHEAP target takes no mark, so the cap never sees it (the JPEG lane, unchanged).
-        assert!(pump_push_front(&mut p, 5, false));
+        assert!(pump_push_front(&mut p, 5, false, false));
         assert!(!p.costly_q.contains(&5));
+    }
+
+    /// 2026-10-28 (the cloud-only round, design 4) — **THE PUMP CARRIES "NOBODY IS LOOKING AT IT" TO
+    /// THE WORKER.** A marked id pops with its mark (and loses it, so a later unmarked push of the same
+    /// id is not refused); `clear_queue` drops the marks with the queue; a front-push marks or unmarks
+    /// as its caller says (the hover ask `true`, `prime_jump`'s jump target `false`).
+    ///
+    /// FALSIFIER (L28): drop the `local_only_q.remove` from `pump_pop` and the first pop reads
+    /// unmarked; drop it from `clear_queue` and the clear row reddens.
+    #[test]
+    fn the_pump_carries_the_speculative_mark_to_the_worker() {
+        let mut p = Pump {
+            queue: VecDeque::from(vec![3, 4]),
+            inflight: HashSet::new(),
+            costly_q: HashSet::new(),
+            costly_inflight: HashSet::new(),
+            local_only_q: HashSet::from([3]),
+        };
+        assert_eq!(pump_pop(&mut p), Some((3, 0, true)), "the mark rides with the job");
+        assert!(p.local_only_q.is_empty(), "…and is consumed");
+        assert_eq!(pump_pop(&mut p), Some((4, 0, false)), "an unmarked id is the photo on screen");
+        p.queue.extend([5, 6]);
+        p.local_only_q.extend([5, 6]);
+        p.clear_queue();
+        assert!(p.local_only_q.is_empty(), "the marks are a property of the queue");
+        assert!(pump_push_front(&mut p, 8, false, true), "the hover's ask");
+        assert!(p.local_only_q.contains(&8));
+        assert!(pump_push_front(&mut p, 8, false, false), "…then the jump lands on it");
+        assert!(!p.local_only_q.contains(&8), "the photo on screen may download");
+        assert_eq!(pump_pop(&mut p), Some((8, 0, false)));
+    }
+
+    /// 2026-10-28 (the cloud-only round, owner answer 3) — **EACH KIND OF WORK IS JUDGED BY THE FILE IT
+    /// READS.** Thumbnails and browse previews read the finished file of a pair (so a pair whose RAW
+    /// alone is in the cloud shows its picture), else the RAW; the full-resolution tier develops the
+    /// RAW in RAW mode; a passenger is not the picture; an undecodable sole source reads nothing.
+    #[test]
+    fn read_file_follows_the_decoders_choice() {
+        use std::path::{Path, PathBuf};
+        let mk = |raw: Option<&str>, jpg: Option<&str>, has_jpg: bool, kind: SrcKind| Shot {
+            id: 0,
+            name: "s".into(),
+            has_raw: raw.is_some(),
+            has_jpg,
+            raw: raw.map(PathBuf::from),
+            jpg: jpg.map(PathBuf::from),
+            kind,
+            cloud_placeholder: false,
+            sniffed: None,
+        };
+        let pair = mk(Some("a.CR3"), Some("a.JPG"), true, SrcKind::Jpeg);
+        let raw_only = mk(Some("b.CR3"), None, false, SrcKind::Jpeg);
+        let png = mk(None, Some("c.png"), true, SrcKind::Png);
+        let passenger = mk(Some("d.CR3"), Some("d.avif"), false, SrcKind::Jpeg);
+        let undecodable = mk(None, Some("e.avif"), false, SrcKind::Unsupported);
+        let fin = |p: &'static str| Some((CloudFile::Finished, Path::new(p)));
+        let raw = |p: &'static str| Some((CloudFile::Raw, Path::new(p)));
+        for tier in [ReadTier::Thumb, ReadTier::Fast, ReadTier::Detail { raw_mode: false }] {
+            assert_eq!(read_file(&pair, tier), fin("a.JPG"), "{tier:?}: a pair's picture is its JPEG");
+            assert_eq!(read_file(&raw_only, tier), raw("b.CR3"), "{tier:?}: RAW-only reads the RAW");
+            assert_eq!(read_file(&png, tier), fin("c.png"), "{tier:?}");
+            assert_eq!(read_file(&passenger, tier), raw("d.CR3"), "{tier:?}: a passenger is not the picture");
+            assert_eq!(read_file(&undecodable, tier), None, "{tier:?}: nothing is read");
+        }
+        let dev = ReadTier::Detail { raw_mode: true };
+        assert_eq!(read_file(&pair, dev), raw("a.CR3"), "RAW mode develops the RAW");
+        assert_eq!(read_file(&raw_only, dev), raw("b.CR3"));
+        assert_eq!(read_file(&png, dev), fin("c.png"), "no RAW: RAW mode reads the finished file");
+        assert_eq!(read_file(&passenger, dev), raw("d.CR3"));
+        assert_eq!(read_file(&undecodable, dev), None);
+    }
+
+    /// 2026-10-28 (the cloud-only round, design 4) — **THE ONE REFUSAL RULE THE PREVIEW AND
+    /// FULL-RESOLUTION WORKERS SHARE, AND THE NOTE IT LEAVES.** Only a read nobody is looking at, of
+    /// a file that is online-only, is refused; the photo on screen never is. The note is per file and
+    /// per folder, and only the folder still open takes one.
+    ///
+    /// FALSIFIER (L28): drop either exemption in `speculative_read_refused` and its row reddens; drop
+    /// the generation test in `note_cloud` and the old-folder row reddens.
+    #[test]
+    fn the_refusal_rule_spares_what_is_on_screen() {
+        use std::path::PathBuf;
+        let pair = Shot {
+            id: 0, name: "a".into(), has_raw: true, has_jpg: true,
+            raw: Some(PathBuf::from("a.CR3")), jpg: Some(PathBuf::from("a.JPG")),
+            kind: SrcKind::Jpeg, cloud_placeholder: false, sniffed: None,
+        };
+        let raw_cloud = |p: &std::path::Path| p.extension().is_some_and(|e| e == "CR3");
+        let jpg_mode = ReadTier::Detail { raw_mode: false };
+        let raw_mode = ReadTier::Detail { raw_mode: true };
+        assert_eq!(speculative_read_refused(true, false, &pair, raw_mode, raw_cloud), Some(CloudFile::Raw), "ahead, RAW mode, RAW in the cloud");
+        assert_eq!(speculative_read_refused(true, false, &pair, jpg_mode, raw_cloud), None, "JPEG mode reads the local JPEG");
+        assert_eq!(speculative_read_refused(true, false, &pair, ReadTier::Fast, raw_cloud), None, "so does a preview");
+        assert_eq!(speculative_read_refused(false, false, &pair, raw_mode, raw_cloud), None, "on screen: may download");
+        assert_eq!(speculative_read_refused(true, true, &pair, raw_mode, raw_cloud), None, "became the current photo");
+        assert_eq!(speculative_read_refused(true, false, &pair, raw_mode, |_: &std::path::Path| false), None, "local");
+
+        let notes: CloudNotes = Mutex::new(HashSet::new());
+        let generation = AtomicU64::new(4);
+        assert!(note_cloud(&notes, &generation, 4, 7, CloudFile::Raw), "the folder's first note");
+        assert!(!note_cloud(&notes, &generation, 4, 8, CloudFile::Finished), "…a second is not the first");
+        assert!(!note_cloud(&notes, &generation, 3, 9, CloudFile::Finished), "an old folder's find");
+        let n = notes.lock().unwrap();
+        assert!(!n.contains(&(3, 9, CloudFile::Finished)), "…never lands");
+        assert!(cloud_noted(&n, 4, 7, &pair, raw_mode), "RAW mode: the RAW's note holds it");
+        assert!(!cloud_noted(&n, 4, 7, &pair, ReadTier::Thumb), "a thumbnail reads the JPEG");
+        assert!(!cloud_noted(&n, 5, 7, &pair, raw_mode), "another generation");
+        drop(n);
+        let shots = vec![pair.clone(); 10];
+        assert_eq!(cloud_noted_in(&notes, 4, &shots, ReadTier::Thumb, 0..10), HashSet::from([8]));
+    }
+
+    /// R1 (Codex's review, 29 October 2026) — **A RAW-MODE TOGGLE IN THE MIDDLE OF A FULL-RESOLUTION
+    /// JOB NEVER CHANGES THE FILE IT READS.** A pair ahead has its JPEG here and its RAW only in the
+    /// cloud. The probe stands in for the toggle landing between the check and the read: it switches
+    /// the live mode to RAW while it is asked. The job keeps the mode it checked, so it reads the local
+    /// JPEG it checked (the RAW-mode epoch discards that frame later; nothing downloads); the next job
+    /// sees RAW mode and is refused.
+    ///
+    /// FALSIFIER (L28): read the switch again for the `Ok` in `detail_job_mode` and the first row
+    /// reddens: the job would open the RAW it never checked.
+    #[test]
+    fn a_raw_mode_toggle_mid_job_never_changes_the_file_read() {
+        use std::path::{Path, PathBuf};
+        let pair = Shot {
+            id: 0, name: "a".into(), has_raw: true, has_jpg: true,
+            raw: Some(PathBuf::from("a.CR3")), jpg: Some(PathBuf::from("a.JPG")),
+            kind: SrcKind::Jpeg, cloud_placeholder: false, sniffed: None,
+        };
+        let raw_cloud = |p: &Path| p.extension().is_some_and(|e| e == "CR3");
+        let mode = AtomicBool::new(false);
+        let toggled_mid_check = |p: &Path| {
+            mode.store(true, Ordering::Relaxed);
+            raw_cloud(p)
+        };
+        let job = detail_job_mode(&mode, true, false, &pair, toggled_mid_check);
+        assert!(mode.load(Ordering::Relaxed), "precondition: the switch flipped during the check");
+        assert_eq!(job, Ok(false), "the job keeps the mode it checked");
+        let read = read_file(&pair, ReadTier::Detail { raw_mode: job.unwrap() }).map(|(_, p)| p);
+        assert_eq!(read, Some(Path::new("a.JPG")), "…so it reads the local JPEG it checked");
+        assert_eq!(detail_job_mode(&mode, true, false, &pair, raw_cloud), Err(CloudFile::Raw), "the next job: RAW mode, refused");
+        assert_eq!(detail_job_mode(&mode, false, false, &pair, raw_cloud), Ok(true), "on screen: never refused");
+        assert_eq!(detail_job_mode(&mode, true, true, &pair, raw_cloud), Ok(true), "the current photo: never refused");
     }
 
     /// v0.8.123 (I1d) — THE SELECTION PANEL'S MODE ARM, now shared by the tile feed and the digit
@@ -27464,7 +28140,12 @@ pub(crate) struct ResolvedOpen {
 
 /// Explicit opens validate on a worker. In particular, a missing argv file must
 /// not silently open its parent and select an unrelated photo.
+/// 1.1.0-rc.1 (issue #11 batch, O1): a relative command-line path (`Falcon.exe IMG_0001.JPG`, or
+/// `Falcon.exe .`) is made absolute first, so its parent is a real folder (not `""`) and `cur_dir`
+/// is never relative. `std::path::absolute` does no filesystem work and doesn't resolve links.
 pub(crate) fn resolve_existing_target(path: &Path) -> std::io::Result<(PathBuf, Option<String>)> {
+    let abs = std::path::absolute(path)?;
+    let path = abs.as_path();
     let metadata = std::fs::metadata(path)?;
     if metadata.is_dir() { return Ok((path.to_path_buf(), None)); }
     if !metadata.is_file() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "target is not a file or folder")); }
@@ -27487,23 +28168,52 @@ pub(crate) fn resolve_target(path: PathBuf) -> (PathBuf, Option<String>) {
 
 /// The shot index to SELECT when opening a file (argv / drag-drop / picker). `target` is
 /// `resolve_target`'s `sel` — the opened item's file name with extension, or `None` for a folder → 0.
-/// Matches the shot whose underlying finished/raw FILE is that file, so it's robust to the split-shot
-/// naming (`stem.ext`) and the `(2)` uniqueness suffix; falls back to the shot NAME then the bare stem.
+/// Matches the shot whose underlying finished/raw FILE is that file (`select_match`), so it's robust
+/// to the split-shot naming (`stem.ext`) and the `(2)` uniqueness suffix; no match → 0.
 pub(crate) fn select_start(shots: &[Shot], target: &Option<String>) -> usize {
-    let Some(fname) = target else { return 0 };
-    let file_is = |p: &Option<std::path::PathBuf>| {
-        p.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some(fname.as_str())
-    };
-    shots
-        .iter()
-        .position(|s| file_is(&s.jpg) || file_is(&s.raw))
-        .or_else(|| shots.iter().position(|s| s.name == *fname)) // split shot named exactly stem.ext
-        .or_else(|| {
-            // lone shot keeps the bare stem — match on the dropped file's stem.
-            let stem = std::path::Path::new(fname).file_stem().and_then(|s| s.to_str());
-            stem.and_then(|st| shots.iter().position(|s| s.name == st))
-        })
-        .unwrap_or(0)
+    select_match(shots, target).unwrap_or(0)
+}
+
+/// 1.1.0-rc.1 (issue #11 batch, O2): the shot an EXPLICITLY opened file is, judged by the shots'
+/// actual files only (the finished `jpg` and the `raw` paths). Never by `Shot.name` or a bare stem:
+/// those are internal review identities that another file can share (`photo.jfif` beside a listed
+/// `photo.jpg`, or `photo.jpg.png` whose split-shot name is `photo.jpg`), and they must not hide that
+/// the requested file isn't listed. The exact filename wins; only when none matches, on Windows and
+/// macOS (case-insensitive by default), an ASCII-case-insensitive match counts, and only when it
+/// names exactly one shot (a RAW+JPG pair's two files are one shot). None: no target, no match, or
+/// an ambiguous case-folded match.
+pub(crate) fn select_match(shots: &[Shot], target: &Option<String>) -> Option<usize> {
+    fn name(p: &Option<PathBuf>) -> Option<&str> { p.as_ref()?.file_name()?.to_str() }
+    let fname = target.as_deref()?;
+    let exact = |p: &Option<PathBuf>| name(p) == Some(fname);
+    if let Some(i) = shots.iter().position(|s| exact(&s.jpg) || exact(&s.raw)) {
+        return Some(i);
+    }
+    if !cfg!(any(windows, target_os = "macos")) {
+        return None;
+    }
+    let folded = |p: &Option<PathBuf>| name(p).is_some_and(|n| n.eq_ignore_ascii_case(fname));
+    let mut hits = shots.iter().enumerate().filter(|(_, s)| folded(&s.jpg) || folded(&s.raw)).map(|(i, _)| i);
+    match (hits.next(), hits.next()) {
+        (Some(i), None) => Some(i),
+        _ => None,
+    }
+}
+
+/// 1.1.0-rc.1 (issue #11 batch, O2): the explicitly opened file's name when the FINAL scan lists no
+/// shot for it (an unsupported extension such as `.jfif` through Open with, a symlink the scan skips,
+/// or different letter case on another system), so apply_scan can say it opened the folder instead.
+/// A folder that couldn't be read shows only its own empty state (plus M5's hint on the Mac).
+pub(crate) fn unlisted_target(scan_err: bool, sel: &Option<String>, matched: Option<usize>) -> Option<String> {
+    if scan_err || matched.is_some() { None } else { sel.clone() }
+}
+
+/// 1.1.0-rc.1 (issue #11 batch, M5): the Mac's hint when a folder listing was refused. On macOS
+/// that is usually Privacy & Security (Desktop, Documents, Downloads, removable or network volumes),
+/// but ordinary folder permissions can refuse it too, so the sentence names both. Other systems keep
+/// the plain "Couldn't read this folder". The owner's wording (27 October).
+pub(crate) fn folder_denied_notice(denied: bool, macos: bool) -> Option<&'static str> {
+    (denied && macos).then_some(tr_noop!("Falcon couldn't read this folder because access was denied. Check the folder's permissions and System Settings → Privacy & Security → Files and Folders, then try again."))
 }
 
 /// Post-op rescan landing (v0.8.34, C3/G1): clamp a desired shot index into the freshly-scanned list.
@@ -27566,6 +28276,12 @@ pub(crate) struct ScanDone {
     /// SYNC reload path never sets this: a live-session rescan that errors keeps its current list and
     /// publishes no ScanDone at all (never silently empties the session).
     pub(crate) scan_err: bool,
+    /// 1.1.0-rc.1 (issue #11 batch, M5): that IO error was "permission denied", so on the Mac the
+    /// empty state also gets the permission hint (`folder_denied_notice`). Only with `scan_err`.
+    pub(crate) scan_denied: bool,
+    /// 1.1.0-rc.1 (issue #11 batch, O2): the explicitly opened file name when the final scan lists no
+    /// shot for it (`unlisted_target`); apply_scan then says it opened the folder instead.
+    pub(crate) unlisted_target: Option<String>,
 }
 // ───────────────────────────── selection (rating/flag/reject) ─────────────────────────────
 // Per-photo cull state lives PER-FOLDER in `<folder>/falcon_review_data.json` (keyed by file
@@ -27915,6 +28631,137 @@ pub(crate) fn range_span(
     let ai = pos(anchor).or_else(|| pos(current)).unwrap_or(ti);
     let (lo, hi) = if ai <= ti { (ai, ti) } else { (ti, ai) };
     order[lo..=hi].to_vec()
+}
+
+/// 2026-10-29 (owner, the jump lists round) — THE REVIEW JUMP LIST'S ENTRIES: `n` panel rows
+/// sampled evenly over `rows` (entry i is row round(i·(rows − 1)/(n − 1)), so the first and the last
+/// row are always there), or every row when there are no more rows than entries. `n` is the tier
+/// the list's Slint side publishes from the scroll bar's real height (12, 17, 25, 40 or 64). Integer
+/// arithmetic, rounding halves up, so the result never depends on float rounding.
+pub(crate) fn jump_rows(rows: usize, n: usize) -> Vec<usize> {
+    if rows == 0 || n == 0 {
+        return Vec::new();
+    }
+    if rows <= n {
+        return (0..rows).collect();
+    }
+    if n == 1 {
+        return vec![0];
+    }
+    (0..n).map(|i| (2 * i * (rows - 1) + (n - 1)) / (2 * (n - 1))).collect()
+}
+
+/// Codex review R1 (the jump lists round) — THE REVIEW PANEL'S CONTENT KEY: an FNV-1a fold (the
+/// `wm_raster_sig` constants) over the folder generation and the photos the panel holds, in order,
+/// never their pictures, folded to the `int` Slint keeps (`review-rows-key`). A jump made in the
+/// jump list is remembered only while it is unchanged (`jr-held` in main_window.slint), so a filter
+/// or a new folder lets go of it even with the same number of rows, and a thumbnail landing keeps it.
+pub(crate) fn review_rows_key(gen: u64, order: &[usize]) -> i32 {
+    let mut hash = 0xcbf29ce484222325u64; // FNV-1a offset basis
+    for v in std::iter::once(gen).chain(order.iter().map(|&i| i as u64)) {
+        hash = (hash ^ v).wrapping_mul(0x100000001b3);
+    }
+    (hash ^ (hash >> 32)) as i32
+}
+
+/// 2026-10-29 (owner, testing rc.2: "Re-sample after bigger changes") — THE JUMP LIST'S ROWS WHEN THE
+/// PANEL'S ROW COUNT CHANGES A LITTLE. `prev` was sampled for `basis_rows` rows. While the count stays
+/// within one entry's spacing of that, the same rows are kept, the last moved to the new last row,
+/// so a new pick does not re-sample the whole list (its photos stay, and stay loaded). `None` means
+/// sample afresh: the tier changed, either count has no more rows than entries (then every row is an
+/// entry), the count has moved by a spacing or more, or the kept rows would no longer rise.
+pub(crate) fn jump_rows_kept(prev: &[usize], basis_rows: usize, rows: usize, n: usize) -> Option<Vec<usize>> {
+    if n < 2 || prev.len() != n || rows <= n || basis_rows <= n {
+        return None;
+    }
+    let spacing = ((basis_rows - 1) as f64 / (n - 1) as f64).max(1.0);
+    if (rows as f64 - basis_rows as f64).abs() >= spacing {
+        return None;
+    }
+    let mut kept = prev.to_vec();
+    kept[n - 1] = rows - 1;
+    (kept[0] == 0 && kept.windows(2).all(|p| p[0] < p[1])).then_some(kept)
+}
+
+#[cfg(test)]
+mod jump_rows_tests {
+    use super::{jump_rows, jump_rows_kept, review_rows_key};
+
+    /// 2026-10-29 (owner: "a 25-item fixed list that evenly sample 25x2 photos"; "keep the fixed
+    /// even sampled") — **THE ENTRIES ARE EVENLY SPACED ROWS FROM THE FIRST TO THE LAST, EVERY ROW
+    /// WHEN THERE ARE NO MORE ROWS THAN ENTRIES, AND NOTHING FOR NO ROWS.**
+    ///
+    /// FALSIFIER (L28), ALL RUN: round down instead of to the nearest (drop `+ (n - 1)`) and the
+    /// 412-photo row reddens; sample short lists too (drop the `rows <= n` arm) and the every-row row
+    /// reddens.
+    #[test]
+    fn the_entries_are_evenly_sampled_rows_from_the_first_to_the_last() {
+        assert!(jump_rows(0, 25).is_empty() && jump_rows(10, 0).is_empty());
+        assert_eq!(jump_rows(7, 25), (0..7).collect::<Vec<_>>(), "fewer rows than entries: every row");
+        assert_eq!(jump_rows(25, 25), (0..25).collect::<Vec<_>>());
+        assert_eq!(jump_rows(5, 1), vec![0]);
+        // 412 photos are 206 rows: 25 entries step 205/24 = 8.54 rows, rounded to the nearest.
+        let r = jump_rows(206, 25);
+        assert_eq!(r.len(), 25);
+        assert_eq!((r[0], r[1], r[2], r[12], r[24]), (0, 9, 17, 103, 205));
+        for n in [12, 17, 25, 40, 64] {
+            for rows in [n + 1, 2 * n, 1000, 10_000] {
+                let r = jump_rows(rows, n);
+                let step = (rows - 1) as f64 / (n - 1) as f64;
+                assert_eq!((r.len(), r[0], r[n - 1]), (n, 0, rows - 1), "{rows} rows, {n} entries");
+                for (i, &x) in r.iter().enumerate() {
+                    assert!((x as f64 - i as f64 * step).abs() <= 0.5, "{rows}/{n}: entry {i} is row {x}");
+                }
+                assert!(r.windows(2).all(|p| p[1] > p[0]), "{rows}/{n}: rising, no row twice");
+            }
+        }
+    }
+
+    /// 2026-10-29 (owner, testing rc.2: "Re-sample after bigger changes") — **A FEW ROWS MORE OR
+    /// FEWER KEEP THE SAME SAMPLED ROWS, THE LAST ON THE NEW LAST ROW; A CHANGE OF ONE ENTRY'S SPACING
+    /// OR MORE, A NEW TIER, A SHORT LIST, OR KEPT ROWS THAT WOULD NO LONGER RISE SAMPLE AFRESH.**
+    ///
+    /// FALSIFIER (L28), ALL RUN: never keep (return `None` first) and the one-more-pick row reddens;
+    /// keep however far the count moves (drop the spacing test) and the one-spacing row reddens;
+    /// leave the last entry where it was (drop `kept[n - 1] = rows - 1`) and the last-row row reddens.
+    #[test]
+    fn a_few_more_or_fewer_rows_keep_the_jump_lists_rows() {
+        let prev = jump_rows(608, 25); // a spacing of 607 / 24, about 25.3 rows
+        let one_more = jump_rows_kept(&prev, 608, 609, 25).expect("one more pick keeps the rows");
+        assert_eq!(&one_more[..24], &prev[..24], "every entry but the last keeps its row");
+        assert_eq!(one_more[24], 608, "the last entry is on the new last row");
+        let fewer = jump_rows_kept(&prev, 608, 600, 25).expect("eight fewer keep the rows");
+        assert_eq!((&fewer[..24], fewer[24]), (&prev[..24], 599));
+        assert!(jump_rows_kept(&prev, 608, 634, 25).is_none(), "26 more, past a spacing: afresh");
+        assert!(jump_rows_kept(&prev, 608, 582, 25).is_none(), "26 fewer: afresh");
+        assert!(jump_rows_kept(&prev, 608, 610, 40).is_none(), "a new tier: afresh");
+        assert!(jump_rows_kept(&jump_rows(20, 25), 20, 21, 25).is_none(), "every row an entry: afresh");
+        assert!(jump_rows_kept(&jump_rows(30, 25), 30, 24, 25).is_none(), "now fewer rows than entries: afresh");
+        // Rows that would no longer rise: 30 rows at 25 entries are nearly every row; 29 would put the
+        // last entry on a row the one before it already has.
+        assert!(jump_rows_kept(&jump_rows(30, 25), 30, 29, 25).is_none(), "the rows no longer rise: afresh");
+    }
+
+    /// Codex review R1 — **THE CONTENT KEY NAMES THE FOLDER AND THE PHOTOS IN ORDER: THE SAME PHOTOS
+    /// IN THE SAME FOLDER GIVE THE SAME KEY; ANOTHER FOLDER, A PHOTO SWAPPED FOR ANOTHER (THE SAME
+    /// COUNT), TWO PHOTOS IN ANOTHER ORDER OR ONE PHOTO MORE EACH GIVE ANOTHER.**
+    ///
+    /// FALSIFIER (L28), ALL RUN: leave the folder out of the fold (`once(gen)` to `once(0)`) and the
+    /// new-folder row reddens.
+    #[test]
+    fn the_content_key_names_the_folder_and_the_photos_in_order() {
+        let order: Vec<usize> = (0..399).collect();
+        let k = review_rows_key(7, &order);
+        assert_eq!(review_rows_key(7, &order), k, "the same photos in the same folder");
+        assert_ne!(review_rows_key(8, &order), k, "a new folder");
+        let mut swapped = order.clone();
+        swapped[0] = 399;
+        assert_ne!(review_rows_key(7, &swapped), k, "a photo swapped for another, the same count");
+        let mut reordered = order.clone();
+        reordered.swap(3, 4);
+        assert_ne!(review_rows_key(7, &reordered), k, "two photos in another order");
+        assert_ne!(review_rows_key(7, &(0..400).collect::<Vec<_>>()), k, "one photo more");
+    }
 }
 
 /// v0.8.129: the DISPLAYED sequence -- the Selection panel's tile feed as a list of indices.
@@ -30633,7 +31480,7 @@ mod rescan_review_tests {
             extra: BTreeMap::from([("STALE_DISK_ONLY".into(), Sel { rating: 5, ..Sel::default() })]),
             rotations: BTreeMap::from([("CLEARED".into(), 2), ("A".into(), 2)]),
             attrs: FolderAttrs::default(), had_file: true, manifest: None,
-            sort: (SortMethod::Rating, true), scan_err: false }
+            sort: (SortMethod::Rating, true), scan_err: false, scan_denied: false, unlisted_target: None }
     }
 
     #[test]
@@ -31498,7 +32345,7 @@ fn part_blocks_claim(src: &Path, to: &Path) -> bool {
         log_event(&format!("file recovery: destination changed {}; left untouched", to.display()));
         return true;
     }
-    if let Err(e) = std::fs::remove_file(to) {
+    if let Err(e) = remove_empty_claim_retry(to) {
         log_event(&format!("file recovery: could not remove empty claim {} ({e})", to.display()));
         return true;
     }
@@ -31518,6 +32365,31 @@ fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(50 * (1 << i)));
         last = std::fs::rename(from, to);
+    }
+    last
+}
+
+/// `remove_file` for recovery's empty claim, with `rename_retry`'s bounded retry (four tries over
+/// ~350 ms; 2026-09-28 review Y2, accepted 27 October). The marker is already unlinked, so a claim
+/// held for a beat by a scanner or sync client would otherwise stay as a marker-less empty file that
+/// `dest_verdict` reports as Attention on every later run. Each retry first rechecks that the claim is
+/// still an empty regular file, so the wider window never removes a file that gained bytes or was
+/// replaced.
+///
+/// FALSIFIERS: back to one `remove_file` and `refinement_recovery_retries_a_briefly_held_empty_claim`
+/// reddens; drop the recheck and the "gains bytes" row of
+/// `refinement_recovery_claim_removal_gives_up_safely` reddens.
+fn remove_empty_claim_retry(to: &Path) -> std::io::Result<()> {
+    let mut last = std::fs::remove_file(to);
+    for i in 0..3 {
+        if last.is_ok() {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50 * (1 << i)));
+        if !is_empty_part_claim(to) {
+            return last;
+        }
+        last = std::fs::remove_file(to);
     }
     last
 }
@@ -32396,6 +33268,65 @@ pub(crate) fn clause_need_attention(n: usize) -> String {
 }
 pub(crate) fn clause_failed(n: usize) -> String {
     if n == 0 { String::new() } else { tr_plural!(n, " · {n} FAILED (see log)", " · {n} FAILED (see log)") }
+}
+/// 2026-10-28 (the cloud-only round, owner answer 10) — **THE APPLY ROTATIONS PLAN**, one per photo
+/// with a pending turn: factored out of `on_apply_rotations` so the ask that counts its cloud-only
+/// files (`apply-rotations-ask`) and the run read one list. The body is the handler's, verbatim.
+pub(crate) fn rotation_apply_plans(rot: &RotState, snap: &[Shot]) -> Vec<(usize, String, falcon_decode::RotApplyPlan)> {
+    let mut plans: Vec<(usize, String, falcon_decode::RotApplyPlan)> = Vec::new();
+    let di = rot.delta_idx.borrow();
+    let base = rot.base.borrow();
+    for (&idx, &t) in di.iter() {
+        if t & 3 == 0 {
+            continue;
+        }
+        let Some(shot) = snap.get(idx) else { continue };
+        plans.push((
+            idx,
+            shot.name.clone(),
+            falcon_decode::RotApplyPlan {
+                // v1.0.0-rc MICRO-TAIL (A-Y3b): `has_jpg` — a RAW's undecodable
+                // passenger is not the picture and must never be opened `read+write`
+                // for an EXIF patch. `None` here routes the rotation to the sidecar
+                // arms, which is what a RAW-only shot has always done.
+                finished: shot.jpg.clone().filter(|_| shot.has_jpg),
+                finished_is_jpeg: shot.has_jpg && shot.is_jpeg_source(),
+                raw: shot.raw.clone(),
+                base_turns: base.get(&idx).copied().unwrap_or(0),
+                delta: t & 3,
+            },
+        ));
+    }
+    plans
+}
+
+/// The cloud-only round (owner answers 10–11): of the files Apply rotations will read for one photo
+/// (`falcon_decode::rotation_reads`), how many are only in the cloud now and were not among the files
+/// the user agreed to download. Asked just before the photo's write; a photo with any is skipped,
+/// not downloaded, and counted into the result.
+///
+/// FALSIFIER (L28): drop the `agreed` term and the agreed row of
+/// `the_apply_run_skips_only_a_file_freed_up_after_the_answer` reddens.
+#[must_use]
+pub(crate) fn rotation_freed_files(
+    reads: &[&Path], agreed: &HashSet<PathBuf>, probe: impl Fn(&Path) -> bool,
+) -> usize {
+    reads.iter().filter(|p| !agreed.contains(**p) && probe(p)).count()
+}
+
+/// 2026-10-28 (the cloud-only round, owner answer 11): a file made online-only after the user's
+/// answer (during a long export or Apply rotations) is skipped, not downloaded, and the result says
+/// so. The owner's sentence, joined to the result line as its last clause.
+pub(crate) fn clause_cloud_now(n: usize) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        tr_plural!(
+            n,
+            " · {n} file was skipped because it is only in the cloud now.",
+            " · {n} files were skipped because they are only in the cloud now."
+        )
+    }
 }
 /// The move result's head, which the pinned last-action row also speaks: "Moved 12 file(s) →
 /// ./Rejected" (English keeps "file(s)" for every count).
@@ -33812,6 +34743,79 @@ pub(crate) fn web_collision_scan(
     (hit, deliverables)
 }
 
+/// 2026-10-28 (the cloud-only round, owner answer 9) — **THE PHOTOS THIS EXPORT WILL DOWNLOAD**, counted
+/// fresh after Export is pressed and after the "already exist" answer, so the number is exactly the
+/// files the run will read: it walks the run's own skips in the run's own order — not a target, an
+/// undecodable source, a RAW-only photo the policy skips, a RAW the policy DEVELOPS (RAW export
+/// refuses a cloud-only RAW itself and never downloads it), a deliverable already there that the
+/// answer keeps — and asks `is_cloud` (metadata only) about the one file the run reads: the
+/// finished file of a pair, the RAW for a camera preview. One file per photo, so photos and files
+/// are the same count here. The deliverable is looked up only for a cloud file, so a local folder
+/// pays one metadata call per target and nothing more. Returns the photos' indices: the user's
+/// "Download and export" agrees to exactly these (`WebRun::cloud_ok`).
+///
+/// FALSIFIER (L28): ask about the scan's tag or the pair's RAW instead of the read file and the pair
+/// row of `web_cloud_scan_counts_exactly_what_the_run_reads` reddens; drop the `collide` term and its
+/// existing-deliverable row reddens; count the developed RAW and its policy row reddens.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn web_cloud_scan(
+    dir: &Path,
+    shots: &[Shot],
+    marks: &[u8],
+    want: u8,
+    suffix: Option<&str>,
+    fmt: falcon_decode::WebFormat,
+    raw_policy: impl Into<RawExportPolicy>,
+    collide: WebCollide,
+    is_cloud: impl Fn(&Path) -> bool,
+) -> Vec<usize> {
+    let raw_policy = raw_policy.into();
+    let outdir = dir.join(EXPORT_SUBFOLDER);
+    let mut out = Vec::new();
+    for (i, s) in shots.iter().enumerate() {
+        if !web_export_targets(marks, want, i) || s.is_unsupported() {
+            continue;
+        }
+        let Some(source) = web_pixel_source(s, raw_policy) else { continue };
+        if source == WebPixelSource::DevelopedRaw {
+            continue; // RAW export never downloads: not counted, and the run skips a cloud-only one
+        }
+        let Some(read) = web_read_file(s, source) else { continue };
+        if !is_cloud(read) {
+            continue;
+        }
+        if collide != WebCollide::Overwrite && std::fs::metadata(outdir.join(web_deliverable_name(&s.name, suffix, fmt))).is_ok() {
+            continue; // the run keeps what is there and never reads the source
+        }
+        out.push(i);
+    }
+    out
+}
+
+/// The photo file a web export reads for `source`: the finished file, or the RAW (its embedded
+/// preview for a camera preview, the RAW itself for a developed RAW). Shared by the count and the
+/// run, so the two cannot disagree. The count leaves a developed RAW out ([`web_cloud_scan`]: RAW
+/// export never downloads); R2 (Codex's review, 29 October): the run's last look asks about it like
+/// any other, so one freed up during the run is reported as only in the cloud now, not as a failed
+/// export.
+fn web_read_file(s: &Shot, source: WebPixelSource) -> Option<&Path> {
+    match source {
+        WebPixelSource::Finished => s.jpg.as_deref(),
+        WebPixelSource::CameraPreview | WebPixelSource::DevelopedRaw => s.raw.as_deref(),
+    }
+}
+
+/// 2026-10-28 (the cloud-only round, owner answer 9) — the export sheet's watermark preview samples
+/// the first photo to export whose file is on this device (asked fresh, stopping at the first), else
+/// the photo on screen (which viewing may download). Opening the sheet must not download the first
+/// target before the export has asked anything.
+///
+/// FALSIFIER (L28): return `targets[0]` (the old pick) and the cloud-first row reddens.
+#[must_use]
+pub(crate) fn wm_sample_index(targets: &[usize], current: usize, is_cloud_at: impl Fn(usize) -> bool) -> usize {
+    targets.iter().copied().find(|&i| !is_cloud_at(i)).unwrap_or(current)
+}
+
 /// A listing supplies exact matches cheaply, but the OS name is not a filesystem case policy:
 /// macOS volumes may be case-sensitive or insensitive, as may individual Windows directories.
 /// Use folding only to find candidates and resolve them through the actual destination lookup.
@@ -33966,6 +34970,10 @@ pub(crate) fn web_done_collision_clause(choice: WebCollide, skipped: usize, over
 ///
 /// RAW-only policy is immutable for the run. Develop reads real sensor pixels and never falls
 /// back to a camera preview; both non-Skip choices share the existing output/overwrite pipeline.
+///
+/// 2026-10-28 (the cloud-only round): the tests' door — it agrees to download nothing. The app's export
+/// goes through [`export_web_run_downloading`] with the photos the user agreed to.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn export_web_run(
     dir: &Path,
@@ -34012,9 +35020,37 @@ pub(crate) fn export_web_run(
     collide: WebCollide,
     progress: &ExportProgress,
 ) -> (String, bool) {
+    export_web_run_downloading(
+        dir, shots, marks, filt, want, long, quality, wm, auto_orient, deltas, suffix, fmt, raw_policy,
+        collide, HashSet::new(), progress,
+    )
+}
+
+/// [`export_web_run`] with the photos the user agreed to download (`agreed`, from
+/// [`web_cloud_scan`] and the "Download and export" answer). Any other file found only in the cloud
+/// just before its read is skipped and reported (owner answer 11); `export_web_run` agrees to none.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn export_web_run_downloading(
+    dir: &Path,
+    shots: &[Shot],
+    marks: &[u8],
+    filt: i32,
+    want: u8,
+    long: u32,
+    quality: u8,
+    wm: Option<falcon_decode::Watermark>,
+    auto_orient: bool,
+    deltas: &HashMap<String, u8>,
+    suffix: Option<&str>,
+    fmt: falcon_decode::WebFormat,
+    raw_policy: impl Into<RawExportPolicy>,
+    collide: WebCollide,
+    agreed: HashSet<usize>,
+    progress: &ExportProgress,
+) -> (String, bool) {
     export_web_run_with_decoder(WebRun {
         dir, shots, marks, filt, want, long, quality, wm, auto_orient, deltas, suffix, fmt,
-        raw_policy: raw_policy.into(), collide,
+        raw_policy: raw_policy.into(), collide, cloud_ok: agreed, is_cloud: falcon_decode::file_is_cloud_placeholder,
     }, progress, decode_web_pixels)
 }
 
@@ -34034,6 +35070,10 @@ pub(crate) struct WebRun<'a> {
     pub(crate) fmt: falcon_decode::WebFormat,
     pub(crate) raw_policy: RawExportPolicy,
     pub(crate) collide: WebCollide,
+    /// 2026-10-28 (the cloud-only round): the photos the user agreed to download, and the
+    /// metadata-only probe asked just before each read (`falcon_decode::file_is_cloud_placeholder`).
+    pub(crate) cloud_ok: HashSet<usize>,
+    pub(crate) is_cloud: fn(&Path) -> bool,
 }
 
 pub(crate) fn export_web_run_with_decoder(
@@ -34042,7 +35082,7 @@ pub(crate) fn export_web_run_with_decoder(
     decode: impl Fn(&Shot, falcon_decode::Keep, WebPixelSource, &ExportProgress) -> WebDecodedPixels,
 ) -> (String, bool) {
     let WebRun { dir, shots, marks, filt, want, long, quality, wm, auto_orient, deltas,
-        suffix, fmt, raw_policy, collide } = run;
+        suffix, fmt, raw_policy, collide, cloud_ok, is_cloud } = run;
     let outdir = dir.join(EXPORT_SUBFOLDER);
     if let Err(e) = std::fs::create_dir_all(&outdir) {
         log_event(&format!("web-export: cannot create {} ({e})", outdir.display()));
@@ -34112,6 +35152,8 @@ pub(crate) fn export_web_run_with_decoder(
     // placeholder is not a deliverable "already there" — see the arm below, and the toast clause at
     // the foot which mirrors the copy path's.
     let mut attention = 0usize;
+    // 2026-10-28 (the cloud-only round, owner answer 11): files made online-only after the answer.
+    let mut cloud_now = 0usize;
     let mut cancelled = false;
     // v0.8.130 (W2-4): the web side had NO per-file gathering at all -- this is created plumbing,
     // keyed on the GENERATED deliverable name (`<stem>.<ext>`), which is what a re-opened ./export
@@ -34217,6 +35259,17 @@ pub(crate) fn export_web_run_with_decoder(
                 continue;
             }
             Err(_) => {}
+        }
+        // 2026-10-28 (the cloud-only round, owner answer 11): THE LAST LOOK BEFORE THE FIRST READ. The
+        // user agreed to download the photos counted when Export was pressed (`cloud_ok`); a file
+        // made online-only since (Free up space during a long run) is skipped, not downloaded, and
+        // the result says so. One metadata call per file, here on the worker. A developed RAW is
+        // never agreed (the count leaves it out: RAW export never downloads), so a cloud-only one is
+        // skipped here, before RAW export's own refusal would report it as a failure (R2).
+        if web_read_file(s, pixel_source).is_some_and(|p| !cloud_ok.contains(&i) && is_cloud(p)) {
+            cloud_now += 1;
+            log_event(&format!("web-export: skip (only in the cloud now, not agreed to download) {}", s.name));
+            continue;
         }
         // v0.8.100 (A1 / design-sweep O13): the deliverable's SOURCE gamut, read from the file's own
         // embedded profile — the same reader the stage's CM pass uses. export_web_image converts it to
@@ -34433,7 +35486,7 @@ pub(crate) fn export_web_run_with_decoder(
         }
     }
     log_event(&format!(
-        "web-export: {} ({}) — {ok} written, {overwritten} overwritten, {skipped} skipped, {attention} need attention, {failed} failed, {raw_only} RAW-only skipped, {from_preview} from camera previews, {from_raw} developed from RAW, {unsupported} unsupported skipped",
+        "web-export: {} ({}) — {ok} written, {overwritten} overwritten, {skipped} skipped, {attention} need attention, {failed} failed, {raw_only} RAW-only skipped, {from_preview} from camera previews, {from_raw} developed from RAW, {unsupported} unsupported skipped, {cloud_now} only in the cloud now",
         if cancelled { "cancelled" } else { "done" },
         fmt.noun()
     ));
@@ -34445,18 +35498,19 @@ pub(crate) fn export_web_run_with_decoder(
     // above keeps its own English.
     let summary = if cancelled {
         format!(
-            "{}{}",
+            "{}{}{}",
             tr_plural!(
                 ok + overwritten,
                 "Export cancelled — {n} written before stopping",
                 "Export cancelled — {n} written before stopping"
             ),
-            if failed > 0 { tr_plural!(failed, " · {n} failed", " · {n} failed") } else { String::new() }
+            if failed > 0 { tr_plural!(failed, " · {n} failed", " · {n} failed") } else { String::new() },
+            clause_cloud_now(cloud_now)
         )
     } else {
         format!(
             // v0.8.131 (F-P7): noun-aware. `filt` is the category the run was launched from.
-            "{}{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}{}",
             out_web_done_head(filt, ok + overwritten),
             // v0.8.143 (D2): "already there" rather than "existed" — the copy path's own words for
             // the same fact, so the two toasts a user sees minutes apart stop being two dialects.
@@ -34497,7 +35551,8 @@ pub(crate) fn export_web_run_with_decoder(
             // (main.rs's `att` clause) — it is not a failure, nothing was touched, and it sends the
             // reader to the log where the file is named.
             clause_need_attention(attention),
-            clause_failed(failed)
+            clause_failed(failed),
+            clause_cloud_now(cloud_now)
         )
     };
     (summary, failed > 0)
@@ -34822,6 +35877,50 @@ pub(crate) fn save_selection(
     rotations: &BTreeMap<String, u8>,
     attrs: &FolderAttrs, // v0.8.49: sort/resume attrs ride the same file — EVERY writer must pass the live ones or a flush would erase them
 ) -> Result<usize, String> {
+    save_selection_via(dir, map, rotations, attrs, enqueue_review_data)
+}
+
+/// Issue #11 batch B1 (the owner's plan): does a FINAL flush (shutdown, folder switch) write? Only if
+/// the snapshot changed since the window last loaded or enqueued it, or that save may not be on disk
+/// (pending or failed). A window that changed nothing then cannot overwrite what another window saved.
+#[must_use]
+pub(crate) fn final_flush_needed(changed: bool, pending_or_failed: bool) -> bool {
+    changed || pending_or_failed
+}
+
+/// B1: the ONE final review-data flush, shared by the folder switch (`flush_old`) and the shutdown
+/// tail. `baseline` is the window's `last_ratings_json`, the dirty JSON it last loaded or enqueued: a
+/// comparison point, never proof of a durable write, so a pending or failed attempt in any visit
+/// ([`review_final_status`]) forces the write too. Advanced only by a successful enqueue. `enqueue` is
+/// [`enqueue_review_data`] in production. `Ok(true)` = written, `Ok(false)` = skipped.
+pub(crate) fn final_review_flush(
+    dir: &Path,
+    map: &BTreeMap<String, Sel>,
+    rotations: &BTreeMap<String, u8>,
+    attrs: &FolderAttrs,
+    baseline: &RefCell<String>,
+    enqueue: impl FnOnce(&Path, Vec<u8>) -> std::io::Result<()>,
+) -> Result<bool, String> {
+    let j = selection_dirty_json(map, rotations, attrs);
+    let unsure = matches!(review_final_status(dir), Some(ReviewSaveStatus::Pending | ReviewSaveStatus::Failed));
+    if !final_flush_needed(*baseline.borrow() != j, unsure) {
+        log_event("review data: unchanged since the last save — final flush skipped");
+        return Ok(false);
+    }
+    save_selection_via(dir, map, rotations, attrs, enqueue)?;
+    *baseline.borrow_mut() = j;
+    Ok(true)
+}
+
+/// [`save_selection`] with its enqueue named (B1: [`final_review_flush`]'s tests drive the real
+/// writer loop through it).
+fn save_selection_via(
+    dir: &Path,
+    map: &BTreeMap<String, Sel>,
+    rotations: &BTreeMap<String, u8>,
+    attrs: &FolderAttrs,
+    enqueue: impl FnOnce(&Path, Vec<u8>) -> std::io::Result<()>,
+) -> Result<usize, String> {
     if dir.as_os_str().is_empty() {
         return Ok(0);
     }
@@ -34857,7 +35956,7 @@ pub(crate) fn save_selection(
     // queued (or, if the writer isn't up — early boot / a unit test — synchronously durably written).
     // v0.8.131 (F-P3 rule 6): addressed by FOLDER — the writer thread picks the file name from
     // on-disk facts at write time (see `WriteMsg::ReviewData`).
-    enqueue_review_data(dir, json.into_bytes()).map_err(|e| e.to_string())?;
+    enqueue(dir, json.into_bytes()).map_err(|e| e.to_string())?;
     Ok(map.len())
 }
 /// v0.8.36 (ITEM 2): a corrupt-settings warning stashed at load (before the events centre exists) and
@@ -35034,23 +36133,104 @@ pub(crate) fn normalize_loaded_settings(mut s: Settings) -> Settings {
     s
 }
 pub(crate) fn save_settings(s: &Settings) {
-    let Some(d) = config_dir() else {
+    save_settings_with(&SETTINGS_SAVES, WRITER.get().map(|h| &h.tx), config_dir().as_deref(), s, &gpu_memo_snapshot());
+}
+/// [`save_settings`] with its inputs named, for the tests: the attempt record, the writer's queue
+/// (`None`: not started), the config folder and the GPU memo. Issue #11 batch B1: every outcome is
+/// recorded in `saves`, the early failures included.
+fn save_settings_with(
+    saves: &'static SettingsSaves,
+    tx: Option<&std::sync::mpsc::Sender<WriteMsg>>,
+    dir: Option<&Path>,
+    s: &Settings,
+    memo: &GpuMemo,
+) {
+    let Some(d) = dir else {
         log_event("settings: no config dir — not saved");
+        saves.fail_now();
         return;
     };
-    if let Err(e) = std::fs::create_dir_all(&d) {
+    if let Err(e) = std::fs::create_dir_all(d) {
         log_event(&format!("settings: create_dir failed ({e}) — not saved"));
+        saves.fail_now();
         return;
     }
     // v0.8.41: the serialization CHOKE POINT. Stamp the live GPU memo onto EVERY settings save (read from
     // the single global source) so no save path — via `build_settings` or not — can persist memo-less JSON
     // while a memo is live. Makes the v0.8.39 "rebuilt Settings dropped the memo" class structurally
     // impossible instead of relying on each caller to thread the field.
-    match settings_payload(s, &gpu_memo_snapshot()) {
+    match settings_payload(s, memo) {
         // v0.8.36: durable via the background writer (a disk failure is surfaced async by the writer).
-        Ok(bytes) => enqueue_write(&d.join("settings.json"), bytes),
-        Err(e) => log_event(&format!("settings: serialize failed ({e})")),
+        Ok(bytes) => enqueue_settings(saves, tx, &d.join("settings.json"), bytes),
+        Err(e) => {
+            log_event(&format!("settings: serialize failed ({e})"));
+            saves.fail_now();
+        }
     }
+}
+
+/// Issue #11 batch B1: settings.json's save attempts, the review writer's ticket pattern for the one
+/// file that has no folder (so no visit ever clears it). Holds the newest attempt's ticket and its
+/// status; `None` = nothing attempted yet in this process.
+pub(crate) struct SettingsSaves(Mutex<(u64, Option<ReviewSaveStatus>)>);
+impl SettingsSaves {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new((0, None)))
+    }
+    /// An attempt that failed before reaching the writer (no config folder, the folder, serialization).
+    fn fail_now(&self) {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *s = (s.0 + 1, Some(ReviewSaveStatus::Failed));
+    }
+    /// The answer for attempt `ticket`: only the newest attempt's answer counts, so an older success
+    /// never clears a newer failure.
+    fn complete(&self, ticket: u64, ok: bool) {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if s.0 == ticket {
+            s.1 = Some(if ok { ReviewSaveStatus::Saved } else { ReviewSaveStatus::Failed });
+        }
+    }
+    pub(crate) fn status(&self) -> Option<ReviewSaveStatus> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+}
+/// The process's settings.json attempts ([`SettingsSaves`]).
+pub(crate) static SETTINGS_SAVES: SettingsSaves = SettingsSaves::new();
+
+/// B1: settings.json onto the writer, its attempt published as pending first and sent under the same
+/// lock (the review writer's rule). Both inline fallbacks (the writer never started, or gone) record
+/// the real result and log a failure; neither drops it.
+fn enqueue_settings(
+    saves: &'static SettingsSaves,
+    tx: Option<&std::sync::mpsc::Sender<WriteMsg>>,
+    target: &Path,
+    data: Vec<u8>,
+) {
+    let msg = {
+        let mut s = saves.0.lock().unwrap_or_else(|e| e.into_inner());
+        *s = (s.0 + 1, Some(ReviewSaveStatus::Pending));
+        let msg = WriteMsg::Settings { target: target.to_path_buf(), data, ticket: s.0, saves };
+        match tx {
+            Some(tx) => match tx.send(msg) { Ok(()) => return, Err(e) => e.0 },
+            None => msg,
+        }
+    };
+    let WriteMsg::Settings { target, data, ticket, saves } = msg else { unreachable!() };
+    let result = write_atomic(&target, &data);
+    saves.complete(ticket, result.is_ok());
+    match result {
+        Ok(()) => save_failure_ended(&target),
+        Err(e) => log_event(&format!("settings: inline save failed ({e})")),
+    }
+}
+
+/// B1: does the shutdown's settings save write? If the settings changed since the last load or
+/// enqueued save (a snapshot that won't serialize for the comparison counts as changed: the old
+/// best-effort save), or the last attempt is pending or failed ([`final_flush_needed`]).
+#[must_use]
+pub(crate) fn settings_final_save_needed(baseline: &str, s: &Settings, status: Option<ReviewSaveStatus>) -> bool {
+    let changed = serde_json::to_string_pretty(s).map_or(true, |j| j != baseline);
+    final_flush_needed(changed, matches!(status, Some(ReviewSaveStatus::Pending | ReviewSaveStatus::Failed)))
 }
 /// Ratings persist keyed by filename (`%LOCALAPPDATA%\Falcon\ratings.json`) so they
 /// survive re-scans / reordering, unlike a positional index.
@@ -45917,8 +47097,9 @@ pub(crate) use falcon_decode::RAW_EXTS;
 pub(crate) const ASSOC_FAMILIES: &[(&str, &[&str])] = &[
     ("JPEG (.jpg, .jpeg)", &["jpg", "jpeg"]),
     // v0.8.56 (audit YELLOW 2): .apng rides the PNG family (decodes via the png crate's default frame
-    // since v0.8.55). "png" stays FIRST — assoc_family_states probes each family's live registry state
-    // on exts[0], so an already-registered PNG family still reads back correctly; apng itself joins the
+    // since v0.8.55). "png" stays FIRST for row and label stability; since 1.1.0-rc.1 (issue #11) a
+    // family reads as on when ANY of its extensions is claimed (assoc_family_states), so an
+    // already-registered PNG family reads back correctly either way; apng itself joins the
     // registry on the next Apply (re-register to pick it up — surfaced in the Settings copy anyway).
     ("PNG (.png, .apng)", &["png", "apng"]),
     ("TIFF (.tif, .tiff)", &["tif", "tiff"]),
@@ -46027,6 +47208,35 @@ pub(crate) fn assoc_reset_target(prev: Option<&str>, all_handlers: &[String]) ->
     all_handlers.iter().find(|h| eq(h, PREVIEW_BUNDLE_ID)).cloned()
 }
 
+/// 1.1.0-rc.1 (issue #11 batch, M2): Reset touches a UTI only while FALCON is its current default
+/// (case-insensitive); otherwise the user's current choice stands (Photoshop is never turned into
+/// Preview, and a type moved to another app after Make default stays there). Then the existing
+/// captured → Preview → skip ladder applies. Both the rows' Reset button and the Reset action use it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Mac-only consumer; pinned by tests on every host
+pub(crate) fn assoc_reset_plan(current: Option<&str>, prev: Option<&str>, handlers: &[String]) -> Option<String> {
+    if current.is_some_and(|c| c.eq_ignore_ascii_case(FALCON_BUNDLE_ID)) { assoc_reset_target(prev, handlers) } else { None }
+}
+
+/// 1.1.0-rc.1 (issue #11 batch, M2 + M3): one UTI of a Mac Reset: plan (M2), set, and on success
+/// consume the captured incumbent (M3), so the next Make default captures afresh instead of a later
+/// Reset restoring an app the user has since replaced. None = skipped; Some((target, LS status)).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Mac-only consumer; pinned by tests on every host
+pub(crate) fn assoc_reset_step(map: &mut BTreeMap<String, String>, uti: &str, current: Option<&str>,
+    handlers: &[String], set_default: impl FnOnce(&str) -> i32) -> Option<(String, i32)> {
+    let target = assoc_reset_plan(current, map.get(uti).map(String::as_str), handlers)?;
+    let st = set_default(&target);
+    if st == 0 { map.remove(uti); }
+    Some((target, st))
+}
+
+/// 1.1.0-rc.1 (issue #11 batch, M4): a Mac test or diagnostic build can't set defaults
+/// (`mac_experiment::associations_allowed`), so the first-launch popup is neither armed nor opened
+/// there: (arm, open) pass through only when allowed. The latch stays, in the test build's own profile.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Mac-only consumer; pinned by tests on every host
+pub(crate) fn assoc_popup_allowed(arm: bool, open: bool, allowed: bool) -> (bool, bool) {
+    (arm && allowed, open && allowed)
+}
+
 /// v0.9.16 (Round B assoc, Mac): the first-launch popup's choice → family-index set (ASSOC_FAMILIES
 /// order). 0 = None (declare-only), 1 = RAW + JPG/HEIC (the photographer core: JPEG, HEIC, RAW),
 /// 2 = all supported formats. Pure; pinned by test against the family labels.
@@ -46039,26 +47249,36 @@ pub(crate) fn assoc_prompt_families(choice: i32) -> &'static [usize] {
     }
 }
 
-/// v0.8.71 (Round B assoc): whether the Settings HEIC association row is available on this platform.
+/// v0.8.71 (Round B assoc): is a HEIC codec installed, for the Settings HEIC association row?
 /// Windows: the READ-ONLY WIC codec-registry probe (falcon-decode, session-cached — a codec installed
-/// mid-session enables on the next launch, accepted). macOS/other: `true` — Image I/O decodes HEIC
-/// natively, no probe (the accel_avail_for per-platform-availability rule: never gate one platform's
-/// arm on another's probe).
-pub(crate) fn heic_codec_present() -> bool {
+/// mid-session enables on the next launch, accepted). macOS/other: `Some(true)` — Image I/O decodes
+/// HEIC natively, no probe (the accel_avail_for per-platform-availability rule: never gate one
+/// platform's arm on another's probe). 1.1.0-rc.1 (issue #11, the plan's A5): three answers — `None`
+/// is a check that failed or was incomplete, never proof that the codec is missing.
+pub(crate) fn heic_codec_state() -> Option<bool> {
     #[cfg(windows)]
     {
-        falcon_decode::wic_heif_codec_present()
+        falcon_decode::wic_heif_codec_state()
     }
     #[cfg(not(windows))]
     {
-        true
+        Some(true)
     }
+}
+
+/// 1.1.0-rc.1 (issue #11, the plan's A5): the HEIC row and Update treat only a DEFINITE "not
+/// installed" as absent. An unknown answer leaves the row enabled and every HEIC claim in place, so a
+/// failed check can no longer remove a working registration at boot.
+#[must_use]
+pub(crate) fn heic_assoc_available(state: Option<bool>) -> bool {
+    state != Some(false)
 }
 
 /// v0.8.71 (Round B assoc): force the HEIC family OFF in an apply-mask when the OS codec is absent —
 /// registering an Open-With claim for a format the machine cannot decode would be a lie (Explorer
 /// would offer Falcon, Falcon would show the decode-failure card). PURE so the gate unit-tests on any
-/// host; the callers pass `heic_codec_present()`. Every other family passes through untouched.
+/// host; the callers pass `heic_assoc_available(heic_codec_state())`. Every other family passes
+/// through untouched.
 pub(crate) fn gate_heic(on: &mut [bool], heic_avail: bool) {
     if !heic_avail {
         if let Some(h) = on.get_mut(HEIC_FAMILY_IDX) {
@@ -47146,6 +48366,89 @@ mod writer_tests {
     /// Ask the filesystem itself for the expected answer. On a default Mac volume case and
     /// canonical Unicode spelling can alias; on a case-sensitive volume they may be distinct.
     /// The same test must hold on either volume, including zero-byte files and directories.
+    /// 2026-10-28 (the cloud-only round, owner answer 9) — **THE EXPORT'S CLOUD COUNT IS EXACTLY THE
+    /// FILES THE RUN WILL READ THAT ARE ONLY IN THE CLOUD.** The probe stands in for placeholders (no
+    /// test can make one); ./export is real, so the "already there" rows are the run's own lookup.
+    ///
+    /// FALSIFIER (L28): ask about the pair's RAW (or the scan's tag) and the pair rows swap; drop the
+    /// `collide` term and the existing-deliverable rows are counted under Skip; count a developed RAW
+    /// and the Develop row reddens.
+    #[test]
+    fn web_cloud_scan_counts_exactly_what_the_run_reads() {
+        let dir = std::env::temp_dir().join(format!("falcon_web_cloud_scan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(EXPORT_SUBFOLDER)).unwrap();
+        let mk = |name: &str, raw: bool, jpg: bool, kind: SrcKind| Shot {
+            id: 0,
+            name: name.into(),
+            has_raw: raw,
+            has_jpg: jpg && kind != SrcKind::Unsupported,
+            raw: raw.then(|| dir.join(format!("{name}.CR3"))),
+            jpg: jpg.then(|| dir.join(format!("{name}.JPG"))),
+            kind,
+            cloud_placeholder: false,
+            sniffed: None,
+        };
+        let shots = vec![
+            mk("p0_jpg_cloud", true, true, SrcKind::Jpeg),  // 0: a pair, its JPEG in the cloud
+            mk("p1_raw_cloud", true, true, SrcKind::Jpeg),  // 1: a pair, only its RAW in the cloud
+            mk("r2_raw_only", true, false, SrcKind::Jpeg),  // 2: RAW-only, in the cloud
+            mk("u3_unsup", false, true, SrcKind::Unsupported), // 3: undecodable, in the cloud
+            mk("j4_exists", false, true, SrcKind::Jpeg),    // 4: in the cloud, deliverable already there
+            mk("j5_empty", false, true, SrcKind::Jpeg),     // 5: in the cloud, a dead run's empty deliverable
+            mk("j6_not_target", false, true, SrcKind::Jpeg), // 6: in the cloud, not exported
+        ];
+        let fmt = falcon_decode::WebFormat::Jpeg;
+        std::fs::write(dir.join(EXPORT_SUBFOLDER).join(web_deliverable_name("j4_exists", None, fmt)), b"x").unwrap();
+        std::fs::write(dir.join(EXPORT_SUBFOLDER).join(web_deliverable_name("j5_empty", None, fmt)), b"").unwrap();
+        let cloud: HashSet<PathBuf> = [
+            dir.join("p0_jpg_cloud.JPG"), dir.join("p1_raw_cloud.CR3"), dir.join("r2_raw_only.CR3"),
+            dir.join("u3_unsup.JPG"), dir.join("j4_exists.JPG"), dir.join("j5_empty.JPG"), dir.join("j6_not_target.JPG"),
+        ]
+        .into_iter()
+        .collect();
+        let marks = [1u8, 1, 1, 1, 1, 1, 0];
+        let scan = |policy: RawExportPolicy, collide: WebCollide| {
+            web_cloud_scan(&dir, &shots, &marks, 1, None, fmt, policy, collide, |p| cloud.contains(p))
+        };
+        assert_eq!(scan(RawExportPolicy::Skip, WebCollide::NotAsked), vec![0], "the pair whose JPEG is read; nothing kept or skipped");
+        assert_eq!(scan(RawExportPolicy::CameraPreview, WebCollide::NotAsked), vec![0, 2], "a camera preview reads the RAW");
+        assert_eq!(scan(RawExportPolicy::Develop, WebCollide::Skip), vec![0], "RAW export refuses a cloud RAW itself");
+        assert_eq!(scan(RawExportPolicy::Skip, WebCollide::Overwrite), vec![0, 4, 5], "replacing reads them all");
+        assert!(web_cloud_scan(&dir, &shots, &marks, 1, None, fmt, RawExportPolicy::Skip, WebCollide::Overwrite, |_| false).is_empty(), "a local folder: nothing to ask");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-28 (the cloud-only round, owner answer 9): the watermark preview samples the first
+    /// photo to export that is on this device, else the photo on screen.
+    #[test]
+    fn the_watermark_preview_never_samples_a_cloud_only_photo() {
+        assert_eq!(wm_sample_index(&[4, 7, 9], 2, |_| false), 4, "the first photo the export processes, as before");
+        assert_eq!(wm_sample_index(&[4, 7, 9], 2, |i| i == 4), 7, "…unless it is only in the cloud");
+        assert_eq!(wm_sample_index(&[4, 7, 9], 2, |_| true), 2, "all in the cloud: the photo on screen");
+        assert_eq!(wm_sample_index(&[], 2, |_| false), 2, "nothing to export: the photo on screen");
+    }
+
+    /// 2026-10-28 (the cloud-only round, owner answers 10–11) — **APPLY ROTATIONS SKIPS ONLY A FILE
+    /// FREED UP AFTER THE ANSWER.** A file the user agreed to download is read; a cloud-only file
+    /// they were not asked about is not; a local file always is.
+    ///
+    /// FALSIFIER (L28): drop the `agreed` term from `rotation_freed_files` and the agreed row reddens.
+    #[test]
+    fn the_apply_run_skips_only_a_file_freed_up_after_the_answer() {
+        let (a, b) = (PathBuf::from("C:/f/a.JPG"), PathBuf::from("C:/f/a.CR3"));
+        let reads = [a.as_path(), b.as_path()];
+        let all_cloud = |_: &Path| true;
+        let agreed_a: HashSet<PathBuf> = [a.clone()].into_iter().collect();
+        assert_eq!(rotation_freed_files(&reads, &HashSet::new(), all_cloud), 2, "nothing agreed: both refused");
+        assert_eq!(rotation_freed_files(&reads, &agreed_a, all_cloud), 1, "the agreed file may download");
+        assert_eq!(rotation_freed_files(&reads, &HashSet::new(), |_: &Path| false), 0, "local files are read");
+        // …and the result's clause, the owner's sentence.
+        assert_eq!(clause_cloud_now(0), "");
+        assert_eq!(clause_cloud_now(1), " · 1 file was skipped because it is only in the cloud now.");
+        assert_eq!(clause_cloud_now(3), " · 3 files were skipped because they are only in the cloud now.");
+    }
+
     #[test]
     fn web_collision_scan_matches_destination_lookup_semantics() {
         use std::fs;
@@ -52680,5 +53983,218 @@ mod review_save_recovery_tests {
         assert_eq!(review_save_status(&dir), Some(ReviewSaveStatus::Saved));
         assert_eq!(std::fs::read(&target).unwrap(), b"recovered");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ── Issue #11 batch B1: the final saves (shutdown, folder switch) ──
+    fn b1_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("falcon-b1-{tag}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    fn stars(photos: &[(&str, u8)]) -> BTreeMap<String, Sel> {
+        photos.iter().map(|&(name, rating)| (name.to_string(), Sel { rating, ..Sel::default() })).collect()
+    }
+    fn on_disk(dir: &Path) -> BTreeMap<String, Sel> {
+        let file: SelectionFile = serde_json::from_slice(&std::fs::read(review_write_target(dir)).unwrap()).unwrap();
+        file.photos
+    }
+    fn no_memo() -> GpuMemo {
+        GpuMemo { backend: String::new(), adapter: String::new(), timings: String::new() }
+    }
+    fn denied() -> std::io::Error {
+        std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+    }
+
+    /// Falsifier: `changed && pending_or_failed`, or drop either term (in `final_flush_needed`, or in
+    /// `settings_final_save_needed`'s status test).
+    #[test]
+    fn final_flush_decisions() {
+        assert!(!final_flush_needed(false, false), "unchanged, nothing pending or failed: skip");
+        assert!(final_flush_needed(true, false), "changed: write");
+        assert!(final_flush_needed(false, true), "pending or failed: write");
+        assert!(final_flush_needed(true, true));
+        let s = Settings::default();
+        let baseline = serde_json::to_string_pretty(&s).unwrap();
+        for (status, writes) in [(None, false), (Some(ReviewSaveStatus::Saved), false),
+            (Some(ReviewSaveStatus::Pending), true), (Some(ReviewSaveStatus::Failed), true)] {
+            assert_eq!(settings_final_save_needed(&baseline, &s, status), writes, "unchanged settings, {status:?}");
+        }
+        let mut changed = s.clone();
+        changed.wheel_nav = !changed.wheel_nav;
+        assert!(settings_final_save_needed(&baseline, &changed, Some(ReviewSaveStatus::Saved)), "changed: always");
+    }
+
+    /// Two windows on one folder (generated data; no writer thread, so saves are the inline durable
+    /// write). Both loaded the same file; window B (another process) saves its edit; window A, which
+    /// changed nothing, then closes or switches folder: B's file stays. When A really edits, its flush
+    /// writes (both-edited windows stay last-writer-wins, the stated limit).
+    /// Falsifier: make `final_flush_needed` always true (the old unconditional final write).
+    #[test]
+    fn an_untouched_window_never_overwrites_another_windows_review_data() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = b1_dir("untouched");
+        let (rots, attrs) = (BTreeMap::new(), FolderAttrs::default());
+        let loaded = stars(&[("IMG_1", 2)]);
+        save_selection(&dir, &loaded, &rots, &attrs).unwrap(); // the file both windows opened
+        forget_review_attempts(&dir); // window A's fresh open: no attempt of its own
+        let a_baseline = RefCell::new(selection_dirty_json(&loaded, &rots, &attrs));
+        let b = stars(&[("IMG_1", 2), ("IMG_2", 5)]);
+        // Window B's save, from its own process: nothing in this process's attempt records.
+        save_selection_via(&dir, &b, &rots, &attrs, |d, data| write_atomic(&review_write_target(d), &data)).unwrap();
+        assert_eq!(final_review_flush(&dir, &loaded, &rots, &attrs, &a_baseline, enqueue_review_data), Ok(false));
+        assert_eq!(on_disk(&dir), b, "the untouched window left B's ratings alone");
+        let edited = stars(&[("IMG_1", 4)]);
+        assert_eq!(final_review_flush(&dir, &edited, &rots, &attrs, &a_baseline, enqueue_review_data), Ok(true));
+        assert_eq!(on_disk(&dir), edited, "a real edit is written");
+        assert_eq!(*a_baseline.borrow(), selection_dirty_json(&edited, &rots, &attrs), "and becomes the baseline");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Through the real `writer_loop` and `write_atomic`: a periodic write still queued when the
+    /// final flush runs (nothing changed since) gets one more attempt; the folder swap's visit runs
+    /// between; the writer fails both tries of the first write and the final attempt lands. Then a
+    /// same-folder rescan clears the visit before a write fails: the exit flush still retries. A fresh
+    /// open forgets the old attempts. Falsifier: ignore the status in `final_review_flush`, or read the
+    /// visit's `review_save_status` there instead of `review_final_status`, or make
+    /// `forget_review_attempts` a no-op.
+    #[test]
+    fn a_pending_or_failed_review_write_keeps_its_final_attempt() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = b1_dir("pending");
+        let (rots, attrs) = (BTreeMap::new(), FolderAttrs::default());
+        let run = |rx: std::sync::mpsc::Receiver<WriteMsg>, failing_tries: usize| {
+            let mut tries = 0;
+            writer_loop(rx, |p, d| { tries += 1; if tries <= failing_tries { Err(denied()) } else { write_atomic(p, d) } },
+                |_, _| Ok(()), |_, _, _| {}, review_write_target, |_, _, _| {});
+            tries
+        };
+        forget_review_attempts(&dir);
+        let baseline = RefCell::new(String::new());
+        // The tick's flush queues an edit and advances the baseline: an enqueue, not a save.
+        let edit = stars(&[("IMG_1", 4)]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let via = |d: &Path, data: Vec<u8>| enqueue_review_data_via(Some(&tx), d, data);
+        save_selection_via(&dir, &edit, &rots, &attrs, via).unwrap();
+        *baseline.borrow_mut() = selection_dirty_json(&edit, &rots, &attrs);
+        assert_eq!(review_final_status(&dir), Some(ReviewSaveStatus::Pending));
+        assert_eq!(final_review_flush(&dir, &edit, &rots, &attrs, &baseline, via), Ok(true), "pending: one more attempt");
+        begin_review_visit(); // the folder swap
+        drop(tx);
+        assert_eq!(run(rx, 2), 3, "the first write failed twice, the final attempt once");
+        assert_eq!(review_final_status(&dir), Some(ReviewSaveStatus::Saved), "the newest attempt decides");
+        assert_eq!(on_disk(&dir), edit);
+
+        // Same folder: a sort pick's rescan clears the visit, then the queued write fails.
+        let edit = stars(&[("IMG_1", 5)]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        save_selection_via(&dir, &edit, &rots, &attrs, |d, data| enqueue_review_data_via(Some(&tx), d, data)).unwrap();
+        *baseline.borrow_mut() = selection_dirty_json(&edit, &rots, &attrs);
+        begin_review_visit();
+        drop(tx);
+        run(rx, usize::MAX);
+        assert_eq!(review_save_status(&dir), None, "the visit forgot it");
+        assert_eq!(review_final_status(&dir), Some(ReviewSaveStatus::Failed), "the final flushes still know");
+        assert_eq!(final_review_flush(&dir, &edit, &rots, &attrs, &baseline, enqueue_review_data), Ok(true), "the exit retries");
+        assert_eq!(on_disk(&dir), edit);
+
+        // A fresh open reads disk: a failure from before it is moot.
+        let (tx, rx) = std::sync::mpsc::channel();
+        save_selection_via(&dir, &stars(&[("IMG_1", 1)]), &rots, &attrs, |d, data| enqueue_review_data_via(Some(&tx), d, data)).unwrap();
+        drop(tx);
+        run(rx, usize::MAX);
+        forget_review_attempts(&dir);
+        let reloaded = RefCell::new(selection_dirty_json(&edit, &rots, &attrs));
+        assert_eq!(final_review_flush(&dir, &edit, &rots, &attrs, &reloaded, enqueue_review_data), Ok(false));
+        let _ = std::fs::remove_dir_all(&dir);
+        begin_review_visit(); // hygiene
+    }
+
+    /// A journal folder opened with MRU memory to migrate (or a rescan keeping live attrs not yet on
+    /// disk): the load's baseline is the file's attrs, so the merged attrs read as changed and the
+    /// final flush writes them. Falsifier: baseline the load from the merged attrs (`apply_scan`'s
+    /// `disk_attrs`; a census in main.rs pins it).
+    #[test]
+    fn the_load_baseline_excludes_unsaved_folder_attrs() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = b1_dir("attrs");
+        let (map, rots, disk) = (stars(&[("IMG_1", 3)]), BTreeMap::new(), FolderAttrs::default());
+        save_selection(&dir, &map, &rots, &disk).unwrap();
+        forget_review_attempts(&dir);
+        let merged = FolderAttrs { sort: Some("rating.desc".into()), resume_shot: Some("IMG_1".into()), panel_min: None };
+        let baseline = RefCell::new(selection_dirty_json(&map, &rots, &disk));
+        assert_eq!(final_review_flush(&dir, &map, &rots, &merged, &baseline, enqueue_review_data), Ok(true));
+        let file: SelectionFile = serde_json::from_slice(&std::fs::read(review_write_target(&dir)).unwrap()).unwrap();
+        assert_eq!((file.sort.as_deref(), file.resume_shot.as_deref()), (Some("rating.desc"), Some("IMG_1")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both inline fallbacks (the writer never started; the writer gone) and the early returns
+    /// record their outcome, and a later success clears it. An isolated attempt record.
+    /// Falsifier: `let _ = write_atomic(…)` in `enqueue_settings`'s fallback, or drop a `fail_now`
+    /// from one of `save_settings_with`'s early returns.
+    #[test]
+    fn settings_save_failures_are_recorded_and_recover() {
+        let saves: &'static SettingsSaves = Box::leak(Box::new(SettingsSaves::new()));
+        let (s, memo, root) = (Settings::default(), no_memo(), b1_dir("settings-inline"));
+        let blocked = root.join("blocked");
+        std::fs::create_dir_all(blocked.join("settings.json")).unwrap(); // a folder where the file must go
+        assert_eq!(saves.status(), None, "nothing attempted yet");
+        save_settings_with(saves, None, Some(&blocked), &s, &memo);
+        assert_eq!(saves.status(), Some(ReviewSaveStatus::Failed), "no writer");
+        save_settings_with(saves, None, Some(&root), &s, &memo);
+        assert_eq!(saves.status(), Some(ReviewSaveStatus::Saved));
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx); // the writer is gone
+        save_settings_with(saves, Some(&tx), Some(&blocked), &s, &memo);
+        assert_eq!(saves.status(), Some(ReviewSaveStatus::Failed), "writer gone");
+        save_settings_with(saves, Some(&tx), Some(&root), &s, &memo);
+        assert_eq!(saves.status(), Some(ReviewSaveStatus::Saved));
+        save_settings_with(saves, None, None, &s, &memo);
+        assert_eq!(saves.status(), Some(ReviewSaveStatus::Failed), "no config folder");
+        save_settings_with(saves, None, Some(&root), &s, &memo);
+        save_settings_with(saves, None, Some(&root.join("settings.json").join("sub")), &s, &memo);
+        assert_eq!(saves.status(), Some(ReviewSaveStatus::Failed), "a config folder that can't be made");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Through `writer_loop`: an older queued save lands after a newer one failed before reaching the
+    /// writer. Falsifier: drop the ticket check from `SettingsSaves::complete`.
+    #[test]
+    fn an_older_settings_completion_never_clears_a_newer_failure() {
+        let saves: &'static SettingsSaves = Box::leak(Box::new(SettingsSaves::new()));
+        let (s, memo, root) = (Settings::default(), no_memo(), b1_dir("settings-order"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        save_settings_with(saves, Some(&tx), Some(&root), &s, &memo);
+        assert_eq!(saves.status(), Some(ReviewSaveStatus::Pending), "queued");
+        save_settings_with(saves, Some(&tx), None, &s, &memo); // the next one fails before the writer
+        drop(tx);
+        writer_loop(rx, write_atomic, |_, _| Ok(()), |_, _, _| {}, |d| d.to_path_buf(), |_, _, _| {});
+        assert!(root.join("settings.json").is_file(), "the older save landed");
+        assert_eq!(saves.status(), Some(ReviewSaveStatus::Failed), "the newer failure stands");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The queued-failure case for settings, through `writer_loop`: a periodic save still queued when
+    /// the shutdown's save runs with nothing changed; the first write fails both tries and the final
+    /// attempt lands. Falsifier: ignore the status in `settings_final_save_needed`.
+    #[test]
+    fn a_pending_settings_write_keeps_its_final_attempt() {
+        let saves: &'static SettingsSaves = Box::leak(Box::new(SettingsSaves::new()));
+        let (s, memo, root) = (Settings::default(), no_memo(), b1_dir("settings-pending"));
+        let baseline = serde_json::to_string_pretty(&s).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        save_settings_with(saves, Some(&tx), Some(&root), &s, &memo); // the periodic save, queued
+        assert!(settings_final_save_needed(&baseline, &s, saves.status()), "pending: one more attempt");
+        save_settings_with(saves, Some(&tx), Some(&root), &s, &memo); // the shutdown's
+        drop(tx);
+        let mut tries = 0;
+        writer_loop(rx, |p, d| { tries += 1; if tries <= 2 { Err(denied()) } else { write_atomic(p, d) } },
+            |_, _| Ok(()), |_, _, _| {}, |d| d.to_path_buf(), |_, _, _| {});
+        assert_eq!(tries, 3);
+        assert_eq!(saves.status(), Some(ReviewSaveStatus::Saved));
+        assert!(root.join("settings.json").is_file());
+        assert!(!settings_final_save_needed(&baseline, &s, saves.status()), "saved and unchanged: skip");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -70,10 +70,40 @@ impl Registration {
     fn has_claim(&self, ext: &str, id: &str) -> bool {
         self.open(&Self::claims(ext)).is_ok_and(|k| k.get_raw_value(id).is_ok())
     }
+    /// `has_claim` with a read-only open, for checks that must never ask for write access.
+    fn has_claim_read(&self, ext: &str, id: &str) -> bool {
+        self.root.open_subkey_with_flags(Self::claims(ext), KEY_READ).is_ok_and(|k| k.get_raw_value(id).is_ok())
+    }
     fn registered(&self) -> bool { self.command(LEGACY).is_some() }
+    // 1.1.0-rc.1 (issue #11): a family is on when ANY of its extensions is claimed. Reading exts[0]
+    // only made Update delete a sibling's claim (a lone .heif, or .jpeg without .jpg).
     fn family_states(&self) -> Vec<bool> {
-        ASSOC_FAMILIES.iter().map(|(_, exts)| self.has_claim(exts[0], LEGACY)
-            || self.has_claim(exts[0], &file_icons::progid(exts[0]))).collect()
+        ASSOC_FAMILIES.iter().map(|(_, exts)| exts.iter().any(|e| self.has_claim(e, LEGACY)
+            || self.has_claim(e, &file_icons::progid(e)))).collect()
+    }
+    /// 1.1.0-rc.1 (issue #11): READ-ONLY — do photos double-clicked in Explorer start THIS exe? The
+    /// legacy command and every claimed format's own command must name it (`owned_command_path`). A
+    /// missing, unreadable or foreign command means no, which is what the update prompt asks about.
+    /// One file probe per distinct command string: Update writes the same command everywhere.
+    fn opens_here(&self, exe: &str) -> bool {
+        let Some(running) = canonical_exe(exe) else { return false };
+        let mut owned = std::collections::HashMap::new();
+        let mut here = |command: &str| *owned.entry(command.to_owned())
+            .or_insert_with(|| owned_command_path(command, &running).is_some());
+        let Ok(Some(command)) = self.read_command(LEGACY) else { return false };
+        if !here(&command) { return false; }
+        for (_, exts) in ASSOC_FAMILIES {
+            for ext in *exts {
+                let id = file_icons::progid(ext);
+                if !self.has_claim_read(ext, LEGACY) && !self.has_claim_read(ext, &id) { continue; }
+                match self.read_command(&id) {
+                    Ok(Some(command)) => if !here(&command) { return false; },
+                    Ok(None) => {} // the claim falls back to the legacy class, checked above
+                    Err(_) => return false,
+                }
+            }
+        }
+        true
     }
     fn write_class(&self, id: &str, command: &str, icon: &str) -> io::Result<()> {
         let key = self.create(&Self::class(id))?;
@@ -107,6 +137,13 @@ impl Registration {
                     }
                     let _ = fa.delete_value(format!(".{ext}"));
                     // Retain handlers so an existing UserChoice never points at a deleted command.
+                    // 1.1.0-rc.1 (issue #11): …and re-point them to this exe, or a UserChoice that
+                    // names one keeps launching the old (possibly deleted) copy. Only an EXISTING
+                    // class; no claim or capability is added, so the family still reads as off. A
+                    // mistyped command here must not fail an Update that succeeds today.
+                    if self.read_command(&id).ok().flatten().is_some() {
+                        self.write_class(&id, &command, &file_icons::reference(exe, file_icons::resource(ext, distinct)))?;
+                    }
                 }
             }
         }
@@ -123,6 +160,13 @@ impl Registration {
             // or revive partially changed helper metadata. A later Update retries.
             if let Err(e) = self.use_static_legacy_icon(exe) {
                 crate::support::log_event(&format!("assoc: icon fallback cleanup failed: {e}"));
+            }
+            // 1.1.0-rc.1 (issue #11): an earlier helper's FallbackIcon must follow this Update too,
+            // or it keeps naming the old exe. Only an existing key; never create it here.
+            if let Ok(key) = self.open(bridge::CLASS_KEY) {
+                if let Err(e) = changed_value(&key, "FallbackIcon", &file_icons::reference(exe, file_icons::GENERIC_DOCUMENT_ID)) {
+                    crate::support::log_event(&format!("assoc: icon fallback re-point failed: {e}"));
+                }
             }
         }
         Ok(())
@@ -289,6 +333,10 @@ fn shell_changed() {
 }
 pub(crate) fn assoc_registered() -> bool { Registration::current_user().registered() }
 pub(crate) fn assoc_family_states() -> Vec<bool> { Registration::current_user().family_states() }
+/// Read-only (the update prompt's "already open in this version?"); never notifies the shell.
+pub(crate) fn assoc_opens_here() -> bool {
+    std::env::current_exe().is_ok_and(|exe| Registration::current_user().opens_here(&exe.display().to_string()))
+}
 pub(crate) fn assoc_apply(on: &[bool], distinct: bool) -> io::Result<()> {
     let result = Registration::current_user().apply(on, &std::env::current_exe()?.display().to_string(), distinct);
     shell_changed(); result
@@ -627,8 +675,8 @@ mod tests {
         let (r, fixture) = scratch(); let owner = fixture.exe(false); let other = fixture.exe(true);
         r.apply(&[true, false, false, true, false, false, false, false, true], &owner, false).unwrap();
         let heic = r.open(&Registration::claims("heic")).unwrap();
-        heic.delete_value("Falcon.Image.heic").unwrap(); // family_states now reports HEIC off
-        assert!(!r.family_states()[crate::support::HEIC_FAMILY_IDX]);
+        heic.delete_value("Falcon.Image.heic").unwrap(); // only the .heif claim is left
+        assert!(r.family_states()[crate::support::HEIC_FAMILY_IDX], "a lone .heif claim keeps the HEIC family on (any-extension rule)");
         let heif = r.open(&Registration::claims("heif")).unwrap();
         heif.set_value(LEGACY, &"").unwrap(); heif.set_value("Another.Heif", &"").unwrap();
         let caps = r.open(&format!(r"{CAPS}\FileAssociations")).unwrap();
@@ -662,12 +710,167 @@ mod tests {
         assert!(!r.cleanup_heic(&owner).unwrap());
     }
 
-    /// Falsifier: create registration or claims while changing the preference before registration.
+    /// Falsifier: create registration or claims while changing the preference before registration,
+    /// for a real absolute owner exe (1.1.0-rc.1, issue #11 batch Q1: the relative `"app.exe"` returned
+    /// early in `canonical_exe`, so the unregistered path was never reached), in every boot repair or
+    /// the read-only "photos open here" check.
     #[test]
     fn unregistered_preferences_do_not_create_any_registry_entries() {
-        let (r, _cleanup) = scratch();
+        let (r, fixture) = scratch();
+        let exe = fixture.exe(false);
+        assert!(!r.upgrade_icons(&exe, true).unwrap());
+        assert!(!r.upgrade_icons(&exe, false).unwrap());
+        assert!(!r.raw_icons(&exe, true).unwrap());
+        assert!(!r.cleanup_heic(&exe).unwrap());
+        assert!(!r.repair_type_name(&exe));
+        assert!(!r.opens_here(&exe), "nothing is registered, so photos don't open here");
         assert!(!r.upgrade_icons("app.exe", true).unwrap());
         assert!(!r.raw_icons("app.exe", true).unwrap());
         assert!(snapshot(&r.root).is_empty());
+    }
+
+    fn command_for(exe: &str) -> String { format!("\"{exe}\" \"%1\"") }
+
+    /// Falsifier: check only the legacy command, count an unclaimed retained class, accept an
+    /// unreadable format command, compare raw spellings, or write anything while checking.
+    #[test]
+    fn opens_here_only_for_the_copy_every_claimed_command_names() {
+        let (r, fixture) = scratch();
+        let owner = fixture.exe(false); let other = fixture.exe(true);
+        assert!(!r.opens_here(&owner), "nothing registered");
+        assert!(snapshot(&r.root).is_empty(), "the check creates nothing");
+        r.apply(&[true; 9], &owner, false).unwrap();
+        let before = snapshot(&r.root);
+        let alias = fixture.dir.join("alias").join("..").join("FALCON OWNER É.EXE").display().to_string();
+        assert!(r.opens_here(&owner));
+        assert!(r.opens_here(&alias), "an equivalent spelling of the registered exe");
+        assert!(!r.opens_here(&other), "photos open in the owner copy");
+        assert_eq!(before, snapshot(&r.root), "read-only");
+        // One claimed format still opening another copy: that format's double-click opens it.
+        r.write_class(&file_icons::progid("cr3"), &command_for(&other), "other,0").unwrap();
+        let before = snapshot(&r.root);
+        assert!(!r.opens_here(&owner));
+        assert_eq!(before, snapshot(&r.root));
+        r.write_class(&file_icons::progid("cr3"), &command_for(&owner), "owner,0").unwrap();
+        assert!(r.opens_here(&owner));
+        // An unreadable format command is not "open in this version".
+        let nef = r.open(r"Software\Classes\Falcon.Image.nef\shell\open\command").unwrap();
+        nef.set_value("", &7_u32).unwrap();
+        assert!(!r.opens_here(&owner));
+        nef.set_value("", &command_for(&owner)).unwrap();
+        // A switched-off family's retained class is not a claim, whatever it names.
+        r.apply(&[true, true, true, true, true, true, true, true, false], &owner, false).unwrap();
+        r.write_class(&file_icons::progid("cr3"), &command_for(&other), "other,0").unwrap();
+        assert!(r.opens_here(&owner), "an unclaimed class does not open photos");
+        // The registered exe was deleted: Explorer can't start this copy either.
+        std::fs::remove_file(&owner).unwrap();
+        assert!(!r.opens_here(&owner));
+    }
+
+    /// Falsifier: skip re-pointing per-format commands or icons, or rewrite UserChoice, claims,
+    /// capabilities or another app's values while Update moves the registration to a new copy.
+    #[test]
+    fn update_from_new_copy_after_owner_deleted_repoints_only_exe_references() {
+        let (r, fixture) = scratch();
+        let owner = fixture.exe(false); let other = fixture.exe(true);
+        let choice = r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.jpg\UserChoice";
+        r.create(choice).unwrap().set_value("ProgId", &"Falcon.Image.jpg").unwrap();
+        r.create(choice).unwrap().set_value("Hash", &"protected").unwrap();
+        r.create(r"Software\Classes\.jpg").unwrap().set_value("", &"OtherApp").unwrap();
+        r.create(&Registration::claims("jpg")).unwrap().set_value("OtherApp", &"").unwrap();
+        r.apply(&[true; 9], &owner, false).unwrap();
+        std::fs::remove_file(&owner).unwrap();
+        let before = snapshot(&r.root);
+        let st = r.family_states(); assert_eq!(st, [true; 9]);
+        r.apply(&st, &other, false).unwrap();
+        assert_eq!(r.command(LEGACY), Some(command_for(&other)));
+        for (_, exts) in ASSOC_FAMILIES { for ext in *exts {
+            let id = file_icons::progid(ext);
+            assert_eq!(r.command(&id), Some(command_for(&other)), "{ext}");
+            assert_eq!(r.open(&format!(r"{}\DefaultIcon", Registration::class(&id))).unwrap().get_value::<String,_>("").unwrap(),
+                file_icons::reference(&other, file_icons::resource(ext, false)), "{ext}");
+        }}
+        let after = snapshot(&r.root);
+        assert!(after.values().all(|v| !v.contains(&owner)), "no value names the deleted copy");
+        let exe_refs = |m: &BTreeMap<String, String>| -> BTreeMap<String, String> { m.iter()
+            .filter(|(k, _)| !k.ends_with(r"\shell\open\command@") && !k.ends_with(r"\DefaultIcon@") && !k.ends_with("@FallbackIcon"))
+            .map(|(k, v)| (k.clone(), v.clone())).collect() };
+        assert_eq!(exe_refs(&before), exe_refs(&after), "only exe references change");
+        assert!(r.opens_here(&other));
+        assert!(!r.upgrade_icons(&other, false).unwrap(), "nothing left for the next boot");
+    }
+
+    /// Falsifier: leave the CLSID FallbackIcon on the old exe when the icon helper is unavailable.
+    #[test]
+    fn update_from_new_copy_with_helper_unavailable_repoints_fallback_icon() {
+        let (mut r, fixture) = scratch();
+        let owner = fixture.exe(false); let other = fixture.exe(true);
+        r.apply(&[true; 9], &owner, false).unwrap();
+        assert!(r.has_bridge());
+        r.icon_dir = None;
+        std::fs::remove_file(&owner).unwrap();
+        r.apply(&r.family_states(), &other, false).unwrap();
+        assert_eq!(r.open(r"Software\Classes\Falcon.Image\DefaultIcon").unwrap().get_value::<String,_>("").unwrap(),
+            file_icons::reference(&other, file_icons::GENERIC_DOCUMENT_ID));
+        assert_eq!(r.open(bridge::CLASS_KEY).unwrap().get_value::<String,_>("FallbackIcon").unwrap(),
+            file_icons::reference(&other, file_icons::GENERIC_DOCUMENT_ID));
+        assert!(!r.has_bridge());
+        assert!(snapshot(&r.root).values().all(|v| !v.contains(&owner)));
+        // Never created when it isn't there.
+        let (mut fresh, fixture) = scratch();
+        fresh.icon_dir = None;
+        fresh.apply(&[true; 9], &fixture.exe(false), false).unwrap();
+        assert!(fresh.open(bridge::CLASS_KEY).is_err());
+    }
+
+    /// Falsifier: skip the disabled branch's re-point, or re-add its claim or capability.
+    #[test]
+    fn update_repoints_retained_handler_of_disabled_family() {
+        let (r, fixture) = scratch();
+        let owner = fixture.exe(false); let other = fixture.exe(true);
+        r.apply(&[true; 9], &owner, false).unwrap();
+        let choice = r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.cr3\UserChoice";
+        r.create(choice).unwrap().set_value("ProgId", &"Falcon.Image.cr3").unwrap();
+        let raw_off = [true, true, true, true, true, true, true, true, false];
+        r.apply(&raw_off, &owner, false).unwrap();
+        std::fs::remove_file(&owner).unwrap();
+        r.apply(&r.family_states(), &other, false).unwrap();
+        assert_eq!(r.command("Falcon.Image.cr3"), Some(command_for(&other)));
+        assert!(!r.has_claim("cr3", "Falcon.Image.cr3"));
+        assert!(r.open(&format!(r"{CAPS}\FileAssociations")).unwrap().get_value::<String,_>(".cr3").is_err());
+        assert!(!r.family_states()[8], "the family stays off");
+        assert_eq!(r.open(choice).unwrap().get_value::<String,_>("ProgId").unwrap(), "Falcon.Image.cr3");
+    }
+
+    /// Falsifier: read a family's state from its first extension only.
+    #[test]
+    fn family_state_counts_any_claimed_extension() {
+        let (r, fixture) = scratch(); let owner = fixture.exe(false);
+        r.write_class(LEGACY, &command_for(&owner), "old,0").unwrap();
+        r.create(&Registration::claims("jpeg")).unwrap().set_value("Falcon.Image.jpeg", &"").unwrap();
+        r.create(&Registration::claims("heif")).unwrap().set_value(LEGACY, &"").unwrap();
+        let st = r.family_states();
+        assert!(st[0], "a lone .jpeg claim keeps JPEG on");
+        assert!(st[crate::support::HEIC_FAMILY_IDX], "a lone .heif claim keeps HEIC on");
+        r.apply(&st, &owner, false).unwrap();
+        assert!(r.has_claim("jpeg", "Falcon.Image.jpeg"), "Update keeps the sibling's claim");
+        assert!(r.has_claim("heif", "Falcon.Image.heif"));
+    }
+
+    /// Falsifier: treat an unknown codec answer as "not installed" at boot or in Update.
+    #[test]
+    fn unknown_heic_codec_state_never_removes_heic_claims() {
+        use crate::support::{gate_heic, heic_assoc_available};
+        for state in [Some(true), None, Some(false)] {
+            let (r, fixture) = scratch(); let owner = fixture.exe(false);
+            r.apply(&[true; 9], &owner, false).unwrap();
+            // The boot repair and Update as main.rs composes them.
+            if !heic_assoc_available(state) { r.cleanup_heic(&owner).unwrap(); }
+            let mut on = r.family_states(); gate_heic(&mut on, heic_assoc_available(state));
+            r.apply(&on, &owner, false).unwrap();
+            for ext in ["heic", "heif"] {
+                assert_eq!(r.has_claim(ext, &file_icons::progid(ext)), state != Some(false), "{ext} with {state:?}");
+            }
+        }
     }
 }

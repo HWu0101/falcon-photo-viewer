@@ -282,6 +282,29 @@ class ReleaseMaterials(unittest.TestCase):
                 (destination / 'docs/licenses/rust-standard-library.html').stat().st_size, 1000
             )
 
+    def test_build_docs_name_every_vendored_patch(self):
+        # Falsifier: a [patch.crates-io] entry the build requires but a shipped guide or the
+        # README leaves out (femtovg was missing until the issue #11 batch, D2).
+        import tomllib
+        patches = tomllib.loads((ROOT / 'falcon/Cargo.toml').read_text(encoding='utf-8'))['patch']['crates-io']
+        # The private checkout keeps the public README beside the export templates.
+        readme = ROOT / 'docs/distribution/public-readme.md'
+        readme = readme if readme.is_file() else ROOT / 'README.md'
+        for guide in (materials.build_guide(ROOT), ROOT / 'REBUILDING.md', readme):
+            text = guide.read_text(encoding='utf-8').lower()
+            for name in patches:
+                self.assertIn(name.lower(), text, f'{guide.name} names the patched {name}')
+
+    def test_shipped_guides_have_no_prerelease_wording(self):
+        # Falsifier: a shipped build guide still calls the release a candidate or unfinished.
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'package'
+            materials.copy(ROOT, destination)
+            for name in ('BUILDING.md', 'REBUILDING.md'):
+                text = (destination / name).read_text(encoding='utf-8').lower()
+                for phrase in ('source candidate', 'staging candidate', 'still in progress', 'pre-release'):
+                    self.assertNotIn(phrase, text, f'{name}: {phrase}')
+
 
 if __name__ == '__main__':
     unittest.main()

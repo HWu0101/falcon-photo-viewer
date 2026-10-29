@@ -5,9 +5,12 @@ use slint::ComponentHandle;
 pub(crate) const REPOSITORY: &str = "https://github.com/HWu0101/falcon-photo-viewer";
 pub(crate) const INSTAGRAM: &str = "https://www.instagram.com/hwuphoto/";
 pub(crate) const LINKEDIN: &str = "https://www.linkedin.com/in/hancheng-wu-325794321";
+/// 1.1.0-rc.1: "Check for updates" opens the latest release in the browser; Falcon itself makes no
+/// network request.
+pub(crate) const RELEASES: &str = "https://github.com/HWu0101/falcon-photo-viewer/releases/latest";
 
 fn target(kind: i32) -> Option<&'static str> {
-    match kind { 0 => Some(REPOSITORY), 1 => Some(INSTAGRAM), 2 => Some(LINKEDIN), _ => None }
+    match kind { 0 => Some(REPOSITORY), 1 => Some(INSTAGRAM), 2 => Some(LINKEDIN), 3 => Some(RELEASES), _ => None }
 }
 
 pub(crate) fn wire(app: &MainWindow, open: impl Fn(&str) -> std::io::Result<()> + 'static) {
@@ -45,5 +48,19 @@ pub(crate) fn open_external(url: &str) -> std::io::Result<()> {
         // `open`/`xdg-open` return after dispatch (no -W); reap the helper and report failure.
         let status = std::process::Command::new(program).arg(url).status()?;
         if status.success() { Ok(()) } else { Err(std::io::Error::other(format!("Link handler exited with {status}"))) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Falsifier: point Check for updates anywhere but the fixed latest-release page of this repository.
+    #[test]
+    fn about_releases_link_is_the_fixed_latest_release_url() {
+        assert_eq!(target(3), Some(RELEASES));
+        assert!(RELEASES.starts_with(REPOSITORY));
+        assert!(RELEASES.ends_with("/releases/latest"));
+        assert_eq!(target(4), None);
     }
 }

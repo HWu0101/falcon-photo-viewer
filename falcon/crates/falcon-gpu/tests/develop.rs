@@ -1,6 +1,9 @@
 //! Integration test: GPU-develop a real Canon CFA and sanity-check the result.
 //! Self-skips if the test folder or a GPU is unavailable.
 
+#[path = "../../test-support/hw_child.rs"]
+mod hw_child;
+
 #[path = "../../test-support/fixture_paths.rs"]
 mod fixture_paths;
 
@@ -12,6 +15,7 @@ use falcon_gpu::GpuDeveloper;
 
 #[test]
 fn gpu_develops_real_cfa() {
+    if !hw_child::run_here(module_path!(), "gpu_develops_real_cfa") { return; }
     let dir = Path::new(fixture_paths::photos());
     if !dir.exists() {
         eprintln!("skip: no test folder");

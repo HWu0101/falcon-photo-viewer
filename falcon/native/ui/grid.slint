@@ -18,7 +18,7 @@
 
 import { Theme } from "theme.slint";
 import { Chip, ChipRole } from "widgets.slint";
-import { FlagGlyph, ArchiveGlyph, UnsupportedGlyph } from "glyphs.slint";
+import { FlagGlyph, ArchiveGlyph, UnsupportedGlyph, CloudGlyph } from "glyphs.slint";
 import { FilmItem } from "structs.slint";
 import { TileBadge } from "filmstrip.slint";
 
@@ -100,9 +100,15 @@ import { TileBadge } from "filmstrip.slint";
                 width: 22px; height: 22px;
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
             }
+            // 2026-10-28 (the cloud-only round): the cloud outline, as the filmstrip draws it.
+            if root.item.cloud && !root.item.valid : CloudGlyph {
+                tint: Theme.text-mute;
+                width: 22px; height: 22px;
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            }
             // loading cell — the FilmThumb "···" affordance (badge != "" is the root visible gate,
             // so a mounted tile is always a REAL shot; quiet dots, never broken/black).
-            if !root.item.valid && !root.item.unsupported && !root.item.failed : Text {
+            if !root.item.valid && !root.item.unsupported && !root.item.failed && !root.item.cloud : Text {
                 text: root.item.pending ? @tr("falcon" => "Loading…") : "···"; color: Theme.text-mute;
                 font-size: root.item.pending ? Theme.font-sm : Theme.font-md; font-weight: root.item.pending ? 400 : 700;
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;

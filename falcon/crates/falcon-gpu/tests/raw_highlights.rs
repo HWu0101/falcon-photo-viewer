@@ -1,8 +1,12 @@
 //! Real GPU pixel regressions, independent of the RAW decompressor and UI.
+#[path = "../../test-support/hw_child.rs"]
+mod hw_child;
+
 use falcon_decode::Cfa;
 
 #[test]
 fn clipped_neutrals_and_bright_colours_follow_cpu_highlight_policy() {
+    if !hw_child::run_here(module_path!(), "clipped_neutrals_and_bright_colours_follow_cpu_highlight_policy") { return; }
     let gpu = match falcon_gpu::GpuDeveloper::new() {
         Ok(gpu) => gpu,
         Err(e) => {

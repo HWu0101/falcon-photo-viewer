@@ -599,6 +599,12 @@ fn encode(c: f32, kind: u32, ch: i32, n: u32) -> f32 {
 // asserts it for all three.
 pub mod heic;
 
+// 28 October (round 2b review P2): the time limit for the tests that reach the driver, shared with the
+// other crates' hardware tests (`heic::tests`' readback row uses it).
+#[cfg(test)]
+#[path = "../../test-support/hw_child.rs"]
+mod hw_child;
+
 // v0.8.166 (WAVE 2), narrowed v0.8.167: the band plan — how one big transfer is cut into pieces.
 // It served two call sites when it landed; the 08-06 audit reverted the renderer-side one (see the
 // module header), so it is now the HEIC assembly READBACK's planner and nothing else.

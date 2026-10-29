@@ -4,6 +4,9 @@
 //! undeclared binding, a signature mismatch) at test time instead of at app boot. Gracefully SKIPS when no
 //! GPU adapter is available (headless CI) — the app's boot is the production backstop either way.
 
+#[path = "../../test-support/hw_child.rs"]
+mod hw_child;
+
 fn headless() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
@@ -13,6 +16,7 @@ fn headless() -> Option<(wgpu::Device, wgpu::Queue)> {
 
 #[test]
 fn yuv_pipeline_compiles() {
+    if !hw_child::run_here(module_path!(), "yuv_pipeline_compiles") { return; }
     let Some((device, _queue)) = headless() else {
         eprintln!("shader_compile: no GPU adapter — skipping (boot is the backstop)");
         return;
@@ -28,6 +32,7 @@ fn yuv_pipeline_compiles() {
 /// bindings and the storage-buffer write.
 #[test]
 fn nv12_kernel_pipeline_compiles() {
+    if !hw_child::run_here(module_path!(), "nv12_kernel_pipeline_compiles") { return; }
     let Some((device, _queue)) = headless() else {
         eprintln!("shader_compile: no GPU adapter — skipping (boot is the backstop)");
         return;
@@ -37,6 +42,7 @@ fn nv12_kernel_pipeline_compiles() {
 
 #[test]
 fn cm_shader_compiles() {
+    if !hw_child::run_here(module_path!(), "cm_shader_compiles") { return; }
     let Some((device, _queue)) = headless() else {
         eprintln!("shader_compile: no GPU adapter — skipping");
         return;

@@ -1,8 +1,7 @@
-# Building the source candidate
+# Building Falcon from source
 
 Use the source snapshot matching the intended release. Keep the bundled licence/notices and
-source revision with any package you distribute. The private staging candidate is not published
-until its final verification and owner approval.
+source revision with any package you distribute.
 
 Use Rust 1.96.0 (including Cargo, rustfmt and Clippy), Python 3.11 or newer, and the native compiler
 for your operating system: the Visual Studio C++ build tools/Windows SDK on Windows, or Xcode
@@ -16,9 +15,10 @@ cargo build --locked --release --bin falcon
 
 The portable Cargo configuration retains Windows static-CRT flags. Set `CARGO_TARGET_DIR` if you
 want build output outside this checkout. Do not set `SLINT_SCALE_FACTOR` while compiling: that
-changes generated UI geometry. The patched `vendor/winit` and `vendor/zune-jpeg` directories are
-required, including their licences and original-file hash inventories. zune-jpeg includes Falcon's
-independently written integer transpose. Keep `Cargo.lock` unchanged for a reproducible build.
+changes generated UI geometry. The patched `vendor/winit`, `vendor/zune-jpeg` and `vendor/femtovg`
+directories are required, including their licences and original-file hash inventories. zune-jpeg
+includes Falcon's independently written integer transpose. Keep `Cargo.lock` unchanged for a
+reproducible build.
 
 On macOS, run the native toolbar tests before a release build:
 
@@ -46,7 +46,7 @@ Real-camera, optional-codec and GPU checks print SKIP when their required inputs
 unavailable; the test framework can count these returns as passes. Preserve those messages and
 report coverage separately. See [fixture setup](docs/testing/private-fixtures.md).
 
-The CPU JPEG fallback works without a developer CUDA installation. This source candidate does not
+The CPU JPEG fallback works without a developer CUDA installation. Falcon does not
 bundle CUDA/nvJPEG runtimes or an HEVC software decoder. Test each intended package on a clean
 machine, then review its actual dependencies, notices and source correspondence before publishing.
 

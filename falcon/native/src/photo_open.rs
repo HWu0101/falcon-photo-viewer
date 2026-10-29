@@ -362,7 +362,7 @@ mod tests {
             id: 1, dir: PathBuf::from("folder"), shots: vec![shot("C"), shot("A"), shot("B")],
             ratings: vec![5, 4, 0], marks: vec![0; 3], start: 2, land: None,
             extra: BTreeMap::new(), rotations: BTreeMap::new(), attrs: FolderAttrs::default(),
-            had_file: true, manifest: None, sort: (SortMethod::Rating, true), scan_err: false };
+            had_file: true, manifest: None, sort: (SortMethod::Rating, true), scan_err: false, scan_denied: false, unlisted_target: None };
         let extra = BTreeMap::from([
             ("A".into(), Sel { rating: 4, ..Sel::default() }),
             ("C".into(), Sel { rating: 5, ..Sel::default() }),

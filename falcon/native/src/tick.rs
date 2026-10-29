@@ -94,6 +94,28 @@ pub(crate) fn frost_mip_hit(
 ) -> Option<(Arc<[u8]>, u32, u32)> {
     parked.filter(|(.., g)| *g == frame_gamut).map(|(m, w, h, _)| (m, w, h))
 }
+
+/// Park one thumbnail-derived blur source, only for the folder still open: `still_open` is asked
+/// UNDER the map's lock. `apply_scan` moves the generation before `Film::on_folder_swap` clears this
+/// map under the same lock, so an old folder's source either lands before that clear (and goes with
+/// it) or is refused here; it can never reach the next folder's photo at the same index (round 2b
+/// review P1). The same rule as the `cloud_skipped` insert. Returns whether it parked.
+///
+/// FALSIFIER: ask `still_open` before taking the lock (the old shape) and
+/// `the_blur_source_is_parked_only_while_its_folder_is_open_asked_under_the_lock` fails.
+pub(crate) fn park_frost_mip(
+    frost: &FrostMap,
+    still_open: impl FnOnce() -> bool,
+    idx: usize,
+    mip: (Arc<[u8]>, u32, u32, falcon_color::Gamut),
+) -> bool {
+    let mut map = frost.lock().unwrap_or_else(|e| e.into_inner());
+    if !still_open() {
+        return false;
+    }
+    map.insert(idx, mip);
+    true
+}
 /// Visible content identity/geometry (including mip arrivals and both kinds of scroll),
 /// plus the output gamut and Custom profile generation. Theme appearance is fixed.
 #[derive(Clone, Copy, PartialEq)]
@@ -1164,6 +1186,9 @@ fn detail_ready(
 /// NEVER-HANG ESCAPES (unchanged, and the reason this cannot deadlock): the folder edge, a
 /// recognised-but-undecodable source, and a shot whose THUMB or whose FAST frame has already
 /// failed all read ready — each of those shows its placeholder, exactly as the un-gated browse does.
+/// 2026-10-28 (the cloud-only round, owner answer 7): …and a shot whose thumbnail file was found
+/// only in the cloud (`thumb_cloud`, the workers' notes): it will never get a thumbnail, so the
+/// browse steps onto it and the stage shows Loading while that one photo downloads, as viewing does.
 ///
 /// The §43 always-sharp gate (`detail_ready`) is a SEPARATE machine on a different tier for a
 /// different promise, and is deliberately untouched.
@@ -1183,14 +1208,19 @@ fn scrub_wait_ready(
     fast_cache: &RefCell<FastCache>, // v0.8.126 (R6d): a showable frame never blocks
     thumb_failed: &Mutex<HashSet<(u64, usize)>>,
     fast_failed: &Mutex<HashSet<(u64, usize)>>,
+    thumb_cloud: &support::CloudNotes,
 ) -> bool {
-    // Cheap checks first; the two worker-contended locks only on a genuine miss.
+    // Cheap checks first; the worker-contended locks only on a genuine miss.
     next == cur // folder edge — nothing to wait for
         || thumbs.borrow().contains_key(&next)
         || fast_cache.borrow().contains_key(&next)
         || shots.get(next).map_or(true, |s| s.is_unsupported())
         || thumb_failed.lock().unwrap_or_else(|e| e.into_inner()).contains(&(gen_now, next))
         || fast_failed.lock().unwrap_or_else(|e| e.into_inner()).contains(&(gen_now, next))
+        || shots.get(next).is_some_and(|s| {
+            let n = thumb_cloud.lock().unwrap_or_else(|e| e.into_inner());
+            support::cloud_noted(&n, gen_now, next, s, support::ReadTier::Thumb)
+        })
 }
 
 /// 4) steady-rate scrub advance while a key is held. Advances `current` on a DRIFT-FREE clock
@@ -1221,6 +1251,7 @@ pub(crate) fn step_scrub_advance(
     fast_cache: &RefCell<FastCache>, // v0.8.126 (R6d): thumb OR a cached fast frame
     thumb_failed: &Mutex<HashSet<(u64, usize)>>,
     fast_failed: &Mutex<HashSet<(u64, usize)>>, // F4: (gen, idx)-keyed like thumb_failed
+    thumb_cloud: &support::CloudNotes, // the cloud-only round: the wait's never-hang escape
     detail: &RefCell<DetailCache>,
     det_failed: &RefCell<HashSet<usize>>,
     detail_fps: &Cell<f32>, // §43: measured sustained full-res landing rate (caps the always-sharp browse)
@@ -1295,6 +1326,7 @@ pub(crate) fn step_scrub_advance(
                 let wait_block = wait_cache
                     && !scrub_wait_ready(
                         next, *cc, gen_now, shots, thumbs, fast_cache, thumb_failed, fast_failed,
+                        thumb_cloud,
                     );
                 if sharp_block || wait_block {
                     // v0.8.124 (R4): the advance is WAITING on the decode. That single fact is what
@@ -1581,6 +1613,7 @@ pub(crate) fn step_wheel_advance(
     fast_cache: &RefCell<FastCache>, // v0.8.126 (R6d)
     thumb_failed: &Mutex<HashSet<(u64, usize)>>,
     fast_failed: &Mutex<HashSet<(u64, usize)>>,
+    thumb_cloud: &support::CloudNotes, // the cloud-only round: the wait's never-hang escape
     nav_kind: &Cell<NavKind>, // v0.8.126 (R5): the wheel steps from where you are, too
     // v1.0 MERGE (F1-4): the live held-nav direction. The mac branch zeroed `wheel_accum` above this
     // call instead; the precedence is a ROW in `wheel_step_decision` now, so a sole notch the hold
@@ -1680,7 +1713,7 @@ pub(crate) fn step_wheel_advance(
         let next_ready = detail_ready(next, *cc, shots, detail, det_failed);
         let wait_ready = !wait_cache
             || scrub_wait_ready(
-                next, *cc, gen_now, shots, thumbs, fast_cache, thumb_failed, fast_failed,
+                next, *cc, gen_now, shots, thumbs, fast_cache, thumb_failed, fast_failed, thumb_cloud,
             );
         let pending = wheel_accum.get().unsigned_abs();
         // v1.0 MERGE TAIL [A-R1]: the platform scope, ANDed here rather than cfg'd inside the
@@ -1849,6 +1882,7 @@ pub(crate) fn step_compare_browse_advance(
     fast_cache: &RefCell<FastCache>,
     thumb_failed: &Mutex<HashSet<(u64, usize)>>,
     fast_failed: &Mutex<HashSet<(u64, usize)>>,
+    thumb_cloud: &support::CloudNotes, // the cloud-only round: the wait's never-hang escape
     // v0.8.195: the browse-rate ceiling — see the single-view siblings. v0.8.196: derived.
     efficiency: support::EfficiencyLimits,
     ask: Option<ThumbAsk<'_>>,
@@ -1895,12 +1929,12 @@ pub(crate) fn step_compare_browse_advance(
             let a_ok = pa
                 || scrub_wait_ready(
                     na, cmp_a_idx.get(), gen_now, shots, thumbs, fast_cache, thumb_failed,
-                    fast_failed,
+                    fast_failed, thumb_cloud,
                 );
             let b_ok = pb
                 || scrub_wait_ready(
                     nb, cmp_b_idx.get(), gen_now, shots, thumbs, fast_cache, thumb_failed,
-                    fast_failed,
+                    fast_failed, thumb_cloud,
                 );
             if !(a_ok && b_ok) {
                 if let Some(ask) = &ask {
@@ -1986,11 +2020,12 @@ mod scrub_wait_tests {
         let fastc: RefCell<FastCache> = RefCell::new(HashMap::new());
         let tfail: Mutex<HashSet<(u64, usize)>> = Mutex::new(HashSet::new());
         let ffail: Mutex<HashSet<(u64, usize)>> = Mutex::new(HashSet::new());
+        let tcloud: support::CloudNotes = Mutex::new(HashSet::new());
         let gen = 3u64;
 
         // (1) nothing in hand for the next shot -> the gate holds. This is the promise: never
         //     advance onto a photo with nothing to show.
-        assert!(!scrub_wait_ready(1, 0, gen, &shots, &thumbs, &fastc, &tfail, &ffail));
+        assert!(!scrub_wait_ready(1, 0, gen, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud));
 
         // (2) THE FIX: a cached THUMBNAIL is enough. It is what the S1 lane fills at folder open,
         //     and it is cheap on every format - including the HEIC lane where the fast tier is a
@@ -1999,10 +2034,10 @@ mod scrub_wait_tests {
             1,
             (slint::Image::from_rgba8(slint::SharedPixelBuffer::new(1, 1)), 0u64),
         );
-        assert!(scrub_wait_ready(1, 0, gen, &shots, &thumbs, &fastc, &tfail, &ffail));
+        assert!(scrub_wait_ready(1, 0, gen, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud));
 
         // (2b) v0.8.126 (R6d): ...and so is a cached FAST frame with no thumb behind it yet.
-        assert!(!scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail));
+        assert!(!scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud));
         fastc.borrow_mut().insert(
             2,
             FastEntry {
@@ -2017,27 +2052,39 @@ mod scrub_wait_tests {
             },
         );
         assert!(
-            scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail),
+            scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud),
             "a showable frame never blocks - the bar is thumb OR fast"
         );
         fastc.borrow_mut().clear();
 
         // (3) never-hang: a recognised-but-undecodable source reads ready (it shows its placeholder).
-        assert!(scrub_wait_ready(3, 2, gen, &shots, &thumbs, &fastc, &tfail, &ffail));
+        assert!(scrub_wait_ready(3, 2, gen, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud));
 
         // (4) never-hang: a shot whose THUMB decode failed, and one whose FAST decode failed.
-        assert!(!scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail));
+        assert!(!scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud));
         tfail.lock().unwrap().insert((gen, 2));
-        assert!(scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail));
+        assert!(scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud));
         tfail.lock().unwrap().clear();
         ffail.lock().unwrap().insert((gen, 2));
-        assert!(scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail));
+        assert!(scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud));
 
         // ...and both latches are (gen, idx)-keyed, so a folder swap does not inherit the escape.
-        assert!(!scrub_wait_ready(2, 1, gen + 1, &shots, &thumbs, &fastc, &tfail, &ffail));
+        assert!(!scrub_wait_ready(2, 1, gen + 1, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud));
+
+        // (4b) 2026-10-28 (the cloud-only round, owner answer 7): never-hang — a shot whose thumbnail
+        //     file was found only in the cloud this folder steps on (it will never get a thumbnail);
+        //     another folder's note does not. FALSIFIER (L28): drop the notes term and this reds.
+        ffail.lock().unwrap().clear();
+        assert!(!scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud));
+        tcloud.lock().unwrap().insert((gen - 1, 2, support::CloudFile::Finished));
+        assert!(!scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud), "another folder's note");
+        tcloud.lock().unwrap().insert((gen, 2, support::CloudFile::Finished));
+        assert!(scrub_wait_ready(2, 1, gen, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud), "a cloud-only next photo is stepped onto");
+        tcloud.lock().unwrap().clear();
+        ffail.lock().unwrap().insert((gen, 2));
 
         // (5) the folder edge (`next == cur`, the clamp's fixed point) can never block itself.
-        assert!(scrub_wait_ready(0, 0, gen + 1, &shots, &thumbs, &fastc, &tfail, &ffail));
+        assert!(scrub_wait_ready(0, 0, gen + 1, &shots, &thumbs, &fastc, &tfail, &ffail, &tcloud));
     }
 
     /// v0.8.175 (THE ZOOMED-WHEEL STICK, owner-confirmed 08-08) — THE NOTCH IS NEVER EATEN.
@@ -2455,6 +2502,10 @@ pub(crate) fn step_prefetch_fast(
     // log's `costly=4/4` against `dec=3–7/s`) and the decode runway. `eff.engaged` is the same bit
     // the bool was, spelled once below so every use in this fn reads it from one place.
     eff: support::EfficiencyLimits,
+    // 2026-10-28 (the cloud-only round): the workers' notes of files found only in the cloud. A noted
+    // photo nobody is looking at is not queued (design 3); every queued photo but those on screen is
+    // marked for the worker's own check (`Pump::local_only_q`).
+    cloud: &support::CloudNotes,
 ) {
     let efficiency = eff.engaged;
     cur_atomic.store(c, Ordering::Relaxed);
@@ -2948,6 +2999,21 @@ pub(crate) fn step_prefetch_fast(
         } else {
             askable
         };
+        // 2026-10-28 (the cloud-only round, design 3): ON THE POOL PATH ONLY, after the RAM serve
+        // (which reads no file): a photo whose preview file a worker found only in the cloud is not
+        // queued again this folder, unless it is on screen (the current photo and the Compare halves
+        // may download, owner answer 4). The want list, `c_serves` and the meter's count are untouched.
+        // One short lock, empty at once in a local folder.
+        let mut pool_wanted = pool_wanted;
+        {
+            let notes = cloud.lock().unwrap_or_else(|e| e.into_inner());
+            if !notes.is_empty() {
+                pool_wanted.retain(|&i| {
+                    displayed(i)
+                        || !shots.get(i).is_some_and(|s| support::cloud_noted(&notes, gen_now, i, s, support::ReadTier::Fast))
+                });
+            }
+        }
         let (m, cv) = &*fast.pump; // v0.8.26 (§64): deref the Arc to the (Mutex, Condvar) tuple
         let mut p = m.lock().unwrap_or_else(|e| e.into_inner());
         // v0.8.111: the COSTLY-decode share of the pool, enforced HERE rather than in the workers.
@@ -3013,6 +3079,11 @@ pub(crate) fn step_prefetch_fast(
             // then bumps the counter at pop without knowing anything about formats or shot lists.
             if is_capped(i) {
                 p.costly_q.insert(i);
+            }
+            // The cloud-only round: nobody is looking at it, so its worker reads its file only if it
+            // is on this device (`main.rs::run_fast_job_with`). The photos on screen may download.
+            if !displayed(i) {
+                p.local_only_q.insert(i);
             }
             p.queue.push_back(i);
         }
@@ -3298,6 +3369,15 @@ pub(crate) fn step_frost_feed(
         let tfail = thumb_failed.lock().unwrap_or_else(|e| e.into_inner());
         cand.retain(|&i| !tfail.contains(&(gen_now, i)));
     }
+    // 2026-10-28 (the cloud-only round): …and the workers' notes of thumbnail files found only in the
+    // cloud, the same way: nothing here may download, and a noted file would be asked for again on
+    // every landing.
+    {
+        let notes = film.cloud_skipped.lock().unwrap_or_else(|e| e.into_inner());
+        if !notes.is_empty() {
+            cand.retain(|&i| !shots.get(i).is_some_and(|s| support::cloud_noted(&notes, gen_now, i, s, support::ReadTier::Thumb)));
+        }
+    }
     if cand.is_empty() {
         return;
     }
@@ -3405,10 +3485,10 @@ pub(crate) fn whole_folder_radius(len: usize, anchors: &[usize], cap: usize) -> 
 /// [`whole_folder_radius`] (the whole folder when the cap allows it), skipping what is cached,
 /// pending, unsupported or permanently failed, and **never a cloud-only file** (`cloud`, the folder
 /// scan's placeholder tags with hydrated files dropped — AGENTS.md's cloud rule: batch work never
-/// downloads). A file made online-only since the scan is not tagged, so each request is
-/// [`support::ThumbReq::whole_folder`]: the worker checks the file is still on this device just before
-/// reading it, and notes one that is not in `film.cloud_skipped`, which this asks for no more (owner,
-/// 27 October: "do the check").
+/// downloads). A file made online-only since the scan is not tagged, so the worker checks the file is
+/// still on this device just before reading it (every thumbnail job, since the cloud-only round), and
+/// notes one that is not in `film.cloud_skipped`, which this asks for no more (owner, 27 October: "do
+/// the check").
 ///
 /// It runs only when the caller says nothing else is asked for (settled, no decode awaited, no open
 /// hold, not in the background — see the call in the tick), within its own small share of the queue
@@ -3454,8 +3534,14 @@ pub(crate) fn step_whole_folder_thumbs(
         // The (cross-thread) failure latch is asked last and one index at a time, so a warm folder,
         // whose every index stops at the cache test, never takes the lock the thumb workers write.
         let failed = |i: usize| film.failed.lock().unwrap_or_else(|e| e.into_inner()).contains(&(gen_now, i));
-        // …and so is the workers' note of the files found online-only since the scan.
-        let skipped = |i: usize| film.cloud_skipped.lock().unwrap_or_else(|e| e.into_inner()).contains(&(gen_now, i));
+        // …and so is the workers' note of the files found online-only since the scan (the file a
+        // thumbnail reads, since the cloud-only round).
+        let skipped = |i: usize| {
+            shots.get(i).is_some_and(|s| {
+                let n = film.cloud_skipped.lock().unwrap_or_else(|e| e.into_inner());
+                support::cloud_noted(&n, gen_now, i, s, support::ReadTier::Thumb)
+            })
+        };
         let wanted = |i: usize| {
             i < len
                 && !tc.contains_key(&i)
@@ -3482,7 +3568,7 @@ pub(crate) fn step_whole_folder_thumbs(
         if tp.insert(idx) {
             send_or_rollback(
                 thumb_req,
-                support::ThumbReq::whole_folder(idx, gen_now, rot.delta_of(idx)),
+                support::ThumbReq::speculative(idx, gen_now, rot.delta_of(idx)),
                 ReqLane::Thumb,
                 || {
                     tp.remove(&idx);
@@ -3540,6 +3626,12 @@ pub(crate) fn step_cache_meter(
     // is derived from `limits`, so a posture change with an unchanged cache reading must still
     // re-publish — a dedup record that ignores what produced the output is the class L45 names.
     last: &Cell<(u32, u32, u32, u32)>,
+    // 2026-10-28 (the cloud-only round, owner answer 8): a photo whose file (the one each tier reads)
+    // was found only in the cloud is never prepared, so it is left out of both numbers.
+    shots: &[Shot],
+    cloud: &support::CloudNotes,
+    gen_now: u64,
+    raw_mode: bool,
 ) {
     if len < 2 {
         if app.get_cache_meter_show() {
@@ -3552,16 +3644,27 @@ pub(crate) fn step_cache_meter(
     // D1: while ZOOMED the user browses on the DETAIL (sharp) tier, so the meter must report the
     // full-res banking over the LIVE zoomed window (det_ahead/det_behind — budget-derived +
     // E3-deepened) — the fast cache is meaningless there. Unzoomed keeps the fast-scrub feed.
+    // The cloud-only round: (available, cached) over one side, a found-cloud photo that is not cached
+    // left out of both.
+    let side = |ks: &mut dyn Iterator<Item = usize>, cached: &dyn Fn(usize) -> bool, noted: &HashSet<usize>| {
+        let (mut avail, mut have) = (0usize, 0usize);
+        for i in ks {
+            let h = cached(i);
+            if h || !noted.contains(&i) {
+                avail += 1;
+                have += usize::from(h);
+            }
+        }
+        (avail, have)
+    };
     let (ahead_avail, behind_avail, ahead_cached, behind_cached) = if zoomed {
         let d = detail.borrow();
         let aa = det_ahead.min(len - 1 - c);
         let ba = det_behind.min(c);
-        (
-            aa,
-            ba,
-            (1..=aa).filter(|k| d.contains_key(&(c + k))).count(),
-            (1..=ba).filter(|k| d.contains_key(&(c - k))).count(),
-        )
+        let noted = support::cloud_noted_in(cloud, gen_now, shots, support::ReadTier::Detail { raw_mode }, (c - ba)..=(c + aa));
+        let (aa, ac) = side(&mut (1..=aa).map(|k| c + k), &|i| d.contains_key(&i), &noted);
+        let (ba, bc) = side(&mut (1..=ba).map(|k| c - k), &|i| d.contains_key(&i), &noted);
+        (aa, ba, ac, bc)
     } else {
         // Use the EFFECTIVE (VRAM-capped) window, not the boot prefetch_ahead/behind. At 4K proxies
         // the fast budget holds far fewer frames than the boot window wants (e.g. ~78 vs 105+35), so
@@ -3592,12 +3695,10 @@ pub(crate) fn step_cache_meter(
             return;
         };
         let cache = cache.borrow();
-        (
-            aa,
-            ba,
-            (1..=aa).filter(|k| cache.contains_key(&(c + k))).count(),
-            (1..=ba).filter(|k| cache.contains_key(&(c - k))).count(),
-        )
+        let noted = support::cloud_noted_in(cloud, gen_now, shots, support::ReadTier::Fast, (c - ba)..=(c + aa));
+        let (aa, ac) = side(&mut (1..=aa).map(|k| c + k), &|i| cache.contains_key(&i), &noted);
+        let (ba, bc) = side(&mut (1..=ba).map(|k| c - k), &|i| cache.contains_key(&i), &noted);
+        (aa, ba, ac, bc)
     };
     // FILL fraction (cached ÷ available). An empty direction (folder edge) is trivially "full" — no
     // gap to show — but it also gets len==0 below, so it renders as nothing, not a green stub.
@@ -3762,7 +3863,10 @@ pub(crate) fn step_prefetch_detail(
     // instead of decoded. It is only ever set for `c`, and only when the tick suppressed that same
     // shot's fast decode this tick (`derive_c`) — the two are one decision, made once, so a
     // suppressed decode can never fail to be replaced and a derive can never run alongside one.
-    req_tx: &Sender<(usize, bool)>,
+    // 2026-10-28 (the cloud-only round): `(idx, derive, local_only)` — `local_only` = nobody is looking
+    // at it (not `support::detail_frame_explicit`), so the worker reads its file only if it is on
+    // this device.
+    req_tx: &Sender<(usize, bool, bool)>,
     // v0.8.115: the tick's suppression decision, forwarded (see `req_tx`). v0.8.116 (R5): it is the
     // NARROWED ask now — [`support::derive_ask`], the suppression MINUS the shots whose scrub frame is
     // already banked. The suppression itself is unchanged and still computed once (a shot whose fast
@@ -3818,6 +3922,12 @@ pub(crate) fn step_prefetch_detail(
     // ask for the awaited frame must leave under `Park` too, or the browse would be stopped on a
     // frame nothing is allowed to go and get.
     det_awaited: &AtomicI64,
+    // 2026-10-28 (the cloud-only round, design 3): the workers' notes, and what this tier reads for a
+    // shot (the RAW in RAW mode). A noted neighbour is passed over; the photos on screen and the
+    // frame a blocked browse waits for are not.
+    shots: &[Shot],
+    raw_mode: bool,
+    cloud: &support::CloudNotes,
 ) {
     // v1.0.0-rc (round X2 / F1): one read per call — both holds below answer from one value.
     let awaited = det_awaited.load(Ordering::Relaxed);
@@ -3963,12 +4073,28 @@ pub(crate) fn step_prefetch_detail(
         }
         wanted.truncate(distinct);
         wanted.truncate(wanted_cap);
+        // The cloud-only round: one short lock over the find. A noted neighbour is moved past (not
+        // latched, so a later download outside Falcon brings it back with its note); the explicit
+        // set keeps its ask.
+        let notes = cloud.lock().unwrap_or_else(|e| e.into_inner());
+        let tier = support::ReadTier::Detail { raw_mode };
+        let cloud_held = |i: usize| {
+            !notes.is_empty()
+                && !support::detail_frame_explicit(
+                    i,
+                    support::displayed_shot(i, c, compare.get(), cmp_a_idx.get(), cmp_b_idx.get(), len),
+                    awaited,
+                )
+                && shots.get(i).is_some_and(|s| support::cloud_noted(&notes, gen_now, i, s, tier))
+        };
         let next = wanted.iter().copied().find(|i| {
             !dcache.contains_key(i)
                 && !failed.contains(i)
                 && Some(*i) != pending_id
                 && !sent.contains(i)
+                && !cloud_held(*i)
         });
+        drop(notes);
         drop(sent);
         if let Some(next) = next {
             // ── v0.8.170 (ONE DECODE PER SHOT): IS IT ALREADY IN RAM? ───────────────────────────
@@ -4148,7 +4274,10 @@ pub(crate) fn step_prefetch_detail(
             // matters — a reader who believed it would conclude that the drain bound above can wedge
             // the detail tier by not draining, and would go and weaken the bound. The tick never
             // clears this flag at all.
-            send_or_rollback(req_tx, (next, derive_ask && next == c), ReqLane::Detail, || {
+            // The cloud-only round: the same explicit set the hold above asks, so a neighbour's file
+            // is read only if it is on this device.
+            let local_only = !support::detail_frame_explicit(next, displayed, awaited);
+            send_or_rollback(req_tx, (next, derive_ask && next == c, local_only), ReqLane::Detail, || {
                 det_sent.borrow_mut().remove(&next);
                 det_busy.store(false, Ordering::Relaxed);
             });
@@ -4551,7 +4680,9 @@ pub(crate) fn step_upload_drain(
     rot: &RotState,
     // v0.8.122 (M7): the film tier, read ONLY at the detail-success landing (`heal_thumb_failure`)
     // — a full decode that succeeded proves the file is readable, so a thumb that lost a scan-time
-    // AV/OneDrive race stops wearing a permanent broken mark. Nothing else here touches it.
+    // AV/OneDrive race stops wearing a permanent broken mark. 2026-10-28 (the cloud-only round): and
+    // at both landings of a photo on screen, which are queued in `film.cloud_landed` for
+    // `step_cloud_landed_with`'s re-check (viewing may have just downloaded it). Nothing else.
     film: &Film,
     // v0.8.128 (SEL-LAG P1): where a finished frosted-backdrop canvas is published. See
     // [`BackdropSink`] for why the key is promoted HERE and not at submit time.
@@ -4759,6 +4890,11 @@ pub(crate) fn step_upload_drain(
                 // pixels changed — a grow re-decode, a re-orientation), which is exactly what a tile
                 // showing that frame needs to hear.
                 fast_gen.set(fast_gen.get().wrapping_add(1));
+                // The cloud-only round (design 6): a photo on screen just landed, so viewing may have
+                // downloaded it — `step_cloud_landed_with` re-checks its notes and tag this tick.
+                if support::displayed_shot(id, c, compare.get(), cmp_a_idx.get(), cmp_b_idx.get(), len) {
+                    film.cloud_landed.borrow_mut().push(id);
+                }
                 // The byte budget and the mode's count limit, window-aware, never a protected photo
                 // (`evict_fast_window_aware`, the same body the per-tick retention below runs). In a
                 // mode its releases are counted (re-check R3): on a mode-change tick this arrival can
@@ -4896,6 +5032,11 @@ pub(crate) fn step_upload_drain(
                         log_event(&format!(
                             "thumb self-heal: #{id} decoded full-res, clearing its thumb-failure latch"
                         ));
+                    }
+                    // The cloud-only round (design 6): …and the same landing re-checks a photo on
+                    // screen's cloud notes and tag (`step_cloud_landed_with`).
+                    if support::displayed_shot(id, c, compare.get(), cmp_a_idx.get(), cmp_b_idx.get(), len) {
+                        film.cloud_landed.borrow_mut().push(id);
                     }
                     let mut order = order.borrow_mut();
                     order.retain(|&x| x != id);
@@ -6973,7 +7114,9 @@ pub(crate) struct ThumbAsk<'a> {
 /// Ask for `idx`'s thumbnail through the ordinary visible-tile path: pending dedup (a queued
 /// blur-feeder job is promoted, never duplicated), the strip's admission limit, and the start-up
 /// hold. A decode that fails latches `film.failed`, which `scrub_wait_ready` reads as ready, so a
-/// held step can never wait on a file that will not decode.
+/// held step can never wait on a file that will not decode. The cloud-only round: a file the worker
+/// finds only in the cloud is noted instead, which `scrub_wait_ready` also reads as ready, so this
+/// is never asked twice for one (its only caller asks only while the target is not ready).
 ///
 /// FALSIFIER: return at the top and `a_compare_browse_survives_two_steps_after_a_grid_scroll`
 /// stays held on its second step.
@@ -7045,6 +7188,9 @@ pub(crate) fn make_film_item(
     // THE ONLY PRODUCTION WRITER of FilmItem.selected, so the filmstrip, the grid dock and the
     // Review panel cannot disagree about what is selected.
     selected: bool,
+    // 2026-10-28 (the cloud-only round, owner answer 1): this shot's thumbnail file was found only in
+    // the cloud this folder (`film.cloud_skipped`). Passed in for the same reason as `failed`.
+    cloud: bool,
 ) -> FilmItem {
     FilmItem {
         pending: false,
@@ -7070,6 +7216,9 @@ pub(crate) fn make_film_item(
         // over a stale latch entry, so the surfaces read one fact, not two.
         failed: failed && !valid,
         selected, // v0.8.129 (W1-1)
+        // The cloud-only round: a landed picture (Falcon's thumbnail, or the stage's frame standing
+        // in) always wins, and a real failure keeps its broken-image mark.
+        cloud: cloud && !valid && !failed,
     }
 }
 
@@ -7251,6 +7400,18 @@ pub(crate) fn step_filmstrip(
                 (i >= 0 && i < len as i64).then_some(i as usize)
             }),
         );
+        // 2026-10-28 (the cloud-only round): …and the thumbnail files found only in the cloud, the
+        // same window and one short lock: drawn as the cloud mark, and never asked for again.
+        let cloud_now = support::cloud_noted_in(
+            &film.cloud_skipped,
+            gen_now,
+            shots,
+            support::ReadTier::Thumb,
+            (0..count).filter_map(|slot| {
+                let i = base + slot as i64;
+                (i >= 0 && i < len as i64).then_some(i as usize)
+            }),
+        );
         let items: Vec<FilmItem> = (0..count)
             .map(|slot| {
                 let idx = base + slot as i64;
@@ -7262,7 +7423,7 @@ pub(crate) fn step_filmstrip(
                 let shot = &shots[idx];
                 let (thumb, valid) = lookup_thumb(&tc, &cache, idx, &mut need_thumb, cm_now);
                 let mk = mv.get(idx).copied().unwrap_or(0);
-                make_film_item(shot, idx, c, thumb, valid, rv.get(idx).copied().unwrap_or(0), mk, rot.delta_of(idx), plan, failed_now.contains(&idx), sel.contains(idx))
+                make_film_item(shot, idx, c, thumb, valid, rv.get(idx).copied().unwrap_or(0), mk, rot.delta_of(idx), plan, failed_now.contains(&idx), sel.contains(idx), cloud_now.contains(&idx))
             })
             .collect();
         drop(cache);
@@ -7293,7 +7454,7 @@ pub(crate) fn step_filmstrip(
         let mut tp = thumb_pending.borrow_mut();
         let tfail = thumb_failed.lock().unwrap_or_else(|e| e.into_inner());
         for idx in need_thumb {
-            if !tfail.contains(&(gen_now, idx)) {
+            if !tfail.contains(&(gen_now, idx)) && !cloud_now.contains(&idx) {
                 if !film.defer_requests.get() { feed_visible_thumb(thumb_req, &mut tp, idx, gen_now, rot.delta_of(idx), THUMB_PENDING_MAX); }
             }
         }
@@ -11684,17 +11845,168 @@ pub(crate) fn heal_thumb_failure(
     true
 }
 
+/// 2026-10-28 (the cloud-only round) — the files of `idx` a worker noted as only in the cloud that
+/// are on this device now (`probe`, metadata only) leave the notes. Returns how many left.
+fn heal_cloud_notes(
+    idx: usize, gen_now: u64, shot: &Shot, notes: &support::CloudNotes, probe: &dyn Fn(&std::path::Path) -> bool,
+) -> usize {
+    let files: Vec<support::CloudFile> = {
+        let n = notes.lock().unwrap_or_else(|e| e.into_inner());
+        if n.is_empty() {
+            return 0;
+        }
+        [support::CloudFile::Finished, support::CloudFile::Raw]
+            .into_iter()
+            .filter(|f| n.contains(&(gen_now, idx, *f)))
+            .collect()
+    };
+    let path_of = |f: support::CloudFile| match f {
+        support::CloudFile::Finished => shot.jpg.as_deref(),
+        support::CloudFile::Raw => shot.raw.as_deref(),
+    };
+    // Probed outside the lock: the workers insert into it.
+    let local: Vec<support::CloudFile> = files.into_iter().filter(|&f| path_of(f).is_some_and(|p| !probe(p))).collect();
+    if !local.is_empty() {
+        let mut n = notes.lock().unwrap_or_else(|e| e.into_inner());
+        for f in &local {
+            n.remove(&(gen_now, idx, *f));
+        }
+    }
+    local.len()
+}
+
+/// The scan's cloud tag leaves these photos: `meta.cloud_tagged`, the retry ledger, and
+/// `Shot::cloud_placeholder` on the shared list (copy-on-write, so RAW export, the whole folder's
+/// preparation and the next rescan's identity check read the live answer), which is re-classified
+/// from its bytes at the same time (the file has arrived; `falcon_decode::reclassify_hydrated`).
+/// Shared by the 30 s sweep's hydrated tail and [`step_cloud_landed_with`]. Returns how many were
+/// re-classified.
+fn drop_cloud_tags(
+    idxs: &[usize],
+    shots_owner: &std::sync::Mutex<std::sync::Arc<Vec<Shot>>>,
+    cloud_tagged: &RefCell<HashSet<usize>>,
+    cloud_retry: &RefCell<HashMap<usize, CloudRetry>>,
+) -> usize {
+    let mut reclassified = 0usize;
+    {
+        let mut owner = shots_owner.lock().unwrap_or_else(|e| e.into_inner());
+        // The tick holds its own clone of this `Arc`, so `make_mut` clones the Vec once — a few
+        // hundred small structs, and only on the tick where something actually arrived.
+        let v = std::sync::Arc::make_mut(&mut *owner);
+        for &idx in idxs {
+            if let Some(shot) = v.get_mut(idx) {
+                shot.cloud_placeholder = false;
+                if falcon_decode::reclassify_hydrated(shot) {
+                    reclassified += 1;
+                }
+            }
+        }
+    }
+    let mut ct = cloud_tagged.borrow_mut();
+    let mut cr = cloud_retry.borrow_mut();
+    for idx in idxs {
+        ct.remove(idx);
+        cr.remove(idx);
+    }
+    reclassified
+}
+
+/// 2026-10-28 (the cloud-only round, design 6) — **A PHOTO ON SCREEN HAS LANDED: ARE ITS FILES ON THIS
+/// DEVICE NOW?** Viewing a cloud-only photo downloads it (the one download the rule allows), and its
+/// frame landing is the event that proves the file read. So for each photo on screen whose frame
+/// landed this tick (`film.cloud_landed`, queued by `step_upload_drain`):
+///   * each of its notes (files found only in the cloud) is re-checked, metadata only, and dropped if
+///     the file is local now, with `thumb_gen` bumped so its tile asks again and Falcon's own
+///     thumbnail replaces the stage's frame standing in for it (owner answer 2);
+///   * the scan's tag is dropped once NEITHER file is online-only ([`drop_cloud_tags`]), so RAW export
+///     and the whole folder's preparation stop treating it as cloud. Viewing in JPEG mode downloads
+///     only the JPEG, so a pair whose RAW is still in the cloud keeps its tag (the plan's side effect).
+///
+/// From an event, not a state, so it cannot loop: one or two metadata calls per landing, and only for
+/// a photo with a note or a tag; a local folder pays one empty-`Vec` check a tick.
+///
+/// FALSIFIER (L28): drop the tag without the re-check and
+/// `a_landing_on_screen_heals_its_notes_and_drops_the_tag_only_when_all_local` reddens on the pair.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn step_cloud_landed_with(
+    gen_now: u64,
+    shots: &[Shot],
+    film: &Film,
+    shots_owner: &std::sync::Mutex<std::sync::Arc<Vec<Shot>>>,
+    cloud_tagged: &RefCell<HashSet<usize>>,
+    cloud_retry: &RefCell<HashMap<usize, CloudRetry>>,
+    thumb_gen: &Cell<u64>,
+    probe: impl Fn(&std::path::Path) -> bool,
+) {
+    let landed = std::mem::take(&mut *film.cloud_landed.borrow_mut());
+    if landed.is_empty() {
+        return;
+    }
+    let mut seen: Vec<usize> = Vec::with_capacity(landed.len());
+    let mut healed = 0usize;
+    let mut untag: Vec<usize> = Vec::new();
+    for idx in landed {
+        if seen.contains(&idx) {
+            continue;
+        }
+        seen.push(idx);
+        let Some(shot) = shots.get(idx) else { continue };
+        healed += heal_cloud_notes(idx, gen_now, shot, &film.cloud_skipped, &probe);
+        if cloud_tagged.borrow().contains(&idx) && !support::shot_is_cloud_only(shot, &probe) {
+            untag.push(idx);
+        }
+    }
+    if healed > 0 {
+        thumb_gen.set(thumb_gen.get().wrapping_add(1));
+    }
+    if !untag.is_empty() {
+        drop_cloud_tags(&untag, shots_owner, cloud_tagged, cloud_retry);
+    }
+    if healed > 0 || !untag.is_empty() {
+        log_event(&format!(
+            "cloud: a photo on screen is on this device now — {healed} cloud note(s) dropped, {} scan tag(s) dropped",
+            untag.len()
+        ));
+    }
+}
+
+/// The cloud-only round: at most this many cloud notes are re-checked per 30 s sweep (metadata only,
+/// on the interface thread), nearest the current photo first.
+pub(crate) const CLOUD_SWEEP_MAX: usize = 150;
+
+/// The cloud-only round: what the 30 s sweep needs beyond the scan's tags — the workers' notes, the
+/// photos on screen or near the current one (`near`: the filmstrip's window, the Review panel's and the
+/// grid dock's tiles, the photos beside the current one and the Compare halves, the preview window),
+/// and the counter that makes the key-gated tiles ask again.
+pub(crate) struct CloudSweep<'a> {
+    pub(crate) notes: &'a support::CloudNotes,
+    pub(crate) c: usize,
+    pub(crate) near: &'a dyn Fn(usize) -> bool,
+    pub(crate) thumb_gen: &'a Cell<u64>,
+}
+
 /// v0.8.24 (D3): timed retry sweep for cloud (OneDrive) placeholder shots. Their per-session failure
 /// latches (fast / detail / thumb / roi / the dims probe) would otherwise be PERMANENT — an offline or
 /// sync-paused placeholder that failed to decode once would look broken for the whole session. Every
-/// ~30 s, and ONLY while some placeholder is tagged (`is_empty()` gate ⇒ zero cost on local-only folders),
-/// for each TAGGED shot that has actually LATCHED a failure under the current generation: re-stat the file
-/// (metadata-only — no data read, no hydration), DROP the tag if it has hydrated since scan (so the shot
-/// goes fully-normal), and CLEAR its failure latches so the normal pipeline re-attempts. Bounded to
-/// tagged ∩ failed, under the current gen only (the (gen,idx) latch discipline; stale-gen entries are
-/// already unreadable and get cleared on swap).
+/// ~30 s, and ONLY while some placeholder is tagged or a file is noted (the gate ⇒ zero cost on
+/// local-only folders), for each TAGGED shot that has actually LATCHED a failure under the current
+/// generation: re-stat the file (metadata-only — no data read, no hydration), DROP the tag if it has
+/// hydrated since scan (so the shot goes fully-normal), and CLEAR its failure latches so the normal
+/// pipeline re-attempts. Bounded to tagged ∩ failed, under the current gen only (the (gen,idx) latch
+/// discipline; stale-gen entries are already unreadable and get cleared on swap).
+///
+/// 2026-10-28 (the cloud-only round, design 6 / owner answer 2): …AND THE WORKERS' NOTES OF PHOTOS ON
+/// SCREEN OR NEAR THE CURRENT ONE (`cloud.near`), up to [`CLOUD_SWEEP_MAX`], nearest first: a file
+/// downloaded outside Falcon ("Always keep on this device", a Finder download) leaves the notes and
+/// its tile asks again (`thumb_gen`), within about 30 s. A file still in the cloud keeps its note, so
+/// the tile does not flicker and the file is never read. Notes further away wait until they come on
+/// screen or the folder is reopened. `probe` is `falcon_decode::file_is_cloud_placeholder` in
+/// production (the `run_thumb_job_with` seam).
+///
+/// FALSIFIER (L28): drop the notes pass and `the_sweep_finds_a_file_downloaded_outside_falcon`
+/// reddens with the note kept; drop the `near` bound and its probe count reddens.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn step_cloud_retry(
+pub(crate) fn step_cloud_retry_with(
     now: Instant,
     gen_now: u64,
     shots: &[Shot],
@@ -11716,9 +12028,13 @@ pub(crate) fn step_cloud_retry(
     // it governs (cleared at `apply_scan` beside `cloud_tagged`). Dropped for a shot the moment it
     // hydrates, so a file that comes down and later fails for a different reason starts fresh.
     cloud_retry: &RefCell<HashMap<usize, CloudRetry>>,
+    cloud: CloudSweep<'_>,
+    probe: impl Fn(&std::path::Path) -> bool,
 ) {
-    // Zero-cost gate FIRST: nothing tagged (local-only folder) → return without touching the clock.
-    if cloud_tagged.borrow().is_empty() {
+    // Zero-cost gate FIRST: nothing tagged and nothing noted (local-only folder) → return without
+    // touching the clock. One uncontended lock a tick.
+    let noted = !cloud.notes.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+    if cloud_tagged.borrow().is_empty() && !noted {
         return;
     }
     if now.duration_since(*last_sweep.borrow()) < Duration::from_secs(30) {
@@ -11749,8 +12065,7 @@ pub(crate) fn step_cloud_retry(
         // the LATCH CLEARING below, which is what makes every tier re-open the file.
         let mut is_hydrated = false;
         if let Some(shot) = shots.get(idx) {
-            let still = shot.raw.as_deref().map_or(false, falcon_decode::file_is_cloud_placeholder)
-                || shot.jpg.as_deref().map_or(false, falcon_decode::file_is_cloud_placeholder);
+            let still = support::shot_is_cloud_only(shot, &probe);
             if !still {
                 hydrated.push(idx);
                 is_hydrated = true;
@@ -11790,25 +12105,45 @@ pub(crate) fn step_cloud_retry(
     // scan was forbidden to read it, so it kept the name's answer, and this sweep then cleared the
     // latches every 30 s so all three tiers could re-fail as a JPEG — indefinitely, until the user
     // thought to leave the folder and come back, a step he has no way to discover.
-    let mut reclassified = 0usize;
-    if !hydrated.is_empty() {
-        let mut owner = shots_owner.lock().unwrap_or_else(|e| e.into_inner());
-        // The tick holds its own clone of this `Arc`, so `make_mut` clones the Vec once — a few
-        // hundred small structs, and only on the sweep where something actually arrived.
-        let v = std::sync::Arc::make_mut(&mut *owner);
-        for &idx in &hydrated {
-            if let Some(shot) = v.get_mut(idx) {
-                if falcon_decode::reclassify_hydrated(shot) {
-                    reclassified += 1;
-                }
+    // The cloud-only round: the tag leaves through the one helper the landing re-check uses, which
+    // also clears `Shot::cloud_placeholder` (the sweep used to leave it, so RAW export kept refusing a
+    // RAW that had come down); a hydrated photo's notes are stale too.
+    let reclassified = if hydrated.is_empty() { 0 } else { drop_cloud_tags(&hydrated, shots_owner, cloud_tagged, cloud_retry) };
+    let mut healed = 0usize;
+    if !hydrated.is_empty() && noted {
+        let mut n = cloud.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let before = n.len();
+        n.retain(|&(_, i, _)| !hydrated.contains(&i));
+        healed += before - n.len();
+    }
+    // …and the notes of photos on screen or near the current one, bounded, nearest first.
+    if noted {
+        let mut near: Vec<(usize, support::CloudFile)> = cloud
+            .notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(g, i, _)| g == gen_now && (cloud.near)(i))
+            .map(|&(_, i, f)| (i, f))
+            .collect();
+        near.sort_by_key(|&(i, f)| (i.abs_diff(cloud.c), f == support::CloudFile::Raw));
+        near.truncate(CLOUD_SWEEP_MAX);
+        let mut seen: Vec<usize> = Vec::new();
+        for (i, _) in near {
+            if seen.contains(&i) {
+                continue;
+            }
+            seen.push(i);
+            if let Some(shot) = shots.get(i) {
+                healed += heal_cloud_notes(i, gen_now, shot, cloud.notes, &probe);
             }
         }
     }
-    if !hydrated.is_empty() {
-        let mut ct = cloud_tagged.borrow_mut();
-        for idx in &hydrated {
-            ct.remove(idx);
-        }
+    if healed > 0 {
+        cloud.thumb_gen.set(cloud.thumb_gen.get().wrapping_add(1));
+        log_event(&format!(
+            "cloud-retry: {healed} file(s) noted as only in the cloud are on this device now — their tiles ask again"
+        ));
     }
     if reclassified > 0 {
         log_event(&format!(
@@ -13038,7 +13373,15 @@ pub(crate) fn step_hover_preview(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(&(gen_now, i));
-            if failed {
+            // 2026-10-28 (the cloud-only round, owner answer 5): a file found only in the cloud is not
+            // asked for either: the card keeps what is in hand, downloads nothing and never says
+            // "Loading…". A first ask for one is refused by the worker (the ask is marked
+            // `local_only` below), which notes it, so the next tick lands here.
+            let cloud = shots.get(i).is_some_and(|s| {
+                let n = film.cloud_skipped.lock().unwrap_or_else(|e| e.into_inner());
+                support::cloud_noted(&n, gen_now, i, s, support::ReadTier::Fast)
+            });
+            if failed || cloud {
                 None
             } else {
                 Some(i)
@@ -13097,12 +13440,15 @@ pub(crate) fn step_hover_preview(
                 // will never be popped.
                 p.queue.retain(|&x| x != old);
                 p.costly_q.remove(&old);
+                p.local_only_q.remove(&old);
             }
         }
         if let Some(i) = want_req {
             let capped = support::fast_cost_view()
                 .costly_by_prior(shots.get(i).map_or(SrcKind::Jpeg, |s| s.kind));
-            if support::pump_push_front(&mut p, i, capped) {
+            // The cloud-only round: nobody is looking at a hovered photo yet, so its worker reads the
+            // file only if it is on this device (`support::Pump::local_only_q`).
+            if support::pump_push_front(&mut p, i, capped, true) {
                 cv.notify_one();
             }
             in_flight = p.inflight.contains(&i) || p.queue.contains(&i);
@@ -13219,6 +13565,66 @@ pub(crate) fn apply_hover_appears(app: &MainWindow, cell: i32) {
     });
 }
 
+/// 2026-10-29 (owner, testing rc.2) — WHAT `step_selection` REMEMBERS BETWEEN PASSES: the photos the
+/// Review panel last showed and each one's inputs to its tile ("lighter row updates": only the rows
+/// whose inputs changed are rewritten), and the jump list's sampled rows with the row count they were
+/// sampled for ("re-sample after bigger changes").
+#[derive(Default)]
+pub(crate) struct SelCache {
+    order: Vec<usize>,
+    sigs: Vec<TileSig>,
+    /// The rebuild key less the picture generations: (sel_gen, filter, folder generation, select_gen).
+    content: Option<(u64, i32, u64, u64)>,
+    jump: Option<JumpBasis>,
+}
+
+impl SelCache {
+    /// How many tile inputs (each holding its picture) the memory keeps.
+    #[cfg(test)]
+    pub(crate) fn pictures(&self) -> usize {
+        self.sigs.len()
+    }
+}
+
+/// One photo's inputs to its Review tile that can change while the panel holds the same photos. The
+/// name, number, badge and kind come from the folder's scan, which a new folder generation replaces
+/// (the full rebuild).
+#[derive(Clone)]
+struct TileSig {
+    // A thumbnail is compared by its pixel buffer, so a new one is a change. A preview frame standing
+    // in (a GPU texture) never compares equal in Slint 1.17, so such a row is rewritten every pass,
+    // as before: right, only not lighter.
+    thumb: slint::Image,
+    valid: bool,
+    rating: i32,
+    mk: u8,
+    rot: u8,
+    failed: bool,
+    selected: bool,
+    cloud: bool,
+    current: bool,
+}
+
+impl PartialEq for TileSig {
+    fn eq(&self, o: &Self) -> bool {
+        // Slint never counts two empty images as equal (`ImageInner`'s `PartialEq` has no arm for
+        // two `None`s), and while a big folder loads most tiles have no picture yet: here an empty
+        // picture equals another empty one, or every such row would count as changed every pass.
+        let empty = |i: &slint::Image| i.size().width == 0;
+        (self.thumb == o.thumb || (empty(&self.thumb) && empty(&o.thumb)))
+            && (self.valid, self.rating, self.mk, self.rot, self.failed, self.selected, self.cloud, self.current)
+                == (o.valid, o.rating, o.mk, o.rot, o.failed, o.selected, o.cloud, o.current)
+    }
+}
+
+/// The jump list's rows, and the row count, tier, filter and folder they were sampled for.
+struct JumpBasis {
+    picks: Vec<usize>,
+    basis_rows: usize,
+    n: usize,
+    ident: Option<(i32, u64)>,
+}
+
 /// 8b) Selection panel: surface a finished copy/move/export result + re-scan after a move; counts
 /// (always cheap) + the tile grid (rebuilt only when selection/filter changes, and only while open).
 #[allow(clippy::too_many_arguments)]
@@ -13295,6 +13701,7 @@ pub(crate) fn step_selection(
     sel_model: &slint::VecModel<SelTileRow>,
     rot: &RotState, // v0.8.0: the delta each thumb request carries
     cloud_tagged: &RefCell<HashSet<usize>>, // v0.8.24 (D4): live cloud-placeholder set → the download advisory
+    sel_cache: &RefCell<SelCache>, // 2026-10-29 (owner, testing rc.2): the rows' and the jump list's memory
 ) {
     // v0.8.32 (§64): rebind the Film field this fn's rebuild reads to the local its body already
     // references (pure state-move extraction). v0.8.42: the `pending`/`failed` aliases left with the
@@ -13629,7 +14036,20 @@ pub(crate) fn step_selection(
         // the floating preview froze wherever a background thumbnail happened to arrive — the
         // user-reported "second drag gets stuck"). The key stays dirty, so the deferred rebuild
         // fires on the first tick after the drop.
+        // The rows' memory holds every tile's picture (thumbnails, and preview textures standing in).
+        // A closed panel lets go of its rows in the background release
+        // (`background_memory::release_unrefreshed_models`), so closed, the memory lets go of them too;
+        // the next pass after it opens rebuilds in full.
+        if !app.get_sel_open() {
+            let mut memo = sel_cache.borrow_mut();
+            if !memo.sigs.is_empty() {
+                memo.order = Vec::new();
+                memo.sigs = Vec::new();
+                memo.content = None;
+            }
+        }
         if app.get_sel_open() && !app.get_sel_dragging() && last_sel_key.get() != (sgv, filt_key, tgen, gen_now, selgv, fgen) {
+            let prev_key = last_sel_key.get();
             last_sel_key.set((sgv, filt_key, tgen, gen_now, selgv, fgen));
             let rv = ratings.borrow();
             let mv = marks.borrow();
@@ -13665,7 +14085,6 @@ pub(crate) fn step_selection(
             // windowed; the element count is not. Virtualizing the grid is a design item on the
             // prefetch-derive posture round's list (it also re-opens that round's sel-lag
             // diagnosis, which eliminated rebuild churn on the premise that this WAS windowed).
-            let failed_now = failed_thumbs_in(&film.failed, gen_now, 0..len);
             let order = support::displayed_order(
                 len,
                 filt,
@@ -13675,32 +14094,72 @@ pub(crate) fn step_selection(
                 &|i| rot.delta_of(i) != 0,
                 &|i| sel.contains(i),
             );
-            let mut items: Vec<FilmItem> = Vec::with_capacity(order.len());
-            for i in order {
-                let r = rv.get(i).copied().unwrap_or(0);
-                let mk = mv.get(i).copied().unwrap_or(0);
-                let rd = rot.delta_of(i); // v0.8.0: this shot's manual delta (badge + Rotated filter)
-                let shot = &shots[i];
-                let (thumb, valid) = lookup_thumb(&tc, &cache, i, &mut need_thumb, cm_now);
-                items.push(make_film_item(shot, i, c, thumb, valid, r, mk, rd, plan, failed_now.contains(&i), sel.contains(i)));
-            }
+            // Codex review R1: the jump list's content key, published with the rows below.
+            let rows_key = support::review_rows_key(gen_now, &order);
+            // The failure and cloud snapshots, one short lock each, for the panel's photos only:
+            // every lookup below is one of them (it was the whole folder).
+            let failed_now = failed_thumbs_in(&film.failed, gen_now, order.iter().copied());
+            let cloud_now = support::cloud_noted_in(&film.cloud_skipped, gen_now, shots, support::ReadTier::Thumb, order.iter().copied());
+            // 2026-10-29 (owner, testing rc.2: "lighter row updates") — ONLY THE ROWS WHOSE TILES
+            // CHANGED. A thumbnail or preview frame landing anywhere in the folder moves this key, and
+            // on a 7,000-photo folder they land tens of times a second; every pass used to build every
+            // tile again (four strings each) and rewrite every row. Each photo's inputs to its tile
+            // are cheap to gather, so a pass over the same photos in the same order (and the same
+            // content key) rewrites only the rows where an input changed. Anything else (another
+            // filter, folder, rating set or selection, or a model this step did not leave as it was)
+            // takes the full path.
+            let sigs: Vec<TileSig> = order
+                .iter()
+                .map(|&i| {
+                    let (thumb, valid) = lookup_thumb(&tc, &cache, i, &mut need_thumb, cm_now);
+                    TileSig {
+                        thumb,
+                        valid,
+                        rating: rv.get(i).copied().unwrap_or(0),
+                        mk: mv.get(i).copied().unwrap_or(0),
+                        rot: rot.delta_of(i), // v0.8.0: this shot's manual delta (badge + Rotated filter)
+                        failed: failed_now.contains(&i),
+                        selected: sel.contains(i),
+                        cloud: cloud_now.contains(&i),
+                        current: i == c,
+                    }
+                })
+                .collect();
+            let item = |p: usize| {
+                let (i, s) = (order[p], &sigs[p]);
+                make_film_item(&shots[i], i, c, s.thumb.clone(), s.valid, s.rating, s.mk, s.rot, plan, s.failed, s.selected, s.cloud)
+            };
             // row-chunk into pairs for the 2-column grid (Slint 1.17 has no flex-wrap)
-            let n_items = items.len(); // v0.8.124 (R2): PHOTOS, before the pairing halves the count
-            let mut rows: Vec<SelTileRow> = Vec::with_capacity((items.len() + 1) / 2);
-            let mut it = items.into_iter();
-            while let Some(a) = it.next() {
-                match it.next() {
-                    Some(b) => rows.push(SelTileRow { a, b, has_b: true }),
-                    None => rows.push(SelTileRow { a, b: FilmItem::default(), has_b: false }),
+            let row = |r: usize| {
+                if 2 * r + 1 < order.len() {
+                    SelTileRow { a: item(2 * r), b: item(2 * r + 1), has_b: true }
+                } else {
+                    SelTileRow { a: item(2 * r), b: FilmItem::default(), has_b: false }
                 }
-            }
+            };
+            let n_items = order.len(); // v0.8.124 (R2): PHOTOS, before the pairing halves the count
+            let n_rows = n_items.div_ceil(2);
+            let mut memo = sel_cache.borrow_mut();
+            let content = (sgv, filt_key, gen_now, selgv);
+            let light = prev_key != crate::background_memory::SEL_KEY_UNBUILT
+                && memo.content == Some(content)
+                && memo.order == order
+                && sel_model.row_count() == n_rows;
             // V3: reuse the live SelTile rows when the row COUNT is unchanged (the common rebuild
             // trigger is a thumbnail landing → thumb_gen bumps the key but the filtered set is the
             // same size). set_vec is a full MODEL RESET — it destroys + recreates every SelTile
             // subtree (measured as the large-folder Selection-grid churn); set_row_data updates the
             // existing instances in place. Only a filter/selection change (different match count)
             // takes the reset path. (Same set_vec-vs-set_row_data rule as the filmstrip, v0.3.30.)
-            if sel_model.row_count() != rows.len() {
+            if light {
+                let mut last = usize::MAX;
+                for (p, (now, was)) in sigs.iter().zip(&memo.sigs).enumerate() {
+                    if now != was && p / 2 != last {
+                        last = p / 2;
+                        sel_model.set_row_data(last, row(last));
+                    }
+                }
+            } else if sel_model.row_count() != n_rows {
                 // v1.0.0-rc (queue item 31, §2 Q8 / ledger L22): `set_vec` is the full MODEL RESET —
                 // every `SelTile` subtree is destroyed and recreated — and "a destroyed TouchArea
                 // NEVER fires `changed has-hover`", so the hovered tile's index would be stranded on
@@ -13710,11 +14169,19 @@ pub(crate) fn step_selection(
                 // its TouchArea and its preview (sheet 2.5h, h5). Rows:
                 // `a_reset_tile_set_cannot_strand_the_hover` and `a_rating_in_place_keeps_the_hover`.
                 app.set_sel_hover_idx(-1);
+                let rows: Vec<SelTileRow> = (0..n_rows).map(row).collect();
                 sel_model.set_vec(rows);
             } else {
-                for (slot, row) in rows.into_iter().enumerate() {
-                    sel_model.set_row_data(slot, row);
+                for slot in 0..n_rows {
+                    sel_model.set_row_data(slot, row(slot));
                 }
+            }
+            memo.order = order;
+            memo.sigs = sigs;
+            memo.content = Some(content);
+            drop(memo);
+            if app.get_review_rows_key() != rows_key {
+                app.set_review_rows_key(rows_key);
             }
             drop(cache);
             drop(tc);
@@ -13880,12 +14347,82 @@ pub(crate) fn step_selection(
                 }
             }
         }
+        // 2026-10-29 (the jump lists round) — THE REVIEW JUMP LIST. Its entries are panel rows
+        // sampled evenly for the tier the Slint side publishes from the scroll bar's real height
+        // (`review-jump-n`), republished only when they change (at most 64 numbers).
+        //
+        // Owner, testing rc.2 ("Re-sample after bigger changes"): a new pick no longer re-samples
+        // them all. The sampled rows are kept, the last moved to the last row, until the row count
+        // has moved by one entry's spacing from the count they were sampled for; a new tier, filter
+        // or folder samples afresh (`support::jump_rows_kept`).
+        let (picks, basis) = {
+            let mut memo = sel_cache.borrow_mut();
+            let n = app.get_review_jump_n().max(0) as usize;
+            let rows = sel_model.row_count();
+            let ident = memo.content.map(|(_, f, g, _)| (f, g));
+            let kept = match &memo.jump {
+                Some(j) if j.n == n && j.ident == ident => support::jump_rows_kept(&j.picks, j.basis_rows, rows, n),
+                _ => None,
+            };
+            match kept {
+                Some(p) => {
+                    let basis = memo.jump.as_ref().map_or(rows, |j| j.basis_rows);
+                    if let Some(j) = memo.jump.as_mut() {
+                        j.picks.clone_from(&p);
+                    }
+                    (p, basis)
+                }
+                None => {
+                    let p = support::jump_rows(rows, n);
+                    memo.jump = Some(JumpBasis { picks: p.clone(), basis_rows: rows, n, ident });
+                    (p, rows)
+                }
+            }
+        };
+        // The Slint side finds the entry for a row on the spacing of the count they were sampled for.
+        if app.get_review_jump_basis() != basis as i32 {
+            app.set_review_jump_basis(basis as i32);
+        }
+        let shown = app.get_review_jump_rows();
+        if shown.row_count() != picks.len() || picks.iter().enumerate().any(|(i, &r)| shown.row_data(i) != Some(r as i32)) {
+            app.set_review_jump_rows(slint::ModelRc::new(slint::VecModel::from(
+                picks.iter().map(|&r| r as i32).collect::<Vec<i32>>(),
+            )));
+        }
+        // While the list is open its photos are on screen too: they join `want` after every visible
+        // tile (a distance past the farthest), so they are pinned with them below and asked for after
+        // them, through the same cloud check, failure latch, start-up hold and request cap. Owner,
+        // testing rc.2: they are asked for from the entry under the pointer (else the current entry,
+        // `review-jump-focus`) outward ("Thumbnails near the pointer first"), and they stay pinned while
+        // the panel is open, so a reopened list shows them at once ("Keep list thumbnails between
+        // opens"); closed, nothing new is asked for, and only those already loaded stay pinned: a pin
+        // also keeps a queued request from being retired (`step_retire_thumbs`), and the newly visible
+        // tiles must not wait behind a closed list's requests.
+        let open = app.get_review_jump_open();
+        let loaded = film.thumbs.borrow();
+        let past = want.iter().map(|&(d, _)| d + 1).max().unwrap_or(0);
+        let focus = (app.get_review_jump_focus().max(0) as usize).min(picks.len().saturating_sub(1));
+        let mut keep: Vec<usize> = Vec::new();
+        for (rank, &r) in picks.iter().enumerate() {
+            let Some(row) = sel_model.row_data(r) else { continue };
+            let photos = [Some(row.a.idx), row.has_b.then_some(row.b.idx)];
+            for idx in photos.into_iter().flatten().map(|i| i as usize).filter(|&i| i < len) {
+                if open {
+                    want.push((past + rank.abs_diff(focus), idx));
+                } else if loaded.contains_key(&idx) {
+                    keep.push(idx);
+                }
+            }
+        }
+        drop(loaded);
         {
-            // Replace the pin set wholesale (≲ ~40 entries — a viewport, not a folder). Cleared on
-            // close below and on folder swap by Film::on_folder_swap (the §64 membership invariant).
+            // Replace the pin set wholesale (≲ ~40 entries — a viewport, not a folder — plus the jump
+            // list's at most 128). Cleared on close below and on folder swap by
+            // Film::on_folder_swap (the §64 membership invariant).
             let mut pin = film.pinned.borrow_mut();
             pin.clear();
             pin.extend(want.iter().map(|&(_, i)| i));
+            pin.extend(keep);
         }
         want.sort_by_key(|&(d, _)| d); // centre-out: the tiles under the user's eye decode first
         let tc = film.thumbs.borrow();
@@ -13894,10 +14431,15 @@ pub(crate) fn step_selection(
         // catalogue lookup_thumb builds), so a bare containment test would leave a switched
         // session's panel showing the old colours until eviction.
         let cm_now = support::cm_bake_key(app.get_output_gamut());
+        // 2026-10-28 (the cloud-only round): this feeder runs EVERY tick, so a noted cloud tile would
+        // be asked for, answered and asked for again at tick rate. One short lock for the window.
+        let cloud_now = support::cloud_noted_in(
+            &film.cloud_skipped, gen_now, shots, support::ReadTier::Thumb, want.iter().map(|&(_, i)| i),
+        );
         let mut tp = film.pending.borrow_mut();
         let tfail = film.failed.lock().unwrap_or_else(|e| e.into_inner());
         for (_, idx) in want {
-            if thumb_needs_bake(&tc, idx, cm_now) && !tfail.contains(&(gen_now, idx)) {
+            if thumb_needs_bake(&tc, idx, cm_now) && !tfail.contains(&(gen_now, idx)) && !cloud_now.contains(&idx) {
                 if !film.defer_requests.get() { feed_visible_thumb(thumb_req, &mut tp, idx, gen_now, rot.delta_of(idx), SEL_FEED_PENDING_MAX); }
             }
         }
@@ -14156,6 +14698,14 @@ pub(crate) fn step_folder_grid(
             gen_now,
             (0..count).filter_map(|slot| (base as usize * cols + slot).checked_sub(leading)).filter(|i| *i < len),
         );
+        // The cloud-only round: the thumbnail files found only in the cloud, as the filmstrip asks.
+        let cloud_now = support::cloud_noted_in(
+            &film.cloud_skipped,
+            gen_now,
+            shots,
+            support::ReadTier::Thumb,
+            (0..count).filter_map(|slot| (base as usize * cols + slot).checked_sub(leading)).filter(|i| *i < len),
+        );
         let items: Vec<FilmItem> = (0..count)
             .map(|slot| {
                 let row_index = base as usize * cols + slot;
@@ -14167,7 +14717,7 @@ pub(crate) fn step_folder_grid(
                 let shot = &shots[idx];
                 let (thumb, valid) = lookup_thumb(&tc, &cache, idx, &mut need_thumb, cm_now);
                 let mk = mv.get(idx).copied().unwrap_or(0);
-                make_film_item(shot, idx, c, thumb, valid, rv.get(idx).copied().unwrap_or(0), mk, rot.delta_of(idx), plan, failed_now.contains(&idx), sel.contains(idx))
+                make_film_item(shot, idx, c, thumb, valid, rv.get(idx).copied().unwrap_or(0), mk, rot.delta_of(idx), plan, failed_now.contains(&idx), sel.contains(idx), cloud_now.contains(&idx))
             })
             .collect();
         drop(cache);
@@ -14201,7 +14751,7 @@ pub(crate) fn step_folder_grid(
         let mut tp = film.pending.borrow_mut();
         let tfail = film.failed.lock().unwrap_or_else(|e| e.into_inner());
         for idx in need_thumb {
-            if !tfail.contains(&(gen_now, idx)) {
+            if !tfail.contains(&(gen_now, idx)) && !cloud_now.contains(&idx) {
                 if !film.defer_requests.get() { feed_visible_thumb(thumb_req, &mut tp, idx, gen_now, rot.delta_of(idx), GRID_FEED_PENDING_MAX); }
             }
         }
@@ -15323,6 +15873,8 @@ mod pool_posture_enqueue_tests {
         // Round 2b review R2: the momentum split the step is handed (0.67, the resting forward lean,
         // unless a row browses backward).
         split: Cell<f32>,
+        // The cloud-only round: the workers' notes of files found only in the cloud.
+        cloud: support::CloudNotes,
     }
 
     impl Rig {
@@ -15352,6 +15904,7 @@ mod pool_posture_enqueue_tests {
                 cmp_a: Cell::new(0),
                 cmp_b: Cell::new(0),
                 split: Cell::new(0.67),
+                cloud: Mutex::new(HashSet::new()),
             }
         }
 
@@ -15513,7 +16066,7 @@ mod pool_posture_enqueue_tests {
                 self.split.get(),
                 1, &self.l2, ram_l2, 2048, &self.gamut, &self.sup, &self.tx, &self.hits,
                 false, interactive_busy, derive_c, &self.c_serves, &self.rot, fast_hold,
-                limits,
+                limits, &self.cloud,
             );
             let p = self.fast.pump.0.lock().unwrap();
             p.queue.iter().copied().collect()
@@ -15637,6 +16190,50 @@ mod pool_posture_enqueue_tests {
         let b = support::mode_limits(support::MODE_BALANCED, support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None);
         let _ = bal.tick_mode(100, &shots, costly_view(), cap, false, b);
         assert_eq!(bal.eff_win.get(), (40, 10));
+    }
+
+    /// 2026-10-28 (the cloud-only round, design 3–4) — **NOTHING AHEAD IS DOWNLOADED, AND THE PHOTOS
+    /// ON SCREEN STILL ARE.** A photo whose preview file a worker found only in the cloud is not
+    /// queued again this folder; the current photo and the Compare halves are queued all the same
+    /// (owner answer 4: they may download). Every queued photo but those is marked for the worker's
+    /// own check, so a file freed up after the scan is caught there too. Another folder's note, and a
+    /// note for a file the preview does not read, hold nothing back.
+    ///
+    /// FALSIFIER (L28): drop the notes filter in `step_prefetch_fast` and 101 is queued; drop the
+    /// `displayed` exemption and the current photo is missing; skip the mark and the marked row reddens.
+    #[test]
+    fn previews_ahead_skip_a_noted_cloud_file_and_mark_the_rest() {
+        let shots: Vec<Shot> = (0..200).map(jpeg).collect();
+        let rig = Rig::new();
+        for i in [100usize, 101, 102] {
+            rig.cloud.lock().unwrap().insert((1, i, support::CloudFile::Finished));
+        }
+        rig.cloud.lock().unwrap().insert((0, 103, support::CloudFile::Finished)); // another folder's
+        rig.cloud.lock().unwrap().insert((1, 104, support::CloudFile::Raw)); // not what a preview reads
+        let tick = || rig.tick_mode(100, &shots, support::FastCostView::inert(), usize::MAX, false, support::EfficiencyLimits::RELEASED);
+        let q = tick();
+        assert!(q.contains(&100), "the current photo is asked for though noted: viewing may download");
+        assert!(!q.contains(&101) && !q.contains(&102), "a noted photo ahead is not asked for again: {q:?}");
+        assert!(q.contains(&99) && q.contains(&103) && q.contains(&104), "the rest of the window is");
+        {
+            let p = rig.fast.pump.0.lock().unwrap();
+            assert!(!p.local_only_q.contains(&100), "the photo on screen is not marked");
+            assert!(q.iter().filter(|&&i| i != 100).all(|i| p.local_only_q.contains(i)), "every other queued photo is");
+        }
+        // Compare: both halves are on screen, so a noted half is asked for, unmarked.
+        rig.pop_all();
+        {
+            let mut p = rig.fast.pump.0.lock().unwrap();
+            p.inflight.clear();
+            p.costly_inflight.clear();
+        }
+        rig.compare.set(true);
+        rig.cmp_a.set(100);
+        rig.cmp_b.set(102);
+        let q = tick();
+        assert!(q.contains(&102), "a Compare half is a photo on screen: {q:?}");
+        assert!(!q.contains(&101), "…its noted neighbour is not");
+        assert!(!rig.fast.pump.0.lock().unwrap().local_only_q.contains(&102), "…and the half is unmarked");
     }
 
     /// Round 2b review R2 (Codex): **CUSTOM UNLIMITED PREPARES ITS WHOLE KEPT WINDOW IN EITHER
@@ -18022,7 +18619,7 @@ mod thumb_retire_tests {
             .collect();
         let fast = RefCell::new(FastCache::new());
         let fast_failed = Mutex::new(HashSet::new());
-        let ready = |film: &Film| scrub_wait_ready(501, 500, 7, &shots, &film.thumbs, &fast, &film.failed, &fast_failed);
+        let ready = |film: &Film| scrub_wait_ready(501, 500, 7, &shots, &film.thumbs, &fast, &film.failed, &fast_failed, &film.cloud_skipped);
         let keep = thumb_keep_around(0, Some((0, 500)));
         let strip = (0, 5); // the filmstrip follows A
         film.pinned.borrow_mut().extend(495..510); // the grid shows B's rows
@@ -18829,6 +19426,36 @@ mod frost_feed_tests {
         );
     }
 
+    /// Round 2b review P1: a thumbnail worker parks its blur source only while its folder is still
+    /// open, and asks that UNDER the map's lock, so a folder switch's clear (under the same lock,
+    /// after the generation moved) can't slip between the question and the insert.
+    ///
+    /// FALSIFIERS: in [`park_frost_mip`], ask `still_open` before `frost.lock()` (the old shape) and
+    /// the "asked while the map is locked" row fails; delete the `still_open` refusal and the "closed
+    /// folder's source is refused" row fails.
+    #[test]
+    fn the_blur_source_is_parked_only_while_its_folder_is_open_asked_under_the_lock() {
+        use falcon_color::Gamut;
+        let frost: FrostMap = Arc::new(Mutex::new(HashMap::new()));
+        let mip = || (Arc::<[u8]>::from(vec![1u8, 2, 3, 255]), 1u32, 1u32, Gamut::Srgb);
+        let mut asked_locked = false;
+        let parked = park_frost_mip(
+            &frost,
+            || {
+                asked_locked = matches!(frost.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+                false
+            },
+            3,
+            mip(),
+        );
+        assert!(asked_locked, "the folder is asked while the map is locked");
+        assert!(!parked, "a closed folder's source is refused");
+        assert!(frost.lock().unwrap().is_empty(), "…and nothing was parked");
+
+        assert!(park_frost_mip(&frost, || true, 3, mip()), "the open folder's source parks");
+        assert!(frost.lock().unwrap().contains_key(&3), "…at its own index");
+    }
+
     // step_frost_feed only reads `shots` for the is_unsupported() filter; an empty slice makes every
     // window index "supported" (shots.get → None), which is exactly what the budget-partition tests want.
     fn empty_shots() -> &'static [Shot] {
@@ -18910,6 +19537,40 @@ mod frost_feed_tests {
             assert!(got.contains(&i), "feeds uncovered window shot #{i}");
         }
         assert!(tp.borrow().is_superset(&got), "every fed index is now pending (dedup + failed-set discipline)");
+
+        // 2026-10-28 (the cloud-only round): …and a shot whose thumbnail file a worker found only in
+        // the cloud this folder. Another folder's note, and a pair's RAW (a thumbnail reads the JPEG),
+        // do not hold a shot back. FALSIFIER (L28): drop the notes term in `step_frost_feed` and 503
+        // is fed.
+        let (tx2, rx2) = channel::<support::ThumbReq>();
+        let film2 = Film::new();
+        let pairs = cloud_pairs(600);
+        film2.cloud_skipped.lock().unwrap().insert((gen_now, 503, support::CloudFile::Finished));
+        film2.cloud_skipped.lock().unwrap().insert((gen_now - 1, 504, support::CloudFile::Finished));
+        film2.cloud_skipped.lock().unwrap().insert((gen_now, 505, support::CloudFile::Raw));
+        step_frost_feed(500, 600, &pairs, &eff_win, &film2, &tx2, gen_now, &rot);
+        let got2: HashSet<usize> = std::iter::from_fn(|| rx2.try_recv().ok().map(|r| r.idx)).collect();
+        assert!(!got2.contains(&503), "a noted cloud-only blur source is not asked for");
+        assert!(got2.contains(&504), "another folder's note does not count");
+        assert!(got2.contains(&505), "a pair whose RAW alone is in the cloud still gets its thumbnail");
+    }
+
+    /// The cloud-only round's rows: `n` RAW+JPEG pairs (the thumbnail's file is the JPEG). Nothing is
+    /// on disk; the feeders only read the paths.
+    fn cloud_pairs(n: usize) -> Vec<Shot> {
+        (0..n)
+            .map(|i| Shot {
+                id: i,
+                name: format!("P_{i:04}"),
+                has_raw: true,
+                has_jpg: true,
+                raw: Some(std::path::PathBuf::from(format!("C:/f/P_{i:04}.CR3"))),
+                jpg: Some(std::path::PathBuf::from(format!("C:/f/P_{i:04}.JPG"))),
+                kind: SrcKind::Jpeg,
+                cloud_placeholder: false,
+                sniffed: None,
+            })
+            .collect()
     }
 
     /// 2026-10-27 (round 2b) — plan test 4, the feeders' half: **THE WHOLE FOLDER, NEAREST FIRST,
@@ -18945,7 +19606,6 @@ mod frost_feed_tests {
         step_whole_folder_thumbs(100, 1_000, empty_shots(), &cloud, &film, &tx, gen_now, &rot, 500, &cursor);
         let got: Vec<support::ThumbReq> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(got.iter().all(|r| !r.explicit && r.gen == gen_now), "speculative, this folder's");
-        assert!(got.iter().all(|r| r.local_only), "each read only if the file is still on this device");
         let idx: Vec<usize> = got.iter().map(|r| r.idx).collect();
         assert_eq!(idx, vec![97, 103, 96, 104, 95, 105, 94], "nearest the current photo first");
         assert_eq!(film.pending.borrow().len(), WHOLE_FOLDER_PENDING_MAX, "its share of the queue, no more");
@@ -18985,15 +19645,19 @@ mod frost_feed_tests {
         assert_eq!(rx2.try_recv().map(|r| r.idx).ok(), Some(53), "a new current photo starts again from it");
 
         // A FILE FOUND ONLY IN THE CLOUD SINCE THE SCAN (the worker's note) is asked for no more this
-        // folder; a note from another folder does not count (owner, 27 October: "do the check").
+        // folder; a note from another folder does not count (owner, 27 October: "do the check"). Since
+        // the cloud-only round the note names the file: a RAW+JPEG pair whose RAW alone was found
+        // online-only still gets its thumbnail, which is read from the JPEG (owner answer 3).
         let (tx5, rx5) = channel::<support::ThumbReq>();
         let film5 = Film::new();
-        film5.cloud_skipped.lock().unwrap().insert((1, 49));
-        film5.cloud_skipped.lock().unwrap().insert((0, 51));
+        let pairs = cloud_pairs(60);
+        film5.cloud_skipped.lock().unwrap().insert((1, 49, support::CloudFile::Finished));
+        film5.cloud_skipped.lock().unwrap().insert((0, 51, support::CloudFile::Finished));
+        film5.cloud_skipped.lock().unwrap().insert((1, 52, support::CloudFile::Raw));
         let cursor5 = Cell::new((u64::MAX, 0, 0, 0, 0));
-        step_whole_folder_thumbs(50, 1_000, empty_shots(), &HashSet::new(), &film5, &tx5, 1, &rot, 2, &cursor5);
+        step_whole_folder_thumbs(50, 60, &pairs, &HashSet::new(), &film5, &tx5, 1, &rot, 2, &cursor5);
         let found: Vec<usize> = std::iter::from_fn(|| rx5.try_recv().ok().map(|r| r.idx)).collect();
-        assert_eq!(found, vec![50, 51, 48, 52], "49 was found online-only; 51's note is another folder's");
+        assert_eq!(found, vec![50, 51, 48, 52], "49 was found online-only; 51's note is another folder's; 52's RAW is not what a thumbnail reads");
 
         // THE CAP: the cache keeps the mode's number (here 600), the nearest kept; the blur sources
         // keep their own 400 whatever it is.
@@ -19677,10 +20341,14 @@ mod one_decode_detail_serve_tests {
         /// `support::displayed_shot`, so those rows stay byte-pins of the pre-round behaviour.
         det_awaited: AtomicI64,
         rot: RotState,
-        req_tx: Sender<(usize, bool)>,
-        req_rx: Receiver<(usize, bool)>,
+        req_tx: Sender<(usize, bool, bool)>,
+        req_rx: Receiver<(usize, bool, bool)>,
         up_tx: std::sync::mpsc::SyncSender<UploadJob>,
         up_rx: std::sync::mpsc::Receiver<UploadJob>,
+        // The cloud-only round: the 40-shot folder (JPEGs, so the detail tier's file is the
+        // finished one in either mode) and the workers' notes.
+        shots: Vec<Shot>,
+        cloud: support::CloudNotes,
     }
 
     impl Rig {
@@ -19713,6 +20381,20 @@ mod one_decode_detail_serve_tests {
                 req_rx,
                 up_tx,
                 up_rx,
+                shots: (0..40)
+                    .map(|i| Shot {
+                        id: i,
+                        name: format!("IMG_{i:04}"),
+                        has_raw: false,
+                        has_jpg: true,
+                        raw: None,
+                        jpg: Some(std::path::PathBuf::from(format!("C:/f/IMG_{i:04}.JPG"))),
+                        kind: SrcKind::Jpeg,
+                        cloud_placeholder: false,
+                        sniffed: None,
+                    })
+                    .collect(),
+                cloud: Mutex::new(HashSet::new()),
             };
             rig.rot.note_base(7, 0);
             rig
@@ -19818,6 +20500,9 @@ mod one_decode_detail_serve_tests {
                 support::PublishGate::Full,
                 &self.last_publish,
                 &self.det_awaited,
+                &self.shots,
+                false,
+                &self.cloud,
             );
         }
 
@@ -19885,6 +20570,9 @@ mod one_decode_detail_serve_tests {
                 gate,
                 &self.last_publish,
                 &self.det_awaited,
+                &self.shots,
+                false,
+                &self.cloud,
             );
         }
 
@@ -20006,11 +20694,48 @@ mod one_decode_detail_serve_tests {
         }
 
         fn asked_worker(&self) -> Vec<usize> {
-            self.req_rx.try_iter().map(|(i, _)| i).collect()
+            self.req_rx.try_iter().map(|(i, _, _)| i).collect()
         }
         fn staged(&self) -> Vec<UploadJob> {
             self.up_rx.try_iter().collect()
         }
+        /// The cloud-only round: the asks with their `local_only` flag.
+        fn asked_local_only(&self) -> Vec<(usize, bool)> {
+            self.req_rx.try_iter().map(|(i, _, lo)| (i, lo)).collect()
+        }
+        /// …and the worker's exit marks cleared, as it clears them on every exit path.
+        fn worker_done(&self) {
+            self.det_sent.borrow_mut().clear();
+            self.det_busy.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// 2026-10-28 (the cloud-only round, design 3–4) — **THE FRAMES AHEAD MOVE PAST A NOTED
+    /// NEIGHBOUR, AND THE EXPLICIT SET IS STILL ASKED FOR.** At photo 7 (cached) with 8 noted as
+    /// only in the cloud, the tier asks for 9, flagged for the worker's own check. The frame a blocked
+    /// browse waits for (8, awaited) and an absent current photo are asked for though noted, unflagged
+    /// (they may download). Nothing is latched, so a later download outside Falcon brings 8 back.
+    ///
+    /// FALSIFIER (L28): drop the `cloud_held` term from the find and 8 is asked for; drop its
+    /// explicit exemption and the awaited row asks for 9; flag every ask and the explicit rows redden.
+    #[test]
+    fn frames_ahead_pass_a_noted_cloud_neighbour_and_ask_for_the_explicit_set() {
+        let rig = Rig::new();
+        rig.detail.cache.borrow_mut().insert(7, (slint::Image::default(), 1, 1));
+        rig.cloud.lock().unwrap().insert((1, 8, support::CloudFile::Finished));
+        rig.tick(false);
+        assert_eq!(rig.asked_local_only(), vec![(9, true)], "the noted 8 is passed over; 9 is checked by its worker");
+        rig.worker_done();
+        rig.awaiting(Some(8));
+        rig.tick(false);
+        assert_eq!(rig.asked_local_only(), vec![(8, false)], "the awaited frame may download");
+        rig.worker_done();
+        rig.awaiting(None);
+        rig.detail.cache.borrow_mut().remove(&7);
+        rig.cloud.lock().unwrap().insert((1, 7, support::CloudFile::Finished));
+        rig.tick(false);
+        assert_eq!(rig.asked_local_only(), vec![(7, false)], "the current photo may download");
+        assert!(rig.detail.failed.borrow().is_empty(), "nothing is latched");
     }
 
     /// **A FULL-RES FRAME ALREADY IN RAM IS NOT DECODED AGAIN** — and it does not consume the decode
@@ -20708,10 +21433,12 @@ mod one_decode_detail_serve_tests {
         let widened = format!("detail_frame_{}(", "explicit");
         let sites = code.iter().filter(|l| holds.iter().any(|h| l.contains(h.as_str()))).count();
         assert_eq!(sites, 4, "the tier's four holding sites, re-counted at this commit");
+        // 2026-10-28 (the cloud-only round): + 2 that are not holds — the frames-ahead find's cloud
+        // exemption and the request's `local_only` flag, both "may this one download?".
         assert_eq!(
             code.iter().filter(|l| l.contains(&widened)).count(),
-            4,
-            "one widened predicate per hold — no more, no fewer"
+            4 + 2,
+            "one widened predicate per hold — no more, no fewer — and the cloud rule's two"
         );
         // …and each one is IN the hold's own call expression, which a count cannot say.
         for (i, l) in code.iter().enumerate() {
@@ -20727,11 +21454,14 @@ mod one_decode_detail_serve_tests {
             );
         }
         let bare = format!("support::displayed_{}(", "shot");
+        // 2026-10-28 (the cloud-only round): + 3 that are not exemptions from a hold either — the
+        // frames-ahead find's cloud exemption and the drain's two "a photo on screen landed" records.
         assert_eq!(
             code.iter().filter(|l| l.contains(&bare)).count(),
-            10,
+            10 + 3,
             "ten code lines still spell the on-screen test: the four holds' own first \
-             argument, and the six sites that are not exemptions from a hold (this row's doc)"
+             argument, and the six sites that are not exemptions from a hold (this row's doc) — \
+             and the cloud rule's three"
         );
     }
 
@@ -20768,6 +21498,171 @@ mod one_decode_detail_serve_tests {
             2,
             "…and each one re-marks the id outstanding, or the prefetch would re-decode it"
         );
+    }
+}
+
+/// 2026-10-28 (the cloud-only round, design 6): a photo is on this device again — the landing
+/// re-check and the 30 s sweep. Cloud state comes through the probe (no test can make a
+/// placeholder); nothing here reads a file.
+#[cfg(test)]
+mod cloud_only_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn pair(i: usize) -> Shot {
+        Shot {
+            id: i,
+            name: format!("P_{i:04}"),
+            has_raw: true,
+            has_jpg: true,
+            raw: Some(PathBuf::from(format!("C:/f/P_{i:04}.CR3"))),
+            jpg: Some(PathBuf::from(format!("C:/f/P_{i:04}.JPG"))),
+            kind: SrcKind::Jpeg,
+            cloud_placeholder: true,
+            sniffed: None,
+        }
+    }
+
+    /// **A PHOTO ON SCREEN THAT LANDS HEALS ITS NOTES, AND LOSES THE SCAN'S TAG ONLY WHEN BOTH FILES
+    /// ARE HERE.** Photo 1 (viewed in RAW mode, say) has both files on this device now: its notes go,
+    /// its tile asks again (`thumb_gen`), and its tag leaves `cloud_tagged`, the retry ledger and the
+    /// shared shot list. Photo 2 was viewed in JPEG mode, which downloads only the JPEG: its JPEG's
+    /// note goes, its RAW's stays, and it keeps its tag, so RAW export still refuses the cloud RAW
+    /// (the plan's side effect, told to the owner). A landing re-checks a photo once, however many
+    /// times it is queued; nothing landed costs nothing.
+    ///
+    /// FALSIFIER (L28): drop the tag without `shot_is_cloud_only`'s re-check and photo 2 loses its
+    /// tag; skip `heal_cloud_notes` and photo 1 keeps its notes.
+    #[test]
+    fn a_landing_on_screen_heals_its_notes_and_drops_the_tag_only_when_all_local() {
+        let shots: Vec<Shot> = (0..4).map(pair).collect();
+        let owner = std::sync::Mutex::new(Arc::new(shots.clone()));
+        let film = Film::new();
+        let tagged = RefCell::new(HashSet::from([1usize, 2]));
+        let retry = RefCell::new(HashMap::from([(1usize, CloudRetry::default()), (2, CloudRetry::default())]));
+        let tg = Cell::new(0u64);
+        {
+            let mut n = film.cloud_skipped.lock().unwrap();
+            n.insert((5, 1, support::CloudFile::Finished));
+            n.insert((5, 2, support::CloudFile::Finished));
+            n.insert((5, 2, support::CloudFile::Raw));
+            n.insert((5, 3, support::CloudFile::Finished)); // not on screen: never landed
+        }
+        let raw2 = shots[2].raw.clone().unwrap();
+        let probes = Cell::new(0usize);
+        let probe = |p: &Path| {
+            probes.set(probes.get() + 1);
+            p == raw2.as_path()
+        };
+        film.cloud_landed.borrow_mut().extend([1, 2, 1]);
+        step_cloud_landed_with(5, &shots, &film, &owner, &tagged, &retry, &tg, probe);
+        assert_eq!(
+            *film.cloud_skipped.lock().unwrap(),
+            HashSet::from([(5, 2, support::CloudFile::Raw), (5, 3, support::CloudFile::Finished)]),
+            "the local files' notes went; the cloud RAW's and the unvisited photo's stayed"
+        );
+        assert_eq!(tg.get(), 1, "the healed tiles ask again");
+        assert_eq!(*tagged.borrow(), HashSet::from([2]), "the tag goes only when both files are here");
+        assert!(!retry.borrow().contains_key(&1) && retry.borrow().contains_key(&2), "…and its retry ledger with it");
+        let live = owner.lock().unwrap().clone();
+        assert!(!live[1].cloud_placeholder, "the shared list says photo 1 is local (RAW export, rescans)");
+        assert!(live[2].cloud_placeholder, "…and photo 2 is still cloud");
+        assert!(film.cloud_landed.borrow().is_empty(), "the landings are consumed");
+        let spent = probes.get();
+        step_cloud_landed_with(5, &shots, &film, &owner, &tagged, &retry, &tg, probe);
+        assert_eq!(probes.get(), spent, "nothing landed: no metadata call");
+    }
+
+    /// **BOTH LANDINGS OF A PHOTO ON SCREEN QUEUE IT FOR THE RE-CHECK, AND THE TICK RUNS IT WITH THE
+    /// REAL PROBE.** `step_upload_drain` needs the GPU import, so it is not driven headless; its two
+    /// queue points are pinned by source: after the frame is in its cache (fast, then full
+    /// resolution), and only for a photo on screen. The tick's two cloud steps ask
+    /// `falcon_decode::file_is_cloud_placeholder` (metadata only).
+    ///
+    /// FALSIFIER (L28): drop either push, or its on-screen test, and this row reddens.
+    #[test]
+    fn the_drain_queues_a_landing_on_screen_at_both_landings() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tick.rs")).unwrap().replace("\r\n", "\n");
+        let start = src.find("pub(crate) fn step_upload_drain(").expect("the drain");
+        let rest = &src[start + 1..];
+        let body = &rest[..rest.find("\npub(crate) fn ").expect("the next step")];
+        let push = "film.cloud_landed.borrow_mut().push(id);";
+        // Split like `every_detail_tier_hold_asks_the_awaited_exemption`'s needles, so this row's own
+        // text is not counted by the censuses that read this file.
+        let on_screen = format!(
+            "if support::displayed_{}(id, c, compare.get(), cmp_a_idx.get(), cmp_b_idx.get(), len) {{\n", "shot"
+        );
+        let on_screen = on_screen.as_str();
+        assert_eq!(body.matches(push).count(), 2, "both landings, no more");
+        let fast = body.find(&format!("cache.{}(id, FastEntry {{ img, w: dw, h: dh, blur, bw, bh, dim, turns }});", "insert")).expect("the fast insert");
+        let full = body.find(&format!("detail.borrow_mut().{}(id, (img, dw, dh));", "insert")).expect("the full-resolution insert");
+        let (p1, p2) = (body.find(push).unwrap(), body.rfind(push).unwrap());
+        assert!(fast < p1 && p1 < full && full < p2, "each after its frame is in the cache");
+        for p in [p1, p2] {
+            let guard = body[..p].rfind(on_screen).expect("an on-screen test before the push");
+            assert!(body[guard + on_screen.len()..p].trim().is_empty(), "…directly guarding it");
+        }
+        let main = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap().replace("\r\n", "\n");
+        assert_eq!(main.matches("&cloud_retry_t, &thumb_gen_t,\n            falcon_decode::file_is_cloud_placeholder,\n        );").count(), 1, "the landing re-check");
+        assert_eq!(main.matches("thumb_gen: &thumb_gen_t },\n            falcon_decode::file_is_cloud_placeholder,\n        );").count(), 1, "the sweep");
+    }
+
+    /// **THE 30 S SWEEP FINDS A FILE DOWNLOADED OUTSIDE FALCON NEAR THE CURRENT PHOTO, KEEPS ONE
+    /// STILL IN THE CLOUD, AND NEVER LOOKS FAR AWAY** (owner answer 2). A local folder (nothing tagged,
+    /// nothing noted) does not even read the clock.
+    ///
+    /// FALSIFIER (L28): drop the notes pass and photo 10's note stays; drop the `near` bound and the
+    /// far photo is probed; drop the empty gate and the local folder's sweep stamps the clock.
+    #[test]
+    fn the_sweep_finds_a_file_downloaded_outside_falcon() {
+        let shots: Vec<Shot> = (0..1000).map(pair).collect();
+        let owner = std::sync::Mutex::new(Arc::new(shots.clone()));
+        let film = Film::new();
+        let tagged = RefCell::new(HashSet::new());
+        let retry = RefCell::new(HashMap::new());
+        let (ff, tf, rf) = (Mutex::new(HashSet::new()), Mutex::new(HashSet::new()), Mutex::new(HashSet::new()));
+        let (df, dims) = (RefCell::new(HashSet::new()), RefCell::new(HashSet::new()));
+        let tg = Cell::new(0u64);
+        let long_ago = Instant::now() - Duration::from_secs(60);
+        let last = RefCell::new(long_ago);
+        let near = |i: usize| i.abs_diff(10) <= 5;
+        let still = shots[11].jpg.clone().unwrap();
+        let far = shots[900].jpg.clone().unwrap();
+        let asked: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        let probe = |p: &Path| {
+            asked.borrow_mut().push(p.to_path_buf());
+            p == still.as_path() || p == far.as_path()
+        };
+        let sweep = |now: Instant| {
+            step_cloud_retry_with(
+                now, 5, &shots, &owner, &tagged, &last, &ff, &df, &tf, &rf, &dims, &retry,
+                CloudSweep { notes: &film.cloud_skipped, c: 10, near: &near, thumb_gen: &tg },
+                probe,
+            )
+        };
+        // A local folder: nothing tagged, nothing noted — the gate returns before the clock.
+        sweep(Instant::now());
+        assert_eq!(*last.borrow(), long_ago, "a local folder pays nothing");
+        assert!(asked.borrow().is_empty());
+        {
+            let mut n = film.cloud_skipped.lock().unwrap();
+            n.insert((5, 10, support::CloudFile::Finished)); // downloaded outside Falcon since
+            n.insert((5, 11, support::CloudFile::Finished)); // still in the cloud
+            n.insert((5, 900, support::CloudFile::Finished)); // far away
+        }
+        sweep(Instant::now());
+        assert_eq!(
+            *film.cloud_skipped.lock().unwrap(),
+            HashSet::from([(5, 11, support::CloudFile::Finished), (5, 900, support::CloudFile::Finished)]),
+            "the downloaded file's note went; the cloud one stayed (no flicker, never read)"
+        );
+        assert_eq!(tg.get(), 1, "its tile asks again");
+        assert!(!asked.borrow().contains(&far), "a far photo is not probed: it waits to come near");
+        assert_eq!(asked.borrow().len(), 2, "one metadata call per near note");
+        // Within 30 s of that sweep, nothing runs again.
+        let n = asked.borrow().len();
+        sweep(Instant::now());
+        assert_eq!(asked.borrow().len(), n, "every ~30 s, not every tick");
     }
 }
 

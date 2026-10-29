@@ -7,6 +7,9 @@
 //! Colour stays out of scope here (src == dst ⇒ the gamut arm is off; cm_parity.rs owns the CM
 //! maths) — luma-only pixels make the placement assertion byte-exact despite chroma filtering.
 
+#[path = "../../test-support/hw_child.rs"]
+mod hw_child;
+
 use falcon_gpu::{YuvConvert, YuvPlanes};
 
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -68,6 +71,7 @@ fn read_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture,
 
 #[test]
 fn yuv_convert_rotates_like_the_cpu_convention() {
+    if !hw_child::run_here(module_path!(), "yuv_convert_rotates_like_the_cpu_convention") { return; }
     let Some((device, queue)) = device() else {
         eprintln!("skip: no GPU adapter");
         return;
@@ -131,6 +135,7 @@ fn yuv_convert_rotates_like_the_cpu_convention() {
 /// Weaken either message and the substring asserts redden.
 #[test]
 fn the_fused_convert_refuses_rather_than_panics() {
+    if !hw_child::run_here(module_path!(), "the_fused_convert_refuses_rather_than_panics") { return; }
     let Some((device, queue)) = device() else {
         eprintln!("skip: no GPU adapter");
         return;

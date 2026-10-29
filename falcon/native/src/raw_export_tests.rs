@@ -1,7 +1,7 @@
 //! Worker-level RAW export contracts. Real encoders/files/manifest, with an injectable pixel source
 //! for deterministic cancellation and depth/orientation checks independent of camera fixtures.
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -66,6 +66,8 @@ fn recipe<'a>(
         fmt: WebFormat::Png,
         raw_policy: policy,
         collide: WebCollide::Overwrite,
+        cloud_ok: HashSet::new(),
+        is_cloud: |_| false,
     }
 }
 
@@ -87,6 +89,62 @@ fn no_parts(fixture: &Fixture) {
         .file_name()
         .to_string_lossy()
         .ends_with(".part")));
+}
+
+/// 2026-10-28 (the cloud-only round, owner answer 11) — **A FILE MADE ONLINE-ONLY AFTER THE ANSWER IS
+/// SKIPPED, NOT READ, AND THE RESULT SAYS SO.** The user agreed to download B (it was counted when
+/// Export was pressed); A became cloud-only after that; C is on this device. The run reads B and C,
+/// never A, and its sentence ends with the owner's clause. The probe stands in for placeholders.
+/// R2 (Codex's review, 29 October): a RAW the run develops is never agreed (RAW export never
+/// downloads); one freed up during the run is the same skip and the same clause, never handed to the
+/// developer (whose own refusal would report a failed export).
+///
+/// FALSIFIER (L28): drop the run's last-look check and A is decoded; drop the `cloud_ok` term and B
+/// is skipped too; leave the developed RAW out of the last look and D is handed to the developer.
+#[test]
+fn a_file_freed_up_after_the_answer_is_skipped_and_reported() {
+    let f = Fixture::new();
+    f.jpg("A_CLOUD.JPG");
+    f.jpg("B_CLOUD.JPG");
+    f.jpg("C.JPG");
+    let shots = f.shots();
+    assert_eq!(shots.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["A_CLOUD", "B_CLOUD", "C"]);
+    let marks = vec![1; shots.len()];
+    let deltas = HashMap::new();
+    let mut run = recipe(&f.0, &shots, &marks, &deltas, RawExportPolicy::Skip);
+    run.is_cloud = |p| p.to_string_lossy().contains("_CLOUD");
+    run.cloud_ok = [1usize].into_iter().collect();
+    let seen = RefCell::new(Vec::new());
+    let progress = ExportProgress::default();
+    let (message, failed) = support::export_web_run_with_decoder(run, &progress, |shot, keep, source, progress| {
+        seen.borrow_mut().push(shot.name.clone());
+        decode_web_pixels(shot, keep, source, progress)
+    });
+    assert!(!failed, "{message}");
+    assert_eq!(*seen.borrow(), ["B_CLOUD", "C"], "the agreed file and the local one are read; the freed one is not");
+    assert!(!f.output("A_CLOUD.png").exists());
+    assert!(message.ends_with(" · 1 file was skipped because it is only in the cloud now."), "{message}");
+
+    // R2: RAW export (developed RAWs). D is freed up during the run; E is on this device.
+    let g = Fixture::new();
+    g.raw("D_CLOUD.CR3");
+    g.raw("E.CR3");
+    let shots = g.shots();
+    assert_eq!(shots.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["D_CLOUD", "E"]);
+    let marks = vec![1; shots.len()];
+    let mut run = recipe(&g.0, &shots, &marks, &deltas, RawExportPolicy::Develop);
+    run.is_cloud = |p| p.to_string_lossy().contains("_CLOUD");
+    let seen = RefCell::new(Vec::new());
+    let progress = ExportProgress::default();
+    let (message, failed) = support::export_web_run_with_decoder(run, &progress, |shot, keep, source, _| {
+        assert_eq!(source, WebPixelSource::DevelopedRaw);
+        seen.borrow_mut().push(shot.name.clone());
+        synthetic_pixels(keep)
+    });
+    assert!(!failed, "a freed-up RAW is a skip, not a failed export: {message}");
+    assert_eq!(*seen.borrow(), ["E"], "the freed RAW never reaches the developer");
+    assert!(!g.output("D_CLOUD.png").exists() && g.output("E.png").exists());
+    assert!(message.ends_with(" · 1 file was skipped because it is only in the cloud now."), "{message}");
 }
 
 #[test]

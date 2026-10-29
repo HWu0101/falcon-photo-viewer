@@ -221,7 +221,10 @@ import { ExifRow } from "structs.slint";
             spacing: root.title == "" ? 0px : 9px;
             if root.title != "" : HorizontalLayout {
                 padding-left: 12px; padding-right: 12px; padding-bottom: 7px;
-                Text { text: root.title; color: Theme.text; font-size: Theme.font-body;
+                // 2026-10-29 (owner: "apply some weight increase to higher-level headings like
+                // 'Custom'"): SemiBold, one step above the 13 px Medium rows inside (ToggleRow), which a
+                // Regular title read no higher than.
+                Text { text: root.title; color: Theme.text; font-size: Theme.font-body; font-weight: 600;
                        vertical-alignment: center; horizontal-stretch: 1; }
             }
             @children

@@ -1256,6 +1256,7 @@ mod tests {
     /// and the SOURCE assert reddens while the whole-vs-banded one would still pass.
     #[test]
     fn the_banded_readback_is_byte_identical_to_the_whole_one() {
+        if !crate::hw_child::run_here(module_path!(), "the_banded_readback_is_byte_identical_to_the_whole_one") { return; }
         let Some((device, queue)) = test_device() else {
             eprintln!("skip: no GPU adapter");
             return;

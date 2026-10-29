@@ -1222,3 +1222,34 @@ fn rotation_existing_sidecar_does_not_open_locked_original() {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+/// 2026-10-28 (the cloud-only round, owner answer 10): the files Apply rotations will read, so it
+/// can count the cloud-only ones before it starts. A JPEG is always read; a PNG and a RAW only
+/// when their own sidecar gives no orientation; a pair reads both. No original is opened here
+/// (none exists).
+#[test]
+fn rotation_reads_mirrors_apply_rotation() {
+    let dir = tmp_dir();
+    let (jpg, png, raw) = (dir.join("a.JPG"), dir.join("b.png"), dir.join("c.CR3"));
+    let plan = |finished: Option<&PathBuf>, is_jpeg: bool, raw: Option<&PathBuf>| RotApplyPlan {
+        finished: finished.cloned(),
+        finished_is_jpeg: is_jpeg,
+        raw: raw.cloned(),
+        base_turns: 0,
+        delta: 1,
+    };
+    let jp = plan(Some(&jpg), true, None);
+    assert_eq!(rotation_reads(&jp), vec![jpg.as_path()], "a JPEG is always read");
+    let pn = plan(Some(&png), false, None);
+    assert_eq!(rotation_reads(&pn), vec![png.as_path()], "a PNG with no sidecar is read");
+    let rw = plan(None, false, Some(&raw));
+    assert_eq!(rotation_reads(&rw), vec![raw.as_path()], "a RAW with no sidecar is read");
+    let pair = plan(Some(&jpg), true, Some(&raw));
+    assert_eq!(rotation_reads(&pair), vec![jpg.as_path(), raw.as_path()], "a pair reads both");
+    write_xmp_sidecar(&sidecar_path_for(&png, false), 6).unwrap();
+    write_xmp_sidecar(&sidecar_path_for(&raw, true), 6).unwrap();
+    assert!(rotation_reads(&pn).is_empty(), "the PNG's own sidecar answers");
+    assert!(rotation_reads(&rw).is_empty(), "the RAW's own sidecar answers");
+    assert_eq!(rotation_reads(&pair), vec![jpg.as_path()], "the JPEG is still patched in place");
+    std::fs::remove_dir_all(dir).unwrap();
+}

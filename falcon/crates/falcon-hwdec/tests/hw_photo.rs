@@ -23,6 +23,9 @@
 
 #![cfg(windows)]
 
+#[path = "../../test-support/hw_child.rs"]
+mod hw_child;
+
 #[path = "../../test-support/fixture_paths.rs"]
 mod fixture_paths;
 
@@ -115,6 +118,22 @@ fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 28 October (round 2b review P2): **each hardware row's first line.** The row runs in its own
+/// process with a time limit (`hw_child`), still one at a time: the parent holds the lock above
+/// around each child, so no two photo pipelines overlap. The skips a child printed count toward
+/// this file's audit (`SKIPPED` lives in the parent).
+fn run_here(row: &str) -> bool {
+    if hw_child::in_child() {
+        return true;
+    }
+    let err = {
+        let _serial = one_at_a_time();
+        hw_child::run_in_child(module_path!(), row)
+    };
+    SKIPPED.fetch_add(err.matches("SKIP #").count(), std::sync::atomic::Ordering::Relaxed);
+    false
+}
+
 /// The `scale_to` values the browse lanes really ask for, via `fast_decode_target(max_dim,
 /// supersample)`: the detail tier's cap, the fast tier at both sampling modes, the thumb tier, and
 /// `None` for the ROI-source full decode. Not invented — read off `browse_frame_rgba`'s callers.
@@ -137,6 +156,7 @@ fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
 /// **THE DIMS GATE.** Every corpus file × every tier the shipping path requests.
 #[test]
 fn the_dims_are_the_shipping_paths_on_every_file_and_tier() {
+    if !run_here("the_dims_are_the_shipping_paths_on_every_file_and_tier") { return; }
     if !hardware() {
         skip!("no D3D11 video device decoding HEVC Main to NV12 on this machine");
         return;
@@ -191,6 +211,7 @@ fn the_dims_are_the_shipping_paths_on_every_file_and_tier() {
 /// **THE FALSIFIER for the dims gate.** One perturbed scale computation must redden it.
 #[test]
 fn the_dims_gate_bites() {
+    if !run_here("the_dims_gate_bites") { return; }
     if !hardware() {
         skip!("no D3D11 video device decoding HEVC Main to NV12 on this machine");
         return;
@@ -268,6 +289,7 @@ fn spread(v: &[f64]) -> (f64, f64, f64) {
 /// else's chroma filter and is reported, not gated.
 #[test]
 fn the_grid_has_no_seam() {
+    if !run_here("the_grid_has_no_seam") { return; }
     if !hardware() {
         skip!("no D3D11 video device decoding HEVC Main to NV12 on this machine");
         return;
@@ -315,6 +337,7 @@ fn the_grid_has_no_seam() {
 /// **THE FALSIFIER for the seam hunt.** A two-pixel tile displacement must break the flatness.
 #[test]
 fn the_seam_hunt_bites() {
+    if !run_here("the_seam_hunt_bites") { return; }
     if !hardware() {
         skip!("no D3D11 video device decoding HEVC Main to NV12 on this machine");
         return;
@@ -355,6 +378,7 @@ fn the_seam_hunt_bites() {
 /// falsifier turns it the other way and requires the comparison to collapse.
 #[test]
 fn the_rotated_file_lands_upright_and_the_reverse_turn_does_not() {
+    if !run_here("the_rotated_file_lands_upright_and_the_reverse_turn_does_not") { return; }
     if !hardware() {
         skip!("no D3D11 video device decoding HEVC Main to NV12 on this machine");
         return;
@@ -476,6 +500,7 @@ fn the_rotated_file_lands_upright_and_the_reverse_turn_does_not() {
 /// **DETERMINISM**, both axes: the same photo twice, and pipelined against serialised.
 #[test]
 fn the_same_photo_twice_is_byte_identical_and_pipelining_changes_nothing() {
+    if !run_here("the_same_photo_twice_is_byte_identical_and_pipelining_changes_nothing") { return; }
     if !hardware() {
         skip!("no D3D11 video device decoding HEVC Main to NV12 on this machine");
         return;
@@ -507,6 +532,7 @@ fn the_same_photo_twice_is_byte_identical_and_pipelining_changes_nothing() {
 /// and must leave the session and the device usable.
 #[test]
 fn a_bad_tile_fails_the_photo_closed_and_leaves_the_session_usable() {
+    if !run_here("a_bad_tile_fails_the_photo_closed_and_leaves_the_session_usable") { return; }
     if !hardware() {
         skip!("no D3D11 video device decoding HEVC Main to NV12 on this machine");
         return;
@@ -610,6 +636,7 @@ fn cpu_reference(src: &TileSource, tiles: &[falcon_hwdec::Nv12Image]) -> (Vec<u8
 /// (54 tiles of 896×1024, `irot` 270), so the rotation arm of the map is proven too.
 #[test]
 fn the_gpu_assembly_is_byte_identical_to_the_cpu_reference() {
+    if !run_here("the_gpu_assembly_is_byte_identical_to_the_cpu_reference") { return; }
     // Public source contains no private camera corpus. An existing corpus still has to
     // satisfy every original pixel/hash/count assertion below.
     if corpus_dirs().iter().all(|dir| !dir.is_dir()) {
@@ -672,6 +699,7 @@ fn the_gpu_assembly_is_byte_identical_to_the_cpu_reference() {
 /// `w*3`, no padding, no alpha. Cheap, and it is the clause a refactor silently breaks.
 #[test]
 fn the_output_is_packed_rgb8_at_stride_w3() {
+    if !run_here("the_output_is_packed_rgb8_at_stride_w3") { return; }
     // Public source contains no private camera corpus. An existing corpus still has to
     // satisfy every original pixel/hash/count assertion below.
     if corpus_dirs().iter().all(|dir| !dir.is_dir()) {
@@ -728,6 +756,7 @@ fn the_output_is_packed_rgb8_at_stride_w3() {
 /// beside `managed` and the row would say so.
 #[test]
 fn the_hardware_pixels_ride_the_same_colour_managed_chain_as_wic() {
+    if !run_here("the_hardware_pixels_ride_the_same_colour_managed_chain_as_wic") { return; }
     // Public source contains no private camera corpus. An existing corpus still has to
     // satisfy every original pixel/hash/count assertion below.
     if corpus_dirs().iter().all(|dir| !dir.is_dir()) {
@@ -903,6 +932,7 @@ fn delta_stats(a: &[u8], b: &[u8]) -> (u8, f64, f64) {
 /// correct results become the same buffer — this assert is what reddens.
 #[test]
 fn the_gpu_colour_arm_lands_where_the_cpu_arm_lands() {
+    if !run_here("the_gpu_colour_arm_lands_where_the_cpu_arm_lands") { return; }
     use falcon_color::{CustomProfile, Gamut};
 
     if !hardware() {
@@ -1258,13 +1288,22 @@ fn patch_boxes(bytes: &mut [u8], want: &[u8; 4], off_in_body: usize, mut f: impl
 ///
 /// Named `zz_` so it sorts last: `cargo test` runs a binary's rows alphabetically, and this number
 /// is only meaningful after the rows that produce it.
+///
+/// 28 October (round 2b review P2): the device question is a driver call, so it is asked in this
+/// row's own process, under the time limit; the count stays here in the parent, where the other
+/// rows' children's skips were added (`run_here`).
 #[test]
 fn zz_the_skip_audit_states_what_this_machine_could_not_run() {
+    if hw_child::in_child() {
+        eprintln!("hardware present: {}", hardware());
+        return;
+    }
+    let err = hw_child::run_in_child(module_path!(), "zz_the_skip_audit_states_what_this_machine_could_not_run");
+    let present = err.lines().find_map(|l| l.strip_prefix("hardware present: ")).unwrap_or("unknown").to_string();
     let n = SKIPPED.load(std::sync::atomic::Ordering::Relaxed);
     eprintln!(
-        "SKIP AUDIT (hw_photo.rs): {n} row(s) declined on this machine — hardware present: {}, \
+        "SKIP AUDIT (hw_photo.rs): {n} row(s) declined on this machine — hardware present: {present}, \
          corpus files: {}",
-        hardware(),
         corpus().len()
     );
 }
@@ -1295,6 +1334,7 @@ fn zz_the_skip_audit_states_what_this_machine_could_not_run() {
 /// boundary and nowhere else.
 #[test]
 fn a_superseded_decode_stops_mid_grid_and_leaves_the_session_usable() {
+    if !run_here("a_superseded_decode_stops_mid_grid_and_leaves_the_session_usable") { return; }
     if !hardware() {
         skip!("no D3D11 video device decoding HEVC Main to NV12 on this machine");
         return;

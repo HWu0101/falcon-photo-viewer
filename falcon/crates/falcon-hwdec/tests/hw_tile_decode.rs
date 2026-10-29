@@ -29,6 +29,9 @@
 
 #![cfg(windows)]
 
+#[path = "../../test-support/hw_child.rs"]
+mod hw_child;
+
 #[path = "../../test-support/fixture_paths.rs"]
 mod fixture_paths;
 
@@ -99,6 +102,7 @@ fn session_for(src: &TileSource) -> Result<DecodeSession, HwDecError> {
 
 #[test]
 fn the_marshalling_reproduces_two_independent_decoders_byte_for_byte() {
+    if !hw_child::run_here(module_path!(), "the_marshalling_reproduces_two_independent_decoders_byte_for_byte") { return; }
     // Public source contains no private camera corpus. An existing corpus still has to
     // satisfy every original pixel/hash/count assertion below.
     if corpus_dirs().iter().all(|dir| !dir.is_dir()) {
@@ -138,6 +142,7 @@ fn the_marshalling_reproduces_two_independent_decoders_byte_for_byte() {
 
 #[test]
 fn the_quantisation_matrices_are_load_bearing_on_both_files() {
+    if !hw_child::run_here(module_path!(), "the_quantisation_matrices_are_load_bearing_on_both_files") { return; }
     // THE FALSIFIER the milestone asked for, both halves of the matched pair. Zeroing the matrices
     // must change the picture — on IMG_3258 because its 20 explicit matrices go missing, and on
     // IMG_1826 because "no explicit lists" still means the H.265 DEFAULTS, not flat 16s. If either
@@ -176,6 +181,7 @@ fn the_quantisation_matrices_are_load_bearing_on_both_files() {
 
 #[test]
 fn one_session_decodes_every_tile_of_a_real_photo() {
+    if !hw_child::run_here(module_path!(), "one_session_decodes_every_tile_of_a_real_photo") { return; }
     // Plan non-negotiable #1 in miniature: all 54 tiles through ONE decoder, surfaces recycled. The
     // interesting failure is not "a tile is wrong" but "tile 9 fails once the 8 surfaces have gone
     // round once" — Stage 0's obstacle #4, and the reason this crate owns surface lifetime.
@@ -209,6 +215,7 @@ fn one_session_decodes_every_tile_of_a_real_photo() {
 
 #[test]
 fn the_pipelined_path_gives_the_same_bytes_as_the_serialised_one() {
+    if !hw_child::run_here(module_path!(), "the_pipelined_path_gives_the_same_bytes_as_the_serialised_one") { return; }
     // The product shape (plan non-negotiable #1) submits a run of pictures before reading any back.
     // That changes WHEN surfaces are recycled and nothing else, so the bytes must be identical —
     // and if they are not, some surface is being read while it is still being written.
@@ -242,6 +249,7 @@ fn the_pipelined_path_gives_the_same_bytes_as_the_serialised_one() {
 
 #[test]
 fn garbled_bitstreams_fail_closed_and_leave_the_device_usable() {
+    if !hw_child::run_here(module_path!(), "garbled_bitstreams_fail_closed_and_leave_the_device_usable") { return; }
     // 500 single-bit flips into a real tile's payload plus 100 truncations, all submitted to the
     // driver. The bar is not that they fail — most flips decode SOMETHING, which is the honest
     // behaviour of an entropy decoder handed slightly wrong bits — but that the PROCESS survives,
@@ -296,6 +304,7 @@ fn garbled_bitstreams_fail_closed_and_leave_the_device_usable() {
 
 #[test]
 fn a_session_refuses_geometry_that_is_not_its_own() {
+    if !hw_child::run_here(module_path!(), "a_session_refuses_geometry_that_is_not_its_own") { return; }
     // The 24 MP file's tiles are 640x896; a session built for 896x1024 must decline them rather
     // than decode a picture into a surface of the wrong shape.
     if !hardware() {
@@ -320,6 +329,7 @@ fn a_session_refuses_geometry_that_is_not_its_own() {
 
 #[test]
 fn the_driver_answers_the_capability_question_directly() {
+    if !hw_child::run_here(module_path!(), "the_driver_answers_the_capability_question_directly") { return; }
     // Stage 0's methodology lesson, kept as a test: ask `ID3D11VideoDevice`, never ffmpeg. On a box
     // with no video device this row reports that and returns — it does not fail.
     match DecodeDevice::new() {

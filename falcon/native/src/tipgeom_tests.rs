@@ -1388,7 +1388,7 @@ fn photo_first_modes_and_promotion_keep_the_view_and_undo_identity() {
     let mut done = ScanDone { changed_sources: HashSet::new(), partial: true, pending_edges: (true, true), source_order: Vec::new(), id: 1, dir: PathBuf::from("folder"),
         shots: vec![neighbor, shot], ratings: vec![0, 5], marks: vec![0, MARK_FLAG], start: 0,
         land: None, extra: BTreeMap::new(), rotations: BTreeMap::new(), attrs: FolderAttrs::default(),
-        had_file: true, manifest: None, sort: (SortMethod::Name, false), scan_err: false };
+        had_file: true, manifest: None, sort: (SortMethod::Name, false), scan_err: false, scan_denied: false, unlisted_target: None };
     let fast = FastTier::new(); let detail = DetailTier::new(); let rot = RotState::new(true);
     let film = Film::new(); let roi = RoiZoom::new();
     let meta=crate::meta::PerShotMeta::new(2);
@@ -3730,6 +3730,184 @@ fn a_mode_trim_is_let_go_by_open_feeds_and_hidden_panels() {
     let arrival = concat!("mode_released += evict_at_arrival(&mut cache, c, eff_win.get(), ", "fast_budget.get(),");
     assert_eq!(tick.matches(arrival).count(), 1, "the arrival's releases are counted");
     assert_eq!(tick.matches(concat!("    mode_released + ", "trimmed\n}")).count(), 1, "…and returned with the trim's");
+    app.set_grid_open(false);
+}
+
+/// Round 2c review P1: **ON THE MAC, A PRESSURE SHED IS LET GO BY THE HIDDEN PANELS TOO.** With Falcon in
+/// front and memory low, the Mac's hold sheds every preview outside the requested photos
+/// (`memory_pressure::shed`). A closed Review panel or a grid hidden by immersive mode can't rebuild,
+/// and its rows still hold the stand-ins `tick::lookup_thumb` gave them, so the shed's count goes to
+/// the panel step a mode's trim uses (`background_memory::release_after_trim`). This drives the Mac
+/// tick's wiring (the shed, then that call) over the REAL `step_folder_grid`: (1) the hidden grid and
+/// the closed Review panel let go, and the caches keep exactly the requested photos; (2) a held tick
+/// that shed nothing leaves them alone; (3) panels that are refreshing keep their rows, and the open
+/// grid rebuilds showing only the requested photos; (4) the Mac call site, which only the Mac build
+/// compiles, by source.
+///
+/// FALSIFIERS: make `shed` return 0 and (1) reddens; ungate `release_after_trim` and (2) reddens;
+/// empty the Review panel while it refreshes and (3) reddens; drop the Mac call, pass it 0, or move it
+/// out of `if memory_hold` and (4) reddens.
+#[test]
+fn a_pressure_shed_is_let_go_by_hidden_panels_and_keeps_the_requested_photos() {
+    use crate::background_memory::{release_after_trim, GRID_KEY_UNBUILT, SEL_KEY_UNBUILT};
+    use crate::tick::{grid_refills, step_folder_grid, FastEntry};
+    use slint::Model;
+    use std::cell::{Cell, RefCell};
+    use std::collections::{HashSet, VecDeque};
+
+    let app = boot();
+    let (c, len) = (30usize, 60usize);
+    let shots: Vec<crate::Shot> = (0..len)
+        .map(|i| crate::Shot {
+            id: i,
+            name: format!("HWU_{i:04}"),
+            has_raw: false,
+            has_jpg: true,
+            raw: None,
+            jpg: Some(std::path::PathBuf::from(format!("C:/rig/HWU_{i:04}.jpg"))),
+            kind: crate::SrcKind::Jpeg,
+            cloud_placeholder: false,
+            sniffed: None,
+        })
+        .collect();
+    // A warm cache: a preview for every photo and no thumbnails yet, so every tile shows its preview
+    // as the stopgap; a few full-resolution frames too.
+    let fast = crate::FastTier::new();
+    let detail = crate::DetailTier::new();
+    let px = || slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(1, 1));
+    let warm = || {
+        let mut cache = fast.cache.borrow_mut();
+        cache.clear();
+        for id in 0..len {
+            cache.insert(id, FastEntry {
+                img: px(), w: 1, h: 1, blur: std::sync::Arc::from([0u8; 4]), bw: 1, bh: 1, dim: 1, turns: 0,
+            });
+        }
+        let (mut full, mut order) = (detail.cache.borrow_mut(), detail.order.borrow_mut());
+        full.clear();
+        order.clear();
+        for id in [12usize, 20, 30, 40] {
+            full.insert(id, (px(), 1, 1));
+            order.push_back(id);
+        }
+    };
+    warm();
+    let film = crate::Film::new();
+    let thumb_gen = Cell::new(0u64);
+    let (thumb_req, _thumb_rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+    let ratings = RefCell::new(vec![0i32; len]);
+    let marks = RefCell::new(vec![0u8; len]);
+    let sel_gen = Cell::new(0u64);
+    let select = RefCell::new(crate::support::SelectSet::default());
+    let select_gen = Cell::new(0u64);
+    let last_grid_key = Cell::new(GRID_KEY_UNBUILT);
+    let last_grid_view: Cell<(bool, u64)> = Cell::new((false, u64::MAX));
+    let last_grid_c: Cell<usize> = Cell::new(usize::MAX);
+    let grid_model = slint::VecModel::<ui::FilmItem>::default();
+    let sel_model = slint::VecModel::<ui::SelTileRow>::default();
+    let last_sel_key = Cell::new(SEL_KEY_UNBUILT);
+    let rot = crate::RotState::new(false);
+    let plan = crate::support::plan_from_shots(&shots);
+    let grid_vp_prog: Cell<Option<crate::support::PanelMemo>> = Cell::new(None);
+    let fast_gen = Cell::new(0u64);
+    let step = || {
+        step_folder_grid(
+            &app, c, len, 1, &shots, &plan, &fast.cache, &film, &thumb_gen, &thumb_req, &fast_gen, &ratings,
+            &marks, &sel_gen, &select, &select_gen, &last_grid_key, &last_grid_view, &last_grid_c,
+            &grid_vp_prog, &grid_model, &rot, crate::support::ThumbScope::Nearby,
+        )
+    };
+    let lay_out = || {
+        hover(&app, 600.0, 300.0);
+        app.set_grid_vp_h(3000.0); // tall enough that the grid's rows cover the whole folder
+    };
+    // The requested photos: the one on screen (30), the hovered Review tile (12), the awaited frame (31).
+    let explicit = crate::support::ExplicitSet::new(c, false, c, c, len, Some(12), 31);
+    let requested: HashSet<usize> = [12usize, 30, 31].into_iter().collect();
+    // One held tick of the Mac wiring: the shed, then main.rs's next call.
+    let pressure_tick = || {
+        let n = crate::memory_pressure::shed(&explicit, &fast, &detail, &fast_gen, &RefCell::new(VecDeque::new()),
+            &RefCell::new(None), &RefCell::new(HashSet::new()), &RefCell::new(Vec::new()));
+        release_after_trim(n, app.get_sel_open(), &sel_model, &last_sel_key, grid_refills(&app, len),
+            &grid_model, &last_grid_key);
+        n
+    };
+    let shown = |m: &slint::VecModel<ui::FilmItem>| -> HashSet<usize> {
+        m.iter().filter(|t| t.valid).map(|t| t.idx as usize).collect()
+    };
+    let review_rows = |tiles: &[ui::FilmItem]| -> Vec<ui::SelTileRow> {
+        tiles
+            .chunks(2)
+            .map(|p| ui::SelTileRow { a: p[0].clone(), b: p.get(1).cloned().unwrap_or_default(), has_b: p.len() == 2 })
+            .collect()
+    };
+    let sel_built = (1, 2, 3, 4, 5, 6);
+
+    // ── (1) A CLOSED Review panel and a grid HIDDEN by immersive mode let go of their rows.
+    app.set_grid_open(true);
+    lay_out();
+    step();
+    let tiles: Vec<ui::FilmItem> = grid_model.iter().filter(|t| t.valid).collect();
+    assert!(tiles.len() > requested.len(), "the rows show previews as their stopgap");
+    sel_model.set_vec(review_rows(&tiles)); // shown while it was open; then it was closed
+    last_sel_key.set(sel_built);
+    assert!(!app.get_sel_open());
+    app.set_immersive(true);
+    lay_out();
+    assert!(app.get_grid_open() && !grid_refills(&app, len), "immersive mode hides the grid");
+    let gen0 = fast_gen.get();
+    assert_eq!(pressure_tick(), len - requested.len(), "the shed reports the previews it removed");
+    let kept: HashSet<usize> = fast.cache.borrow().keys().copied().collect();
+    assert_eq!(kept, requested, "the preview cache keeps exactly the requested photos");
+    assert!(detail.cache.borrow().keys().all(|id| requested.contains(id)), "…and so does the full-resolution cache");
+    assert_ne!(fast_gen.get(), gen0, "the refreshing feeds hear the shed");
+    assert_eq!(grid_model.row_count(), 0, "the hidden grid lets go of its rows");
+    assert_eq!(last_grid_key.get(), GRID_KEY_UNBUILT);
+    assert_eq!(sel_model.row_count(), 0, "the closed Review panel lets go of its rows");
+    assert_eq!(last_sel_key.get(), SEL_KEY_UNBUILT);
+
+    // ── (2) A held tick that shed nothing leaves even a hidden panel alone.
+    grid_model.set_vec(tiles.clone());
+    sel_model.set_vec(review_rows(&tiles));
+    last_sel_key.set(sel_built);
+    assert_eq!(pressure_tick(), 0, "nothing left to shed");
+    assert!(grid_model.row_count() > 0 && sel_model.row_count() > 0, "only a shed that removed previews lets go");
+
+    // ── (3) Panels that are refreshing keep their rows; the open grid rebuilds with only the
+    //        requested photos.
+    warm();
+    fast_gen.set(fast_gen.get() + 1); // the re-warm is a run of arrivals, each of which moves it
+    app.set_immersive(false);
+    lay_out();
+    assert!(grid_refills(&app, len));
+    step();
+    assert!(shown(&grid_model).len() > requested.len(), "the stopgaps are back for the whole folder");
+    app.set_sel_open(true);
+    sel_model.set_vec(review_rows(&tiles));
+    last_sel_key.set(sel_built);
+    assert!(pressure_tick() > 0);
+    assert!(grid_model.row_count() > 0, "an open grid is refreshing, so it rebuilds its own rows");
+    assert!(sel_model.row_count() > 0 && last_sel_key.get() == sel_built, "an open Review panel keeps its rows");
+    step();
+    assert_eq!(shown(&grid_model), requested, "the open grid rebuilt showing only the requested photos");
+    app.set_sel_open(false);
+
+    // ── (4) The Mac call site (only the Mac build compiles it): the shed's count reaches the panel
+    //        step, inside the hold, before the publish gate (production code only).
+    let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let prod = src.replace('\r', "");
+    let prod = prod.split_once("\nmod tests {").map_or(prod.as_str(), |(p, _)| p);
+    let shed = "                let shed_previews = memory_pressure::shed(&explicit, &fast_t, &detail_t, &fast_gen_t, &drain_buf,\n";
+    let release = concat!(
+        "                background_memory::release_after_trim(shed_previews, app.get_sel_open(), &sel_model, &last_sel_key,\n",
+        "                    tick::grid_refills(&app, len), &grid_model, &last_grid_key);\n",
+        "            }\n",
+        "            mac_pool_gov_t.as_ref().map_or(publish_gate,"
+    );
+    assert_eq!((prod.matches(shed).count(), prod.matches(release).count()), (1, 1), "the Mac hold hands the shed's count on");
+    let hold = prod.find("        let publish_gate = {\n            if memory_hold {\n").expect("the Mac hold's block");
+    let (at_shed, at_release) = (prod.find(shed).unwrap(), prod.find(release).unwrap());
+    assert!(hold < at_shed && at_shed < at_release, "…inside the hold, after the shed");
     app.set_grid_open(false);
 }
 
@@ -9332,6 +9510,55 @@ fn a_warning_outranks_a_same_tick_info_for_the_toast() {
     assert_eq!(toast_pick(&[(3, false), (1, true)]), Some(1));
 }
 
+/// 2026-10-28 (the cloud-only round, owner answer 8) — **THE CACHE METER LEAVES CLOUD-ONLY PHOTOS OUT
+/// OF BOTH NUMBERS.** The steady reading of `cache_meter_holds_its_reading_through_a_window_collapse`
+/// (3/3 behind, 4/8 ahead), with two photos ahead noted as only in the cloud this folder: they are
+/// never prepared, so the ahead half reads 4/6. A noted photo that is cached all the same still
+/// counts (498), and another folder's note does not (505).
+///
+/// FALSIFIER (L28): count a noted photo as available and the ahead reading is 4/8 again.
+#[test]
+fn the_cache_meter_leaves_cloud_only_photos_out() {
+    use std::cell::{Cell, RefCell};
+    let app = boot();
+    app.set_motion_ui(false);
+    app.set_count_all(1000);
+    app.set_hud_pos("501/1000".into());
+    let img = slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(1, 1));
+    let blur: std::sync::Arc<[u8]> = std::sync::Arc::from(vec![0u8; 4]);
+    let cache: RefCell<crate::tick::FastCache> = RefCell::new(std::collections::HashMap::new());
+    for i in 497..=504 {
+        cache.borrow_mut().insert(
+            i,
+            crate::tick::FastEntry { img: img.clone(), w: 2, h: 1, blur: blur.clone(), bw: 1, bh: 1, dim: 2048, turns: 0 },
+        );
+    }
+    let detail: RefCell<crate::tick::DetailCache> = RefCell::new(std::collections::HashMap::new());
+    let shots: Vec<crate::Shot> = (0..1000)
+        .map(|i| crate::Shot {
+            id: i,
+            name: format!("IMG_{i:04}"),
+            has_raw: false,
+            has_jpg: true,
+            raw: None,
+            jpg: Some(std::path::PathBuf::from(format!("C:/rig/IMG_{i:04}.jpg"))),
+            kind: crate::SrcKind::Jpeg,
+            cloud_placeholder: false,
+            sniffed: None,
+        })
+        .collect();
+    let fin = crate::support::CloudFile::Finished;
+    let notes: crate::support::CloudNotes =
+        std::sync::Mutex::new([(4, 506, fin), (4, 507, fin), (4, 498, fin), (3, 505, fin)].into_iter().collect());
+    let (eff_win, pf_win) = (Cell::new((78usize, 26usize)), Cell::new((8usize, 3usize)));
+    let last: Cell<(u32, u32, u32, u32)> = Cell::new((u32::MAX, u32::MAX, u32::MAX, u32::MAX));
+    crate::tick::step_cache_meter(
+        &app, 500, 1000, false, &cache, &detail, &eff_win, &pf_win, 3, 1, "", &last, &shots, &notes, 4, false,
+    );
+    hover(&app, 600.0, 300.0);
+    assert_eq!(app.get_cache_meter_tip().to_string(), "Cache · behind 3/3 · ahead 4/6");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // v0.8.113 — THE CACHE METER MUST NOT FLASH WHILE BROWSING.
 //
@@ -9409,6 +9636,8 @@ fn cache_meter_holds_its_reading_through_a_window_collapse() {
             // COMPOSED sentence now, and a released posture composes nothing.
             "",
             &last,
+            // The cloud-only round: nothing noted, so nothing is left out.
+            &[], &Default::default(), 0, false,
         );
     };
     // Everything the user can see: the four published bar properties, the tip sentence, the
@@ -12847,7 +13076,7 @@ fn a_held_nav_key_owns_the_wheel_only_where_the_platform_says_so() {
         let qt = quiet_wheel_toast();
         crate::tick::step_wheel_advance(
             &app, now, shots.len(), &accum, &wheel_at, &wheel_adv, &last_motion, &cur,
-            &shots, &detail, &dfail, &dfps, &dpace, 0, &thumbs, &fastc, &tfail, &ffail, &nkind,
+            &shots, &detail, &dfail, &dfps, &dpace, 0, &thumbs, &fastc, &tfail, &ffail, &Default::default(), &nkind,
             held_dir,
             crate::support::EfficiencyLimits::RELEASED,
             crate::tick::WheelToast { counts_unread: &qt.0, left: &qt.1, at: &qt.2 },
@@ -12977,7 +13206,7 @@ fn the_wait_setting_governs_the_wheel_and_the_keys_alike() {
         let cur = RefCell::new(from);
         crate::tick::step_scrub_advance(
             &app, now, shots.len(), 0, &held, &scrubbing, &last_key, &last_adv, &last_motion,
-            &cur, &shots, &thumbs, &fastc, &tfail, &ffail, &detail, &dfail, &dfps, &dpace, &nkind,
+            &cur, &shots, &thumbs, &fastc, &tfail, &ffail, &Default::default(), &detail, &dfail, &dfps, &dpace, &nkind,
             crate::support::EfficiencyLimits::RELEASED, // v0.8.195: released for every pre-existing row
         );
         let out = *cur.borrow();
@@ -12995,7 +13224,7 @@ fn the_wait_setting_governs_the_wheel_and_the_keys_alike() {
         let qt = quiet_wheel_toast();
         crate::tick::step_wheel_advance(
             &app, now, shots.len(), &accum, &wheel_at, &wheel_adv, &last_motion, &cur,
-            &shots, &detail, &dfail, &dfps, &dpace, 0, &thumbs, &fastc, &tfail, &ffail, &nkind,
+            &shots, &detail, &dfail, &dfps, &dpace, 0, &thumbs, &fastc, &tfail, &ffail, &Default::default(), &nkind,
             0, // v1.0 MERGE (F1-4): no nav key held — the wheel owns `current` in every row here
             crate::support::EfficiencyLimits::RELEASED, // v0.8.195: released for every pre-existing row
             crate::tick::WheelToast { counts_unread: &qt.0, left: &qt.1, at: &qt.2 },
@@ -13045,7 +13274,7 @@ fn the_wait_setting_governs_the_wheel_and_the_keys_alike() {
         let ff = Cell::new(false);
         crate::tick::step_compare_browse_advance(
             &app, now, shots.len(), 0, &compare, &accum, &wheel_at, &wheel_adv, &last_motion,
-            &a_idx, &b_idx, &cur, &ff, &nkind, &shots, &thumbs, &fastc, &tfail, &ffail,
+            &a_idx, &b_idx, &cur, &ff, &nkind, &shots, &thumbs, &fastc, &tfail, &ffail, &Default::default(),
             crate::support::EfficiencyLimits::RELEASED, // v0.8.195: released for every pre-existing row
             None, // the gate alone: nothing asks for a missing target here
         );
@@ -13787,7 +14016,7 @@ fn the_compare_retarget_step_is_wired_to_the_real_invokers() {
     // step 4: the scrub engine advances `current` off the pinned half, exactly as it does live.
     crate::tick::step_scrub_advance(
         &app, now, r.shots.len(), 0, &held, &scrubbing, &last_key, &last_adv, &last_motion,
-        &current, &r.shots, &thumbs, &fastc, &tfail, &ffail, &dcache, &dfail, &dfps, &dpace,
+        &current, &r.shots, &thumbs, &fastc, &tfail, &ffail, &Default::default(), &dcache, &dfail, &dfps, &dpace,
         &nkind,
         crate::support::EfficiencyLimits::RELEASED, // v0.8.195: released for every pre-existing row
     );
@@ -14022,7 +14251,7 @@ fn every_scrub_cap_the_estimator_can_hold_is_one_the_advance_loops_can_step() {
             *last_key.borrow_mut() = now; // the key is still down (the OS auto-repeat re-stamps)
             crate::tick::step_scrub_advance(
                 &app, now, shots.len(), 0, &held, &scrubbing, &last_key, &last_adv, &last_motion,
-                &cur, &shots, &thumbs, &fastc, &tfail, &ffail, &detail, &dfail, &dfps, &dpace,
+                &cur, &shots, &thumbs, &fastc, &tfail, &ffail, &Default::default(), &detail, &dfail, &dfps, &dpace,
                 &nkind,
                 eff, // v0.8.195 fix tail (skeptic A, O1 / L29): and the posture is a PARAMETER now
             );
@@ -14048,7 +14277,7 @@ fn every_scrub_cap_the_estimator_can_hold_is_one_the_advance_loops_can_step() {
             *wheel_at.borrow_mut() = now; // a live spin keeps this fresh (else the residual drops)
             crate::tick::step_wheel_advance(
                 &app, now, shots.len(), &accum, &wheel_at, &wheel_adv, &last_motion, &cur, &shots,
-                &detail, &dfail, &dfps, &dpace, 0, &thumbs, &fastc, &tfail, &ffail, &nkind,
+                &detail, &dfail, &dfps, &dpace, 0, &thumbs, &fastc, &tfail, &ffail, &Default::default(), &nkind,
                 0, // v1.0 MERGE (F1-4): no nav key held
                 eff, // v0.8.195 fix tail (skeptic A, O1 / L29)
                 crate::tick::WheelToast { counts_unread: &qt.0, left: &qt.1, at: &qt.2 },
@@ -14085,7 +14314,7 @@ fn every_scrub_cap_the_estimator_can_hold_is_one_the_advance_loops_can_step() {
             *wheel_at.borrow_mut() = now;
             crate::tick::step_compare_browse_advance(
                 &app, now, shots.len(), 0, &compare, &accum, &wheel_at, &wheel_adv, &last_motion,
-                &a_idx, &b_idx, &cur, &ff, &nkind, &shots, &thumbs, &fastc, &tfail, &ffail,
+                &a_idx, &b_idx, &cur, &ff, &nkind, &shots, &thumbs, &fastc, &tfail, &ffail, &Default::default(),
                 eff, // v0.8.195 fix tail (skeptic A, O1 / L29)
                 None,
             );
@@ -14432,7 +14661,7 @@ fn a_lone_zoomed_wheel_notch_is_never_discarded_unadvanced() {
             let now = t0 + Duration::from_millis(tick_ms * k);
             crate::tick::step_wheel_advance(
                 &app, now, shots.len(), &accum, &wheel_at, &wheel_adv, &last_motion, &cur, &shots,
-                &detail, &dfail, &dfps, &dpace, 0, &thumbs, &fastc, &tfail, &ffail, &nkind,
+                &detail, &dfail, &dfps, &dpace, 0, &thumbs, &fastc, &tfail, &ffail, &Default::default(), &nkind,
                 0, // v1.0 MERGE (F1-4): no nav key held
                 crate::support::EfficiencyLimits::RELEASED, // v0.8.195: released for every pre-existing row
                 crate::tick::WheelToast { counts_unread: &qt.0, left: &qt.1, at: &qt.2 },
@@ -14565,7 +14794,7 @@ fn a_stale_both_pinned_state_cannot_reach_single_view_navigation() {
     let last_motion = RefCell::new(now);
     crate::tick::step_scrub_advance(
         &app, now, shots.len(), 0, &held, &scrubbing, &last_key, &last_adv, &last_motion, &current,
-        &shots, &thumbs, &fastc, &tfail, &ffail, &detail, &dfail, &dfps, &dpace, &nkind,
+        &shots, &thumbs, &fastc, &tfail, &ffail, &Default::default(), &detail, &dfail, &dfps, &dpace, &nkind,
         crate::support::EfficiencyLimits::RELEASED, // v0.8.195: released for every pre-existing row
     );
     assert_eq!(*current.borrow(), 4, "the held key advances in the single view, pins or no pins");
@@ -15138,7 +15367,7 @@ fn the_review_panel_feeds_from_the_selections_own_generation() {
             &app, 0, 6, 1, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
             &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key, &last_count_key,
             &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view, &sel_vp_prog, &sel_model,
-            &rot, &cloud,
+            &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()),
         )
     };
     use slint::Model;
@@ -15422,7 +15651,7 @@ fn the_review_panels_open_recenter_does_not_stamp_the_input_clock() {
             &app, c, 40, 1, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
             &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key, &last_count_key,
             &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view, &sel_vp_prog, &sel_model,
-            &rot, &cloud,
+            &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()),
         )
     };
 
@@ -15546,7 +15775,7 @@ fn the_frost_feeder_does_not_get_ahead_of_the_visible_tiles() {
         &app, 0, N, 1, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
         &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key,
         &last_count_key, &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view,
-        &sel_vp_prog, &sel_model, &rot, &cloud,
+        &sel_vp_prog, &sel_model, &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()),
     );
 
     // THE DEQUEUE POINT, which is where the lane lives: `take` is what the fixed pools block in
@@ -15584,6 +15813,478 @@ fn the_frost_feeder_does_not_get_ahead_of_the_visible_tiles() {
     );
 
     app.set_sel_open(false);
+}
+
+/// 2026-10-29 (the jump lists round; plan: "those shown are pinned while the list is open (eviction
+/// safe), and missing ones are asked for like on-screen tiles (cloud-only photos show the cloud
+/// outline, never downloaded)"; testing rc.2: "Thumbnails near the pointer first", "Keep list
+/// thumbnails between opens") — **THE ROWS RUST PUBLISHES ARE THE SAMPLER'S FOR THE TIER THE PANEL
+/// REPORTS; WHILE THE REVIEW JUMP LIST IS OPEN ITS PHOTOS ARE PINNED WITH THE VISIBLE TILES AND ASKED
+/// FOR AFTER THEM, FROM THE FOCUS ENTRY OUTWARD, EXCEPT A PHOTO NOTED AS ONLY IN THE CLOUD; CLOSED,
+/// THOSE ALREADY LOADED STAY PINNED WHILE THE PANEL IS OPEN, THE REST ARE NOT (SO THEIR QUEUED
+/// REQUESTS CAN BE RETIRED), AND NOTHING NEW IS ASKED FOR.**
+///
+/// FALSIFIER (L28), ALL RUN: never ask for them (`if open {` to `if false {`) and the asked-for row
+/// reddens; give the entries a distance of 0 and the visible-first row reddens; order them from the
+/// top (`rank.abs_diff(focus)` to `rank`) and the focus-first row reddens; drop the kept pins
+/// (`pin.extend(keep);`) and the closed-pinned row reddens; keep the unloaded ones too (`} else if
+/// loaded.contains_key(&idx) {` to `} else {`) and the closed-pinned row reddens too; ask while closed
+/// (`if open {` to `if true {`) and the nothing-new row reddens.
+#[test]
+fn the_open_review_jump_list_pins_its_photos_and_asks_for_them_after_the_visible_tiles() {
+    use crate::tick::step_selection;
+    use slint::Model;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
+    const N: usize = 400;
+    let app = boot();
+    app.set_sel_open(true);
+    app.set_sel_rating_filter(-1);
+    let shots: Vec<crate::Shot> = (0..N)
+        .map(|i| crate::Shot {
+            id: i,
+            name: format!("HWU_{i:04}"),
+            has_raw: false,
+            has_jpg: true,
+            raw: None,
+            jpg: Some(std::path::PathBuf::from(format!("C:/rig/HWU_{i:04}.jpg"))),
+            kind: crate::SrcKind::Jpeg,
+            cloud_placeholder: false,
+            sniffed: None,
+        })
+        .collect();
+    let plan = crate::support::plan_from_shots(&shots);
+    let cache = RefCell::new(crate::tick::FastCache::new());
+    let film = crate::Film::new();
+    let thumb_gen = Cell::new(0u64);
+    let (thumb_req, rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+    let ratings = RefCell::new(vec![1i32; N]);
+    let marks = RefCell::new(vec![0u8; N]);
+    let filter_mode = Cell::new(0i32);
+    let sel_gen = Cell::new(7u64);
+    let select = RefCell::new(crate::support::SelectSet::default());
+    let select_gen = Cell::new(0u64);
+    let last_sel_key = Cell::new((u64::MAX, i32::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX));
+    let last_count_key = Cell::new((u64::MAX, u64::MAX, u64::MAX, u64::MAX));
+    let last_out_key = Cell::new((u64::MAX, u64::MAX, u64::MAX, i32::MIN, i32::MIN, i32::MIN, i32::MIN));
+    let sel_rated_sig = Cell::new((0i32, 0u64));
+    let last_sel_log = Cell::new((i32::MIN, i32::MIN, usize::MAX, usize::MAX, usize::MAX, i32::MIN, u64::MAX));
+    let last_sel_view = Cell::new((false, u64::MAX));
+    let sel_vp_prog: Cell<Option<crate::support::PanelMemo>> = Cell::new(None);
+    let sel_model = slint::VecModel::<ui::SelTileRow>::default();
+    let rot = crate::RotState::new(false);
+    let cloud: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    let fast_gen = Cell::new(0u64);
+    let step = || {
+        step_selection(
+            &app, 0, N, 1, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
+            &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key,
+            &last_count_key, &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view,
+            &sel_vp_prog, &sel_model, &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()),
+        )
+    };
+    app.set_sel_vp_h(400.0);
+    app.set_sel_vp_y(0.0);
+    app.set_review_jump_n(12);
+    let picks = crate::support::jump_rows(N / 2, 12);
+    let photos: Vec<usize> = picks.iter().flat_map(|&r| [2 * r, 2 * r + 1]).collect();
+    // One of the list's photos is noted as only in the cloud.
+    let noted = photos[11];
+    film.cloud_skipped.lock().unwrap().insert((1, noted, crate::support::CloudFile::Finished));
+    // OPEN: the rows, the pins, the requests, asked for from the entry under the pointer (6) outward.
+    app.set_review_jump_open(true);
+    app.set_review_jump_focus(6);
+    step();
+    let shown: Vec<usize> = app.get_review_jump_rows().iter().map(|r| r as usize).collect();
+    assert_eq!(shown, picks, "the published rows are the sampler's for the reported tier");
+    let visible: HashSet<usize> = (0..10).collect(); // rows 0..=4 (the viewport and its 2-row margin)
+    {
+        let pin = film.pinned.borrow();
+        assert!(visible.iter().all(|i| pin.contains(i)), "the visible tiles are pinned");
+        assert!(photos.iter().all(|i| pin.contains(i)), "every photo in the open list is pinned: {photos:?}");
+    }
+    let sent: Vec<usize> = std::iter::from_fn(|| rx.try_recv().ok()).map(|r| r.idx).collect();
+    let first_list = sent.iter().position(|i| !visible.contains(i)).expect("the list's photos were asked for");
+    assert!(
+        visible.iter().all(|i| sent[..first_list].contains(i)),
+        "the visible tiles are asked for first (a visible one in the list again is only promoted): {sent:?}"
+    );
+    let asked: HashSet<usize> = sent.iter().copied().collect();
+    assert!(photos.iter().filter(|&&i| i != noted).all(|i| asked.contains(i)), "every list photo is asked for: {sent:?}");
+    assert!(!asked.contains(&noted), "except the one only in the cloud");
+    // From entry 6 outward: its pair first, then entries 5 and 7, then 4 and 8.
+    let list: Vec<usize> = sent[first_list..].iter().copied().filter(|i| !visible.contains(i)).collect();
+    let entry = |k: usize| [photos[2 * k], photos[2 * k + 1]];
+    let ring = |ks: &[usize]| ks.iter().flat_map(|&k| entry(k)).filter(|&i| i != noted).collect::<HashSet<usize>>();
+    assert_eq!(list[..2].iter().copied().collect::<HashSet<_>>(), ring(&[6]), "the focus entry's pair first: {list:?}");
+    let r1 = ring(&[5, 7]);
+    assert_eq!(list[2..2 + r1.len()].iter().copied().collect::<HashSet<_>>(), r1, "then its neighbours: {list:?}");
+    // Entry 6's pair lands. CLOSED: those loaded stay pinned while the panel is open, the rest are
+    // not, so their queued requests can be retired; and nothing new is asked for.
+    let cm = crate::support::cm_bake_key(app.get_output_gamut());
+    for i in entry(6) {
+        film.thumbs.borrow_mut().insert(i, (slint::Image::from_rgba8(slint::SharedPixelBuffer::new(3, 2)), cm));
+    }
+    app.set_review_jump_open(false);
+    step();
+    let more: Vec<usize> = std::iter::from_fn(|| rx.try_recv().ok()).map(|r| r.idx).collect();
+    assert!(more.iter().all(|i| visible.contains(i)), "closed: nothing new is asked for: {more:?}");
+    let pin = film.pinned.borrow();
+    let kept: HashSet<usize> = visible.iter().copied().chain(entry(6)).collect();
+    assert_eq!(pin.iter().copied().collect::<HashSet<_>>(), kept, "closed: the loaded list photos stay pinned");
+    assert!(entry(7).iter().all(|i| !pin.contains(i)), "closed: the not-loaded ones are not pinned");
+}
+
+/// Codex review R1 (the jump lists round) — **THE TICK PUBLISHES THE REVIEW PANEL'S CONTENT KEY FROM
+/// THE FOLDER AND THE PHOTOS IT HOLDS: A THUMBNAIL LANDING OR A RATING IN PLACE KEEPS IT; THE SAME
+/// NUMBER OF ROWS WITH ANOTHER PHOTO, OR ANOTHER FOLDER, CHANGES IT.** The jump list remembers a
+/// jump only while the key is unchanged (`jr-held`).
+///
+/// FALSIFIER (L28), ALL RUN: fold the thumbnail generation into the key (`gen_now` to
+/// `gen_now ^ tgen`) and the thumbnail row reddens; key on no photos (`&order` to `&order[..0]`) and
+/// the first row, the key names the folder and the photos, reddens.
+#[test]
+fn the_tick_keys_the_review_rows_on_their_photos_not_their_pictures() {
+    use crate::support::review_rows_key;
+    use crate::tick::step_selection;
+    use slint::Model;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
+    const N: usize = 400;
+    let app = boot();
+    app.set_sel_open(true);
+    app.set_sel_rating_filter(-1);
+    let shots: Vec<crate::Shot> = (0..N)
+        .map(|i| crate::Shot {
+            id: i,
+            name: format!("HWU_{i:04}"),
+            has_raw: false,
+            has_jpg: true,
+            raw: None,
+            jpg: Some(std::path::PathBuf::from(format!("C:/rig/HWU_{i:04}.jpg"))),
+            kind: crate::SrcKind::Jpeg,
+            cloud_placeholder: false,
+            sniffed: None,
+        })
+        .collect();
+    let plan = crate::support::plan_from_shots(&shots);
+    let cache = RefCell::new(crate::tick::FastCache::new());
+    let film = crate::Film::new();
+    let thumb_gen = Cell::new(0u64);
+    let (thumb_req, _rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+    // Every photo but the last is rated, so the Reviewed view holds 399 photos in 200 rows.
+    let mut r = vec![1i32; N];
+    r[N - 1] = 0;
+    let ratings = RefCell::new(r);
+    let marks = RefCell::new(vec![0u8; N]);
+    let filter_mode = Cell::new(0i32);
+    let sel_gen = Cell::new(7u64);
+    let select = RefCell::new(crate::support::SelectSet::default());
+    let select_gen = Cell::new(0u64);
+    let last_sel_key = Cell::new((u64::MAX, i32::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX));
+    let last_count_key = Cell::new((u64::MAX, u64::MAX, u64::MAX, u64::MAX));
+    let last_out_key = Cell::new((u64::MAX, u64::MAX, u64::MAX, i32::MIN, i32::MIN, i32::MIN, i32::MIN));
+    let sel_rated_sig = Cell::new((0i32, 0u64));
+    let last_sel_log = Cell::new((i32::MIN, i32::MIN, usize::MAX, usize::MAX, usize::MAX, i32::MIN, u64::MAX));
+    let last_sel_view = Cell::new((false, u64::MAX));
+    let sel_vp_prog: Cell<Option<crate::support::PanelMemo>> = Cell::new(None);
+    let sel_model = slint::VecModel::<ui::SelTileRow>::default();
+    let rot = crate::RotState::new(false);
+    let cloud: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    let fast_gen = Cell::new(0u64);
+    let step = |gen: u64| {
+        step_selection(
+            &app, 0, N, gen, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
+            &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key,
+            &last_count_key, &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view,
+            &sel_vp_prog, &sel_model, &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()),
+        )
+    };
+    app.set_sel_vp_h(400.0);
+    app.set_sel_vp_y(0.0);
+    step(1);
+    let k = app.get_review_rows_key();
+    assert_eq!(sel_model.row_count(), 200, "precondition: 399 photos, 200 rows");
+    assert_eq!(k, review_rows_key(1, &(0..N - 1).collect::<Vec<_>>()), "the key names the folder and the photos");
+    // A thumbnail landing rebuilds the rows (their pictures change) and keeps the key.
+    thumb_gen.set(thumb_gen.get() + 1);
+    step(1);
+    assert_eq!(app.get_review_rows_key(), k, "a thumbnail landing keeps the key");
+    // A rating changed in place keeps the photos, so the key.
+    ratings.borrow_mut()[5] = 3;
+    sel_gen.set(sel_gen.get() + 1);
+    step(1);
+    assert_eq!(app.get_review_rows_key(), k, "a rating in place keeps the key");
+    // The first photo out, the last in: the same 200 rows, another photo.
+    ratings.borrow_mut()[0] = 0;
+    ratings.borrow_mut()[N - 1] = 1;
+    sel_gen.set(sel_gen.get() + 1);
+    step(1);
+    assert_eq!(sel_model.row_count(), 200, "precondition: the same number of rows");
+    let swapped = review_rows_key(1, &(1..N).collect::<Vec<_>>());
+    assert!(app.get_review_rows_key() == swapped && swapped != k, "another photo changes the key");
+    // Another folder with the same photo numbers.
+    step(2);
+    assert_eq!(app.get_review_rows_key(), review_rows_key(2, &(1..N).collect::<Vec<_>>()), "another folder changes the key");
+    app.set_sel_open(false);
+}
+
+/// A `step_selection` rig of its own (the tests above build theirs inline): one window, its Review
+/// rows bound to the window as in the app, and the step's per-window memos, so two can run side by
+/// side over the same folder state.
+struct SelRig {
+    app: ui::MainWindow,
+    model: std::rc::Rc<slint::VecModel<ui::SelTileRow>>,
+    key: std::cell::Cell<(u64, i32, u64, u64, u64, u64)>,
+    count: std::cell::Cell<(u64, u64, u64, u64)>,
+    out: std::cell::Cell<(u64, u64, u64, i32, i32, i32, i32)>,
+    rated: std::cell::Cell<(i32, u64)>,
+    log: std::cell::Cell<(i32, i32, usize, usize, usize, i32, u64)>,
+    view: std::cell::Cell<(bool, u64)>,
+    prog: std::cell::Cell<Option<crate::support::PanelMemo>>,
+}
+
+fn sel_rig() -> SelRig {
+    use std::cell::Cell;
+    let app = boot();
+    app.set_sel_open(true);
+    app.set_sel_rating_filter(-1);
+    app.set_sel_vp_h(400.0);
+    app.set_sel_vp_y(0.0);
+    let model = std::rc::Rc::new(slint::VecModel::default());
+    app.set_sel_rows(model.clone().into());
+    SelRig {
+        app,
+        model,
+        key: Cell::new(crate::background_memory::SEL_KEY_UNBUILT),
+        count: Cell::new((u64::MAX, u64::MAX, u64::MAX, u64::MAX)),
+        out: Cell::new((u64::MAX, u64::MAX, u64::MAX, i32::MIN, i32::MIN, i32::MIN, i32::MIN)),
+        rated: Cell::new((0, 0)),
+        log: Cell::new((i32::MIN, i32::MIN, usize::MAX, usize::MAX, usize::MAX, i32::MIN, u64::MAX)),
+        view: Cell::new((false, u64::MAX)),
+        prog: Cell::new(None),
+    }
+}
+
+/// `n` generated JPEG shots named `{stem}_0000…`.
+fn sel_rig_shots(n: usize, stem: &str) -> Vec<crate::Shot> {
+    (0..n)
+        .map(|i| crate::Shot {
+            id: i,
+            name: format!("{stem}_{i:04}"),
+            has_raw: false,
+            has_jpg: true,
+            raw: None,
+            jpg: Some(std::path::PathBuf::from(format!("C:/rig/{stem}_{i:04}.jpg"))),
+            kind: crate::SrcKind::Jpeg,
+            cloud_placeholder: false,
+            sniffed: None,
+        })
+        .collect()
+}
+
+/// 2026-10-29 (owner, testing rc.2: "lighter row updates", for this build) — **A PASS OVER THE SAME
+/// PHOTOS REWRITES ONLY THE ROWS WHOSE TILES CHANGED, AND AFTER EVERY KIND OF CHANGE THE ROWS ARE
+/// EXACTLY A FULL REBUILD'S: A THUMBNAIL LANDING IN OR OUT OF THE PANEL, AN EVICTION, A FAILURE, A
+/// CLOUD NOTE, A ROTATION, THE CURRENT PHOTO MOVING, A RATING, ANOTHER PHOTO, ANOTHER FOLDER, AND A
+/// ROTATION THAT CHANGES WHICH PHOTOS THE ROTATED VIEW HOLDS.** Two rigs run each pass over the same
+/// folder state: one keeps the step's memory, the other starts empty every pass (always the full
+/// rebuild). A marker in an untouched row shows what the lighter pass leaves alone.
+///
+/// FALSIFIER (L28), ALL RUN: always rebuild in full (`let light = prev_key` to `let light = false &&
+/// prev_key`) and the own-row row reddens; leave the current photo out of the inputs (`current: i ==
+/// c` to `current: false`) and the current-photo row reddens; drop the same-order condition and the
+/// rotated-into-the-view row reddens; drop the same-content condition and the another-folder row
+/// reddens; compare pictures as Slint does (`self.thumb == o.thumb`) and the own-row row reddens;
+/// keep the memory while the panel is closed (`if !app.get_sel_open()` to `if false`) and the
+/// closed row reddens.
+#[test]
+fn the_review_rows_are_rewritten_only_where_a_tile_changed_and_match_a_full_rebuild() {
+    use crate::tick::{step_selection, SelCache};
+    use slint::Model;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
+    const N: usize = 400;
+    let shots = sel_rig_shots(N, "HWU");
+    let shots2 = sel_rig_shots(N, "DSC"); // another folder, the same photo numbers
+    let (plan, plan2) = (crate::support::plan_from_shots(&shots), crate::support::plan_from_shots(&shots2));
+    let fast = RefCell::new(crate::tick::FastCache::new());
+    let film = crate::Film::new();
+    let thumb_gen = Cell::new(0u64);
+    let (thumb_req, _rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+    let mut r = vec![1i32; N];
+    r[N - 1] = 0; // 399 photos in the Reviewed view, 200 rows
+    let ratings = RefCell::new(r);
+    let marks = RefCell::new(vec![0u8; N]);
+    let filter_mode = Cell::new(0i32);
+    let sel_gen = Cell::new(7u64);
+    let select = RefCell::new(crate::support::SelectSet::default());
+    let select_gen = Cell::new(0u64);
+    let rot = crate::RotState::new(false);
+    let cloud: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    let fast_gen = Cell::new(0u64);
+    let (light, full) = (sel_rig(), sel_rig());
+    let memo = RefCell::new(SelCache::default());
+    let step = |c: usize, gen: u64| {
+        let (s, p) = if gen == 1 { (&shots, &plan) } else { (&shots2, &plan2) };
+        for (rig, cache) in [(&light, &memo), (&full, &RefCell::new(SelCache::default()))] {
+            step_selection(
+                &rig.app, c, N, gen, s, p, &ratings, &marks, &filter_mode, &sel_gen, &select,
+                &select_gen, &fast, &fast_gen, &film, &thumb_gen, &thumb_req, &rig.key,
+                &rig.count, &rig.out, &rig.rated, &rig.log, &rig.view,
+                &rig.prog, &rig.model, &rot, &cloud, cache,
+            );
+        }
+    };
+    // Rows alike: every field, the picture by identity, two empty pictures alike (Slint's own
+    // comparison never counts two empty images as equal).
+    let alike = |a: &ui::FilmItem, b: &ui::FilmItem| {
+        let empty = |i: &slint::Image| i.size().width == 0;
+        let (mut x, mut y) = (a.clone(), b.clone());
+        (x.thumb, y.thumb) = (slint::Image::default(), slint::Image::default());
+        (a.thumb == b.thumb || (empty(&a.thumb) && empty(&b.thumb))) && format!("{x:?}") == format!("{y:?}")
+    };
+    let same = |what: &str| {
+        assert_eq!(light.model.row_count(), full.model.row_count(), "{what}: the row count");
+        for r in 0..full.model.row_count() {
+            let (l, f) = (light.model.row_data(r).unwrap(), full.model.row_data(r).unwrap());
+            assert!(alike(&l.a, &f.a) && alike(&l.b, &f.b) && l.has_b == f.has_b, "{what}: row {r} is a full rebuild's: {l:?} vs {f:?}");
+        }
+    };
+    // Row 50 marked in the lighter rig: a pass that rewrote every row would wipe the mark.
+    let mark = || {
+        let mut d = light.model.row_data(50).unwrap();
+        d.a.name = "MARK".into();
+        light.model.set_row_data(50, d);
+    };
+    let marked = || light.model.row_data(50).unwrap().a.name == "MARK";
+    let unmark = || light.model.set_row_data(50, full.model.row_data(50).unwrap());
+    let bump = || thumb_gen.set(thumb_gen.get() + 1);
+    let pic = || slint::Image::from_rgba8(slint::SharedPixelBuffer::new(3, 2));
+    step(0, 1);
+    same("the first pass");
+    let cm = crate::support::cm_bake_key(light.app.get_output_gamut());
+    // A thumbnail lands for photo 20 (row 10): its row is rewritten, row 50 is not.
+    mark();
+    film.thumbs.borrow_mut().insert(20, (pic(), cm));
+    bump();
+    step(0, 1);
+    assert!(marked(), "a landing rewrites only its own row");
+    unmark();
+    same("a thumbnail landed");
+    // One lands for photo 399, not in the panel: nothing is rewritten.
+    mark();
+    film.thumbs.borrow_mut().insert(N - 1, (pic(), cm));
+    bump();
+    step(0, 1);
+    assert!(marked(), "a landing outside the panel rewrites nothing");
+    unmark();
+    same("a landing outside the panel");
+    film.thumbs.borrow_mut().remove(&20);
+    bump();
+    step(0, 1);
+    same("an eviction");
+    film.failed.lock().unwrap().insert((1, 30));
+    bump();
+    step(0, 1);
+    same("a failure");
+    film.cloud_skipped.lock().unwrap().insert((1, 40, crate::support::CloudFile::Finished));
+    bump();
+    step(0, 1);
+    same("a cloud note");
+    rot.delta_idx.borrow_mut().insert(60, 1);
+    bump();
+    step(0, 1);
+    same("a rotation");
+    bump();
+    step(50, 1);
+    same("the current photo moved");
+    ratings.borrow_mut()[5] = 3;
+    sel_gen.set(sel_gen.get() + 1);
+    step(50, 1);
+    same("a rating in place");
+    // The same number of rows with another photo: the first out, the last in.
+    ratings.borrow_mut()[0] = 0;
+    ratings.borrow_mut()[N - 1] = 1;
+    sel_gen.set(sel_gen.get() + 1);
+    step(50, 1);
+    same("another photo");
+    step(50, 2);
+    same("another folder");
+    // The Rotated view holds photo 60; rotating photo 70 adds it, with no other key moving (one row,
+    // then a full pair).
+    filter_mode.set(4);
+    bump();
+    step(50, 2);
+    same("the Rotated view");
+    rot.delta_idx.borrow_mut().insert(70, 1);
+    bump();
+    step(50, 2);
+    same("a photo rotated into the view");
+    // Closed, the memory lets go of the tiles' pictures (the background release empties the rows).
+    assert!(memo.borrow().pictures() > 0, "precondition: the memory holds the pictures");
+    light.app.set_sel_open(false);
+    full.app.set_sel_open(false);
+    step(50, 2);
+    assert_eq!(memo.borrow().pictures(), 0, "closed: the memory holds no pictures");
+}
+
+/// 2026-10-29 (owner, testing rc.2: "Re-sample after bigger changes") — **A NEW PICK KEEPS THE JUMP
+/// LIST'S ROWS, THE LAST ON THE NEW LAST ROW; A CHANGE OF A SPACING OR MORE, OR A NEW TIER, SAMPLES
+/// AFRESH.** The tick keeps the rows between passes in its memory.
+///
+/// FALSIFIER (L28), ALL RUN: never keep (`Some(j) if j.n == n` to `Some(j) if false && j.n == n`) and
+/// the new-pick row reddens.
+#[test]
+fn the_jump_lists_rows_stay_when_a_pick_comes_in_and_resample_after_a_bigger_change() {
+    use crate::support::jump_rows;
+    use crate::tick::{step_selection, SelCache};
+    use slint::Model;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
+    const N: usize = 400;
+    let shots = sel_rig_shots(N, "HWU");
+    let plan = crate::support::plan_from_shots(&shots);
+    let fast = RefCell::new(crate::tick::FastCache::new());
+    let film = crate::Film::new();
+    let thumb_gen = Cell::new(0u64);
+    let (thumb_req, _rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+    let ratings = RefCell::new((0..N).map(|i| i32::from(i < 380)).collect::<Vec<i32>>()); // 380 photos, 190 rows
+    let marks = RefCell::new(vec![0u8; N]);
+    let filter_mode = Cell::new(0i32);
+    let sel_gen = Cell::new(7u64);
+    let select = RefCell::new(crate::support::SelectSet::default());
+    let select_gen = Cell::new(0u64);
+    let rot = crate::RotState::new(false);
+    let cloud: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    let fast_gen = Cell::new(0u64);
+    let rig = sel_rig();
+    let memo = RefCell::new(SelCache::default());
+    let step = || {
+        step_selection(
+            &rig.app, 0, N, 1, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
+            &select_gen, &fast, &fast_gen, &film, &thumb_gen, &thumb_req, &rig.key, &rig.count,
+            &rig.out, &rig.rated, &rig.log, &rig.view, &rig.prog, &rig.model, &rot, &cloud, &memo,
+        );
+        rig.app.get_review_jump_rows().iter().map(|r| r as usize).collect::<Vec<usize>>()
+    };
+    rig.app.set_review_jump_n(25);
+    let a = step();
+    assert_eq!(a, jump_rows(190, 25), "first: evenly sampled");
+    // One new pick: 191 rows, the same rows, the last on the new last row.
+    ratings.borrow_mut()[380] = 1;
+    sel_gen.set(sel_gen.get() + 1);
+    let b = step();
+    assert_eq!((&b[..24], b[24]), (&a[..24], 190), "a new pick keeps the rows");
+    // Nineteen more: 200 rows, ten more than sampled for, past a spacing of 189 / 24: afresh.
+    for i in 381..N {
+        ratings.borrow_mut()[i] = 1;
+    }
+    sel_gen.set(sel_gen.get() + 1);
+    assert_eq!(step(), jump_rows(200, 25), "a bigger change samples afresh");
+    rig.app.set_review_jump_n(40);
+    assert_eq!(step(), jump_rows(200, 40), "a new tier samples afresh");
+    rig.app.set_sel_open(false);
 }
 
 /// v0.8.132 (OQ1 rule 1, ledger L18) — THE RESET EDGES, AND THE SURFACES THEY DO NOT TOUCH.
@@ -22556,7 +23257,7 @@ fn the_move_download_advisory_follows_the_live_placeholder_set() {
             &app, 0, 6, 1, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
             &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key, &last_count_key,
             &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view, &sel_vp_prog, &sel_model,
-            &rot, &cloud,
+            &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()),
         )
     };
 
@@ -22917,6 +23618,160 @@ fn cancelling_the_collision_modal_returns_to_the_export_sheet() {
     key(&app, slint::platform::Key::Escape);
     assert_eq!(app.get_confirm_kind(), 0);
     assert!(!app.get_export_open(), "an unrelated confirm must not open the export sheet");
+}
+
+/// 2026-10-28 (the cloud-only round, owner answer 9) — **THE EXPORT'S CLOUD QUESTION READS IN BOTH
+/// LANGUAGES AND FITS THE CONFIRM FRAME.** Kind 9: the warn-coloured count, the count-plus-phrase
+/// title, the body and the two buttons, every text inside the panel's body, in English and zh-CN.
+///
+/// FALSIFIER (L28): drop a zh-CN entry and the Chinese block finds the English; a title or body that
+/// overruns the 392 px frame reddens the inside test.
+#[test]
+fn the_export_cloud_question_reads_in_english_and_chinese_and_fits() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let zh_plural = |english: &str| -> String {
+        let pack: serde_json::Value =
+            serde_json::from_str(include_str!("../translations/zh-CN.json")).expect("the zh-CN pack parses");
+        pack.get(english).and_then(|v| v.get("other")).and_then(|v| v.as_str()).unwrap_or(english).to_string()
+    };
+    for lang in ["en", "zh-CN"] {
+        let app = boot();
+        slint::select_bundled_translation(lang).expect("the language is bundled");
+        app.window().set_size(slint::LogicalSize::new(1200.0, 800.0));
+        app.set_motion_ui(false);
+        app.set_web_cloud_count(3);
+        app.set_confirm_kind(9);
+        hover(&app, 600.0, 300.0);
+        let (title, body, go) = if lang == "en" {
+            (
+                "cloud-only photos → download, then export".to_string(),
+                "These photos are stored only in the cloud. Exporting them downloads them to this computer first.".to_string(),
+                "Download and export".to_string(),
+            )
+        } else {
+            (
+                zh_plural("cloud-only photo → download, then export"),
+                zh("These photos are stored only in the cloud. Exporting them downloads them to this computer first."),
+                zh("Download and export"),
+            )
+        };
+        assert!(lang == "en" || (!title.contains("cloud") && !body.contains("cloud")), "[{lang}] premise: translated");
+        let cfbox = E::find_by_element_id(&app, "MainWindow::cfbox").next().expect("the confirm frame's body");
+        let (bp, bs) = (cfbox.absolute_position(), cfbox.size());
+        let inside = |e: &E| {
+            let (p, s) = (e.absolute_position(), e.size());
+            p.x >= bp.x - 0.5 && p.x + s.width <= bp.x + bs.width + 0.5 && p.y >= bp.y - 0.5 && p.y + s.height <= bp.y + bs.height + 0.5
+        };
+        for t in [&title, &body, &"3".to_string()] {
+            let e = E::find_by_accessible_label(&app, t).find(|e| e.size().width > 1.0)
+                .unwrap_or_else(|| panic!("[{lang}] \"{t}\" is shown"));
+            assert!(inside(&e), "[{lang}] \"{t}\" fits the frame");
+        }
+        let primary = E::find_by_element_id(&app, "MainWindow::cfprimary").next().expect("the primary button");
+        assert!(inside(&primary), "[{lang}] the button row fits");
+        assert_eq!(E::find_by_accessible_label(&app, &go).filter(|e| e.size().width > 1.0).count(), 1, "[{lang}] \"{go}\"");
+        assert_eq!(E::find_by_element_id(&app, "MainWindow::ecskip").count(), 0, "[{lang}] two buttons, not kind 8's three");
+        app.set_confirm_kind(0);
+        let _ = slint::select_bundled_translation("en");
+    }
+}
+
+/// 2026-10-28 (the cloud-only round, owner answer 9) — **THE "ALREADY EXIST" ANSWER HANDS ON TO THE
+/// CLOUD QUESTION, AND EVERY WAY OUT OF THE CLOUD QUESTION RETURNS TO THE SHEET.** Rust raises kind
+/// 9 from inside kind 8's own callback (the gate in front of `launch_web`), so the click that
+/// answered kind 8 must neither close kind 9 nor answer it. Cancel, Esc and Enter on kind 9 drop the
+/// parked run and return to the export sheet, as kind 8's do.
+///
+/// FALSIFIER (L28): put kind 8's Overwrite arm back as `overwrite(); confirm-kind = 0` and the first
+/// row reads 0; move the kind-9 arm after kind 8 in the primary chain and "Download and export" is
+/// pressed by the same click; drop a door's `export-cloud-cancel` and its count reddens.
+#[test]
+fn the_already_exist_answer_hands_on_to_the_cloud_question() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let app = boot();
+    app.window().set_size(slint::LogicalSize::new(1200.0, 800.0));
+    app.set_motion_ui(false);
+    app.set_web_collide_count(2);
+    app.set_web_collide_total(5);
+    app.set_web_collide_title("of 5 already exist".into());
+    app.set_web_cloud_count(3);
+    let (go, cancel) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let raise = |app: &ui::MainWindow| {
+        let a = app.as_weak();
+        move || a.upgrade().expect("the window").set_confirm_kind(9) // the gate found cloud photos
+    };
+    app.on_export_collide_overwrite(raise(&app));
+    app.on_export_collide_skip(raise(&app));
+    app.on_export_cloud_go({ let g = go.clone(); move || g.set(g.get() + 1) });
+    app.on_export_cloud_cancel({ let c = cancel.clone(); move || c.set(c.get() + 1) });
+    let press = |id: &str| {
+        let e = i_slint_backend_testing::ElementHandle::find_by_element_id(&app, id)
+            .next()
+            .unwrap_or_else(|| panic!("{id} is mounted"));
+        let (p, s) = (e.absolute_position(), e.size());
+        click(&app, p.x + s.width / 2.0, p.y + s.height / 2.0, i_slint_core::items::PointerEventButton::Left);
+    };
+    for verb in ["MainWindow::cfprimary", "MainWindow::ecskip"] {
+        app.set_export_open(false);
+        app.set_confirm_kind(8);
+        hover(&app, 600.0, 300.0);
+        press(verb);
+        assert_eq!(app.get_confirm_kind(), 9, "{verb}: the cloud question is up, not closed");
+        assert_eq!(go.get(), 0, "{verb}: …and not answered by the same click");
+        hover(&app, 600.0, 300.0);
+        press("MainWindow::cfcancel");
+        assert_eq!(app.get_confirm_kind(), 0, "{verb}: Cancel closes it");
+        assert!(app.get_export_open(), "{verb}: …and returns to the export sheet");
+    }
+    assert_eq!(cancel.get(), 2, "each Cancel dropped its parked run");
+    for k in [slint::platform::Key::Escape, slint::platform::Key::Return] {
+        app.set_export_open(false);
+        app.set_confirm_kind(9);
+        hover(&app, 600.0, 300.0);
+        key(&app, k);
+        assert_eq!(app.get_confirm_kind(), 0, "{k:?} closes it");
+        assert!(app.get_export_open(), "{k:?}: …back to the sheet, never a download");
+    }
+    assert_eq!((cancel.get(), go.get()), (4, 0), "Esc and Enter cancel too; nothing downloaded");
+    app.set_export_open(false); // as on the way in: the sheet closes when Export is pressed
+    app.set_confirm_kind(9);
+    hover(&app, 600.0, 300.0);
+    press("MainWindow::cfprimary");
+    assert_eq!((go.get(), app.get_confirm_kind()), (1, 0), "Download and export answers it once and closes it");
+}
+
+/// 2026-10-28 (the cloud-only round, owner answer 10) — **APPLY ROTATIONS' CONFIRM SHOWS COPY AND
+/// MOVE'S LINE WHEN ITS FILES ARE IN THE CLOUD.** Kind 5 mounts the warn-coloured line only when
+/// Rust set it; no other kind shows it; and the Apply button asks Rust first rather than raising
+/// kind 5 itself.
+///
+/// FALSIFIER (L28): key the line on another kind, or ignore the empty string, and its row reddens;
+/// put `root.confirm-kind = 5` back on the button and the source row reddens.
+#[test]
+fn the_apply_confirm_shows_the_cloud_line_only_when_set() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let app = boot();
+    app.window().set_size(slint::LogicalSize::new(1200.0, 800.0));
+    app.set_motion_ui(false);
+    let line = crate::tick::cloud_download_notice(2);
+    let shown = |app: &ui::MainWindow| E::find_by_accessible_label(app, &line).filter(|e| e.size().width > 1.0).count();
+    app.set_count_rotated(4);
+    app.set_apply_cloud_notice(line.as_str().into());
+    app.set_confirm_kind(5);
+    hover(&app, 600.0, 300.0);
+    assert_eq!(shown(&app), 1, "kind 5 with cloud-only files shows the line");
+    app.set_apply_cloud_notice("".into());
+    hover(&app, 600.0, 300.0);
+    assert_eq!(shown(&app), 0, "an empty line is not mounted");
+    app.set_apply_cloud_notice(line.as_str().into());
+    app.set_confirm_kind(1);
+    hover(&app, 600.0, 300.0);
+    assert_eq!(shown(&app), 0, "another kind never shows Apply's line");
+    app.set_confirm_kind(0);
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/main_window.slint")).unwrap();
+    assert_eq!(src.matches("clicked => { root.apply-rotations-ask(); }").count(), 1, "the Apply button asks Rust first");
+    assert_eq!(src.matches("root.confirm-kind = 5;").count(), 0, "…and nothing raises kind 5 without the count");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28966,7 +29821,7 @@ fn a_dropped_wheel_notch_says_so_on_screen_once_every_second_and_a_half() {
             Cell::new(spoke_ms_ago.map(|ms| now - Duration::from_millis(ms)));
         crate::tick::step_wheel_advance(
             &app, now, shots.len(), &accum, &wheel_at, &wheel_adv, &last_motion, &cur,
-            &shots, &detail, &dfail, &dfps, &dpace, 0, &thumbs, &fastc, &tfail, &ffail, &nkind,
+            &shots, &detail, &dfail, &dfps, &dpace, 0, &thumbs, &fastc, &tfail, &ffail, &Default::default(), &nkind,
             0, // no nav key held: the wheel owns `current` in every row here
             crate::support::EfficiencyLimits::RELEASED,
             crate::tick::WheelToast { counts_unread: &tcu, left: &tleft, at: &at },
@@ -29954,6 +30809,56 @@ fn a_hover_miss_requests_at_most_one_fast_frame() {
     app.set_sel_open(false);
 }
 
+/// 2026-10-28 (the cloud-only round, owner answer 5) — **A HOVER ON A CLOUD-ONLY REVIEW TILE ASKS
+/// FOR NOTHING AND NEVER SAYS "LOADING…".** The card shows what is in hand (here the tile's
+/// thumbnail, baked before the file was freed up); a tile whose preview file a worker found only in
+/// the cloud is not asked for. An un-noted tile asks as before, and that ask is marked for the
+/// worker's own check (nobody is looking at a hovered photo yet), so a file freed up since is refused
+/// there and noted.
+///
+/// FALSIFIER (L28): drop the `cloud` term from the hover's miss arm and the first block reddens with
+/// the index queued and "Loading…" shown; push the ask unmarked and the marked row reddens.
+#[test]
+fn a_hover_on_a_cloud_only_tile_asks_for_nothing_and_never_says_loading() {
+    let app = boot();
+    let r = hp_rig();
+    hp_panel(&app);
+    let shots: Vec<crate::Shot> = (0..8)
+        .map(|i| crate::Shot {
+            id: i,
+            name: format!("IMG_{i:04}"),
+            has_raw: false,
+            has_jpg: true,
+            raw: None,
+            jpg: Some(std::path::PathBuf::from(format!("C:/rig/IMG_{i:04}.jpg"))),
+            kind: crate::SrcKind::Jpeg,
+            cloud_placeholder: false,
+            sniffed: None,
+        })
+        .collect();
+    let step = || {
+        crate::tick::step_hover_preview(&app, &r.hover, &r.fast, &r.film, &shots, &r.rot, 1, std::time::Instant::now())
+    };
+    let cm = crate::support::cm_bake_key(app.get_output_gamut());
+    r.film.thumbs.borrow_mut().insert(0, (hp_img(256, 171), cm));
+    r.film.cloud_skipped.lock().unwrap().insert((1, 0, crate::support::CloudFile::Finished));
+    let tiles = hp_tiles(&app);
+    hover(&app, tiles[0].0 + tiles[0].2 / 2.0, tiles[0].1 + tiles[0].2 / 3.0);
+    step();
+    assert!(app.get_sel_preview_shown(), "the card shows what is in hand");
+    assert!(!app.get_sel_preview_loading(), "…and never says Loading for a file it will not download");
+    assert!(r.fast.pump.0.lock().unwrap().queue.is_empty(), "…and asks for nothing");
+    assert_eq!(r.fast.hover_ask.load(std::sync::atomic::Ordering::Relaxed), -1);
+    // An un-noted tile asks as before, marked for the worker's own check.
+    r.film.cloud_skipped.lock().unwrap().clear();
+    step();
+    let p = r.fast.pump.0.lock().unwrap();
+    assert_eq!(p.queue.iter().copied().collect::<Vec<_>>(), vec![0], "a local file is asked for as before");
+    assert!(p.local_only_q.contains(&0), "…marked: nobody is looking at a hovered photo yet");
+    drop(p);
+    app.set_sel_open(false);
+}
+
 /// v1.0.0-rc (item 31, §3.C.1) — **A FAILED DECODE FALLS BACK TO THE THUMBNAIL, WITH NO WORD AND NO
 /// RETRY.** The fast tier's `(gen, idx)` failure latch is its retry-storm guard; a hover that
 /// re-asked every tick for a corrupt file would be the storm it exists to prevent.
@@ -30750,7 +31655,7 @@ fn a_worker_that_pops_the_hover_ask_between_two_ticks_leaves_it_running() {
     {
         let mut p = r.fast.pump.0.lock().unwrap();
         let popped = crate::support::pump_pop(&mut p);
-        assert_eq!(popped.map(|(i, _)| i), Some(0), "premise: the worker took the hover's ask");
+        assert_eq!(popped.map(|(i, _, _)| i), Some(0), "premise: the worker took the hover's ask");
     }
     // The rest moves. The withdraw looks in the QUEUE, and the ask is not there any more.
     hover(&app, tiles[2].0 + tiles[2].2 / 2.0, tiles[2].1 + tiles[2].2 / 3.0);
@@ -32449,14 +33354,15 @@ fn about_card_version_links_modal_gates_and_dismissal() {
         let p=version.absolute_position(); let size=version.size();
         click(&app,p.x+size.width/2.,p.y+size.height/2.,Left);
         assert!(app.get_about_open()); assert!(app.get_settings_open());
-        for (id, expected) in [("AboutCard::about-github",crate::about::REPOSITORY),
+        for (id, expected) in [("AboutCard::about-releases",crate::about::RELEASES),
+                               ("AboutCard::about-github",crate::about::REPOSITORY),
                                ("AboutCard::about-instagram","https://www.instagram.com/hwuphoto/"),
                                ("AboutCard::about-linkedin","https://www.linkedin.com/in/hancheng-wu-325794321")] {
             let row=E::find_by_element_id(&app,id).next().unwrap(); let p=row.absolute_position(); let size=row.size();
             click(&app,p.x+size.width/2.,p.y+size.height/2.,Left);
             assert_eq!(calls.borrow().last().map(String::as_str),Some(expected));
         }
-        app.invoke_about_link_requested(999); assert_eq!(calls.borrow().len(),3);
+        app.invoke_about_link_requested(999); assert_eq!(calls.borrow().len(),4);
         key(&app,slint::platform::Key::Escape);
         assert!(!app.get_about_open()); assert!(app.get_settings_open(), "Escape returns to Settings");
         app.invoke_show_about(); hover(&app,600.,300.);
@@ -32534,16 +33440,20 @@ fn public_release_footer_left_aligns_about_and_keeps_welcome_separate() {
     }
 }
 
+/// Falsifier (1.1.0-rc.1, issue #11 batch M1 + M4): leave the Mac first-launch popup armed after
+/// Apply to all answered it, or let a Mac test build's Apply to all call the first-launch choice.
 #[test]
 fn welcome_associations_apply_all_uses_existing_platform_paths_and_available_formats() {
     use std::{cell::Cell,rc::Rc};
     use i_slint_backend_testing::ElementHandle as E;
     use i_slint_core::items::PointerEventButton::Left;
-    for mac in [false,true] {
+    // (mac, test build) — a test build exists only on the Mac.
+    for (mac,test_build) in [(false,false),(true,false),(true,true)] {
         for heic in [false,true] {
             let app=boot(); app.set_motion_ui(false); app.set_welcome_open(true);
             app.window().set_size(slint::LogicalSize::new(1400.,1400.));
             app.set_file_assoc_visible(true); app.set_assoc_mac_mode(mac);
+            app.set_mac_assoc_change_enabled(!test_build);
             app.set_assoc_heic_avail(heic);
             app.set_assoc_jpeg(false); app.set_assoc_raw(false);
             let windows=Rc::new(Cell::new(0)); let w=windows.clone();
@@ -32551,10 +33461,15 @@ fn welcome_associations_apply_all_uses_existing_platform_paths_and_available_for
             let apple=Rc::new(Cell::new(-1)); let m=apple.clone();
             app.on_assoc_prompt_choice(move |choice|m.set(choice));
             hover(&app,700.,700.);
+            // A first Mac launch arms the popup behind the welcome (main.rs's assoc_boot).
+            if mac { app.set_assoc_prompt_armed(true); }
             let button=E::find_by_element_id(&app,"MainWindow::welcome-assoc-all").next().unwrap();
             let pos=button.absolute_position(); let size=button.size();
             click(&app,pos.x+size.width/2.,pos.y+size.height/2.,Left);
-            if mac {
+            if test_build {
+                assert_eq!(apple.get(),-1,"a test build's Apply to all must not pretend to set defaults");
+                assert!(app.get_assoc_prompt_armed(),"nothing was answered, so nothing is disarmed");
+            } else if mac {
                 assert_eq!(apple.get(),2); assert_eq!(windows.get(),0);
             } else {
                 assert_eq!(windows.get(),1); assert_eq!(apple.get(),-1);
@@ -32564,8 +33479,237 @@ fn welcome_associations_apply_all_uses_existing_platform_paths_and_available_for
                 assert_eq!(app.get_assoc_heic(),heic,"no registration claim for an unavailable codec");
             }
             assert!(app.get_welcome_open(),"one-click setup keeps the welcome card usable");
+            if mac && !test_build {
+                // M1: Apply to all answered the first-launch question, so closing the welcome
+                // must not ask it again.
+                app.set_welcome_open(false);
+                i_slint_core::properties::ChangeTracker::run_change_handlers();
+                assert!(!app.get_assoc_prompt_open(),"Apply to all answered the first-launch question");
+                assert!(!app.get_assoc_prompt_armed());
+            }
         }
     }
+    // Control: without Apply to all, the armed popup still opens when the welcome closes.
+    let app=boot(); app.set_motion_ui(false); app.set_assoc_mac_mode(true);
+    app.window().set_size(slint::LogicalSize::new(1400.,1400.));
+    app.set_welcome_open(true);
+    hover(&app,700.,700.); // flushes the handlers, so modal-open's baseline is true
+    app.set_assoc_prompt_armed(true);
+    app.set_welcome_open(false);
+    i_slint_core::properties::ChangeTracker::run_change_handlers();
+    assert!(app.get_assoc_prompt_open(),"the armed popup opens when the welcome closes");
+}
+
+/// 2026-10-29 (owner, testing 1.1.0-rc.1: Apply to all "did not have any visual feedback") — **THE
+/// GUIDE'S APPLY TO ALL SAYS IT WORKED, UNTIL THE GUIDE CLOSES.** A successful apply greys the button
+/// out and relabels it "Applied to all supported formats" (the owner's wording), inside the button, in
+/// English and zh-CN; a second click asks nothing; closing and reopening the guide brings the button
+/// back. A failed apply keeps the button and shows the error line. An apply while the guide is closed
+/// (Settings, the update prompt) never greets the next open. Real panel, input and apply body
+/// (`assoc_apply_ui`, the registry write faked); the Mac arm is pinned by source in main.rs
+/// (`mac_reset_and_first_launch_glue_uses_the_owned_plan_and_the_test_build_gate`).
+///
+/// FALSIFIER (L28): leave the flag out of the button's `enabled` and the second click applies again;
+/// drop the close handler's reset and the reopened guide still says applied; set the flag on failure,
+/// or whatever the guide's state, and those rows redden; drop the zh-CN entry and the Chinese block
+/// finds English.
+#[test]
+fn the_guides_apply_to_all_says_it_worked_until_the_guide_closes() {
+    use std::{cell::Cell, rc::Rc};
+    use i_slint_backend_testing::ElementHandle as E;
+    use i_slint_core::items::PointerEventButton::Left;
+    for lang in ["en", "zh-CN"] {
+        let (apply, applied) = if lang == "en" {
+            ("Apply to all".to_string(), "Applied to all supported formats".to_string())
+        } else {
+            (zh("Apply to all"), zh("Applied to all supported formats"))
+        };
+        assert!(lang == "en" || !applied.contains("Applied"), "[{lang}] premise: translated");
+        let app = boot();
+        slint::select_bundled_translation(lang).expect("the language is bundled");
+        app.set_motion_ui(false);
+        app.window().set_size(slint::LogicalSize::new(1400., 1400.));
+        app.set_file_assoc_visible(true); app.set_assoc_mac_mode(false);
+        let (calls, fail) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(false)));
+        let (c, f, w) = (calls.clone(), fail.clone(), app.as_weak());
+        app.on_assoc_apply(move || {
+            if let Some(a) = w.upgrade() {
+                crate::assoc_apply_ui(&a, true, |_, _| {
+                    c.set(c.get() + 1);
+                    if f.get() { Err(std::io::Error::other("fixture denied")) } else { Ok(()) }
+                });
+            }
+        });
+        let button = |app: &ui::MainWindow| E::find_by_element_id(app, "MainWindow::welcome-assoc-all").next().expect("the guide's button");
+        let press = |app: &ui::MainWindow| {
+            let b = button(app);
+            let (p, s) = (b.absolute_position(), b.size());
+            click(app, p.x + s.width / 2., p.y + s.height / 2., Left);
+        };
+        // The label shown inside the button (the same words can't hide elsewhere).
+        let says = |app: &ui::MainWindow, t: &str| {
+            let b = button(app);
+            let (bp, bs) = (b.absolute_position(), b.size());
+            E::find_by_accessible_label(app, t).filter(|e| {
+                let (p, s) = (e.absolute_position(), e.size());
+                s.width > 1.0 && p.x >= bp.x - 0.5 && p.x + s.width <= bp.x + bs.width + 0.5
+                    && p.y >= bp.y - 0.5 && p.y + s.height <= bp.y + bs.height + 0.5
+            }).count() == 1
+        };
+        let flush = |app: &ui::MainWindow| { hover(app, 700., 700.); i_slint_core::properties::ChangeTracker::run_change_handlers(); };
+        app.set_welcome_open(true); flush(&app);
+        assert!(says(&app, &apply), "[{lang}] before: Apply to all");
+        press(&app);
+        assert_eq!(calls.get(), 1);
+        assert!(app.get_welcome_assoc_applied());
+        assert!(says(&app, &applied) && !says(&app, &apply), "[{lang}] it says it worked, inside the button");
+        press(&app);
+        assert_eq!(calls.get(), 1, "[{lang}] greyed out: a second click asks nothing");
+        app.set_welcome_open(false); flush(&app);
+        assert!(!app.get_welcome_assoc_applied(), "[{lang}] closing the guide clears it");
+        app.set_welcome_open(true); flush(&app);
+        assert!(says(&app, &apply), "[{lang}] the reopened guide offers it again");
+        fail.set(true);
+        press(&app);
+        assert_eq!(calls.get(), 2);
+        assert!(!app.get_welcome_assoc_applied() && says(&app, &apply), "[{lang}] a failed apply claims nothing");
+        assert!(app.get_assoc_status().contains("fixture denied"), "[{lang}] …and the error line says why");
+        fail.set(false);
+        app.set_welcome_open(false); flush(&app);
+        app.invoke_assoc_apply();
+        assert_eq!(calls.get(), 3);
+        assert!(!app.get_welcome_assoc_applied(), "[{lang}] an apply outside the guide is not the guide's");
+        app.set_welcome_open(true); flush(&app);
+        assert!(says(&app, &apply), "[{lang}] …and never greets the next open");
+        let _ = slint::select_bundled_translation("en");
+    }
+}
+
+// 1.1.0-rc.1 (issue #11): the Windows update prompt. Falsifiers: open it over the welcome guide or
+// over the panel the guide closed into; leave it out of the dialog gates or the Esc ladder; apply
+// without first loading the live formats; close it on a failed Update; offer Update inside the zip;
+// keep a waiting prompt after the guide's Apply to all succeeded. Real panel, input and apply body.
+#[test]
+fn the_update_prompt_waits_for_an_idle_ui_and_updates_with_the_live_formats() {
+    use std::{cell::{Cell, RefCell}, rc::Rc};
+    use i_slint_backend_testing::ElementHandle as E;
+    use i_slint_core::items::PointerEventButton::Left;
+    let press = |app: &ui::MainWindow, id: &str| {
+        let b = E::find_by_element_id(app, id).next().unwrap_or_else(|| panic!("{id} is mounted"));
+        let (p, s) = (b.absolute_position(), b.size());
+        click(app, p.x + s.width / 2., p.y + s.height / 2., Left);
+    };
+    let mounted = |app: &ui::MainWindow, id: &str| E::find_by_element_id(app, id).next().is_some();
+
+    // Armed behind the feature-update guide, which closes into Settings: it waits for both.
+    let app = boot(); app.set_motion_ui(false); app.set_update_version("1.1.0-rc.1".into());
+    app.set_welcome_open(true); app.set_update_prompt_armed(true); hover(&app, 600., 300.);
+    assert!(!app.get_update_prompt_open(), "never over the guide");
+    app.set_welcome_open(false); app.set_settings_open(true); hover(&app, 600., 300.);
+    assert!(!app.get_update_prompt_open(), "never over the panel the guide closed into");
+    app.set_settings_open(false); hover(&app, 600., 300.);
+    assert!(app.get_update_prompt_open(), "opens when the UI is idle");
+    assert!(!app.get_update_prompt_armed());
+    assert!(app.get_dialog_open() && app.get_modal_blocking());
+    assert_eq!(E::find_by_accessible_label(&app, "Update to Falcon 1.1.0-rc.1").count(), 1);
+    assert!(mounted(&app, "MainWindow::update-now") && mounted(&app, "MainWindow::update-later"));
+    key(&app, slint::platform::Key::Escape);
+    assert!(!app.get_update_prompt_open(), "Esc = Not now");
+
+    // Update loads the live formats, then runs Settings' own apply; a failure keeps it open.
+    let app = boot(); app.set_motion_ui(false);
+    let calls = Rc::new(RefCell::new(Vec::<String>::new()));
+    let fail = Rc::new(Cell::new(true));
+    let (c, w) = (calls.clone(), app.as_weak());
+    app.on_refresh_assoc(move || {
+        c.borrow_mut().push("refresh".into());
+        if let Some(a) = w.upgrade() { a.set_assoc_registered(true); a.set_assoc_raw(true); } // the user's saved RAW choice
+    });
+    let (c, f, w) = (calls.clone(), fail.clone(), app.as_weak());
+    app.on_assoc_apply(move || {
+        if let Some(a) = w.upgrade() {
+            crate::assoc_apply_ui(&a, true, |on, _| {
+                c.borrow_mut().push(format!("apply raw={}", on[8]));
+                if f.get() { Err(std::io::Error::other("fixture denied")) } else { Ok(()) }
+            });
+        }
+    });
+    app.set_update_prompt_open(true); hover(&app, 600., 300.);
+    assert!(!mounted(&app, "MainWindow::update-error"));
+    press(&app, "MainWindow::update-now");
+    assert_eq!(*calls.borrow(), ["refresh", "apply raw=true"], "the live formats, then Settings' apply");
+    assert!(app.get_update_prompt_open(), "a failed Update keeps the panel open");
+    assert!(mounted(&app, "MainWindow::update-error") && app.get_assoc_status().contains("fixture denied"));
+    fail.set(false);
+    press(&app, "MainWindow::update-now");
+    assert!(!app.get_update_prompt_open(), "a successful Update closes it");
+    assert!(app.get_assoc_status().is_empty());
+
+    // Inside the zip there is nothing to update: the message and Not now only.
+    let app = boot(); app.set_motion_ui(false);
+    app.set_update_prompt_zip(true); app.set_update_prompt_open(true); hover(&app, 600., 300.);
+    assert!(!mounted(&app, "MainWindow::update-now"));
+    assert_eq!(E::find_by_accessible_label(&app, "Falcon is running from inside the zip file. To update, extract it to a folder first, then open Falcon from that folder.").count(), 1);
+    press(&app, "MainWindow::update-later");
+    assert!(!app.get_update_prompt_open());
+
+    // The guide's Apply to all succeeds: photos open here now, so nothing opens after the guide.
+    let app = boot(); app.set_motion_ui(false);
+    app.window().set_size(slint::LogicalSize::new(1400., 1400.));
+    app.set_file_assoc_visible(true); app.set_assoc_mac_mode(false);
+    let w = app.as_weak();
+    app.on_assoc_apply(move || {
+        if let Some(a) = w.upgrade() { crate::assoc_apply_ui(&a, true, |_, _| Ok(())); }
+    });
+    app.set_welcome_open(true); app.set_update_prompt_armed(true); hover(&app, 700., 700.);
+    press(&app, "MainWindow::welcome-assoc-all");
+    assert!(!app.get_update_prompt_armed(), "a successful apply disarms the prompt");
+    app.set_welcome_open(false); hover(&app, 700., 700.);
+    assert!(!app.get_update_prompt_open());
+}
+
+// 1.1.0-rc.1 (review R2, 28 October): photos stop opening in Falcon before the waiting prompt opens,
+// or while it is open. Falsifiers: leave the prompt armed after Remove; let Update apply after its
+// refresh found photos no longer set to open in Falcon. Real panel, input, Remove and apply bodies
+// (the registry writes faked).
+#[test]
+fn remove_cancels_the_update_prompt_and_update_never_registers_a_removed_setup() {
+    use std::{cell::Cell, rc::Rc};
+    use i_slint_backend_testing::ElementHandle as E;
+    use i_slint_core::items::PointerEventButton::Left;
+
+    // Armed behind the guide, which closes into Settings; Remove there; Settings closes: nothing opens.
+    let app = boot(); app.set_motion_ui(false); app.set_assoc_registered(true);
+    let removed = Rc::new(Cell::new(false));
+    let (r, w) = (removed.clone(), app.as_weak());
+    app.on_assoc_remove(move || {
+        if let Some(a) = w.upgrade() { crate::assoc_remove_ui(&a, || r.set(true)); }
+    });
+    app.set_welcome_open(true); app.set_update_prompt_armed(true); hover(&app, 600., 300.);
+    app.set_welcome_open(false); app.set_settings_open(true); hover(&app, 600., 300.);
+    app.invoke_assoc_remove();
+    assert!(removed.get() && !app.get_assoc_registered());
+    assert!(!app.get_update_prompt_armed(), "Remove cancels the waiting prompt");
+    app.set_settings_open(false); hover(&app, 600., 300.);
+    assert!(!app.get_update_prompt_open(), "nothing to update once photos don't open in Falcon");
+
+    // Open, then removed elsewhere (another window, or Windows' settings): Update only closes it.
+    let app = boot(); app.set_motion_ui(false); app.set_assoc_registered(true);
+    let applied = Rc::new(Cell::new(false));
+    let w = app.as_weak();
+    app.on_refresh_assoc(move || {
+        if let Some(a) = w.upgrade() { a.set_assoc_registered(false); } // what the live registry says now
+    });
+    let (f, w) = (applied.clone(), app.as_weak());
+    app.on_assoc_apply(move || {
+        if let Some(a) = w.upgrade() { crate::assoc_apply_ui(&a, true, |_, _| { f.set(true); Ok(()) }); }
+    });
+    app.set_update_prompt_open(true); hover(&app, 600., 300.);
+    let b = E::find_by_element_id(&app, "MainWindow::update-now").next().expect("Update is mounted");
+    let (p, s) = (b.absolute_position(), b.size());
+    click(&app, p.x + s.width / 2., p.y + s.height / 2., Left);
+    assert!(!applied.get(), "the checkbox defaults never register a removed setup");
+    assert!(!app.get_assoc_registered() && !app.get_update_prompt_open());
 }
 
 // Falsifier: retain the redundant bottom Close row or its reserved vertical gap.
@@ -33047,7 +34191,7 @@ fn a_compare_browse_survives_two_steps_after_a_grid_scroll() {
         let last_motion = RefCell::new(now);
         step_compare_browse_advance(
             &app, now, shots.len(), 0, &compare, &accum, &wheel_at, &wheel_adv, &last_motion,
-            &a_idx, &b_idx, &cur, &ff, &nkind, &shots, &film.thumbs, &fastc, &film.failed, &ffail,
+            &a_idx, &b_idx, &cur, &ff, &nkind, &shots, &film.thumbs, &fastc, &film.failed, &ffail, &film.cloud_skipped,
             crate::support::EfficiencyLimits::RELEASED,
             Some(ThumbAsk { tx: &tx, film: &film, rot: &rot }),
         );
@@ -33143,6 +34287,755 @@ fn settings_scroll_bar_fits_padding_and_seeks_the_body() {
     assert!(body.size().height < flick.size().height, "tall fixture fits the complete body");
     assert_eq!(E::find_by_element_type_name(&app, "MiniVBar").count(), 0,
         "no bar when Settings needs no scrolling");
+}
+
+// ── 2026-10-29 (the jump lists round) — THE SETTINGS SECTION LIST. ─────────────────────────────
+
+type SjRect = (f32, f32, f32, f32);
+
+/// Settings open on a 960×720 window, which scrolls, with motion off so the panel stands still.
+/// Returns the scroll bar's band (`MiniVBar::barta`) and the panel (`setbox`, at the panel's 0,0).
+fn sj_settings() -> (ui::MainWindow, SjRect, SjRect) {
+    use i_slint_backend_testing::ElementHandle as E;
+    let app = boot();
+    app.window().set_size(slint::LogicalSize::new(960., 720.));
+    app.set_motion_ui(false);
+    app.set_welcome_open(false);
+    app.set_grid_open(false);
+    app.set_sel_open(false);
+    app.set_settings_open(true);
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(300));
+    hover(&app, 800., 400.);
+    let rect = |id: &str| {
+        let e = E::find_by_element_id(&app, id).next().unwrap_or_else(|| panic!("{id}"));
+        (e.absolute_position().x, e.absolute_position().y, e.size().width, e.size().height)
+    };
+    let (band, panel) = (rect("MiniVBar::barta"), rect("MainWindow::setbox"));
+    (app, band, panel)
+}
+
+/// Rest the pointer at (x, y) for `ms` on Slint's clock (the list's timings are `animate` delays).
+fn sj_rest(app: &ui::MainWindow, x: f32, y: f32, ms: u64) {
+    hover(app, x, y);
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(ms));
+    hover(app, x, y);
+}
+
+/// The open section list's rect, if it is mounted.
+fn sj_list(app: &ui::MainWindow) -> Option<SjRect> {
+    let e = i_slint_backend_testing::ElementHandle::find_by_element_type_name(app, "SectionJump").next()?;
+    Some((e.absolute_position().x, e.absolute_position().y, e.size().width, e.size().height))
+}
+
+/// A caption's row in the open list (the label inside the list's rect, not the body's caption).
+fn sj_row(app: &ui::MainWindow, t: &str) -> SjRect {
+    let (lx, ly, lw, lh) = sj_list(app).expect("the list is open");
+    let e = i_slint_backend_testing::ElementHandle::find_by_accessible_label(app, t)
+        .find(|e| {
+            let p = e.absolute_position();
+            e.size().width > 1. && p.x >= lx && p.x < lx + lw && p.y >= ly && p.y < ly + lh
+        })
+        .unwrap_or_else(|| panic!("{t} in the list"));
+    (e.absolute_position().x, e.absolute_position().y, e.size().width, e.size().height)
+}
+
+const SJ_SECTIONS: [&str; 11] = ["LANGUAGE", "INPUT", "COPY SHORTCUT", "PERFORMANCE", "DISPLAY", "REVIEW", "COLOUR",
+    "FILE ASSOCIATIONS", "DEVELOPER", "CONTROLS", "BASIC SHORTCUTS"];
+
+/// 2026-10-29 (owner, testing 1.1.0-rc.1, after mockups: variant A; "make sure the hover detection
+/// box is big enough so it is easy to reach rather than dropping when the cursor is in the gap
+/// between the slider and the panel"; "standard reveal and disappear animations/timings similar to
+/// the review panel image hover"; testing rc.2: "reduce the hover jump menu's trigger delay", 200 ms
+/// for both lists) — **THE SETTINGS SECTION LIST OPENS AFTER A 200 MS REST WITHIN 10 PX
+/// OF EITHER SIDE OF THE SCROLL BAR, 8 PX RIGHT OF THE PANEL AND LEVEL WITH THE BAR'S TRACK, WITH THE
+/// ELEVEN SECTIONS IN ORDER; IT STAYS OPEN ACROSS THE GAP, OVER THE LIST AND ITS MARGIN, AND CLOSES
+/// 120 MS AFTER THE POINTER LEAVES.**
+///
+/// FALSIFIER (L28), ALL RUN: shorten the reach (`self.jl-bx - 10px` to `- 2px`) and the 210 ms row
+/// reddens; drop the rest (200 ms to 0) and the 120 ms row reddens; drop the list's rect from the
+/// zone and the list row reddens; drop the linger (120 ms to 0) and the 100 ms row reddens.
+#[test]
+fn the_section_list_opens_by_the_bar_after_a_rest_and_stays_across_the_gap() {
+    let (app, (bx, by, bw, bh), (px, _py, pw, _ph)) = sj_settings();
+    let open = || sj_list(&app).is_some();
+    let mid = by + bh / 2.;
+    // A pass that does not rest does not open it.
+    sj_rest(&app, bx - 9., mid, 120);
+    assert!(!open(), "120 ms by the bar: not yet");
+    sj_rest(&app, 800., 400., 400);
+    assert!(!open(), "left before 200 ms: it never opens");
+    // A rest 9 px left of the band (over the panel, beside its controls) opens it at 200 ms.
+    sj_rest(&app, bx - 9., mid, 190);
+    assert!(!open(), "190 ms: not yet");
+    sj_rest(&app, bx - 9., mid, 20);
+    let (lx, ly, lw, lh) = sj_list(&app).expect("210 ms: open");
+    assert!((lx - (px + pw + 8.)).abs() < 0.5, "8 px right of the panel ({lx} vs {})", px + pw + 8.);
+    assert!((ly - (by + 8.)).abs() < 0.5, "level with the track's top ({ly} vs {})", by + 8.);
+    assert!((lh - (18. + 11. * 27. - 3.)).abs() < 0.5, "eleven 24 px rows, 3 px apart ({lh})");
+    let rows: Vec<SjRect> = SJ_SECTIONS.iter().map(|t| sj_row(&app, t)).collect();
+    assert!(rows.windows(2).all(|p| (p[1].1 - p[0].1 - 27.).abs() < 0.5), "in Settings' order: {rows:?}");
+    assert!(rows.iter().all(|r| r.0 >= lx + 9. && r.0 + r.2 <= lx + lw - 9.), "every caption inside its cell");
+    // The other side of the band, across the gap, over the list and its margin: it stays open.
+    for (x, y, what) in [
+        (bx + bw + 9., mid, "9 px right of the band"),
+        (px + pw + 4., ly + 40., "the gap"),
+        (lx + lw / 2., ly + lh / 2., "the list"),
+        (lx + lw + 10., ly + lh + 10., "the margin"),
+    ] {
+        sj_rest(&app, x, y, 500);
+        assert!(open(), "{what}: still open");
+    }
+    // Leaving: still there at 100 ms, gone at 130 ms.
+    sj_rest(&app, 800., 400., 100);
+    assert!(open(), "100 ms after leaving: still open");
+    sj_rest(&app, 800., 400., 30);
+    assert!(!open(), "130 ms after leaving: closed");
+    // Closed, the list's place is no longer a zone: resting there does not reopen it.
+    sj_rest(&app, lx + lw / 2., ly + lh / 2., 500);
+    assert!(!open(), "the closed list's place does not reopen it");
+    // Coming back within 120 ms keeps it open.
+    sj_rest(&app, bx - 9., mid, 340);
+    assert!(open(), "reopened");
+    sj_rest(&app, 800., 400., 100);
+    sj_rest(&app, lx + lw / 2., ly + lh / 2., 500);
+    assert!(open(), "back within 120 ms: it never closed");
+}
+
+/// 2026-10-29 (owner: "dragging the sections in that small panel should also jump through the
+/// respective sections"; "the last element "basic shortcuts" cannot be correctly turned to selected
+/// state - make sure it does not happen in the real app"; solid blue for the current section) —
+/// **A CLICK ON THE SECTION LIST PUTS THAT SECTION'S CAPTION WHERE LANGUAGE'S SITS AT REST; A DRAG
+/// JUMPS SECTION BY SECTION, KEEPS THE LIST OPEN WHEREVER THE POINTER GOES, AND PAST THE END LANDS ON
+/// THE LAST; THE ACCENT PILL MARKS THE CURRENT SECTION: THE JUMPED-TO ONE UNTIL THE USER SCROLLS, THE
+/// LAST AT THE BOTTOM OF THE SCROLL, ELSE THE LAST CAPTION AT OR ABOVE THE TOP. WITHOUT FILE
+/// ASSOCIATIONS THE LIST HAS TEN ROWS AND STILL JUMPS TO THE RIGHT SECTIONS.**
+///
+/// FALSIFIER (L28), ALL RUN: drop the bottom rule and the wheel-to-the-end row reddens; drop the
+/// jumped rule and the CONTROLS row reddens; drop `held` from the latch and the dragged-away row
+/// reddens; map keys to rows without skipping k = 7 and the ten-row DEVELOPER row reddens.
+#[test]
+fn a_section_list_click_or_drag_jumps_and_marks_the_current_section_to_the_last() {
+    use i_slint_backend_testing::ElementHandle as E;
+    use i_slint_core::items::PointerEventButton::Left;
+    let (app, (bx, by, _bw, bh), (px, _py, pw, _ph)) = sj_settings();
+    let flick = E::find_by_element_id(&app, "MainWindow::setflick").next().unwrap();
+    let body = E::find_by_element_id(&app, "MainWindow::body").next().unwrap();
+    let body_y = || body.absolute_position().y;
+    // A body caption's place in the body. The rig's search skips what a clip hides, so the places
+    // are read on a window tall enough to show the whole body (the body's width, and so its layout,
+    // does not depend on the window's height), then the window goes back to scrolling.
+    let cap = |t: &str| {
+        E::find_by_accessible_label(&app, t)
+            .find(|e| e.absolute_position().x < px + pw && e.size().width > 1.)
+            .map(|e| e.absolute_position().y)
+            .unwrap_or_else(|| panic!("the body's {t}"))
+            - body_y()
+    };
+    app.window().set_size(slint::LogicalSize::new(960., 9000.));
+    hover(&app, 800., 400.);
+    let offs: Vec<f32> = SJ_SECTIONS.iter().map(|t| cap(t)).collect();
+    app.window().set_size(slint::LogicalSize::new(960., 720.));
+    hover(&app, 800., 400.);
+    sj_rest(&app, bx - 9., by + bh / 2., 340);
+    let (lx, ly, lw, lh) = sj_list(&app).expect("open");
+    let (lcx, lcy) = (lx + lw / 2., ly + lh / 2.);
+    let (fy, fh, bodyh) = (flick.absolute_position().y, flick.size().height, body.size().height);
+    let jumped_to = |k: usize| fy - (offs[k] - offs[0]).clamp(0., bodyh - fh);
+    let pill_on = |t: &str| {
+        let p = E::find_by_element_id(&app, "SectionJump::pill").next().expect("the pill");
+        let (cy, r) = (p.absolute_position().y + p.size().height / 2., sj_row(&app, t));
+        cy > r.1 && cy < r.1 + r.3
+    };
+    assert!(pill_on("LANGUAGE"), "at the top: LANGUAGE");
+    // A click: DISPLAY's caption goes where LANGUAGE's sat.
+    let r = sj_row(&app, "DISPLAY");
+    click(&app, r.0 + r.2 / 2., r.1 + r.3 / 2., Left);
+    sj_rest(&app, lcx, lcy, 200);
+    assert!((body_y() - jumped_to(4)).abs() < 0.5, "DISPLAY at the top ({} vs {})", body_y(), jumped_to(4));
+    assert!(pill_on("DISPLAY"), "the pill on DISPLAY");
+    // A drag from REVIEW down the list: each section it crosses is jumped to, in order.
+    let centres: Vec<(f32, f32)> = SJ_SECTIONS[5..].iter().map(|t| { let r = sj_row(&app, t); (lcx, r.1 + r.3 / 2.) }).collect();
+    let mut pts = centres.clone();
+    pts.push((lcx, ly + lh + 30.)); // past the end
+    pts.push((900., 600.));         // and far away, still pressed
+    let mut seen = Vec::new();
+    drag_probed(&app, &pts, |i| {
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(200));
+        i_slint_core::properties::ChangeTracker::run_change_handlers();
+        seen.push((i, body_y(), sj_list(&app).is_some()));
+    });
+    for &(i, y, open) in &seen {
+        let k = (5 + i).min(10);
+        assert!((y - jumped_to(k)).abs() < 0.5, "drag step {i}: {} ({y} vs {})", SJ_SECTIONS[k], jumped_to(k));
+        assert!(open, "drag step {i}: the list stays open while it is dragged, wherever the pointer is");
+    }
+    assert!((body_y() + bodyh - fy - fh).abs() < 0.5, "past the end: the bottom of the scroll");
+    sj_rest(&app, lcx, lcy, 200);
+    assert!(pill_on("BASIC SHORTCUTS"), "and BASIC SHORTCUTS is current");
+    // CONTROLS cannot reach the top this near the end, yet once jumped to it is the current one.
+    assert!(offs[9] - offs[0] > bodyh - fh + 1., "precondition: CONTROLS sits within the last screen: {offs:?}, body {bodyh}, viewport {fh}");
+    let r = sj_row(&app, "CONTROLS");
+    click(&app, r.0 + r.2 / 2., r.1 + r.3 / 2., Left);
+    sj_rest(&app, lcx, lcy, 200);
+    assert!(pill_on("CONTROLS"), "jumped to CONTROLS: CONTROLS, not the bottom's BASIC SHORTCUTS");
+    // The user scrolls (the wheel over the list): the scroll position decides again.
+    for _ in 0..4 {
+        wheel(&app, lcx, lcy, 120.);
+    }
+    sj_rest(&app, lcx, lcy, 200);
+    let top = fy - body_y();
+    let k = (0..11).rev().find(|&k| offs[k] - offs[0] <= top + 0.5).unwrap();
+    assert!(body_y() + bodyh > fy + fh + 1., "precondition: off the bottom");
+    assert!(pill_on(SJ_SECTIONS[k]), "after the wheel: {} (the last caption at or above the top)", SJ_SECTIONS[k]);
+    for _ in 0..40 {
+        wheel(&app, lcx, lcy, -120.);
+    }
+    sj_rest(&app, lcx, lcy, 200);
+    assert!(pill_on("BASIC SHORTCUTS"), "the wheel to the end: BASIC SHORTCUTS, with no jump");
+    // Where the platform hides FILE ASSOCIATIONS: ten rows, and DEVELOPER still jumps to DEVELOPER.
+    app.set_file_assoc_visible(false);
+    sj_rest(&app, lcx, lcy, 200);
+    assert!(E::find_by_accessible_label(&app, "FILE ASSOCIATIONS").next().is_none());
+    let (_, _, _, lh10) = sj_list(&app).expect("still open");
+    assert!((lh10 - (18. + 10. * 27. - 3.)).abs() < 0.5, "ten rows ({lh10})");
+    let r = sj_row(&app, "DEVELOPER");
+    click(&app, r.0 + r.2 / 2., r.1 + r.3 / 2., Left);
+    sj_rest(&app, lcx, lcy, 200);
+    assert!((cap("DEVELOPER") + body_y() - fy - offs[0]).abs() < 0.5, "DEVELOPER at the top, not CONTROLS");
+    assert!(pill_on("DEVELOPER"));
+}
+
+/// 2026-10-29 (owner, from a mockup bug: "scrolling mouse wheel when the hover panel is active is
+/// blocked (the settings page/panel is not moving) - make sure it does not happen in the actual
+/// app") — **THE WHEEL SCROLLS SETTINGS OVER THE SCROLL BAR, THE GAP AND THE OPEN LIST, KEEPING THE
+/// LIST OPEN, AND OVER THE PANEL'S HEADER; OVER THE PHOTO AWAY FROM SETTINGS IT STILL MOVES NOTHING.**
+///
+/// FALSIFIER (L28), ALL RUN: drop the open zone from `jl-wheels` and the margin row reddens; drop
+/// `jl-panel` and the header row reddens; make `jl-wheels` always true and the photo row reddens.
+#[test]
+fn the_wheel_scrolls_settings_over_the_bar_the_gap_and_the_open_list() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let (app, (bx, by, bw, bh), (px, py, pw, _ph)) = sj_settings();
+    let body_y = || E::find_by_element_id(&app, "MainWindow::body").next().unwrap().absolute_position().y;
+    sj_rest(&app, bx - 9., by + bh / 2., 340);
+    let (lx, ly, lw, lh) = sj_list(&app).expect("open");
+    for (x, y, what) in [
+        (bx + bw / 2., by + bh / 2., "the bar"),
+        (px + pw + 4., ly + 40., "the gap"),
+        (lx + lw / 2., ly + lh / 2., "the list"),
+        (lx + lw + 8., ly + lh / 2., "the margin beside the list"),
+    ] {
+        hover(&app, x, y);
+        let before = body_y();
+        wheel(&app, x, y, -120.);
+        sj_rest(&app, x, y, 200);
+        assert!(body_y() < before - 1., "{what}: the wheel scrolls Settings ({before} to {})", body_y());
+        assert!(sj_list(&app).is_some(), "{what}: and the list stays open");
+    }
+    let before = body_y();
+    wheel(&app, px + 100., py + 30., 120.);
+    sj_rest(&app, px + 100., py + 30., 200);
+    assert!(body_y() > before + 1., "the header: the wheel scrolls Settings ({before} to {})", body_y());
+    let before = body_y();
+    wheel(&app, 800., 400., -120.);
+    sj_rest(&app, 800., 400., 200);
+    assert!((body_y() - before).abs() < 0.5, "over the photo: Settings does not move");
+}
+
+// ── 2026-10-29 (the jump lists round) — THE REVIEW JUMP LIST. ──────────────────────────────────
+
+/// The Review panel open on a 1400 × `h` window with `rows` rows (2 photos each), motion off, and the
+/// rows Rust would publish for the tier the panel reports (the rig runs no tick).
+fn jr_panel(app: &ui::MainWindow, h: f32, rows: slint::ModelRc<ui::SelTileRow>) {
+    use slint::Model;
+    app.window().set_size(slint::LogicalSize::new(1400.0, h));
+    app.set_motion_ui(false);
+    app.set_immersive(false);
+    app.set_compare(false);
+    app.set_grid_open(false);
+    app.set_settings_open(false);
+    app.set_sel_open(true);
+    let n = rows.row_count();
+    app.set_sel_rows(rows);
+    hover(app, 900.0, 400.0);
+    let picks = crate::support::jump_rows(n, app.get_review_jump_n().max(0) as usize);
+    app.set_review_jump_rows(slint::ModelRc::new(slint::VecModel::from(picks.iter().map(|&r| r as i32).collect::<Vec<i32>>())));
+    hover(app, 900.0, 400.0);
+}
+
+/// Open the list the way a person does: rest 9 px left of the bar's band for 340 ms. Returns the bar.
+fn jr_open(app: &ui::MainWindow) -> MvbRect {
+    let (_g, bar) = mvb_review_geom(app);
+    sj_rest(app, bar.0 - 9., bar.1 + bar.3 / 2., 340);
+    assert!(jr_list(app).is_some(), "the Review jump list opened");
+    bar
+}
+
+/// The open list's keep-open area (the `PhotoJump` element) and its card.
+fn jr_list(app: &ui::MainWindow) -> Option<(MvbRect, MvbRect)> {
+    use i_slint_backend_testing::ElementHandle as E;
+    let e = E::find_by_element_type_name(app, "PhotoJump").next()?;
+    let c = E::find_by_element_id(app, "PhotoJump::card").next()?;
+    let r = |e: &E| (e.absolute_position().x, e.absolute_position().y, e.size().width, e.size().height);
+    Some((r(&e), r(&c)))
+}
+
+/// The entries' rects, top to bottom.
+fn jr_entries(app: &ui::MainWindow) -> Vec<MvbRect> {
+    let mut v: Vec<MvbRect> = i_slint_backend_testing::ElementHandle::find_by_element_id(app, "PhotoJump::entry")
+        .map(|e| (e.absolute_position().x, e.absolute_position().y, e.size().width, e.size().height))
+        .collect();
+    v.sort_by(|a, b| a.1.total_cmp(&b.1));
+    v
+}
+
+/// Which entry the current entry's accent plate stands on.
+fn jr_plate(app: &ui::MainWindow) -> Option<usize> {
+    let p = i_slint_backend_testing::ElementHandle::find_by_element_id(app, "PhotoJump::plate").next()?;
+    let cy = p.absolute_position().y + p.size().height / 2.;
+    jr_entries(app).iter().position(|e| cy > e.1 && cy < e.1 + e.3)
+}
+
+/// 2026-10-29 (owner: "keep the fixed even sampled but the previews number should have a few fixed
+/// tiers to snap to … actually the logical res not the screen pixels"; "add a smaller tier if a
+/// laptop user uses it non-maximized"; "It adapts to whatever the true height is and do the math so
+/// the total number of photos does not change and the total height is equal to the actual slider")
+/// — **THE REVIEW JUMP LIST'S ENTRY COUNT SNAPS TO 12 / 17 / 25 / 40 / 64 BY THE SCROLL BAR'S REAL
+/// TRACK HEIGHT; ITS ENTRIES SHARE THAT TRACK EXACTLY, THE FIRST LEVEL WITH ITS TOP AND THE LAST
+/// ENDING AT ITS BOTTOM; WITH NO MORE ROWS THAN ENTRIES IT SHOWS EVERY ROW AT THE TIER'S OWN PITCH.**
+/// Measured at the plan's window heights: the logical height of a 864, 1080, 1440 and 2160 px tall
+/// screen less a 48 px taskbar, and a short laptop window. Prints the measured tracks.
+///
+/// FALSIFIER (L28), ALL RUN: move a threshold (`< 600px` to `< 700px`) and the 1032 px row reddens.
+#[test]
+fn the_review_jump_list_snaps_to_its_tier_and_fills_the_track_exactly() {
+    for (h, want) in [(560., 12), (816., 17), (1032., 25), (1392., 40), (2112., 64)] {
+        let app = boot();
+        jr_panel(&app, h, sel_rows(300));
+        let bar = jr_open(&app);
+        let (top, track) = (bar.1 + 8., bar.3 - 16.);
+        eprintln!("review jump list: window {h} px, track {track:.1} px, {} entries", app.get_review_jump_n());
+        assert_eq!(app.get_review_jump_n(), want, "window {h}: track {track}");
+        let e = jr_entries(&app);
+        assert_eq!(e.len(), want as usize, "window {h}: one entry per sampled row");
+        let pitch = track / want as f32;
+        assert!((e[0].1 - top).abs() < 0.5, "window {h}: the first entry level with the track's top ({} vs {top})", e[0].1);
+        let last = e[want as usize - 1];
+        assert!((last.1 + last.3 + 2. - (top + track)).abs() < 0.5, "window {h}: the last ends at the track's bottom");
+        assert!(e.windows(2).all(|p| (p[1].1 - p[0].1 - pitch).abs() < 0.05), "window {h}: one pitch apart ({pitch})");
+        assert!(e.iter().all(|r| (r.2 - 1.5 * 2. * (pitch - 6.) - 6.).abs() < 0.05), "window {h}: two 3:2 photos an entry");
+    }
+    // Ten rows on a 25-entry window: every row, at the 25-entry pitch.
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(10));
+    let bar = jr_open(&app);
+    let e = jr_entries(&app);
+    assert_eq!(e.len(), 10, "every row");
+    assert!(e.windows(2).all(|p| (p[1].1 - p[0].1 - (bar.3 - 16.) / 25.).abs() < 0.05), "at the tier's own pitch");
+}
+
+/// 2026-10-29 (owner: the Mac Dock-style zoom, "keep it"; "make the zoom and select snappy instead
+/// of having a delay for the zoom-in") — **THE ENTRY UNDER THE POINTER IS AT ONCE 1.8 TIMES ITS
+/// SIZE, ITS NEIGHBOURS 1.48 AND 1.16, THE NEXT UNCHANGED, AND THE POINT UNDER THE POINTER STAYS
+/// UNDER IT; THE CARD KEEPS ITS WIDTH AND THE ZOOMED ENTRY GROWS OUT PAST IT (owner, testing rc.2:
+/// "should only zoom the affected thumbnails not the whole menu panel"); BESIDE IT THE LABEL NAMES
+/// ITS PHOTOS; THE BIG HOVER PREVIEW IS OFF WHILE THE LIST IS OPEN; A CLOUD-ONLY PHOTO SHOWS THE
+/// CLOUD OUTLINE.**
+///
+/// FALSIFIER (L28), ALL RUN: zoom 1.6 (`0.8` to `0.6`) and the 1.8 row reddens; widen the reach
+/// (`2.5` to `3.5`) and the unchanged row reddens; drop `lift` and the under-the-pointer row
+/// reddens; drop `!root.review-jump-open` from `hover-preview-live` and its row reddens; drop the
+/// cloud outline and its row reddens; let the card grow with the zoom again (its width
+/// `2 * root.tw + 18px` to `2 * (1 + root.grow(root.under)) * root.tw + 18px`) and the card row
+/// reddens; drop the list's `changed under` copy and the entry-under-the-pointer row reddens.
+#[test]
+fn the_review_jump_list_zooms_at_once_under_the_pointer_and_names_its_photos() {
+    use i_slint_backend_testing::ElementHandle as E;
+    use slint::Model;
+    let app = boot();
+    app.set_hover_to_preview(true);
+    let rows = sel_rows(300);
+    let mut r0 = rows.row_data(0).unwrap();
+    r0.a.valid = false;
+    r0.a.cloud = true;
+    rows.set_row_data(0, r0);
+    jr_panel(&app, 1032., rows);
+    assert!(app.get_hover_preview_live(), "precondition: the hover preview is live");
+    jr_open(&app);
+    assert!(!app.get_hover_preview_live(), "the hover preview is off while the list is open");
+    let (_, card) = jr_list(&app).unwrap();
+    let e0 = jr_entries(&app);
+    let th = e0[0].3 - 4.;
+    assert_eq!(app.get_review_jump_focus(), 0, "by the bar: the current entry is where loading starts");
+    let k = 10;
+    let (px, py) = (card.0 + 12., e0[k].1 + e0[k].3 / 2.);
+    hover(&app, px, py); // no time passes: the zoom has no easing and no delay
+    assert_eq!(app.get_review_jump_focus(), k as i32, "over the list: the entry under the pointer is");
+    let e = jr_entries(&app);
+    for (d, s) in [(0usize, 1.8f32), (1, 1.48), (2, 1.16), (3, 1.0)] {
+        for i in [k - d, k + d] {
+            assert!((e[i].3 - (s * th + 4.)).abs() < 0.05, "entry {i}, {d} from the pointer: {s}× ({} vs {})", e[i].3, s * th + 4.);
+        }
+    }
+    assert!((e[k].1 + e[k].3 / 2. - py).abs() < 0.5, "the pointer's point stays under it ({} vs {py})", e[k].1 + e[k].3 / 2.);
+    let (_, zoomed) = jr_list(&app).unwrap();
+    assert!((zoomed.2 - card.2).abs() < 0.05, "the card keeps its width ({} vs {})", zoomed.2, card.2);
+    assert!(e[k].0 + e[k].2 > zoomed.0 + zoomed.2 + 10., "the zoomed entry grows out past the card");
+    let r = crate::support::jump_rows(300, 25)[k];
+    let label = format!("photos {}–{} of 600", 2 * r + 1, 2 * r + 2);
+    let l = E::find_by_accessible_label(&app, &label).next().unwrap_or_else(|| panic!("the label \"{label}\""));
+    assert!(l.absolute_position().x > e[k].0 + e[k].2, "the label is beside the entry");
+    // Entry 0's first photo is only in the cloud: the outline, inside the list.
+    let (_, card) = jr_list(&app).unwrap();
+    assert!(
+        E::find_by_element_type_name(&app, "CloudGlyph").any(|g| g.absolute_position().x >= card.0 && g.absolute_position().y < e[0].1 + e[0].3),
+        "the cloud outline on the cloud-only photo"
+    );
+    // Leaving closes the list and gives the hover preview back.
+    sj_rest(&app, 900., 400., 200);
+    assert!(jr_list(&app).is_none() && app.get_hover_preview_live(), "closed: the hover preview is back");
+}
+
+/// 2026-10-29 (owner: "click/drag jump"; the same current-entry rules as the Settings list; "the
+/// wheel scrolls the panel") — **A CLICK ON AN ENTRY PUTS ITS ROW AT THE TOP OF THE REVIEW PANEL, A
+/// DRAG GOES ENTRY BY ENTRY AND PAST THE END TO THE LAST; THE PLATE MARKS THE ENTRY A JUMP WENT TO
+/// UNTIL THE USER SCROLLS, THE LAST AT THE BOTTOM, ELSE THE ONE WHOSE STRETCH HOLDS THE TOP ROW; THE
+/// WHEEL OVER THE LIST AND OVER THE BAR SCROLLS THE PANEL AND KEEPS THE LIST OPEN.**
+///
+/// FALSIFIER (L28), ALL RUN: drop the jumped rule and the ten-row entry 8 row reddens; drop the
+/// bottom rule and the ten-row wheel row reddens; reject the wheel in the list's `scroll-event` and
+/// the list wheel row reddens; drop `review-swallow`'s forward and the bar wheel row reddens.
+#[test]
+fn the_review_jump_list_jumps_the_panel_and_marks_the_current_entry() {
+    use i_slint_core::items::PointerEventButton::Left;
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(300));
+    let bar = jr_open(&app);
+    let picks = crate::support::jump_rows(300, 25);
+    let pitch = crate::tick::SEL_ROW_PITCH;
+    let travel = 300. * pitch - app.get_sel_vp_h();
+    let at = |r: usize| -(r as f32 * pitch).min(travel);
+    // The entries' places before any zoom: the frame the pointer is measured against (a zoom moves
+    // what is drawn, never where an entry is taken from).
+    let e0 = jr_entries(&app);
+    let centre = |i: usize| (e0[i].0 + 12., e0[i].1 + e0[i].3 / 2.);
+    assert_eq!(jr_plate(&app), Some(0), "at the top: the first entry");
+    let (x, y) = centre(5);
+    click(&app, x, y, Left);
+    hover(&app, x, y);
+    assert!((app.get_sel_vp_y() - at(picks[5])).abs() < 0.5, "entry 5: its row at the top ({} vs {})", app.get_sel_vp_y(), at(picks[5]));
+    assert_eq!(jr_plate(&app), Some(5));
+    // A drag from entry 5 down the list: each entry it crosses, in order, then past the end.
+    let mut pts: Vec<(f32, f32)> = (5..=9).map(centre).collect();
+    let (_, card) = jr_list(&app).unwrap();
+    pts.push((x, card.1 + card.3 + 40.));
+    let mut seen = Vec::new();
+    drag_probed(&app, &pts, |i| {
+        i_slint_core::properties::ChangeTracker::run_change_handlers();
+        seen.push((i, app.get_sel_vp_y()));
+    });
+    for &(i, vy) in &seen {
+        let k = if i < 5 { 5 + i } else { 24 }; // the last point is past the end
+        assert!((vy - at(picks[k])).abs() < 0.5, "drag step {i}: entry {k} ({vy} vs {})", at(picks[k]));
+    }
+    hover(&app, x, y);
+    assert_eq!(jr_plate(&app), Some(24), "past the end: the last entry");
+    // The wheel over the list scrolls the panel; the plate follows the scroll again.
+    let before = app.get_sel_vp_y();
+    for _ in 0..8 {
+        wheel(&app, x, y, 120.);
+    }
+    hover(&app, x, y);
+    assert!(app.get_sel_vp_y() > before + 100., "the wheel over the list scrolls the panel");
+    assert!(jr_list(&app).is_some(), "and the list stays open");
+    let top = ((-app.get_sel_vp_y() + 0.5) / pitch).floor() as usize;
+    let want = (top as f32 * 24. / 299.).round() as usize;
+    assert_eq!(jr_plate(&app), Some(want), "the entry whose stretch holds row {top}");
+    // The wheel over the bar too.
+    let before = app.get_sel_vp_y();
+    wheel(&app, bar.0 + bar.2 / 2., bar.1 + bar.3 / 2., -120.);
+    hover(&app, bar.0 + bar.2 / 2., bar.1 + bar.3 / 2.);
+    assert!(app.get_sel_vp_y() < before - 1., "the wheel over the bar scrolls the panel");
+    for _ in 0..80 {
+        wheel(&app, x, y, -120.);
+    }
+    hover(&app, x, y);
+    assert_eq!(jr_plate(&app), Some(24), "the wheel to the end: the last entry, with no jump");
+    // Ten rows, every row an entry: row 8 cannot reach the top, yet once jumped to it is current.
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(10));
+    jr_open(&app);
+    let (x, y) = { let e = jr_entries(&app)[8]; (e.0 + 12., e.1 + e.3 / 2.) };
+    click(&app, x, y, Left);
+    hover(&app, x, y);
+    assert!((app.get_sel_vp_y() + (10. * pitch - app.get_sel_vp_h())).abs() < 0.5, "row 8 stops at the bottom");
+    assert_eq!(jr_plate(&app), Some(8), "jumped to entry 8: entry 8, not the bottom's last");
+    // A wheel is the user's own scroll: at the bottom, the last entry (the top row there is row 6).
+    wheel(&app, x, y, -120.);
+    hover(&app, x, y);
+    assert_eq!(jr_plate(&app), Some(9), "the wheel at the bottom: the last entry");
+}
+
+/// 2026-10-29 (Codex review R1, required; the owner's rule: the plate marks the entry a jump went to
+/// "until the user scrolls") — **A JUMP STAYS CURRENT ONLY WHILE WHAT IT WAS MADE ON IS UNCHANGED:
+/// A NEW TIER (THE WINDOW'S HEIGHT), A NEW ROW COUNT OR OTHER PHOTOS (A FILTER, A NEW FOLDER) OR A
+/// RECENTRE LETS GO OF IT FOR GOOD AND THE PLATE FOLLOWS THE SCROLL AGAIN; A THUMBNAIL LANDING AND THE
+/// SELECTED CHIP ROW KEEP IT, EVEN ON A ROW THAT CANNOT REACH THE TOP.** Each stale case leaves the
+/// remembered entry inside the new list, so a plate that merely exists would not pass. The row-count
+/// case changes the rows and the sampled rows in one step, as the tick does, onto a list where the
+/// remembered entry's row ends at the bottom too, so it cannot pass by the order the change handlers
+/// happen to run in.
+///
+/// FALSIFIER (L28), ALL RUN: drop the row term from `jr-held` and the new tier row reddens; drop the
+/// content key term and the other photos row reddens; drop the recentre's `jr-jumped = -1` and the
+/// recentre to the top row reddens; drop the `changed jr-held` handler and the tier-and-back row
+/// reddens; hold the jump on the scroll position in place of both terms (the first draft,
+/// `abs(viewport-y - jr-at) < 0.5px`) and the row-count row reddens (the Flickable's own clamp lands
+/// on the jump's new target first, so the stale entry 7 stays); put that scroll term in place of the
+/// row term only and the chip row reddens.
+#[test]
+fn the_review_jump_marker_lets_go_of_a_jump_when_the_rows_or_the_scroll_change_under_it() {
+    use i_slint_core::items::PointerEventButton::Left;
+    use slint::Model;
+    let pitch = crate::tick::SEL_ROW_PITCH;
+    // The plate the scroll alone gives: the last at the bottom, else the entry whose stretch holds
+    // the top row.
+    let by_scroll = |app: &ui::MainWindow, rows: usize, m: usize| -> usize {
+        let vp = app.get_sel_vp_y();
+        if vp <= app.get_sel_vp_h() - rows as f32 * pitch + 0.5 {
+            return m - 1;
+        }
+        let top = ((-vp + 0.5) / pitch).floor().max(0.) as usize;
+        if rows <= m { top.min(m - 1) } else { (top as f32 * (m - 1) as f32 / (rows - 1) as f32).round() as usize }
+    };
+    // The tick's answers: the content key for the photos the panel holds, and the sampled rows.
+    let key = |photos: std::ops::Range<usize>| crate::support::review_rows_key(1, &photos.collect::<Vec<_>>());
+    let publish = |app: &ui::MainWindow, rows: usize| {
+        let picks = crate::support::jump_rows(rows, app.get_review_jump_n().max(0) as usize);
+        app.set_review_jump_rows(slint::ModelRc::new(slint::VecModel::from(picks.iter().map(|&r| r as i32).collect::<Vec<i32>>())));
+        hover(app, 900., 400.);
+    };
+    let resize = |app: &ui::MainWindow, h: f32, rows: usize| {
+        app.window().set_size(slint::LogicalSize::new(1400., h));
+        hover(app, 900., 400.);
+        publish(app, rows);
+    };
+    // Jump to entry i, then leave the list (it closes).
+    let jump = |app: &ui::MainWindow, i: usize| {
+        jr_open(app);
+        let e = jr_entries(app)[i];
+        click(app, e.0 + 12., e.1 + e.3 / 2., Left);
+        hover(app, e.0 + 12., e.1 + e.3 / 2.);
+        assert_eq!(jr_plate(app), Some(i), "jumped to entry {i}");
+        sj_rest(app, 900., 400., 200);
+    };
+    let plate = |app: &ui::MainWindow| {
+        jr_open(app);
+        let p = jr_plate(app);
+        sj_rest(app, 900., 400., 200);
+        p
+    };
+    // A new tier: entry 12 of 25 is row 150, which is in entry 8's stretch of 17.
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(300));
+    jump(&app, 12);
+    resize(&app, 816., 300);
+    assert_eq!(app.get_review_jump_n(), 17, "precondition: the 17-entry tier");
+    assert_eq!(by_scroll(&app, 300, 17), 8, "precondition: row 150 is at the top");
+    assert_eq!(plate(&app), Some(8), "a new tier: the plate follows the scroll");
+    // A new row count (a filter), the rows and the sampled rows in one step: entry 7 of 25 is row 87;
+    // on ten rows entry 7 is row 7, which ends at the bottom too, where the last entry is current.
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(300));
+    app.set_review_rows_key(key(0..600));
+    jump(&app, 7);
+    app.set_sel_rows(sel_rows(10));
+    app.set_review_rows_key(key(0..20));
+    publish(&app, 10);
+    assert_eq!(by_scroll(&app, 10, 10), 9, "precondition: ten rows, at the bottom");
+    assert_eq!(plate(&app), Some(9), "a new row count: the plate follows the scroll");
+    // Other photos, the same count (a filter, or a new folder that does not recentre): the tick
+    // rewrites the rows in place, as for a thumbnail, and the sampled rows stay the same.
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(10));
+    app.set_review_rows_key(key(0..20));
+    jump(&app, 8);
+    let rows = app.get_sel_rows();
+    for r in 0..rows.row_count() {
+        let mut d = rows.row_data(r).unwrap();
+        d.a.idx += 100;
+        d.b.idx += 100;
+        rows.set_row_data(r, d);
+    }
+    app.set_review_rows_key(key(100..120));
+    publish(&app, 10);
+    assert_eq!(by_scroll(&app, 10, 10), 9, "precondition: at the bottom");
+    assert_eq!(plate(&app), Some(9), "other photos: the plate follows the scroll");
+    // A recentre (a new folder): to the top, entry 0; on ten rows, to the bottom where the jump to
+    // row 8 had put the panel, the bottom's own last entry.
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(300));
+    jump(&app, 12);
+    app.set_sel_scroll_y(0.);
+    app.set_sel_scroll_seq(app.get_sel_scroll_seq() + 1);
+    hover(&app, 900., 400.);
+    assert_eq!(plate(&app), Some(0), "a recentre to the top: the first entry");
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(10));
+    jump(&app, 8);
+    app.set_sel_scroll_y(app.get_sel_vp_y());
+    app.set_sel_scroll_seq(app.get_sel_scroll_seq() + 1);
+    hover(&app, 900., 400.);
+    assert_eq!(plate(&app), Some(9), "a recentre to the bottom: the last entry");
+    // Let go of for good: on 40 rows the jump to entry 23 (row 37) stops at the bottom; a 17-entry
+    // window lets go of it, and the panel back at the same bottom shows the bottom's last entry.
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(40));
+    jump(&app, 23);
+    assert_eq!(by_scroll(&app, 40, 25), 24, "precondition: row 37 cannot reach the top");
+    resize(&app, 816., 40);
+    assert_eq!(plate(&app), Some(by_scroll(&app, 40, 17)), "17 entries: the plate follows the scroll");
+    resize(&app, 1032., 40);
+    assert_eq!(by_scroll(&app, 40, 25), 24, "precondition: back at the bottom");
+    assert_eq!(plate(&app), Some(24), "the tier and back: the jump stays let go of");
+    // A thumbnail landing rewrites the rows in place (the tick's same-count path, the same photos) and
+    // a republish of the same rows changes nothing; selecting a photo shows the Selected chip row and
+    // makes the panel shorter. Neither scrolls: the jump to row 8, which cannot reach the top, stays
+    // current.
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(10));
+    app.set_review_rows_key(key(0..20));
+    jump(&app, 8);
+    let rows = app.get_sel_rows();
+    let thumb = slint::Image::from_rgba8(slint::SharedPixelBuffer::new(3, 2));
+    for r in 0..rows.row_count() {
+        let mut d = rows.row_data(r).unwrap();
+        d.a.thumb = thumb.clone();
+        d.b.thumb = thumb.clone();
+        d.b.rating = 3;
+        rows.set_row_data(r, d);
+    }
+    hover(&app, 900., 400.);
+    publish(&app, 10);
+    assert_eq!(plate(&app), Some(8), "a thumbnail landing keeps the jump");
+    let h = app.get_sel_vp_h();
+    app.set_count_selected(1);
+    hover(&app, 900., 400.);
+    assert!(app.get_sel_vp_h() < h - 20., "precondition: the chip row makes the panel shorter ({} vs {h})", app.get_sel_vp_h());
+    assert_eq!(plate(&app), Some(8), "the Selected chip row keeps the jump");
+    app.set_count_selected(0);
+    hover(&app, 900., 400.);
+    assert_eq!(plate(&app), Some(8), "and its going keeps it");
+}
+
+/// 2026-10-29 (owner, testing rc.2: "Re-sample after bigger changes"; the fix's own check) — **WITH
+/// THE ROWS KEPT FOR A SLIGHTLY DIFFERENT ROW COUNT, THE PLATE AND WHERE LOADING STARTS ARE THE ENTRY
+/// WHOSE STRETCH HOLDS THE TOP ROW ON THE SPACING THE ROWS WERE SAMPLED FOR.** Sampled for 608 rows,
+/// the panel now has 628: row 582 is entry 23's own row, and the 628-row spacing would call it 22.
+///
+/// FALSIFIER (L28), ALL RUN: read the current row count instead (`jr-basis` to
+/// `root.sel-rows.length`) and the entry-23 row reddens.
+#[test]
+fn the_review_jump_list_marks_the_entry_for_its_kept_rows() {
+    let pitch = crate::tick::SEL_ROW_PITCH;
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(628));
+    let mut kept = crate::support::jump_rows(608, 25);
+    kept[24] = 627;
+    assert_eq!(kept[23], 582, "precondition: entry 23 is row 582");
+    app.set_review_jump_rows(slint::ModelRc::new(slint::VecModel::from(kept.iter().map(|&r| r as i32).collect::<Vec<i32>>())));
+    app.set_review_jump_basis(608);
+    app.set_sel_scroll_y(-582. * pitch);
+    app.set_sel_scroll_seq(app.get_sel_scroll_seq() + 1);
+    hover(&app, 900., 400.);
+    jr_open(&app);
+    assert_eq!(jr_plate(&app), Some(23), "row 582 at the top: entry 23");
+    assert_eq!(app.get_review_jump_focus(), 23, "and loading starts there");
+}
+
+/// 2026-10-29 (owner, testing rc.2 on a 7,000-photo folder with 1,216 photos in Review: "it
+/// took >10s for the hover to appear or simply does not trigger at all - it need to appear
+/// immediately, even if some thumbnails are not ready yet ... ALSO CAREFULLY CHECK THE LOGIC") — **A JUMP LIST
+/// OPENS 200 MS AFTER THE POINTER COMES NEAR ITS BAR AND CLOSES 120 MS AFTER IT LEAVES, WHILE
+/// THUMBNAILS LAND IN THE REVIEW ROWS AND THE HAND DRIFTS; A SCROLL BAR THAT DISAPPEARS UNDER THE
+/// POINTER DOES NOT LEAVE THE LIST TO OPEN BY ITSELF LATER.** The cause was Slint restarting a
+/// delayed animation whenever its binding is marked dirty: every Review-row change reached the
+/// latch through the bar's need for the grid's layout, and every pointer move through the reach.
+/// The Review rows rest the pointer still on the bar itself, so only the landings could restart the
+/// clock (the owner's case); the Settings rows drift the hand.
+///
+/// FALSIFIER (L28), ALL RUN: let the rest read `near` again (`rest: self.near-v` to `self.near`, in
+/// the binding and the delay) and the Review landing row reddens; let the close read `zone` again
+/// (`keep-v` to `self.zone || self.held`, in the binding and the delay) and the closing row reddens;
+/// drop the `changed jr-bars` clear and the bar-gone row reddens.
+#[test]
+fn the_jump_lists_open_on_time_while_thumbnails_land_and_the_hand_drifts() {
+    use slint::Model;
+    let step = std::time::Duration::from_millis(50);
+    // REVIEW: the pointer rests still on the bar; every 50 ms a thumbnail lands in a far row (a new
+    // picture in row 250 or after, far below the view).
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(300));
+    let rows = app.get_sel_rows();
+    let land = |k: usize| {
+        let r = 250 + k % 40;
+        let mut d = rows.row_data(r).unwrap();
+        d.a.thumb = slint::Image::from_rgba8(slint::SharedPixelBuffer::new(3, 2));
+        d.a.valid = k.is_multiple_of(2);
+        rows.set_row_data(r, d);
+    };
+    let (_g, bar) = mvb_review_geom(&app);
+    let (x, y) = (bar.0 + bar.2 / 2., bar.1 + bar.3 / 2.);
+    let mut opened = None;
+    for k in 0..40 {
+        land(k);
+        hover(&app, x, y);
+        if jr_list(&app).is_some() {
+            opened = Some(k * 50);
+            break;
+        }
+        i_slint_backend_testing::mock_elapsed_time(step);
+    }
+    let t = opened.expect("the list opened while thumbnails landed (it never did in 2 s)");
+    assert!((200..=250).contains(&t), "opened at {t} ms, 200 ms after the rest began");
+    // Leaving while they keep landing: closed 120 ms later, not when they stop.
+    let mut closed = None;
+    for k in 0..40 {
+        land(100 + k);
+        hover(&app, 900., 400.);
+        if jr_list(&app).is_none() {
+            closed = Some(k * 50);
+            break;
+        }
+        i_slint_backend_testing::mock_elapsed_time(step);
+    }
+    let t = closed.expect("the list closed while thumbnails landed (it never did in 2 s)");
+    assert!((100..=200).contains(&t), "closed at {t} ms, 120 ms after the pointer left");
+    // The bar goes under the pointer (the rows come to fit), the pointer leaves, the rows come back:
+    // nothing near the bar, so the list stays shut.
+    let app = boot();
+    jr_panel(&app, 1032., sel_rows(300));
+    let (_g, bar) = mvb_review_geom(&app);
+    hover(&app, bar.0 + bar.2 / 2., bar.1 + bar.3 / 2.);
+    app.set_sel_rows(sel_rows(2));
+    hover(&app, bar.0 + bar.2 / 2., bar.1 + bar.3 / 2.);
+    hover(&app, 900., 400.);
+    app.set_sel_rows(sel_rows(300));
+    sj_rest(&app, 900., 400., 500);
+    assert!(jr_list(&app).is_none(), "the bar gone and back: the list does not open by itself");
+    // SETTINGS: the pointer rests beside the bar with the hand drifting by 1 px every 50 ms.
+    let (app, (bx, by, _bw, bh), _panel) = sj_settings();
+    let mut opened = None;
+    for k in 0..40 {
+        hover(&app, bx - 9. + (k % 2) as f32, by + bh / 2.);
+        if sj_list(&app).is_some() {
+            opened = Some(k * 50);
+            break;
+        }
+        i_slint_backend_testing::mock_elapsed_time(step);
+    }
+    let t = opened.expect("the Settings list opened while the hand drifted (it never did in 2 s)");
+    assert!((200..=250).contains(&t), "Settings opened at {t} ms");
 }
 
 
@@ -33318,6 +35211,187 @@ fn the_four_modes_fit_the_guide_and_custom_links_to_settings() {
     let _ = slint::select_bundled_translation("en");
 }
 
+/// 2026-10-28 (the accepted small fixes; `2026-10-26_mode_control_2b/PLAN_guide_scroll.md`, the owner's
+/// answer: the Mode card at the top): **THE GUIDE'S CUSTOM LINK OPENS SETTINGS WITH THE MODE CARD AT
+/// THE TOP OF THE SCROLL AREA, ON THE FIRST FRAME; EVERY OTHER WAY IN STARTS AT THE TOP; A WINDOW TOO
+/// TALL TO SCROLL THAT FAR SHOWS THE END OF SETTINGS, WITH NO OVERSCROLL.** English and zh-CN. Offsets
+/// are measured from the scroll area's top, so the cards above the Mode card (one is Windows-only) are
+/// measured, not assumed.
+///
+/// FALSIFIERS: drop `setflick`'s `init` landing and the landing row reddens; land with one write in
+/// `init` instead of the binding and the landing row reddens (the cards above arrive after `init`);
+/// don't consume the request and the reopen row reddens; write the unclamped target and the tall-window
+/// row reddens. NOT caught here: animating the landing (80 ms always). The rig works the binding out
+/// after the layout is final, so nothing changes and nothing animates; the zero duration while landing
+/// is a guard for the real window, checked by hand with motion on (round BUILD.md, falsifier S5b).
+#[test]
+fn the_guide_custom_link_opens_settings_at_the_mode_card() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let flick = |app: &ui::MainWindow| E::find_by_element_id(app, "MainWindow::setflick").next().expect("Settings' scroll area");
+    // Offset of an element's top from the scroll area's top (None: not on screen, the finder skips
+    // what the scroll area clips).
+    let top = |app: &ui::MainWindow, id: &str| -> Option<f32> {
+        let e = E::find_by_element_id(app, &format!("MainWindow::{id}")).next()?;
+        Some(e.absolute_position().y - flick(app).absolute_position().y)
+    };
+    let fresh = |lang: &str, h: f32| {
+        let app = boot();
+        slint::select_bundled_translation(lang).expect("the language is bundled");
+        app.window().set_size(slint::LogicalSize::new(1200.0, h));
+        app.set_motion_ui(false);
+        app.set_mode(3);
+        app
+    };
+    let settle = |app: &ui::MainWindow| {
+        hover(app, 600.0, 300.0);
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(500));
+        hover(app, 600.0, 300.0);
+    };
+    // The guide's link, clicked; then one pass that mounts the panel, with no time elapsed.
+    let land = |app: &ui::MainWindow, lang: &str| {
+        app.set_welcome_open(true);
+        hover(app, 600.0, 300.0);
+        let link = E::find_by_element_id(app, "MainWindow::wccustomlink").next().expect("the link");
+        let (lp, ls) = (link.absolute_position(), link.size());
+        click(app, lp.x + 20.0, lp.y + ls.height / 2.0, i_slint_core::items::PointerEventButton::Left);
+        hover(app, 600.0, 300.0);
+        assert!(!app.get_welcome_open() && app.get_settings_open(), "[{lang}] the link opens Settings");
+    };
+    for lang in ["en", "zh-CN"] {
+        // Settings unscrolled in a window tall enough to show all of it: where the Mode card sits
+        // (m0), how tall the content is (the footer is the body's last child, and the body has no
+        // padding), and the window's height outside the scroll area.
+        let tall = fresh(lang, 9000.0);
+        tall.set_settings_open(true);
+        settle(&tall);
+        let m0 = top(&tall, "modecard").expect("the Mode card");
+        let footer_h = E::find_by_element_id(&tall, "MainWindow::about-footer").next().expect("the footer").size().height;
+        let content = top(&tall, "about-footer").expect("the footer") + footer_h;
+        let chrome = 9000.0 - flick(&tall).size().height;
+        assert!(m0 > 100.0 && content < flick(&tall).size().height, "[{lang}] premise: {m0} / {content}");
+        drop(tall);
+
+        // ── The landing: the Mode card at the top, on the first frame, the Custom card under it.
+        let app = fresh(lang, 900.0);
+        land(&app, lang);
+        let m = top(&app, "modecard").unwrap_or_else(|| panic!("[{lang}] the Mode card is on screen"));
+        assert!(m.abs() <= 1.0, "[{lang}] the Mode card is at the top with no time elapsed: {m}");
+        assert!(top(&app, "customcard").is_some_and(|y| y > 1.0), "[{lang}] the Custom card is under it");
+        settle(&app);
+        let m = top(&app, "modecard").expect("the Mode card");
+        assert!(m.abs() <= 1.0, "[{lang}] …and stays there once everything above it is laid out: {m}");
+
+        // ── The user's own scroll takes over: it moves Settings, and nothing pulls it back.
+        let (fp, fs) = (flick(&app).absolute_position(), flick(&app).size());
+        wheel(&app, fp.x + fs.width / 2.0, fp.y + fs.height / 2.0, 120.0);
+        settle(&app);
+        let moved = top(&app, "modecard").expect("the Mode card");
+        assert!(moved > 20.0, "[{lang}] a wheel scroll after landing moves Settings: {moved}");
+        settle(&app);
+        assert_eq!(top(&app, "modecard"), Some(moved), "[{lang}] …and the landing does not pull it back");
+
+        // ── Every other way in starts at the top (the request was consumed).
+        app.set_settings_open(false);
+        settle(&app);
+        app.set_settings_open(true);
+        settle(&app);
+        let again = top(&app, "modecard");
+        assert!(again.is_none_or(|y| (y - m0).abs() <= 1.0), "[{lang}] reopened at the top: {again:?} vs {m0}");
+
+        // ── A window too tall to scroll that far (the content is about half the Mode card's distance
+        //    taller than the scroll area): the landing stops where the user's own scroll stops, with
+        //    the Mode card short of the top, and nothing overscrolls. (Settings' scroll range is a few
+        //    pixels shorter than its laid-out content, so the user's own end is the yardstick.)
+        let short = fresh(lang, chrome + content - m0 / 2.0);
+        land(&short, lang);
+        let m = top(&short, "modecard").expect("the Mode card");
+        assert!(m > m0 / 4.0, "[{lang}] the scroll stops short of the Mode card: {m} (it is {m0} down)");
+        let (fp, fs) = (flick(&short).absolute_position(), flick(&short).size());
+        for _ in 0..8 {
+            wheel(&short, fp.x + fs.width / 2.0, fp.y + fs.height / 2.0, -240.0);
+            settle(&short);
+        }
+        let end = top(&short, "modecard").expect("the Mode card");
+        assert!((m - end).abs() <= 1.0, "[{lang}] it landed at the end of the scroll: {m} vs the user's end {end}");
+    }
+    let _ = slint::select_bundled_translation("en");
+}
+
+/// 2026-10-29 (owner, testing 1.1.0-rc.1, after mockups: "go with 11 and 11"; "group the 3
+/// background-related items together") — **THE CUSTOM AND IN THE BACKGROUND CARDS: 11 PX BETWEEN THE
+/// GROUPS AND UNDER EACH SMALL HEADING, 7 PX BETWEEN THE ROWS OF A GROUP; THE THREE BACKGROUND SETTINGS
+/// IN ONE CARD.** Measured box to box at every heading. The GPU memory usage limit and Release over sit
+/// in the In the background card under the wait, and mount only while Custom is selected.
+///
+/// FALSIFIER (L28): set a card's outer spacing, or a group's heading gap, back to 7 px, or a group's
+/// rows to 11, and its row reddens; mount the two Custom rows without `if root.mode == 3` and the
+/// Balanced row reddens; leave them in the Custom card and the card rows redden.
+#[test]
+fn the_custom_and_background_cards_keep_11_px_around_headings() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let app = boot();
+    app.window().set_size(slint::LogicalSize::new(1200.0, 9000.0));
+    app.set_motion_ui(false);
+    app.set_settings_open(true);
+    app.set_mode(3);
+    let settle = |app: &ui::MainWindow| {
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(500));
+        hover(app, 600.0, 300.0);
+    };
+    settle(&app);
+    let span = |e: E| (e.absolute_position().y, e.absolute_position().y + e.size().height);
+    let row = |n: &str| span(E::find_by_element_id(&app, &format!("MainWindow::{n}")).next().unwrap_or_else(|| panic!("{n}")));
+    let text = |card: &str, t: &str| {
+        let (top, bottom) = row(card);
+        span(E::find_by_accessible_label(&app, t)
+            .find(|e| e.size().width > 1.0 && e.absolute_position().y >= top && e.absolute_position().y < bottom)
+            .unwrap_or_else(|| panic!("\"{t}\" in {card}")))
+    };
+    let gap = |upper: (f32, f32), lower: (f32, f32)| lower.0 - upper.1;
+    // The Custom card: (what is above, the heading, the row under it).
+    let lead = text("customcard", "The most Falcon prepares; memory limits can lower these.");
+    for (above, heading, under) in [
+        (lead, "Browsing speed", row("customfpsseg")),
+        (row("customfpsseg"), "Previews kept ready", row("cprevahead")),
+        (row("cprevbehind"), "Sharp photos kept ready", row("csharpahead")),
+        (row("csharpbehind"), "Sharp photos while zoomed", row("czoomahead")),
+        (row("czoombehind"), "Thumbnails", row("cthumbseg")),
+    ] {
+        let h = text("customcard", heading);
+        assert!((gap(above, h) - 11.0).abs() < 0.5, "Custom, {heading}: 11 px from the group above ({})", gap(above, h));
+        assert!((gap(h, under) - 11.0).abs() < 0.5, "Custom, {heading}: 11 px to its own rows ({})", gap(h, under));
+    }
+    for (a, b) in [("cprevahead", "cprevbehind"), ("cthumbseg", "cthumbmb"), ("cthumbmb", "cthumbline")] {
+        assert!((gap(row(a), row(b)) - 7.0).abs() < 0.5, "Custom: {a} to {b} 7 px ({})", gap(row(a), row(b)));
+    }
+    // The In the background card: the wait, then Custom's limit and release speed.
+    let (custom, bg) = (row("customcard"), row("bgcard"));
+    for n in ["ckeepseg", "ckeepline", "creleaseseg"] {
+        let r = row(n);
+        assert!(r.0 >= bg.0 && r.1 <= bg.1, "{n} is in the In the background card");
+        assert!(r.0 >= custom.1, "{n} is no longer in the Custom card");
+    }
+    let wait = text("bgcard", "Release memory after Falcon has been in the background for");
+    assert!((gap(wait, row("bgwaitseg")) - 11.0).abs() < 0.5, "the wait: 11 px to its row ({})", gap(wait, row("bgwaitseg")));
+    for (above, heading, under) in [
+        (row("bgwaitseg"), "GPU memory usage limit", row("ckeepseg")),
+        (row("ckeepline"), "Release over", row("creleaseseg")),
+    ] {
+        let h = text("bgcard", heading);
+        assert!((gap(above, h) - 11.0).abs() < 0.5, "In the background, {heading}: 11 px from the group above ({})", gap(above, h));
+        assert!((gap(h, under) - 11.0).abs() < 0.5, "In the background, {heading}: 11 px to its own rows ({})", gap(h, under));
+    }
+    assert!((gap(row("ckeepseg"), row("ckeepline")) - 7.0).abs() < 0.5, "the limit's line: 7 px under it");
+    // Balanced: the wait only.
+    app.set_mode(1);
+    settle(&app);
+    assert_eq!(E::find_by_element_id(&app, "MainWindow::bgwaitseg").count(), 1, "Balanced: the wait");
+    for n in ["ckeepseg", "ckeepline", "creleaseseg"] {
+        assert_eq!(E::find_by_element_id(&app, &format!("MainWindow::{n}")).count(), 0, "Balanced: no {n}");
+    }
+    assert_eq!(E::find_by_accessible_label(&app, "GPU memory usage limit").count(), 0);
+}
+
 /// 2026-10-27 (round 2b) — plan test 6, the card's half: **THE CUSTOM CARD MOUNTS ONLY WHILE CUSTOM
 /// IS SELECTED, EVERY ROW FITS IT IN ENGLISH AND ZH-CN (L5), TEXT CELLS SHARE ONE WIDTH AND NUMBER
 /// CELLS ANOTHER (the owner's rule), A STOP WRITES ITS NUMBER, AND EACH LINE NAMES THE CHOICE IN
@@ -33357,11 +35431,21 @@ fn the_custom_card_mounts_only_for_custom_and_its_rows_fit() {
         // ── (2) EVERY ROW INSIDE THE CARD.
         assert_eq!(app.get_custom_thumbs(), 2, "precondition: Whole folder, so the cap row is mounted");
         let rows = ["customfpsseg", "cprevahead", "cprevbehind", "csharpahead", "csharpbehind", "czoomahead",
-            "czoombehind", "cthumbseg", "cthumbmb", "cthumbline", "ckeepseg", "ckeepline", "creleaseseg"];
+            "czoombehind", "cthumbseg", "cthumbmb", "cthumbline"];
         for n in rows {
             let e = find(n).unwrap_or_else(|| panic!("[{lang}] {n}"));
             let (p, s) = (e.absolute_position(), e.size());
             assert!(s.width > 100.0 && p.x >= cp.x && p.x + s.width <= cp.x + cs.width + 0.5, "[{lang}] {n} inside the card");
+        }
+        // 2026-10-29 (owner): the GPU memory usage limit and Release over are in the In the background
+        // card, still mounted only for Custom.
+        let bg = find("bgcard").unwrap_or_else(|| panic!("[{lang}] the In the background card"));
+        let (bp, bs) = (bg.absolute_position(), bg.size());
+        for n in ["ckeepseg", "ckeepline", "creleaseseg"] {
+            let e = find(n).unwrap_or_else(|| panic!("[{lang}] {n}"));
+            let (p, s) = (e.absolute_position(), e.size());
+            assert!(s.width > 100.0 && p.x >= bp.x && p.x + s.width <= bp.x + bs.width + 0.5
+                && p.y >= bp.y && p.y + s.height <= bp.y + bs.height + 0.5, "[{lang}] {n} inside the In the background card");
         }
         let inside = |e: &E, n: &str| {
             let r = find(n).unwrap();
@@ -33509,7 +35593,7 @@ fn the_custom_card_mounts_only_for_custom_and_its_rows_fit() {
             settle(&app);
             assert_eq!(line("cthumbline"), tr(text), "[{lang}] thumbnails {v}");
         }
-        let whole = "Whole folder: then the rest of the folder while Falcon is idle, up to {} MB. Cloud-only files are skipped.";
+        let whole = "Whole folder: then the rest of the folder while Falcon is idle, up to about {} MB. Cloud-only files are skipped.";
         for mb in [500, 750] {
             app.set_custom_thumbs(2);
             app.set_custom_thumbs_mb(mb);
@@ -33521,7 +35605,7 @@ fn the_custom_card_mounts_only_for_custom_and_its_rows_fit() {
         assert_eq!(line("ckeepline"), tr("Only the photos in use: everything else is released."));
         app.set_custom_bg_keep(25);
         settle(&app);
-        assert_eq!(line("ckeepline"), tr("Up to {}% of the graphics memory.").replace("{}", "25"));
+        assert_eq!(line("ckeepline"), tr("Up to {}% of GPU memory.").replace("{}", "25"));
         for n in ["cthumbline", "ckeepline"] {
             assert!(find(n).unwrap().size().width <= cs.width, "[{lang}] {n} wraps inside the card");
         }
@@ -33544,6 +35628,234 @@ fn the_custom_card_mounts_only_for_custom_and_its_rows_fit() {
 /// its row reddens with the margin's requests; drop the scope term from the frost feeder's gate, or
 /// the scope or a pause term (the Mac memory hold included) from the whole-folder call, and the
 /// census reddens.
+/// 2026-10-28 (the cloud-only round, owner answers 1–2; plan "Tests", Part 1) — **TILES ON SCREEN
+/// WHOSE FILES ARE ONLY IN THE CLOUD SETTLE WITH THE CLOUD MARK, AND NOTHING READS THEM.** The real
+/// filmstrip, grid dock and Review panel steps ask; the real thumbnail worker answers (every file is
+/// only in the cloud, through its probe); the real drain lands the answers; then each step is run
+/// again. Each window asks once and never again, nothing is latched as a failure (a read that was
+/// tried would latch: the files do not exist), and every tile without a picture carries `cloud`.
+///
+/// FALSIFIER (L28): drop a feeder's notes term and its later passes ask again (the Review panel's
+/// feeder at tick rate); hardcode `cloud: false` in `make_film_item` and the rows read no cloud; drop
+/// the worker's check and the failure latch fills.
+#[test]
+fn on_screen_cloud_tiles_settle_with_the_cloud_mark_and_are_never_read() {
+    use crate::support::ThumbScope;
+    use crate::tick::{drain_thumbs, step_folder_grid, step_selection, FastCache, ThumbDrop};
+    use slint::Model;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    let app = boot();
+    hover(&app, 600.0, 300.0);
+    let n = 400usize;
+    let shots: Vec<crate::Shot> = (0..n)
+        .map(|i| crate::Shot {
+            id: i,
+            name: format!("IMG_{i:04}.JPG"),
+            has_raw: false,
+            has_jpg: true,
+            raw: None,
+            jpg: Some(std::path::PathBuf::from(format!("C:/rig/IMG_{i:04}.jpg"))),
+            kind: crate::SrcKind::Jpeg,
+            cloud_placeholder: false,
+            sniffed: None,
+        })
+        .collect();
+    let plan = crate::support::plan_from_shots(&shots);
+    let rot = crate::RotState::new(false);
+    let cm = crate::support::cm_bake_key(app.get_output_gamut());
+    // The real worker, sharing the film's latch and notes, every file only in the cloud. Returns how
+    // many requests it answered.
+    let serve = |film: &crate::Film, rx: &std::sync::mpsc::Receiver<crate::support::ThumbReq>, thumb_gen: &Cell<u64>| {
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<ThumbDrop>();
+        let ctx = crate::ThumbWorkerCtx {
+            shots: Arc::new(Mutex::new(Arc::new(shots.clone()))),
+            generation: Arc::new(AtomicU64::new(0)),
+            thumb_res_tx: res_tx,
+            output_gamut: Arc::new(AtomicU32::new(0)),
+            thumb_failed: film.failed.clone(),
+            frost_map: film.frost.clone(),
+            auto_orient: Arc::new(AtomicBool::new(true)),
+            orient_cache: Arc::new(Mutex::new(crate::OrientCache::new())),
+            cloud_skipped: film.cloud_skipped.clone(),
+        };
+        let reqs: Vec<crate::support::ThumbReq> = rx.try_iter().collect();
+        for r in &reqs {
+            crate::run_thumb_job_with(&ctx, *r, |_: &std::path::Path| true);
+        }
+        drop(ctx);
+        drain_thumbs(&res_rx, film, &rot, thumb_gen, 0, cm, 200, 200, 400);
+        reqs.len()
+    };
+    let settled = |rows: Vec<ui::FilmItem>, what: &str| {
+        let blank: Vec<&ui::FilmItem> = rows.iter().filter(|r| !r.name.is_empty() && !r.pending).collect();
+        assert!(!blank.is_empty(), "{what}: premise, tiles on screen");
+        assert!(blank.iter().all(|r| r.cloud && !r.valid && !r.failed), "{what}: every tile carries the cloud mark");
+    };
+
+    // ── THE FILMSTRIP, on photo 200.
+    {
+        let film = crate::Film::new();
+        let (tx, rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+        let cache = RefCell::new(FastCache::default());
+        let ratings = RefCell::new(vec![0i32; n]);
+        let marks = RefCell::new(vec![0u8; n]);
+        let film_model = slint::VecModel::<ui::FilmItem>::default();
+        let now = Instant::now();
+        let (last_tick, pos, base) = (Cell::new(now), Cell::new(200.0f32), Cell::new(0i64));
+        let (dragging, follow, target) = (Cell::new(true), Cell::new(false), Cell::new(200.0f32));
+        let (thumb_gen, sel_gen, select_gen, fast_gen) = (Cell::new(0u64), Cell::new(0u64), Cell::new(0u64), Cell::new(0u64));
+        let select = RefCell::new(crate::support::SelectSet::default());
+        let last_key = RefCell::new((0i64, 0u64, 0usize, 0usize, 0u64, 0u64, 0u64));
+        let film_clamp = Cell::new((0.0f32, f32::MAX));
+        let asked: Vec<usize> = (0..5)
+            .map(|_| {
+                crate::tick::step_filmstrip(
+                    &app, 200, n, now, &last_tick, 0, &shots, &plan, &cache, &film, &thumb_gen, &tx, &fast_gen,
+                    &ratings, &marks, &sel_gen, &select, &select_gen, &pos, &base, &dragging, &follow,
+                    &target, &film_clamp, &last_key, &film_model, &rot, ThumbScope::Nearby,
+                );
+                serve(&film, &rx, &thumb_gen)
+            })
+            .collect();
+        assert!(asked[0] > 0 && asked[1..].iter().all(|&k| k == 0), "the strip asks once, then never: {asked:?}");
+        assert!(film.failed.lock().unwrap().is_empty(), "the strip: nothing was read");
+        settled(film_model.iter().collect(), "the strip");
+    }
+
+    // ── THE GRID DOCK, over the first photos.
+    {
+        app.set_grid_open(true);
+        hover(&app, 600.0, 300.0);
+        if app.get_grid_vp_h() <= 0.0 {
+            app.set_grid_vp_h(654.0);
+        }
+        app.set_grid_vp_y(0.0);
+        let film = crate::Film::new();
+        let (tx, rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+        let cache = RefCell::new(FastCache::new());
+        let ratings = RefCell::new(vec![0i32; n]);
+        let marks = RefCell::new(vec![0u8; n]);
+        let (thumb_gen, sel_gen, select_gen, fast_gen) = (Cell::new(0u64), Cell::new(0u64), Cell::new(0u64), Cell::new(0u64));
+        let select = RefCell::new(crate::support::SelectSet::default());
+        let last_grid_key = Cell::new(crate::background_memory::GRID_KEY_UNBUILT);
+        let last_grid_view: Cell<(bool, u64)> = Cell::new((false, u64::MAX));
+        let last_grid_c: Cell<usize> = Cell::new(usize::MAX);
+        let grid_model = slint::VecModel::<ui::FilmItem>::default();
+        let grid_vp_prog: Cell<Option<crate::support::PanelMemo>> = Cell::new(None);
+        let asked: Vec<usize> = (0..5)
+            .map(|_| {
+                step_folder_grid(
+                    &app, 0, n, 0, &shots, &plan, &cache, &film, &thumb_gen, &tx, &fast_gen, &ratings, &marks,
+                    &sel_gen, &select, &select_gen, &last_grid_key, &last_grid_view, &last_grid_c,
+                    &grid_vp_prog, &grid_model, &rot, ThumbScope::Nearby,
+                );
+                serve(&film, &rx, &thumb_gen)
+            })
+            .collect();
+        assert!(asked[0] > 0 && asked[1..].iter().all(|&k| k == 0), "the dock asks once, then never: {asked:?}");
+        assert!(film.failed.lock().unwrap().is_empty(), "the dock: nothing was read");
+        settled(grid_model.iter().collect(), "the dock");
+        app.set_grid_open(false);
+    }
+
+    // ── THE REVIEW PANEL, whose feeder runs on every tick (the worst case for a re-ask loop).
+    {
+        app.set_sel_open(true);
+        app.set_sel_rating_filter(-1);
+        app.set_sel_vp_y(0.0);
+        app.set_sel_vp_h(600.0);
+        let m = 12usize;
+        let film = crate::Film::new();
+        let (tx, rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+        let cache = RefCell::new(FastCache::new());
+        let ratings = RefCell::new(vec![0i32; m]);
+        let marks = RefCell::new(vec![crate::MARK_FLAG; m]); // reviewed, so in the panel
+        let filter_mode = Cell::new(0i32);
+        let (thumb_gen, fast_gen) = (Cell::new(0u64), Cell::new(0u64));
+        let sel_gen = Cell::new(7u64);
+        let select = RefCell::new(crate::support::SelectSet::default());
+        let select_gen = Cell::new(0u64);
+        let last_sel_key = Cell::new((u64::MAX, i32::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX));
+        let last_count_key = Cell::new((u64::MAX, u64::MAX, u64::MAX, u64::MAX));
+        let last_out_key = Cell::new((u64::MAX, u64::MAX, u64::MAX, i32::MIN, i32::MIN, i32::MIN, i32::MIN));
+        let sel_rated_sig = Cell::new((0i32, 0u64));
+        let last_sel_log = Cell::new((i32::MIN, i32::MIN, usize::MAX, usize::MAX, usize::MAX, i32::MIN, u64::MAX));
+        let last_sel_view = Cell::new((false, u64::MAX));
+        let sel_vp_prog: Cell<Option<crate::support::PanelMemo>> = Cell::new(None);
+        let sel_model = slint::VecModel::<ui::SelTileRow>::default();
+        let tagged: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+        let asked: Vec<usize> = (0..5)
+            .map(|_| {
+                step_selection(
+                    &app, 0, m, 0, &shots[..m], &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
+                    &select_gen, &cache, &fast_gen, &film, &thumb_gen, &tx, &last_sel_key, &last_count_key,
+                    &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view, &sel_vp_prog, &sel_model,
+                    &rot, &tagged, &std::cell::RefCell::new(crate::tick::SelCache::default()),
+                );
+                serve(&film, &rx, &thumb_gen)
+            })
+            .collect();
+        assert!(asked[0] > 0 && asked[1..].iter().all(|&k| k == 0), "the panel asks once, then never: {asked:?}");
+        assert!(film.failed.lock().unwrap().is_empty(), "the panel: nothing was read");
+        let rows: Vec<ui::FilmItem> = sel_model.iter().flat_map(|r| [r.a, r.b]).collect();
+        settled(rows, "the panel");
+        app.set_sel_open(false);
+    }
+}
+
+/// 2026-10-28 (the cloud-only round, owner answer 1) — **THE CLOUD MARK IS THE MAIN VIEW'S CLOUD
+/// OUTLINE, ALONE ON THE TILE, IN THE BROKEN-IMAGE MARK'S PLACE AND GREY.** On all three tile
+/// surfaces: a cloud tile with no picture draws one `CloudGlyph` (22 px in the filmstrip and the
+/// dock, 30 px in the Review panel, `Theme.text-mute`) and no loading dots; a landed picture draws
+/// neither; a failed tile keeps its broken-image mark.
+///
+/// FALSIFIER (L28): drop `&& !root.cloud` from a dots condition and that surface draws both; drop a
+/// surface's glyph and its count reddens.
+#[test]
+fn a_cloud_tile_draws_the_cloud_outline_and_no_dots() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let app = boot();
+    let row = |i: i32, valid: bool, cloud: bool, failed: bool| ui::FilmItem {
+        name: format!("IMG_{i:04}").into(),
+        number: format!("{i}").into(),
+        badge: "JPG".into(),
+        idx: i,
+        valid,
+        cloud,
+        failed,
+        thumb: if valid { slint::Image::from_rgba8(slint::SharedPixelBuffer::new(4, 4)) } else { slint::Image::default() },
+        ..Default::default()
+    };
+    // One cloud tile, one landed tile flagged cloud (make_film_item never sends that, but the markup
+    // must not draw over a picture), one failed tile, on each surface.
+    let three = || vec![row(0, false, true, false), row(1, true, true, false), row(2, false, false, true)];
+    app.set_film(std::rc::Rc::new(slint::VecModel::from(three())).into());
+    app.set_grid_open(true);
+    app.set_grid_items(std::rc::Rc::new(slint::VecModel::from(three())).into());
+    review_panel(&app, std::rc::Rc::new(slint::VecModel::from(vec![
+        ui::SelTileRow { a: row(0, false, true, false), b: row(1, true, true, false), has_b: true },
+        ui::SelTileRow { a: row(2, false, false, true), b: ui::FilmItem::default(), has_b: false },
+    ])).into());
+    hover(&app, 600.0, 300.0);
+    i_slint_core::properties::ChangeTracker::run_change_handlers();
+    let clouds: Vec<(f32, String)> = E::find_by_element_type_name(&app, "CloudGlyph")
+        .filter(|e| e.size().width > 1.0 && e.size().width < 33.0) // the tiles', not the stage card's 34 px
+        .map(|e| (e.size().width, format!("{:?}", e.absolute_position())))
+        .collect();
+    let sizes: Vec<f32> = { let mut s: Vec<f32> = clouds.iter().map(|c| c.0).collect(); s.sort_by(f32::total_cmp); s };
+    assert_eq!(sizes, vec![22.0, 22.0, 30.0], "one cloud per surface, at the broken-image mark's size: {clouds:?}");
+    let broken = E::find_by_element_type_name(&app, "UnsupportedGlyph").filter(|e| e.size().width > 1.0).count();
+    assert_eq!(broken, 3, "a failed tile keeps its broken-image mark on each surface");
+    let dots = E::find_by_accessible_label(&app, "···").filter(|e| e.size().width > 1.0).count();
+    assert_eq!(dots, 0, "no loading dots under a cloud, a picture or a failure");
+    app.set_grid_open(false);
+    app.set_sel_open(false);
+}
+
 #[test]
 fn visible_only_asks_only_for_the_tiles_on_screen() {
     use crate::support::ThumbScope;

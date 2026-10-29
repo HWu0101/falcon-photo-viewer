@@ -23,11 +23,12 @@ CPU fallback remains available. The standard Rust toolchain and OS SDK are separ
 ## Modify and relink rawler
 
 1. Extract the matching source and dependency-source archives to a new directory. Keep the supplied
-   patched winit and zune-jpeg sources and all licence files. Use a copy, not a shared Cargo registry cache.
+   patched winit, zune-jpeg and femtovg sources and all licence files. Use a copy, not a shared
+   Cargo registry cache.
 2. Copy rawler's supplied source into a writable directory, for example third-party/rawler, and
    make your changes there. Keep its package version/API compatible initially.
 3. In falcon/Cargo.toml, add the following entry to the EXISTING [patch.crates-io] table. Retain
-   the existing winit and zune-jpeg entries. The path is relative to falcon/Cargo.toml:
+   every existing entry (winit, zune-jpeg, femtovg). The path is relative to falcon/Cargo.toml:
 
 ```toml
 rawler = { path = "../third-party/rawler" }
@@ -42,5 +43,4 @@ Use the application and library sources matching your downloaded version. These 
 cover modifying rawler; substituting a different RAW decoder requires adapting Falcon's code.
 A successful Windows rebuild does not verify a Mac build: build and test on the target platform.
 
-Release preparation is still in progress. Do not present an unmatched binary/source archive or
-an incomplete dependency-source set as the final public download.
+Use the application, dependency-source and binary archives from the same release.

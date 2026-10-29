@@ -120,12 +120,19 @@ pub(crate) struct Film {
     /// …and how many times the cache has lost thumbnails (an eviction, or a request retired or
     /// dropped), so the whole-folder feeder's cursor scans again from the current photo (review C-02).
     pub(crate) losses: Cell<u64>,
-    /// 2026-10-27 (round 2b, owner: "do the check"): the (gen, idx) of photos the whole folder's worker
-    /// found only in the cloud just before reading them (made online-only since the scan). Written by
-    /// the thumbnail workers (`main.rs::run_thumb_job_with`), read by `tick::step_whole_folder_thumbs`,
-    /// which asks for them no more this folder. Not a failure: a tile on screen still asks for its
-    /// thumbnail as before. Cleared on a folder swap.
-    pub(crate) cloud_skipped: Arc<Mutex<HashSet<(u64, usize)>>>,
+    /// 2026-10-27 (round 2b, owner: "do the check") → 2026-10-28 (the cloud-only round): the files
+    /// the workers found only in the cloud just before reading them, `(gen, idx, file)`
+    /// ([`support::CloudNotes`]). Written by all three workers (thumbnails `main.rs::run_thumb_job_with`,
+    /// previews `run_fast_job_with`, full resolution the detail worker); read by every producer that
+    /// would ask for that file again (the tiles, the backdrop, the whole folder, the previews and
+    /// frames ahead, the hover), which ask for it no more this folder, and by the tiles, which show
+    /// the cloud mark. Not a failure. A file on this device again leaves it
+    /// (`tick::step_cloud_landed_with`, `tick::step_cloud_retry_with`); cleared on a folder swap.
+    pub(crate) cloud_skipped: Arc<support::CloudNotes>,
+    /// The cloud-only round (design 6): the photos on screen whose frame genuinely landed this tick
+    /// (`tick::step_upload_drain`, beside the fast insert and the full-resolution landing), for
+    /// `tick::step_cloud_landed_with` to re-check their notes and scan tag. Drained every tick.
+    pub(crate) cloud_landed: RefCell<Vec<usize>>,
     pub(crate) visible_signal: Arc<(Mutex<(u64, usize)>, std::sync::Condvar)>,
     startup_at: Cell<Option<Instant>>,
     startup_request: Cell<(u64, usize)>,
@@ -150,6 +157,7 @@ impl Film {
             frost_window: Cell::new((1, 0)),
             losses: Cell::new(0),
             cloud_skipped: Arc::new(Mutex::new(HashSet::new())),
+            cloud_landed: RefCell::new(Vec::new()),
             visible_signal: Arc::new((Mutex::new((0, 0)), std::sync::Condvar::new())),
             startup_at: Cell::new(None), startup_request: Cell::new((0, 0)),
             models_ready: Cell::new(false), any_thumb: Cell::new(false),
@@ -181,7 +189,9 @@ impl Film {
             if row.name.is_empty() { continue; }
             total += 1;
             any |= row.valid;
-            terminal += usize::from(row.valid || row.failed || row.unsupported);
+            // The cloud-only round: a cloud tile is settled too (it never gets a picture by itself),
+            // or every cloud folder's open would hold the background work for the full 3 s.
+            terminal += usize::from(row.valid || row.failed || row.unsupported || row.cloud);
         }
         self.any_thumb.set(any);
         self.models_ready.set(total > 0 && terminal == total);
@@ -214,9 +224,9 @@ impl Film {
     ///   • `frost` — cleared under its lock (was `frost_map.lock()…clear()`). A3 (§61): the old folder's
     ///     mips are meaningless (indices re-keyed) — clearing STOPS a new-folder fast decode reading a stale
     ///     same-index mip as its frost backdrop (the exact §61 bug this extraction hardens by construction).
-    ///     The thumb workers may still land a straggler mip for the OLD gen just after this clear (the
-    ///     accepted ~+worker-count residual race, self-healed by the next drain's key-bounding + the next
-    ///     swap-clear) — unchanged from the loose-handle behaviour.
+    ///     A thumb worker's straggler mip for the OLD gen is refused under this lock
+    ///     (`tick::park_frost_mip`, round 2b review P1), so this clear must stay AFTER `apply_scan`'s
+    ///     generation bump, as the `cloud_skipped` clear already requires.
     ///   • `failed` — cleared under its lock (was `thumb_failed.lock()…clear()`). The (gen, idx) keys can't
     ///     collide across folders (the gen differs), so this is not needed for correctness — it keeps the
     ///     set BOUNDED across a long session of swaps. This line used to sit ~14 lines BELOW the other three
@@ -244,6 +254,7 @@ impl Film {
         self.frost_window.set((1, 0));
         self.losses.set(0);
         self.cloud_skipped.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.cloud_landed.borrow_mut().clear();
     }
 }
 
@@ -272,6 +283,26 @@ mod tests {
         assert!(!film.startup_hold(Instant::now()+Duration::from_secs(4)), "hidden/failed windows cannot hold background discovery forever");
     }
 
+    /// The cloud-only round (plan "Tests", Part 1): a cloud tile is a settled tile. It never gets a
+    /// picture by itself, so a window of them must not hold the folder's background work for the full
+    /// 3 s start-up budget.
+    ///
+    /// FALSIFIER (L28): drop `|| row.cloud` from `observe_models` and the window never reads ready.
+    #[test]
+    fn a_cloud_tile_counts_as_settled_for_the_open() {
+        let film = Film::new();
+        let strip = slint::VecModel::from(vec![
+            FilmItem { name: "here".into(), valid: true, ..Default::default() },
+            FilmItem { name: "cloud".into(), valid: false, cloud: true, ..Default::default() },
+        ]);
+        let grid = slint::VecModel::from(Vec::<FilmItem>::new());
+        film.arm_open(3, 2);
+        let now = Instant::now();
+        film.observe_models(&strip, &grid, false);
+        film.note_presented();
+        assert!(!film.startup_hold(now), "the cloud tile is as settled as it will get");
+    }
+
     /// A 1×1 placeholder frame — the same no-backend `slint::Image` construction the
     /// `rotate_invalidate_tests` (and fast.rs / detail.rs / roi.rs) use, so a thumbnail entry can be built
     /// under `cargo test` (no event loop).
@@ -293,7 +324,8 @@ mod tests {
         f.mipless.borrow_mut().insert(7);
         f.frost_window.set((5, 9));
         f.losses.set(3);
-        f.cloud_skipped.lock().unwrap().insert((3, 7));
+        f.cloud_skipped.lock().unwrap().insert((3, 7, support::CloudFile::Finished));
+        f.cloud_landed.borrow_mut().push(7);
     }
 
     /// The direct swap-clear test (the review's "cheap first target", film edition): populate every owned
@@ -319,6 +351,7 @@ mod tests {
         assert_eq!(f.frost_window.get(), (1, 0), "…and so is the frost feeder's window");
         assert_eq!(f.losses.get(), 0, "…and so is the loss count");
         assert!(f.cloud_skipped.lock().unwrap().is_empty(), "…and so are the photos found online-only");
+        assert!(f.cloud_landed.borrow().is_empty(), "…and the landings waiting for their re-check");
     }
 
     /// Idempotence: `on_folder_swap` on an already-clean tier is a no-op — this pins that a second swap in a

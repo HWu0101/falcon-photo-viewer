@@ -22,6 +22,9 @@
 //! convention `shader_compile.rs` already uses — a skip that ever fires HERE is a finding, so it
 //! prints loudly.
 
+#[path = "../../test-support/hw_child.rs"]
+mod hw_child;
+
 use falcon_decode::yuv_kernel::*;
 use falcon_gpu::Nv12Kernel;
 
@@ -72,6 +75,7 @@ fn first_diff(cpu: &[u8], gpu: &[u8], w: u32) -> Option<String> {
 /// **The gate.** Every golden row, both twins, byte for byte.
 #[test]
 fn the_twins_are_byte_identical_on_every_golden_row() {
+    if !hw_child::run_here(module_path!(), "the_twins_are_byte_identical_on_every_golden_row") { return; }
     let Some((device, queue)) = headless() else {
         eprintln!("!! yuv_kernel_twin: NO GPU ADAPTER — the E2 stage gate did NOT run");
         return;
@@ -103,6 +107,7 @@ fn the_twins_are_byte_identical_on_every_golden_row() {
 /// statement from "the twins agree", and the one that would catch both twins moving together.
 #[test]
 fn the_golden_digests_hold_on_the_gpu_twin() {
+    if !hw_child::run_here(module_path!(), "the_golden_digests_hold_on_the_gpu_twin") { return; }
     let Some((device, queue)) = headless() else {
         eprintln!("!! yuv_kernel_twin: NO GPU ADAPTER — the E2 digest check did NOT run");
         return;
@@ -145,6 +150,7 @@ fn the_golden_digests_hold_on_the_gpu_twin() {
 /// does move a byte — the honest statement of what this gate can and cannot resolve.
 #[test]
 fn a_perturbed_coefficient_breaks_the_identity() {
+    if !hw_child::run_here(module_path!(), "a_perturbed_coefficient_breaks_the_identity") { return; }
     let Some((device, queue)) = headless() else {
         eprintln!("!! yuv_kernel_twin: NO GPU ADAPTER — the falsifier did NOT run");
         return;

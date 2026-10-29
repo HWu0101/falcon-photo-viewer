@@ -292,7 +292,8 @@ pub(crate) fn accel_toggle_label() -> String {
 }
 
 /// v0.8.71 (Round B assoc): the Settings HEIC-association row's explanation when the row is disabled
-/// because no WIC HEIF codec is installed (the boot-time read-only probe — `heic_codec_present`).
+/// because no WIC HEIF codec is installed (the boot-time read-only probe — `heic_codec_state`; since
+/// 1.1.0-rc.1 only a definite "not installed" disables the row).
 /// Windows-only in practice: the row only disables there (macOS decodes HEIC natively via Image I/O,
 /// so the row never fades and this line never mounts). One unconditional composition — the string
 /// names the Windows codec story because only Windows can surface it. Pinned byte-for-byte by

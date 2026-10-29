@@ -1,6 +1,9 @@
 //! Real-pixel regression for the iPhone selfie. Only private copies are modified.
 #![cfg(windows)]
 
+#[path = "../../test-support/hw_child.rs"]
+mod hw_child;
+
 #[path = "../../test-support/fixture_paths.rs"]
 mod fixture_paths;
 
@@ -9,6 +12,7 @@ use std::path::PathBuf;
 
 #[test]
 fn selfie_hardware_pixels_match_wic_for_both_mirrors_and_all_rotations() {
+    if !hw_child::run_here(module_path!(), "selfie_hardware_pixels_match_wic_for_both_mirrors_and_all_rotations") { return; }
     let path = std::env::var_os("FALCON_SELFIE_FIXTURE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

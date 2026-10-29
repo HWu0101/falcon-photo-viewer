@@ -34,6 +34,8 @@ export component AboutCard inherits SolidPanel {
             viewport-height: body.preferred-height;
             body := VerticalLayout {
                 width: parent.width; spacing: 12px;
+                // 1.1.0-rc.1: first, above the contact rows, so the card still ends after LinkedIn.
+                about-releases := PillBtn { text: @tr("falcon" => "Check for updates"); clicked => { root.link-requested(3); } }
                 about-github := PillBtn { text: root.repository; clicked => { root.link-requested(0); } }
                 about-instagram := PillBtn { text: "Instagram · @hwuphoto"; clicked => { root.link-requested(1); } }
                 about-linkedin := PillBtn { text: "LinkedIn · Hancheng Wu"; clicked => { root.link-requested(2); } }

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import zipfile
 from release_materials import copy as copy_materials, validate, text_hash, MATERIAL_MARKER
@@ -78,7 +79,15 @@ def build(root, revision, env):
     return binary, receipt
 
 
-def package_built(binary, destination, receipt, root=None):
+def commit_stamp(root, revision):
+    """The source commit's time (UTC) as a zip entry date. Every file in the package carries it, so the
+    same source always makes the same zip. A fixed 1 January 1980 00:00 read as a time before 1980 in
+    time zones ahead of UTC, and Windows showed the files as dated 1899, or not at all."""
+    seconds = subprocess.check_output(['git', 'log', '-1', '--format=%ct', revision], cwd=root, text=True)
+    return time.gmtime(int(seconds.strip()))[:6]
+
+
+def package_built(binary, destination, receipt, root=None, stamp=None):
     """Internal staging step, called only with this invocation's successful build."""
     root = root or ROOT
     version = tomllib.loads((root/'falcon/native/Cargo.toml').read_text(encoding='utf-8'))['package']['version']
@@ -99,14 +108,19 @@ def package_built(binary, destination, receipt, root=None):
             'Extract this whole folder, then run Falcon.exe. No installer is needed.\n'
             'This free build is unsigned. If Windows SmartScreen blocks the trusted download,\n'
             'use More info > Run anyway when offered. Keep system-wide security enabled.\n'
-            'For file icons/opening, choose Settings > File associations > Update after placing\n'
-            'the app in its intended folder. Keep the accompanying licence/notices files.\n\n'
+            'For file icons/opening, choose Settings > File associations > Add to Open With after\n'
+            'placing the app in its intended folder. To update, close Falcon and extract the new\n'
+            'zip into the folder that contains this one, replacing its files. If you keep it\n'
+            'elsewhere, open the new copy and choose Update when it asks.\n'
+            'Keep the accompanying licence/notices files.\n\n'
             'Source, issues and updates: https://github.com/HWu0101/falcon-photo-viewer\n'
             'Source rebuilding and the RAW library: REBUILDING.md\n', encoding='utf-8', newline='\n')
+        if stamp is None:
+            raise ValueError('The package needs its source commit time')
         with zipfile.ZipFile(output, 'x', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
             for path in sorted(stage.rglob('*')):
                 if path.is_file() and path.relative_to(stage).as_posix() != 'docs/licenses/'+MATERIAL_MARKER:
-                    info = zipfile.ZipInfo(path.relative_to(stage.parent).as_posix(), (1980,1,1,0,0,0))
+                    info = zipfile.ZipInfo(path.relative_to(stage.parent).as_posix(), stamp)
                     info.compress_type = zipfile.ZIP_DEFLATED; info.external_attr = 0o100644 << 16
                     archive.writestr(info, path.read_bytes(), compresslevel=9)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
@@ -123,7 +137,7 @@ def package(destination):
         binary, receipt = build(source, revision, env)
         if clean_revision(ROOT) != revision:
             raise ValueError('Source changed during the release build')
-        return package_built(binary, destination, receipt, source)
+        return package_built(binary, destination, receipt, source, commit_stamp(ROOT, revision))
 
 
 if __name__ == '__main__':

@@ -94,6 +94,7 @@ impl FastTier {
                     inflight: HashSet::new(),
                     costly_q: HashSet::new(),
                     costly_inflight: HashSet::new(),
+                    local_only_q: HashSet::new(),
                 }),
                 Condvar::new(),
             )),

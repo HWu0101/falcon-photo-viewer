@@ -3,6 +3,8 @@
 // `export` added — they were macro-file-local; the macro imports them by name.
 
 import { Theme } from "theme.slint";
+import { FilmItem, SelTileRow } from "structs.slint";
+import { CloudGlyph } from "glyphs.slint";
 
     // One cache-status bar: a recessed pill track with an inner colour-coded fill sized to `frac`
     // (0..1). The fill ANCHORS toward the current position — the BEFORE bar (frames behind the
@@ -236,6 +238,13 @@ import { Theme } from "theme.slint";
         in property <length> content-h;  // the content's (virtual) height
         in property <length> vp-y;       // the live viewport-y (negative when scrolled)
         callback seek(length);           // the viewport-y the host should apply (negative)
+        // 2026-10-29 (the jump lists): true while the host's jump list is being dragged, so the bar
+        // shows its pressed look as the list moves the scroll (owner: the list "follows the slider's
+        // patterns"). False, the default, leaves every host as it was.
+        in property <bool> lit: false;
+        // …and whether the pointer is on the band or pressing it, for a host that opens a jump list
+        // from it (the Review panel; the band's ids are inside the host's `if` and cannot be named).
+        out property <bool> engaged: barta.has-hover || barta.pressed;
         property <length> padt: 8px;
         property <length> trackh: root.height - 2 * root.padt;
         property <length> thumbh: max(28px, root.trackh * (root.vp-h / max(1px, root.content-h)));
@@ -252,15 +261,289 @@ import { Theme } from "theme.slint";
         track := Rectangle { // track (centred in the 8px band)
             x: 2px; y: root.padt; width: 4px; height: root.trackh;
             border-radius: 2px;
-            background: barta.has-hover || barta.pressed ? Theme.block : transparent;
+            background: barta.has-hover || barta.pressed || root.lit ? Theme.block : transparent;
             animate background { duration: Theme.anim; easing: ease; }
         }
         thumb := Rectangle { // thumb (proportional height, accent while engaged)
             x: 1px; y: root.padt + (root.trackh - root.thumbh) * max(0.0, min(1.0, root.frac));
             width: 6px; height: root.thumbh;
             border-radius: 3px;
-            background: barta.pressed ? Theme.accent : (barta.has-hover ? Theme.text-mute : Theme.block);
-            opacity: barta.has-hover && !barta.pressed ? 0.55 : 1.0;
+            background: barta.pressed || root.lit ? Theme.accent : (barta.has-hover ? Theme.text-mute : Theme.block);
+            opacity: barta.has-hover && !barta.pressed && !root.lit ? 0.55 : 1.0;
             animate background, opacity { duration: Theme.anim; easing: ease; }
+        }
+    }
+
+    // ── 2026-10-29 (owner, testing 1.1.0-rc.1) — THE SCROLL BARS' JUMP LISTS: WHEN ONE SHOWS. ──────
+    //
+    // A jump list opens beside a scroll bar when the pointer rests near the bar, stays open while the
+    // pointer is anywhere in one keep-open zone (the bar, the gap, the list and a margin, so crossing
+    // the gap never drops it) or a drag on the list is in flight, and closes once the pointer has left
+    // that zone. It shows after the pointer has been near the bar for 200 ms (owner, testing rc.2:
+    // "reduce the hover jump menu's trigger delay", 200 ms for both lists; it was the hover preview's
+    // 333 ms) and goes 120 ms after it leaves the zone (the hover preview's `HOVER_LINGER_MS`), with
+    // no fade, as that card has none (the owner's h4 ruling).
+    //
+    // The host works out `near` and `zone` from pointer geometry alone and mounts its list under
+    // `if latch.open` (ledger L4 / L49). Slint keeps this clock, not Rust: an `animate` with a `delay`
+    // and no duration, the tooltip layer's idiom (there is no `Timer` element in this UI; see the
+    // "Rust owns the clock" note in main_window.slint). `armed` is a plain property that `changed`
+    // handlers set and clear, so `open` never reads itself.
+    //
+    // THE CLOCKS READ COPIES THAT CHANGE ONLY WHEN THEIR INPUTS REALLY FLIP (owner, testing rc.2: on
+    // a 7,000-photo folder the Review list took ">10s ... or simply does not trigger at all"). Slint
+    // 1.17 restarts a delayed animation whenever its binding is marked dirty, even when the value it
+    // computes stays the same (`AnimatedBindingCallable::mark_dirty` resets the start time, and dirty
+    // marking does not compare values). The hosts' `near` and `zone` read the pointer position and,
+    // in Review, the scroll bar's need, which reads the layout of every row; so each thumbnail landing
+    // in a Review row, and each small pointer move beside the bar, restarted the 200 ms (and the
+    // 120 ms close). `changed` handlers do compare values, so `near-v` and `keep-v` move only on a
+    // real enter or leave, and the rest now means "inside the reach for 200 ms".
+    export component JumpLatch {
+        in property <bool> near;   // the pointer is within the opening reach of the bar
+        in property <bool> zone;   // the pointer is inside the keep-open zone
+        in property <bool> held;   // a drag on the list is in flight
+        out property <bool> open: self.hold > 0.5;
+        property <bool> armed: false;
+        property <bool> near-v: false;
+        property <bool> keep-v: false;
+        init => { self.near-v = self.near; self.keep-v = self.zone || self.held; }
+        changed near => { self.near-v = self.near; }
+        changed zone => { self.keep-v = self.zone || self.held; }
+        changed held => { self.keep-v = self.zone || self.held; }
+        property <float> rest: self.near-v ? 1.0 : 0.0;
+        animate rest { delay: self.near-v ? 200ms : 0ms; duration: 0ms; }
+        changed rest => { if (self.rest > 0.5) { self.armed = true; } }
+        property <float> hold: self.armed && self.keep-v ? 1.0 : 0.0;
+        animate hold { delay: self.armed && self.keep-v ? 0ms : 120ms; duration: 0ms; }
+        changed open => { if (!self.open) { self.armed = false; } }
+    }
+
+    // ── 2026-10-29 (owner, after mockups: variant A, "solid blue") — SETTINGS' SECTION LIST. ───────
+    //
+    // The section captions as a vertical `Seg` on a floating card: a `Theme.block` card (radius 12,
+    // padding 6, the one control shadow) holding a `Theme.well` track of 24 px cells, 3 px apart and
+    // 3 px from its edges, with `Seg`'s own nested radius. The current section is the solid accent
+    // pill with `Theme.text` (owner: "solid blue as it is draggable so it is closer to a vertical
+    // slider thus it follows the slider's patterns"), gliding between cells as `Seg`'s does; the other
+    // captions `Theme.text-dim`, 11 px SemiBold, as the captions themselves; the hover wash
+    // `Theme.hover`. A press jumps to the row under it; a drag jumps row by row as the pointer crosses
+    // them (past either end, to the end row); the release stays where it is. The wheel is handed to
+    // the host (`scrolled`) and accepted, so the list never swallows it and its hover never drops
+    // mid-wheel (a rejected wheel clears a TouchArea's hover).
+    export component SectionJump inherits Rectangle {
+        in property <[string]> rows;
+        in property <int> current: -1;
+        out property <bool> dragging: ta.pressed;
+        callback jump(int);
+        callback scrolled(length);
+        property <length> pitch: 27px; // a 24 px cell and its 3 px gap
+        property <length> top: 9px;    // the card's 6 px padding and the track's 3 px
+        property <int> n: max(1, root.rows.length);
+        property <int> under: ta.has-hover || ta.pressed
+            ? Math.max(0, Math.min(root.n - 1, Math.floor((ta.mouse-y - root.top + 1.5px) / root.pitch))) : -1;
+        property <int> sent: -1; // the row the press or the drag last jumped to
+        width: col.preferred-width;
+        height: 2 * root.top + root.n * root.pitch - 3px;
+        background: Theme.block;
+        border-radius: Theme.radius;
+        drop-shadow-blur: Theme.shadow-blur;
+        drop-shadow-color: Theme.shadow-control;
+        drop-shadow-offset-y: Theme.shadow-dy;
+        Rectangle {
+            x: 6px; y: 6px; width: parent.width - 12px; height: parent.height - 12px;
+            border-radius: Theme.radius-ctrl;
+            background: Theme.well;
+            for t[i] in root.rows : Rectangle {
+                x: 3px; y: 3px + i * root.pitch; width: parent.width - 6px; height: 24px;
+                border-radius: Theme.radius-ctrl - 3px;
+                background: root.under == i && root.current != i ? Theme.hover : transparent;
+            }
+            pill := Rectangle {
+                x: 3px; y: 3px + root.current * root.pitch; width: parent.width - 6px; height: 24px;
+                border-radius: Theme.radius-ctrl - 3px;
+                background: Theme.accent;
+                visible: root.current >= 0;
+                animate y { duration: Theme.anim-fast; easing: ease-out; }
+            }
+        }
+        // The captions; this column's preferred width sizes the card (10 px either side of the text).
+        col := VerticalLayout {
+            padding-top: root.top; padding-bottom: root.top; padding-left: 19px; padding-right: 19px;
+            spacing: 3px;
+            for t[i] in root.rows : Text {
+                height: 24px;
+                text: t;
+                color: i == root.current ? Theme.text : Theme.text-dim;
+                font-size: Theme.font-sm; font-weight: 600;
+                vertical-alignment: center;
+            }
+        }
+        ta := TouchArea {
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                    root.sent = root.under;
+                    root.jump(root.under);
+                }
+            }
+            moved => {
+                if (self.pressed && root.under != root.sent) {
+                    root.sent = root.under;
+                    root.jump(root.under);
+                }
+            }
+            scroll-event(e) => {
+                root.scrolled(e.delta-y);
+                accept
+            }
+        }
+    }
+
+    // A Review jump-list photo: the panel tile's own thumbnail at a few pixels, the empty well while
+    // it is not ready, the cloud outline for a photo only in the cloud (never downloaded for this).
+    component JumpThumb inherits Rectangle {
+        in property <FilmItem> item;
+        border-radius: 3px;
+        clip: true;
+        background: Theme.well;
+        if root.item.valid : Image { source: root.item.thumb; image-fit: cover; width: 100%; height: 100%; }
+        if root.item.cloud && !root.item.valid : CloudGlyph {
+            tint: Theme.text-mute;
+            width: min(parent.width, parent.height) * 0.7; height: self.width;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+        }
+    }
+
+    // ── 2026-10-29 (owner, after mockups) — THE REVIEW PANEL'S JUMP LIST. ────────────────────────
+    //
+    // The panel shows about six photos at a time, so a long review takes ages to scroll through
+    // (owner). One column of entries beside the panel's scroll bar; each entry is one panel row, its
+    // two photos side by side (owner: "the neighboring 2 are linked"), sampled evenly over the rows
+    // by Rust (`support::jump_rows`, in `picks`). The entries divide the bar's track exactly (`pitch`,
+    // from the host's tier: owner, "the total height is equal to the actual slider"), so each sits
+    // beside its own place on the bar; a photo is 3:2 inside its entry.
+    //
+    // Mac Dock-style zoom (owner: "keep it", "snappy"): the entry under the pointer at 1.8×, its
+    // neighbours less by distance, back to 1× at 2.5 entries, with no easing and no delay. The zoom
+    // keeps the point under the pointer where it is and grows the column up and down around it, so
+    // the entry you see under the pointer is the one a press takes. The current entry stands on the
+    // solid accent plate (the Settings list's grammar). Beside the entry under the pointer, on the
+    // tooltip's badge, "photos a–b of n". A press jumps to the entry under it and a drag goes entry
+    // by entry; the wheel goes to the host. The photos are the panel's own tiles (`rows`).
+    //
+    // THIS ELEMENT IS THE LIST'S WHOLE KEEP-OPEN AREA, A FIXED RECTANGLE: from the panel's edge (the
+    // card is 8 px in) to past the widest zoom plus a 14 px margin, and above and below the column by
+    // the most a zoom can grow it plus the same margin. Its TouchArea measures the pointer against
+    // that fixed frame, so the zoom can move the card without moving what the pointer is measured
+    // against (no feedback between the two).
+    export component PhotoJump {
+        in property <[SelTileRow]> rows;
+        in property <[int]> picks;
+        in property <length> pitch: 24px;
+        in property <int> current: -1;
+        in property <int> photos;
+        in property <float> sfx: 1.0; // the window's scale, to put the label's text on whole pixels
+        out property <bool> dragging: root.held && ta.pressed;
+        out property <bool> hot: ta.has-hover || ta.pressed;
+        out property <length> top: root.slack; // where the first entry starts, unzoomed
+        callback jump(int);
+        callback scrolled(length);
+        property <int> m: root.picks.length;
+        property <length> th: max(2px, root.pitch - 6px); // a photo's height: 2 px of plate above and below, 2 px between entries
+        property <length> tw: 1.5 * root.th;
+        property <length> slack: 2.5 * root.th + 20px;    // the most a zoom grows the column at one end, the card's pad, the margin
+        property <length> cx: 8px;                         // the card, 8 px right of the panel
+        property <length> cw-max: 3.6 * root.tw + 18px;   // the widest zoomed entry and its pads: the keep-open area
+        width: root.cx + root.cw-max + 14px;
+        height: 2 * root.slack + root.m * root.pitch;
+        property <bool> over: ta.has-hover
+            && ta.mouse-x >= root.cx && ta.mouse-x <= root.cx + root.cw-max
+            && ta.mouse-y >= root.top - root.th && ta.mouse-y <= root.top + root.m * root.pitch + root.th;
+        property <bool> held: false; // a press that began over the column
+        // The pointer's place in entries, on the fixed frame: entry i's centre is i (an entry is its
+        // pitch less the 2 px gap under it, hence the 1 px), -1 when the pointer is not over the column.
+        property <float> hp: root.m > 0 && (root.over || (root.held && ta.pressed))
+            ? Math.max(0, Math.min(root.m - 1, (ta.mouse-y - root.top + 1px) / root.pitch - 0.5)) : -1;
+        out property <int> under: root.hp < 0 ? -1 : Math.round(root.hp); // the entry under the pointer, -1 for none
+        property <int> sent: -1; // the entry the press or the drag last jumped to
+        property <int> k0: Math.floor(root.hp) - 2;
+        pure function grow(j: int) -> float { // an entry's zoom, less one
+            return root.hp < 0 || j < 0 || j >= root.m ? 0 : 0.8 * Math.max(0, 1 - Math.abs(j - root.hp) / 2.5);
+        }
+        pure function grow-before(j: int, i: int) -> float { return j < i ? root.grow(j) : 0; }
+        // The height the zoom adds above entry i: only the six entries around the pointer grow.
+        pure function above(i: int) -> length {
+            return root.th * (root.grow-before(root.k0, i) + root.grow-before(root.k0 + 1, i) + root.grow-before(root.k0 + 2, i)
+                + root.grow-before(root.k0 + 3, i) + root.grow-before(root.k0 + 4, i) + root.grow-before(root.k0 + 5, i));
+        }
+        // How far the column moves up so that the point under the pointer stays under it.
+        property <length> lift: root.under < 0 ? 0px
+            : root.above(root.under) + root.grow(root.under) * root.th * (root.hp + 0.5 - root.under);
+        // The card keeps its unzoomed width (owner, testing rc.2: "should only zoom the affected
+        // thumbnails not the whole menu panel"; the column still spreads up and down, like the Dock):
+        // a zoomed entry grows out past its right edge.
+        card := Rectangle {
+            x: root.cx; y: root.top - root.lift - 6px;
+            width: 2 * root.tw + 18px;
+            height: root.m * root.pitch - 2px + root.above(root.m) + 12px;
+            background: Theme.block;
+            border-radius: Theme.radius;
+            drop-shadow-blur: Theme.shadow-blur;
+            drop-shadow-color: Theme.shadow-control;
+            drop-shadow-offset-y: Theme.shadow-dy;
+            for r[i] in root.picks : entry := Rectangle {
+                property <SelTileRow> pair: root.rows[r]; // (`row` is a grid-layout property)
+                property <float> s: 1 + root.grow(i);
+                x: 6px; y: 6px + i * root.pitch + root.above(i);
+                width: 2 * self.s * root.tw + 6px; height: self.s * root.th + 4px;
+                if i == root.current : plate := Rectangle {
+                    width: 100%; height: 100%;
+                    border-radius: 5px;
+                    background: Theme.accent;
+                }
+                JumpThumb { x: 2px; y: 2px; width: entry.s * root.tw; height: entry.s * root.th; item: entry.pair.a; }
+                if entry.pair.has-b : JumpThumb {
+                    x: 4px + entry.s * root.tw; y: 2px; width: entry.s * root.tw; height: entry.s * root.th; item: entry.pair.b;
+                }
+            }
+        }
+        if root.under >= 0 : Rectangle {
+            property <SelTileRow> pair: root.rows[root.picks[root.under]];
+            property <int> first: 2 * root.picks[root.under] + 1;
+            property <length> cy: card.y + 6px + root.under * root.pitch + root.above(root.under)
+                + ((1 + root.grow(root.under)) * root.th + 4px) / 2;
+            // 8 px past where a card that wide would end: beside the zoomed entry, as before.
+            x: Math.round((card.x + 2 * (1 + root.grow(root.under)) * root.tw + 26px) / 1px * root.sfx) / root.sfx * 1px;
+            y: Math.round((self.cy - self.height / 2) / 1px * root.sfx) / root.sfx * 1px;
+            width: poslab.preferred-width + 16px; height: poslab.preferred-height + 8px;
+            background: Theme.badge-bg;
+            border-radius: Theme.radius-sm;
+            poslab := Text {
+                x: 8px; y: 4px;
+                color: Theme.text; font-size: Theme.font-sm;
+                text: parent.pair.has-b ? @tr("falcon" => "photos {0}–{1} of {2}", parent.first, parent.first + 1, root.photos)
+                    : @tr("falcon" => "photo {0} of {1}", parent.first, root.photos);
+            }
+        }
+        ta := TouchArea {
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left && root.over && root.under >= 0) {
+                    root.held = true;
+                    root.sent = root.under;
+                    root.jump(root.under);
+                } else if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                    root.held = false;
+                }
+            }
+            moved => {
+                if (root.held && self.pressed && root.under >= 0 && root.under != root.sent) {
+                    root.sent = root.under;
+                    root.jump(root.under);
+                }
+            }
+            scroll-event(e) => {
+                root.scrolled(e.delta-y);
+                accept
+            }
         }
     }

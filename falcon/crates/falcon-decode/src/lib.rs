@@ -397,6 +397,24 @@ pub fn file_is_cloud_placeholder(_path: &Path) -> bool {
     false
 }
 
+/// 2026-10-28 (the cloud-only round, owner answer 12): [`file_is_cloud_placeholder`]'s answer from
+/// metadata already in hand (a directory listing's, or the Date-taken sort's own `metadata` call), so
+/// a caller that has it pays no second call.
+#[cfg(windows)]
+pub fn metadata_is_cloud_placeholder(m: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    is_cloud_placeholder(m.file_attributes())
+}
+#[cfg(target_os = "macos")]
+pub fn metadata_is_cloud_placeholder(m: &std::fs::Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    is_dataless(m.st_flags())
+}
+#[cfg(all(not(windows), not(target_os = "macos")))]
+pub fn metadata_is_cloud_placeholder(_m: &std::fs::Metadata) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod cloud_placeholder_tests {
     use super::{
@@ -1801,9 +1819,13 @@ pub struct Shot {
     pub sniffed: Option<SrcKind>,
     /// v0.8.24 (D1): EITHER pair file is a cloud (OneDrive Files-On-Demand) placeholder — present in the
     /// listing but not hydrated locally. Detected at scan from the file ATTRIBUTES only (no data read →
-    /// no download). Drives the "not downloaded" failure notice + the timed retry sweep + the Copy/Move
-    /// download advisory. Server-side runtime state (like `raw`/`jpg`) → never serialized; always `false`
-    /// off Windows.
+    /// no download); on macOS from `SF_DATALESS` (iCloud, and OneDrive/Dropbox on File Provider). Drives
+    /// the "not downloaded" failure notice + the timed retry sweep + the Copy/Move download advisory.
+    /// Server-side runtime state (like `raw`/`jpg`) → never serialized; `false` on other systems.
+    /// 2026-10-28 (the cloud-only round): the app clears it on the shared list once neither file is
+    /// online-only any more (a viewed photo's landing re-check, the retry sweep), so RAW export and the
+    /// whole folder's preparation read the live answer. The per-file truth the workers act on is
+    /// separate (the app's `support::CloudNotes`).
     #[serde(skip)]
     pub cloud_placeholder: bool,
 }
@@ -4537,7 +4559,15 @@ pub fn read_exif(shot: &Shot) -> Exif {
 /// yields `None` and the sort falls back to the file's modified time (documented, Explorer-like).
 /// CALLER CONTRACT: never call this on a cloud-placeholder shot — opening the file HYDRATES it
 /// (the sort layer guards on `Shot::cloud_placeholder` and uses the mtime fallback there).
+/// 2026-10-28 (the cloud-only round, owner answer 12): the sort layer checks the PRIMARY file's
+/// metadata it already has; the RAW this falls back to is checked here, before it is opened, so a
+/// re-sort never downloads a RAW freed up during the session.
 pub fn read_date_taken(shot: &Shot) -> Option<String> {
+    read_date_taken_with(shot, file_is_cloud_placeholder)
+}
+
+/// [`read_date_taken`] with the cloud probe passed in (no test can make a real placeholder).
+pub fn read_date_taken_with(shot: &Shot, is_cloud: impl Fn(&Path) -> bool) -> Option<String> {
     use exif::{In, Tag};
     const DATE_READ_CAP: u64 = 64 * 1024;
     let read_capped = |path: &Path| -> Option<exif::Exif> {
@@ -4558,6 +4588,9 @@ pub fn read_date_taken(shot: &Shot) -> Option<String> {
         return Some(d);
     }
     let rp = shot.raw.as_deref()?;
+    if is_cloud(rp) {
+        return None; // only in the cloud: the sort uses the modified time, and nothing downloads
+    }
     if let Some(d) = date_of(rp) {
         return Some(d); // TIFF-based RAW (CR2/NEF/ARW/DNG) parsed directly
     }
@@ -5003,6 +5036,59 @@ mod orient_tests {
         for r in [1, 3, 6, 8] {
             assert!(!orientation_is_mirrored(r));
         }
+    }
+
+    /// 2026-10-28 (the cloud-only round, owner answer 12) — **THE DATE-TAKEN SORT NEVER OPENS A RAW
+    /// THAT IS ONLY IN THE CLOUD.** A RAW carrying a real `DateTimeOriginal` (a JPEG container under a
+    /// RAW name, which the reader parses by content) is read when it is on this device and not opened
+    /// when the probe says it is online-only; the probe is asked before the read.
+    ///
+    /// FALSIFIER (L28): drop the `is_cloud(rp)` test in `read_date_taken_with` and the cloud row
+    /// returns the date.
+    #[test]
+    fn a_date_taken_read_never_opens_a_cloud_only_raw() {
+        // TIFF: IFD0 with the Exif-IFD pointer; the Exif IFD with DateTimeOriginal (ASCII, 20 bytes).
+        let date = b"2024:05:06 07:08:09\0";
+        let mut tiff = b"II*\0".to_vec();
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        for (tag, ty, count, value) in [(0x8769u16, 4u16, 1u32, 26u32)] {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&ty.to_le_bytes());
+            tiff.extend_from_slice(&count.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        for (tag, ty, count, value) in [(0x9003u16, 2u16, 20u32, 44u32)] {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&ty.to_le_bytes());
+            tiff.extend_from_slice(&count.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(tiff.len(), 44, "premise: the string sits where the entry points");
+        tiff.extend_from_slice(date);
+        let mut jpeg = Vec::new();
+        jpeg_encoder::Encoder::new(&mut jpeg, 90).encode(&[90; 18], 2, 3, jpeg_encoder::ColorType::Rgb).unwrap();
+        let mut app1 = b"\xff\xe1".to_vec();
+        app1.extend_from_slice(&((tiff.len() + 8) as u16).to_be_bytes());
+        app1.extend_from_slice(b"Exif\0\0");
+        app1.extend_from_slice(&tiff);
+        jpeg.splice(2..2, app1);
+        let path = std::env::temp_dir().join(format!("falcon_cloud_date_{}.CR2", std::process::id()));
+        std::fs::write(&path, &jpeg).unwrap();
+        let shot = Shot { id: 0, name: "raw".into(), has_raw: true, has_jpg: false, raw: Some(path.clone()),
+            jpg: None, kind: SrcKind::Jpeg, cloud_placeholder: false, sniffed: None };
+        assert_eq!(read_date_taken_with(&shot, |_| false).as_deref(), Some("2024:05:06 07:08:09"), "on this device: read");
+        let asked = std::cell::Cell::new(false);
+        let got = read_date_taken_with(&shot, |p| {
+            asked.set(p == path.as_path());
+            true
+        });
+        assert!(asked.get(), "the RAW is asked about before it is opened");
+        assert_eq!(got, None, "only in the cloud: not opened (the sort uses the modified time)");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -7643,8 +7729,10 @@ pub fn heic_decode_at_scale_engages(_path: &Path, _target_long: u32) -> bool {
 /// on the CONTAINER GUID (not `CLSID_WICHeifDecoder`) covers any HEIF decoder implementation, not
 /// just Microsoft's Store-delivered "HEVC/HEIF Image Extensions". Result is cached for the session
 /// (`OnceLock`) — a codec installed mid-session enables on the next launch (accepted; the Settings
-/// HEIC association row is the consumer). Any COM failure degrades to `false` (row disabled), never
-/// a panic — the same posture as a genuinely absent codec.
+/// HEIC association row is the consumer). Never a panic. 1.1.0-rc.1 (issue #11, the plan's A5): a
+/// failed or incomplete check is reported as `None` by [`wic_heif_codec_state`]; this bool still reads
+/// `false` then, for decode and the scan, but the association row treats it as unknown and stays
+/// enabled, and nothing removes HEIC claims on it.
 ///
 /// THREADING (the RPC_E_CHANGED_MODE trap, caught by the v0.8.71 boot-verify): the probe runs on its
 /// OWN throwaway thread. Its `CoInitializeEx(COINIT_MULTITHREADED)` is per-thread — issued on the
@@ -7652,19 +7740,57 @@ pub fn heic_decode_at_scale_engages(_path: &Path, _target_long: u32) -> bool {
 /// drag-drop) on that same thread panics with RPC_E_CHANGED_MODE. `wic_decode_rgb24` never hits this
 /// because it only runs on decode-worker threads; this probe is called from boot (main thread), so
 /// the thread isolation is mandatory, not hygiene. One-time cost (OnceLock), a few ms.
-#[cfg(windows)]
 pub fn wic_heif_codec_present() -> bool {
+    wic_heif_codec_state() == Some(true)
+}
+/// 1.1.0-rc.1 (issue #11, the plan's A5): the probe's three answers. `Some(true)`: a HEIF container
+/// decoder was found. `Some(false)`: every returned decoder was inspected and none is HEIF. `None`:
+/// the check failed or was incomplete and found no HEIF decoder — never proof of absence. One cache
+/// and one probe thread for the session.
+#[cfg(windows)]
+pub fn wic_heif_codec_state() -> Option<bool> {
     use std::sync::OnceLock;
-    static PRESENT: OnceLock<bool> = OnceLock::new();
-    *PRESENT.get_or_init(|| {
-        std::thread::spawn(|| unsafe { wic_heif_probe().unwrap_or(false) })
-            .join()
-            .unwrap_or(false)
-    })
+    static STATE: OnceLock<Option<bool>> = OnceLock::new();
+    *STATE.get_or_init(|| std::thread::spawn(|| unsafe { wic_heif_probe() }).join().unwrap_or(None))
+}
+/// One step of the WIC decoder walk, for [`heif_walk`].
+#[cfg_attr(not(windows), allow(dead_code))] // Windows-only producer; pinned by tests on every host
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeifStep {
+    /// The enumeration ended normally (`S_FALSE`, nothing fetched).
+    End,
+    /// `Next` returned an error.
+    NextFailed,
+    /// `Next` reported an item but returned none.
+    EmptyItem,
+    /// The item is not an `IWICBitmapDecoderInfo`.
+    CastFailed,
+    /// `GetContainerFormat` returned an error.
+    FormatFailed,
+    /// The item's container format: HEIF or not.
+    Format(bool),
+}
+/// The walk's answer, portable so every outcome is tested on any host: a HEIF decoder wins even after
+/// an earlier item failed; a clean end with nothing found is `Some(false)`; a failed `Next`, an empty
+/// item, or a normal end after any failed inspection is `None`.
+#[cfg_attr(not(windows), allow(dead_code))] // Windows-only producer; pinned by tests on every host
+fn heif_walk(steps: impl IntoIterator<Item = HeifStep>) -> Option<bool> {
+    let mut inspection_failed = false;
+    for step in steps {
+        match step {
+            HeifStep::Format(true) => return Some(true),
+            HeifStep::Format(false) => {}
+            HeifStep::CastFailed | HeifStep::FormatFailed => inspection_failed = true,
+            HeifStep::NextFailed | HeifStep::EmptyItem => return None,
+            HeifStep::End => return if inspection_failed { None } else { Some(false) },
+        }
+    }
+    None // a walk that never reached its end
 }
 #[cfg(windows)]
 unsafe fn wic_heif_probe() -> Option<bool> {
     use windows::core::Interface;
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
     use windows::Win32::Graphics::Imaging::{
         CLSID_WICImagingFactory, GUID_ContainerFormatHeif, IWICBitmapDecoderInfo,
         IWICImagingFactory, WICComponentEnumerateDefault, WICDecoder,
@@ -7678,32 +7804,56 @@ unsafe fn wic_heif_probe() -> Option<bool> {
     // lifetime via the decode workers, and an explicit CoUninitialize here — even on this throwaway
     // probe thread — risks tearing down the last MTA reference and forcing an apartment teardown/
     // recreate cycle. Letting the thread simply exit drops its own init count without that risk.
-    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    // A failed initialisation proves nothing about the codec (RPC_E_CHANGED_MODE still leaves COM usable).
+    if let Err(e) = CoInitializeEx(None, COINIT_MULTITHREADED).ok() {
+        if e.code() != RPC_E_CHANGED_MODE { return None; }
+    }
     let factory: IWICImagingFactory =
         CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
     let enumerator = factory
         .CreateComponentEnumerator(WICDecoder.0 as u32, WICComponentEnumerateDefault.0 as u32)
         .ok()?;
-    loop {
+    heif_walk(std::iter::from_fn(|| {
         let mut item: [Option<windows::core::IUnknown>; 1] = [None];
         let mut fetched = 0u32;
-        // S_FALSE (fetched == 0) = end of the enumeration; a hard error also ends the walk.
-        if enumerator.Next(&mut item, Some(&mut fetched)).is_err() || fetched == 0 {
-            return Some(false);
-        }
-        let Some(unk) = item[0].take() else { return Some(false) };
-        // Every WICDecoder item is an IWICBitmapDecoderInfo; a failed cast is skipped defensively.
-        let Ok(info) = unk.cast::<IWICBitmapDecoderInfo>() else { continue };
-        if info.GetContainerFormat() == Ok(GUID_ContainerFormatHeif) {
-            return Some(true);
-        }
-    }
+        // S_FALSE (fetched == 0) = the end of the enumeration; a hard error is not an answer.
+        if enumerator.Next(&mut item, Some(&mut fetched)).is_err() { return Some(HeifStep::NextFailed); }
+        if fetched == 0 { return Some(HeifStep::End); }
+        let Some(unk) = item[0].take() else { return Some(HeifStep::EmptyItem) };
+        // Every WICDecoder item should be an IWICBitmapDecoderInfo.
+        let Ok(info) = unk.cast::<IWICBitmapDecoderInfo>() else { return Some(HeifStep::CastFailed) };
+        // GetContainerFormat returns an HRESULT; an error is a failed inspection, not "not HEIF".
+        Some(match info.GetContainerFormat() {
+            Ok(format) => HeifStep::Format(format == GUID_ContainerFormatHeif),
+            Err(_) => HeifStep::FormatFailed,
+        })
+    }))
 }
 /// Non-Windows stub: HEIC availability is not WIC's concern there (macOS Image I/O decodes HEIC
 /// natively — the caller's platform seam short-circuits before this).
 #[cfg(not(windows))]
-pub fn wic_heif_codec_present() -> bool {
-    false
+pub fn wic_heif_codec_state() -> Option<bool> {
+    Some(false)
+}
+
+#[cfg(test)]
+mod heif_walk_tests {
+    use super::{heif_walk, HeifStep::*};
+
+    /// Falsifier: end a walk with `Some(false)` after a failed `Next`, an empty item or a failed
+    /// inspection, or let an earlier failure hide a later HEIF decoder.
+    #[test]
+    fn a_failed_or_incomplete_check_is_never_absence() {
+        assert_eq!(heif_walk([Format(false), Format(false), End]), Some(false), "clean walk, no HEIF");
+        assert_eq!(heif_walk([End]), Some(false), "no decoders at all");
+        assert_eq!(heif_walk([Format(false), Format(true)]), Some(true));
+        assert_eq!(heif_walk([CastFailed, FormatFailed, Format(true)]), Some(true), "a later HEIF match wins");
+        assert_eq!(heif_walk([Format(false), NextFailed]), None);
+        assert_eq!(heif_walk([EmptyItem]), None);
+        assert_eq!(heif_walk([CastFailed, End]), None);
+        assert_eq!(heif_walk([Format(false), FormatFailed, Format(false), End]), None);
+        assert_eq!(heif_walk([]), None, "never reached the end");
+    }
 }
 
 // ───────────────────── v0.8.99 (H1): the HEIC codec CAPABILITY probe ─────────────────────

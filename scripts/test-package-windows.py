@@ -40,11 +40,17 @@ class WindowsPackage(unittest.TestCase):
                 package, 'isolated_source', return_value=nullcontext((package.ROOT, 'a' * 40, {}))
             ), patch.object(package, 'clean_revision', return_value='a' * 40), patch.object(
                 package, 'build', return_value=(binary, receipt)
-            ) as build:
+            ) as build, patch.object(
+                package, 'commit_stamp', return_value=(2026, 10, 29, 3, 4, 6)
+            ) as stamp:
                 output = package.package(root / 'out')
                 build.assert_called_once_with(package.ROOT, 'a' * 40, {})
+                stamp.assert_called_once_with(package.ROOT, 'a' * 40)
             prefix = 'Falcon Photo Viewer/'
             with zipfile.ZipFile(output) as archive:
+                # Falsifier: stamp 1 January 1980 again. Every file carries the source commit's time
+                # (that fixed date showed as 1899 in time zones ahead of UTC).
+                self.assertEqual({i.date_time for i in archive.infolist()}, {(2026, 10, 29, 3, 4, 6)})
                 # Falsifier: include the staging-only ownership marker in the download.
                 self.assertFalse(
                     any(n.endswith('/.falcon-generated-materials') for n in archive.namelist())
@@ -64,6 +70,11 @@ class WindowsPackage(unittest.TestCase):
                     'docs/licenses/rust-standard-library.html',
                 ):
                     self.assertGreater(len(archive.read(prefix + name)), 100)
+                # Falsifier (issue #11 batch, D1): the Read me still sends a first setup to Update,
+                # or doesn't say how a copy in a new folder takes over photo opening.
+                readme = archive.read(prefix + 'Read me.txt').decode('utf-8')
+                self.assertIn('Add to Open With', readme)
+                self.assertIn('choose Update when it asks', readme)
             checksum = output.with_suffix(output.suffix + '.sha256').read_text().split()[0]
             self.assertEqual(checksum, hashlib.sha256(output.read_bytes()).hexdigest())
             with patch.object(package, 'build') as build:

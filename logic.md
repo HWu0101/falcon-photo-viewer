@@ -94,7 +94,7 @@ How to read the tables:
 | Window size and position | At launch, when **Remember window size & position** is on (Settings → DISPLAY, default Off) | `remember_geometry` | `win_geom` in settings. A watchdog re-applies maximize on the window's own monitor. | `SavedWinGeom` |
 | Panel layout | At launch and on folder open; **Restore panels** (`restore-panels`) | Settings → DISPLAY → **Floating panels**: Hidden, Minimised or On (`panels_default`) | `info_open_v2`, `raw_open`, `grid_open`, `film_visible`. A folder you have read before reopens in its remembered info view (Simple, Standard or Full). The launch default `info_view` changes only through Settings → DISPLAY → **Info panel view**, never through the panel's own header buttons. | `PanelsSegCell`, `InfoView` |
 | Folder memories | Opening a folder seen before | Settings → INPUT → **Resume position memory** (off, last 3, last 10 or a custom number; `resume-cap-changed`) and **Remember sorting and panel layout** (same choices, default 10; `sort-cap-changed`; 0 turns those memories off) | A toast offers **Resume**, which jumps to the photo you last viewed (`last_viewed`, most recent first). The folder's sort, info view and minimised panels come back. Ratings, flags, rejects and pending rotations always reload from the folder's review file, whatever these settings say. | `trim_resume_lru`, `sort_folders`, `panel_folders` |
-| Several Falcon windows | Launching Falcon again | Never blocked: there is no single-instance lock | `open_folders.json` lists each window's folder, refreshed about every 25 s and treated as stale after 90 s. Opening a folder that another live window has open shows a warning that review edits are last-writer-wins. The first instance owns `falcon.log`; later ones write `falcon-<pid>.log` in the configuration folder (only when diagnostic logging is on). | `register_open_folder`, `heartbeat_open_folder`, `claim_primary_instance` |
+| Several Falcon windows | Launching Falcon again | Never blocked: there is no single-instance lock | `open_folders.json` lists each window's folder, refreshed about every 25 s and treated as stale after 90 s. Opening a folder that another live window has open shows a warning that review edits are last-writer-wins. A window that changed nothing writes nothing when it closes or opens another folder. The first instance owns `falcon.log`; later ones write `falcon-<pid>.log` in the configuration folder (only when diagnostic logging is on). | `register_open_folder`, `heartbeat_open_folder`, `claim_primary_instance` |
 | Reveal in Explorer / Finder | Photo menus: **Reveal in Explorer/Finder** (`reveal-shot`). When the menu's photo is in an armed selection, **Reveal N in Explorer/Finder** (`reveal-selected`) opens one window with every selected photo's file highlighted, one file per shot (the finished file, else the RAW). **Show** in result toasts and the events centre opens the output folder (`reveal-path`). | Needs a real file on disk | Nothing | `reveal_paths`; `SHOpenFolderAndSelectItems` (Windows), `activateFileViewerSelectingURLs` (Mac) |
 | Show the log file | Settings → DEVELOPER → **Show log file** (`show-log`), below **Diagnostic logging** | — | Nothing | `active_log_path` |
 
@@ -118,7 +118,7 @@ How to read the tables:
 | Immersive / full screen | **f** (`toggle-fullscreen`), **F11**, **⌃⌘F** on Mac (on a Mac laptop F11 is the system's Show Desktop key), the Mac menu's Enter/Exit Full Screen, the photo menu; **Esc** leaves | Windows: Falcon covers the screen with a borderless window and never calls winit's `set_fullscreen`, which briefly repaints a framed window. Mac: see [Platform rules and the Mac](#platform-rules-and-the-mac). | Hides all chrome; rating and marking keys stay live. Corner controls reappear on hover and stay for **Corner controls stay visible** seconds (`reveal_linger_sec`, default 3). See [Motion and immersive mode](#motion-and-immersive-mode). | `immersive`, `FKeyIntent` |
 | Window controls | Title-bar minimise, maximise and close; double-click; drag (`titlebar-pressed`, `square-release-requested`) | `modal-blocking` mutes the toolbar's panel buttons | Windows: a latch squares the window's rounded corners while maximized or immersive (`chrome-square`). Mac: Falcon draws no window buttons (`native-window-controls`); Apple's own buttons sit beside the toolbar in the title bar. | `chrome-square` |
 | Toolbar status area | Always, in the toolbar's `hudclip` area | Shrinks in four fixed steps as room runs out: everything (384 px or more); without the path pill (316 px or more); only the filmstrip and grid toggles and the cache meter (76 px or more); buttons only. See [Title-bar geometry](#title-bar-geometry). | Position chip (click recentres the strip and resumes following), path pill (click copies the photo's path), cache meter, events bell | `MainToolbar` (`toolbar.slint`) |
-| Developer readouts | Settings → DEVELOPER → **Dev panel (HUD)** (`toggle-hud`) | — | Extra engine readouts; also reveals the Simulate VRAM chips | `dev_hud` |
+| Developer readouts | Settings → DEVELOPER → **Dev panel (HUD)** (`toggle-hud`) | — | Extra engine readouts; also reveals the Simulate GPU memory chips | `dev_hud` |
 | GIF playback | An animated GIF with two or more frames, in single view | Not in compare | `step_gif_advance` owns the stage and `step_display` steps aside | `tick.rs` |
 
 ### Culling, selection and review data
@@ -132,7 +132,7 @@ How to read the tables:
 | Selection | Click a tile; **Ctrl-click** toggles; **Shift-click** selects a range (`sel-gesture`); **Select / Deselect** in either photo menu (the word follows whether the menu's photo is selected); **Select all** (**Ctrl+A**, `select-all-displayed`: every photo currently displayed — the Review panel's filtered list while it is open, the whole folder when it is closed); **Select new / edited** (`select-new-edited`); **Clear selection** (`clear-selection`); **Esc** clears it when no menu or dialog is open, compare is off and the Review panel is closed | `sel-affordance-live` = not opening a photo, not in compare, not immersive, no dialog. One classifier, `sel-gesture-kind(ctrl, shift)`, is read by all four tile surfaces and by the menu row. | `SelectSet`: in memory only, kept by file name through a same-folder rescan, cleared by a folder change, never saved. When you clear or replace a selection of three or more photos, a toast offers **Restore**. | `SelectSet`, `esc_clears_selection` |
 | Bulk rate, flag, reject, unmark, delete, rotate, reveal, copy | The same keys (including **r** / **Shift+R** and **Ctrl+C**), or the counted rows in either photo menu: Flag N, Reject N, Unmark N, Delete N photos…, Rotate N right/left, Reveal N in Explorer/Finder and the counted Copy rows. Counted rows appear only when at least two photos are selected and the menu's own photo is one of them (`ctx-plural`); otherwise the single-photo rows show. | `bulk-actions-armed` = something selected, not in compare, not immersive. This one property decides whether the keys act on one photo or on the selection, and every plural label and shortcut hint follows it. Bulk rating asks first (`BulkAsk`) unless **Direct bulk rating** (DEVELOPER → Advanced) is on. | `ratings` / `marks` over `bulk_targets`; delete uses the normal recycle path | `bulk_actions_allowed`, `bulk_targets`, `BulkAsk` |
 | Review panel | **s** (`toggle-sel-panel`), the toolbar's Review button, the Picks and Rejects count chips, the rotation reminder's **Open Review** | Shares the top-left area with Settings and the browse-speed panel: one at a time | Filters: **Reviewed** (rated, flagged or rejected), **Picks**, **Rejects**, **Rated** (with per-star chips) and **Rotated**, plus a hidden **Selected** filter whose chip appears only while something is selected. The generic open lands on Selected when a selection exists, otherwise on Reviewed. It loads and pins its own thumbnails. Its output area holds Copy and Export (for whatever it displays), Move rejected, Empty to Recycle Bin/Trash, the Rotations Apply and Discard buttons, and **XMP sync**. | `sel_open`, `filter-mode`, `out_col1_label` |
-| Hover preview | Rest the pointer on a Review thumbnail | **Hover to preview** (Settings → REVIEW, default On); **Appears**: after a short rest (333 ms, `HOVER_REST_MS`) or at once. Off in compare, in immersive and under any dialog or menu (`hover-preview-live`). No room below about 759 px of window width. **Esc** hides it. | Shows the photo larger beside the panel, using the browsing preview (a preview decode on a miss, never full resolution). The box keeps the photo's shape: a 3:2 photo is half the window wide, other shapes get the same area, capped at 60 % of the window width and 80 % of the height between toolbar and filmstrip. The hovered frame is protected from eviction. | `hover_box`, `hover_preview_step`, `fast_evict_protected` |
+| Hover preview | Rest the pointer on a Review thumbnail | **Hover to preview** (Settings → REVIEW, default On); **Appears**: after a short rest (333 ms, `HOVER_REST_MS`) or at once. Off in compare, in immersive, under any dialog or menu, and while the Review jump list is open (`hover-preview-live`). No room below about 759 px of window width. **Esc** hides it. | Shows the photo larger beside the panel, using the browsing preview (a preview decode on a miss, never full resolution). The box keeps the photo's shape: a 3:2 photo is half the window wide, other shapes get the same area, capped at 60 % of the window width and 80 % of the height between toolbar and filmstrip. The hovered frame is protected from eviction. | `hover_box`, `hover_preview_step`, `fast_evict_protected` |
 | Undo / redo | **Ctrl+Z**; **Ctrl+Shift+Z** or **Ctrl+Y** (`undo`, `redo`); the events centre's Undo and Redo buttons | Per folder, up to 500 steps. Blocked by any dialog or menu (`popup-open`), because undo jumps `current` to the edited photo. While a photo menu is open, the keys act on that menu's photo. There is no redo of a delete or a move. | One history: the `UndoRedo` stack plus the last delete and the last move, ordered by `Act.seq`, so Ctrl+Z always undoes the most recent of them | `undo_arm`, `UndoRedo`, `UndoEntry` |
 | Rotate | **r** / **Shift+R** (`rotate-shot`), both photo menus. With a selection armed, `bulk-rotate(dir)` makes one undo step for the whole batch and skips animated GIFs, GIFs it could not check and unchecked GIFs that are still cloud-only, saying so. | Automatic EXIF orientation combines with the manual turn | `RotState` holds turns over unrotated cached pixels: rotation is applied when drawing, so it never throws away decoded pixels | `RotState`, `UndoEntry::BulkRot` |
 | Apply rotations | Review panel → Rotations → **Apply** or **Discard** (`apply-rotations`, `discard-rotations`), each with a counted confirm. Closing the app with turns pending shows a reminder: **Open Review** or **Close anyway**. | Pending turns exist | Writes the original. A JPEG gets a 2-byte orientation patch at a re-parsed, verified position, checked before and after the write (compare-and-swap). RAW files, finished PNG, TIFF, WebP and HEIC, and JPEGs without a usable EXIF orientation get an XMP sidecar instead. See [Orientation and rotation](#orientation-and-rotation). | `apply_rotation`, `patch_jpeg_orientation`, `write_xmp_sidecar` |
@@ -157,18 +157,38 @@ How to read the tables:
 
 ### Settings
 
-The Settings body scrolls beneath its header. When it overflows, the same `MiniVBar` used by the grid and Review appears in the existing right padding; it does not narrow the controls. Wheel scrolling and the bar move the same viewport.
+The Settings body scrolls beneath its header. When it overflows, the same `MiniVBar` used by the grid and Review appears in the existing right padding; it does not narrow the controls. Wheel scrolling and the bar move the same viewport, and the wheel scrolls Settings anywhere over the panel (its header and padding too), the bar, and the section list below.
+
+**Section list** (owner, 29 October 2026, after mockups; `SectionJump` and `JumpLatch` in `widgets.slint`). Rest the pointer by the scroll bar and a small list of the sections opens beside the panel, over the photo:
+
+```
+ ┌ Settings panel ──────────┐ ┌──────────────────┐
+ │ LANGUAGE            ░ ▐ │ │ LANGUAGE         │  ← level with the bar's track
+ │ …                   ░ ▐ │ │ INPUT            │
+ │                     ░ █ │ │ ███ DISPLAY ████ │  ← the current section: the solid blue pill
+ │                     ░ ▐ │ │ …                │
+ │                     ░ ▐ │ │ BASIC SHORTCUTS  │
+ └──────────────────────────┘ └──────────────────┘
+        10 px either side of the bar opens it; the gap and the list keep it open
+```
+
+- **The look:** a vertical version of the segmented control (`Seg`): a dark card holding a recessed track of 24 px cells, the section captions in 11 px SemiBold, and the current section as the solid blue pill ("closer to a vertical slider", owner). Hovering a row washes it.
+- **Opening and closing:** it opens once the pointer has been within 10 px of either side of the bar for 200 ms (owner, testing rc.2: "reduce the hover jump menu's trigger delay"; it was the hover preview's 333 ms), and closes 120 ms after the pointer leaves one keep-open zone (the bar, the gap, the list and a 14 px margin), with no fade. A hand that drifts a little inside the reach still counts. A drag on the list keeps it open wherever the pointer goes.
+- **The two clocks count real entering and leaving only** (`JumpLatch`'s `near-v` and `keep-v`). Slint restarts a delayed animation whenever anything it reads is marked as possibly changed, even when its value stays the same. In Review, "near the bar" reads whether the panel needs a scroll bar, which reads the layout of every row, so every thumbnail arriving in a Review row restarted the 200 ms and the 120 ms. On a 7,000-photo folder they arrive all the time, and the list took more than 10 seconds to open or never did (owner, testing rc.2). The clocks now read copies that change only when the pointer really enters or leaves. The list never waits for thumbnails: an entry without one shows its empty well until it arrives.
+- **Jumping:** a click puts that section's caption where LANGUAGE's sits at the top; pressing and dragging along the list jumps section by section, past either end to the end one; releasing stays there. While the list is dragged, the scroll bar shows its pressed look.
+- **The current section:** the one a jump went to, until you scroll; otherwise the last section once the scroll reaches the bottom (so BASIC SHORTCUTS, which can never reach the top, can still be current); otherwise the last section whose caption is at or above the top. Where FILE ASSOCIATIONS is hidden, the list leaves it out.
+- **How the pointer is watched:** the area that closes Settings when you click outside the panel is now the panel's *parent*, so it sees the pointer over the panel, the bar, the gap and the list without taking any clicks from them (`setzone`).
 
 | Section | Rows | Notes |
 | --- | --- | --- |
 | INPUT | **While the folder is loading**: View only or Allow photo edits (`photo_open_edits`, default View only) · **Mouse wheel changes photo** (default On) · **Press current rating again to clear** (default On) · **Never browse onto a blank photo** (`scrub_wait_cache`, default Off) · **Resume position memory** · **Remember sorting and panel layout** | |
 | COPY SHORTCUT | The ordered preference for what **Ctrl+C** copies: the image, the RAW or both (`CopyPrefRow`, `copy_prefs`) | One preference drives both Ctrl+C and the menu's shortcut hint. |
-| PERFORMANCE | **GPU JPEG decode** (nvJPEG on Windows; on Mac the row names Image I/O, `accel_toggle_label`) · **Adaptive Hi-Res** (default On; when off, a whole-image resolution limit) · **HEIC speed priority** (default Off) · **Colour-managed CMYK JPEGs** (Windows only, default Off: sends four-channel JPEGs to Windows' own codec instead of Falcon's portable conversion; hidden on Mac because its wording is about Windows' codec, `cmyk_route_visible`) · **Mode**: Turbo, Balanced, Eco or Custom (default Balanced; Custom adds a card of its own numbers), with **Use Eco on battery power** (default on) · **In the background**: release memory after 5, 20, 60 or 300 s in another application, or a typed 5–300 s (default 20 s) · **Fast View**: preview detail (Faster preview or Sharper preview) and **Benchmark** with the current folder or a generated target size (`run-benchmark`, `set-bench-target-mp`, `apply-bench-rec`) | The rows that trade decode work against what you see sit together. A mode limits only preparing-ahead work — never the displayed photo, the compare halves, explicit requests, zoom tiles or the thumbnails on screen — and a status line says which mode is in effect and why. The battery switch follows the power source and, on Windows, Battery saver. See [The mode control](#the-mode-control-turbo-balanced-eco-custom). The browse rate itself (5, 12, 20, 30 or 120 fps, or custom; default 30) and **When zoomed** (Speed or Always sharp) are in the toolbar's browse-speed panel. |
+| PERFORMANCE | **GPU JPEG decode** (nvJPEG on Windows; on Mac the row names Image I/O, `accel_toggle_label`) · **Adaptive Hi-Res** (default On; when off, a whole-image resolution limit) · **HEIC speed priority** (default Off) · **Colour-managed CMYK JPEGs** (Windows only, default Off: sends four-channel JPEGs to Windows' own codec instead of Falcon's portable conversion; hidden on Mac because its wording is about Windows' codec, `cmyk_route_visible`) · **Mode**: Turbo, Balanced, Eco or Custom (default Balanced; Custom adds a card of its own numbers), with **Use Eco on battery power** (default on) · **In the background**: release memory after 5, 20, 60 or 300 s in another application, or a typed 5–300 s (default 20 s); with Custom, also its **GPU memory usage limit** and **Release over** · **Fast View**: preview detail (Faster preview or Sharper preview) and **Benchmark** with the current folder or a generated target size (`run-benchmark`, `set-bench-target-mp`, `apply-bench-rec`) | The rows that trade decode work against what you see sit together. A mode limits only preparing-ahead work — never the displayed photo, the compare halves, explicit requests, zoom tiles or the thumbnails on screen — and a status line says which mode is in effect and why. The battery switch follows the power source and, on Windows, Battery saver. See [The mode control](#the-mode-control-turbo-balanced-eco-custom). The browse rate itself (5, 12, 20, 30 or 120 fps, or custom; default 30) and **When zoomed** (Speed or Always sharp) are in the toolbar's browse-speed panel. |
 | DISPLAY | **Auto-orient (EXIF)** (default On) · **Interface motion** (default On) · **Remember window size & position** (default Off) · **Floating panels**: Hidden, Minimised or On · **Info panel view**: Simple, Standard or Full · **Corner controls stay visible** (1–10 s, default 3) | `motion_ui` is a pure interface switch: Off makes every panel, toast and full-screen transition instant. **Info panel view** is the launch default for folders without a remembered view and applies to the open panel at once; the panel's own header buttons change only the current view and that folder's memory. |
 | REVIEW | **Hover to preview** (default On) · **Appears**: After a short rest or At once (default after a short rest; dimmed, not hidden, while hover preview is off) | Placed between DISPLAY and COLOUR: what you see, then how you judge it. |
 | COLOUR | One card per display: gamut (sRGB, Display P3, Adobe RGB, Rec.2020, DCI-P3 or a custom profile) · **Auto-detect this monitor** · load an ICC profile · **Forget display** (with a confirm) · expand or collapse | One window, one active display and one live transform; the setting is stored per display. On Windows, Auto-detect reads the display's SDR profile and knows the colour mode: under Auto Colour Management or HDR it chooses sRGB and says which mode is on, how to turn it off and which profile it would use otherwise, because Windows already maps SDR windows and a second transform would convert twice. A background watcher reports colour changes made in Windows. On Mac, Auto-detect asks CoreGraphics for the window's display colour space (`CGDisplayCopyColorSpace` → `CGColorSpaceCopyICCData`), saves the bytes as an app-owned profile and installs it through `install_custom_icc`; the Mac listens for display changes with `CGDisplayRegisterReconfigurationCallback`. See [Colour](#colour). |
 | FILE ASSOCIATIONS | Windows: one checkbox per format — JPEG · PNG/APNG · TIFF · HEIC/HEIF · WebP · GIF · BMP · JPEG XL · RAW — plus **Distinct RAW-format icons**, **Remove** and **Windows Settings…** (`assoc-apply`, `assoc-remove`, `assoc-open-defaults`, `refresh-assoc`). Mac: **Make default** and **Reset** per format family, through LaunchServices. | The Windows HEIC row is dimmed, with an explanation, when Windows' HEIF/HEVC codec is not installed. See [Windows file icons and associations](#windows-file-icons-and-associations). |
-| DEVELOPER | Always shown: **Dev panel (HUD)** · **Diagnostic logging** (default Off) · **Show log file** · the **HEIC hardware lane** speculative decode cap (applies at once; the `FALCON_HEIC_LANE_CAP` environment variable overrides it for the whole run and hides the control). Two folds that close every time Settings opens; each header counts the rows changed from their defaults (`dev_fold_counts`): **Advanced** — Direct bulk rating (no ask) · Posture benchmark · Filmstrip drag-up tolerance · GPU backend (status; on Windows also Auto, Vulkan or DX12, applied at next launch) · Simulate VRAM (with the Dev panel on); **Legacy** — Async frosted blur · RAM frame cache (L2) · Browse-priority detail scheduling · Frost from thumbnails · Decode pool: 18 workers (restart) | Engine levers; the defaults are tuned. |
+| DEVELOPER | Always shown: **Dev panel (HUD)** · **Diagnostic logging** (default Off) · **Show log file** · the **HEIC hardware lane** speculative decode cap (applies at once; the `FALCON_HEIC_LANE_CAP` environment variable overrides it for the whole run and hides the control). Two folds that close every time Settings opens; each header counts the rows changed from their defaults (`dev_fold_counts`): **Advanced** — Direct bulk rating (no ask) · Posture benchmark · Filmstrip drag-up tolerance · GPU backend (status; on Windows also Auto, Vulkan or DX12, applied at next launch) · Simulate GPU memory (with the Dev panel on); **Legacy** — Async frosted blur · RAM frame cache (L2) · Browse-priority detail scheduling · Frost from thumbnails · Decode pool: 18 workers (restart) | Engine levers; the defaults are tuned. |
 | CONTROLS | Rebind the 17 printable-key actions in `ACTIONS`: rate 1–5 and 0, flag, reject, unmark, next unrated, compare, info panel, Review panel, reset zoom, immersive, rotate right and left (`rebind`, `reset-cull-binds`) | Printable characters only; Space is reserved. |
 | BASIC SHORTCUTS | Rebind the 7 system keys in `BASIC_ACTIONS` — previous, next, first, last, compare swap, compare pin and delete — behind an edit-mode unlock (`basics-locked`, `basics-unlocked`, `basics-cancelled`, `reset-basic-binds`) | Esc, the grid's ↑/↓ and mouse clicks are listed for information and cannot be rebound. The delete key also covers Backspace. |
 | Footer | The version (opens the [About card](#about-card)) · **Show welcome** | |
@@ -185,6 +205,7 @@ The Settings body scrolls beneath its header. When it overflows, the same `MiniV
 | Failure cards | A photo that cannot be shown | Three kinds. A **genuine failure**: warning colour and "Tap to retry — the other photos are unaffected". A **cloud placeholder**: a calm cloud and no retry line, because Falcon retries by itself; nothing is damaged. **Unsupported**: "This file type can't be previewed yet", with a format badge named from the file's bytes where they are readable — a HEIC on a Windows PC without the codec says HEIC, which tells the user what to install; a container Falcon can read but not decode (today AVIF) gets the generic wording. | `cur-failed`, `cur-cloud`, `cur-unsupported` |
 | Tick failure banner | About 30 consecutive failed ticks (~0.5 s) | A danger banner, and a rescue save of the review data outside the failing tick, repeated while the failures last. One clean tick clears it. See [The tick, threads and workers](#the-tick-threads-and-workers). | `PANIC_SURFACE_TICKS`, `tick-degraded` |
 | Welcome guide | First run; reopen it from the Settings footer's **Show welcome** (Mac: Falcon → Show Welcome Guide) | Three columns: **1 · The keys** (the live key map, **[Right-click] a photo for everything else**, and File associations → Apply to all), **2 · The feel** (the mode control, the same `Seg` as Settings, and Quick benchmark) and **3 · The colour** (match Falcon to this display once). `onboarding_shown` is saved when the guide is shown, not when it is closed. The guide also returns once after a feature update: when the running version's major.minor (`feature_version`) is newer than `guide_seen_feature`, it opens headed "New in Falcon {version}" (`guide_boot`, `welcome-updating`). | `welcome-open` |
+| Update prompt (Windows) | A launch whose double-clicked photos still open in another copy of Falcon | "Update to Falcon {version}" with **Not now** and **Update**; after the welcome guide or any other panel has closed. See [The update prompt](#the-update-prompt-windows). | `update-prompt-open` |
 | Context menus | Right-click | Two photo menus aimed at one photo — the photo menu (stage and filmstrip) and its Review-tile twin — plus the sort menu, the **Open ▾** menu and the events dropdown. `ctx-target` is −1 for the stage photo, or the clicked thumbnail's index. Both photo menus close on a folder change, use the frosted glass panel and show shortcut hints built from the live key map. While a photo menu is open, its shortcut keys act on that menu's photo (`menu-action`). See [Review, selection and menus](#review-selection-and-menus). | `ctx_populate_fields`, `menu.slint` |
 | About card | The version in the Settings footer | See [About card](#about-card) | `about.rs` |
 
@@ -214,7 +235,7 @@ flowchart LR
 
 Most "why can't I do this right now?" answers come from one of these. Each is a single named property or function, not a rule repeated in every control.
 
-1. **Dialogs (`modal-open`).** `dialog-open` is true while the About card, Settings, the browse-speed panel (`loading-open`), a confirm dialog (`confirm-kind` not 0), the export sheet, the rotation reminder, the forget-display confirm or the Mac first-launch association prompt is open. `modal-open` adds the welcome guide, an unfinished-boundary loading wait, and, in **View only**, a photo-first open that is still scanning the folder (`opening-photo` and not `photo-open-edits`). Rating, marking, rotating, copying and the other edits read it; Rust reads it through `get_modal_open()`. Narrower gates sit beside it:
+1. **Dialogs (`modal-open`).** `dialog-open` is true while the About card, Settings, the browse-speed panel (`loading-open`), a confirm dialog (`confirm-kind` not 0), the export sheet, the rotation reminder, the forget-display confirm, the Mac first-launch association prompt or the Windows update prompt is open. `modal-open` adds the welcome guide, an unfinished-boundary loading wait, and, in **View only**, a photo-first open that is still scanning the folder (`opening-photo` and not `photo-open-edits`). Rating, marking, rotating, copying and the other edits read it; Rust reads it through `get_modal_open()`. Narrower gates sit beside it:
    - `inspection-blocked` = dialogs plus the welcome guide. Zoom, pan, Fit and 1:1 read it, so you can inspect the clicked photo while its folder is still loading.
    - `menu-open` = a photo menu, the Review-tile menu, the sort menu, the Open menu or the events dropdown. `popup-open` = `modal-open` or a menu; Home/End, undo and redo, compare swap and pin, the compare wheel and the hover preview read it. `photo-popup-open` = `inspection-blocked` or a menu; the arrow keys and the photo and filmstrip wheels read it, which is why a wheel notch over Settings or over a menu never changes the photo.
    - `modal-blocking` is the subset that draws a full-window dimmed layer: About, confirms, the rotation reminder, the export sheet, forget display and the association prompt. It mutes the toolbar's panel buttons, and together with the welcome guide and the pointer it freezes the toast countdown.
@@ -246,7 +267,7 @@ Each of these is a real, deliberate coupling.
 | Falcon is **in the background** for the set wait (default 20 s), or **minimised** | Preparing ahead stops and the photo caches give their graphics memory back gradually over 10 s (in Custom, at once or over 30 s if chosen), farthest photos first, down to the tier's target (`background_memory`). The displayed photo, both compare halves, the hovered Review tile, the awaited frame and thumbnails stay. Coming back stops it at once. See [Sharing the card with other applications](#sharing-the-card-with-other-applications). |
 | **Auto-orient** is off | EXIF orientation is ignored; manual turns still apply. |
 | **RAW mode** is on for a pair | The full-resolution tier develops the RAW while the preview tier still shows the finished image. That is why the full-resolution tier's RAM-cache shortcut is switched off in RAW mode (the `!raw` term beside `l2::full_res_serves`). |
-| A shot is a **cloud placeholder** | Its failure card is the calm cloud. It is the one kind of file the scan may not read, so it keeps its extension's type and says so in one log line. A retry sweep clears its failure marks after 30 s, then 60, 120 and 240 s, up to five times (`CLOUD_RETRY_CAP`); a completed download is noticed at once and the file's bytes are then read to classify it (`reclassify_hydrated`). Copy and Move confirms count it as needing a download first. |
+| A shot is a **cloud placeholder** | Its failure card is the calm cloud, and its tiles show the cloud outline. It is the one kind of file the scan may not read, so it keeps its extension's type and says so in one log line. A retry sweep clears its failure marks after 30 s, then 60, 120 and 240 s, up to five times (`CLOUD_RETRY_CAP`); a completed download is noticed at once and the file's bytes are then read to classify it (`reclassify_hydrated`). Copy, Move, web export and Apply rotations count it as needing a download first. |
 | The **output colour** (gamut or ICC profile) changes | `drop_developed_caches` drops every developed cache, every interface colour (48 theme tokens) is converted again (`apply_theme_transform`), and every `cm_bake_key` changes, so old colour bakes cannot be reused. See [Colour changes versus folder switches](#colour-changes-versus-folder-switches). |
 | The **folder changes** | `apply_scan` closes any open confirm, forgets a pending delete, resets every tier, and drops the upload drain's carried work together with its in-flight marks. |
 
@@ -277,7 +298,7 @@ This is a statement about the product, not a to-do list. Everything here is deli
 - **No stacking, virtual copies or collections** beyond ratings, flags, rejects and the selection.
 - **Export is deliberately narrow.** Copy the displayed photos' original files, move the rejects away, or make new web copies in **JPG or PNG** (`WebFormat` in `falcon-decode`; sRGB, optional watermark, optional RAW development for RAW-only shots). There is no WebP export: the linked `image-webp` encoder writes only lossless WebP, and a useful lossy WebP would need libwebp, a C library, which would be a project of its own. There is no TIFF, PSD or GIF export: none of them is a format for handing photos over for the web, even though the `tiff` and `gif` libraries are already linked for decoding. There is no print module and there are no upload targets.
 - **Accessibility is limited.** Only the menus carry accessibility labels, and there is no tested screen-reader support. Falcon is designed for visual, pointer-first use; keyboard shortcuts speed it up but do not form a complete keyboard-only path.
-- **Distribution.** Windows ships as one portable `.exe`: no installer and no code signing, so Windows may warn before the first run. The Mac app is ad-hoc signed (signed without a paid Apple identity) but not notarized, so macOS asks once per build ("Open Anyway"). The Windows build links its C runtime statically, and the newer per-display colour functions (`ColorProfileGetDisplayDefault`, `ColorProfileGetDisplayUserScope`) are looked up at run time from System32 only (`bind_modern_icc`), so Falcon also starts on Windows 10 and falls back to the older per-device profile there.
+- **Distribution.** Windows ships as one portable `.exe`: no installer and no code signing, so Windows may warn before the first run. The zip holds a `Falcon Photo Viewer` folder with `Falcon.exe` and its notices. The photo registration stores the exe's absolute path, so a copy in a new folder needs Update (it offers it with [the update prompt](#the-update-prompt-windows)); extracting the new zip into the same parent folder replaces `Falcon Photo Viewer\Falcon.exe` in place and keeps photos opening. The Mac app is ad-hoc signed (signed without a paid Apple identity) but not notarized, so macOS asks once per build ("Open Anyway"). The Windows build links its C runtime statically, and the newer per-display colour functions (`ColorProfileGetDisplayDefault`, `ColorProfileGetDisplayUserScope`) are looked up at run time from System32 only (`bind_modern_icc`), so Falcon also starts on Windows 10 and falls back to the older per-device profile there.
 
 ### Colour, stated exactly
 
@@ -853,7 +874,7 @@ Process-wide memos are reset next to the owners:
 - `hwheic::note_folder_swap`: the hardware decline memo and the HEIC tile-plan cache.
 - `tick::release_parked_done`: frames the upload drain was holding, released together with their in-flight marks.
 
-**One memo deliberately crosses folders.** The Date-taken sort memo (`TAKEN_CACHE` in `support.rs`) is keyed by file path and checked against each file's modified time, so it stays correct across folders. It is not cleared on a folder switch, so sorting, switching folders and switching back stays fast. Instead, it is emptied all at once when it reaches 50,000 entries (`TAKEN_CACHE_MAX`, about 10 MB of paths). Cloud placeholders never get an EXIF read for this sort; they use the modified time from the folder listing, so sorting never downloads them.
+**One memo deliberately crosses folders.** The Date-taken sort memo (`TAKEN_CACHE` in `support.rs`) is keyed by file path and checked against each file's modified time, so it stays correct across folders. It is not cleared on a folder switch, so sorting, switching folders and switching back stays fast. Instead, it is emptied all at once when it reaches 50,000 entries (`TAKEN_CACHE_MAX`, about 10 MB of paths). Cloud placeholders never get an EXIF read for this sort; they use the modified time from the folder listing, so sorting never downloads them. Since the cloud-only round a re-sort also asks the metadata it reads for that modified time, so a file freed up during the session is not read either, and a pair's RAW is checked before the sort falls back to it.
 
 ### Colour changes versus folder switches
 
@@ -864,7 +885,7 @@ Some caches hold pixels already converted into the output colour space (the disp
 
 `drop_developed_caches(&fast.cache, &detail, &roi, &l2)` in `main.rs` is the single list of colour-dependent caches: the fast preview cache, the full-detail and zoom developed sets, and the RAM cache (`l2`). Both the output-colour handler (`on_set_output_gamut`) and `apply_scan` call it, so a colour change and a folder switch always agree on what is colour-dependent. **Any new cache that holds converted pixels must be added to this function, never at a call site.** On a folder switch some stores are therefore cleared twice. That is harmless, and each owner's `on_folder_swap_is_idempotent` test pins it.
 
-`drop_developed_caches` neither touches the upload-in-flight marks nor bumps the develop-settings stamp (`det_epoch`). Each handler that changes how photos are developed bumps `det_epoch` after storing its new setting. Those handlers are RAW mode, output colour, Resolution limit, Adaptive Hi-Res, Simulate VRAM, and both steps of the GPU-memory recovery ladder (`tick::step_vram_recovery`). Results still in flight under the old setting are then rejected, and the shown-photo record (`support::ShownRec`) sees that the stage is out of date. A new develop-settings handler owes the same bump.
+`drop_developed_caches` neither touches the upload-in-flight marks nor bumps the develop-settings stamp (`det_epoch`). Each handler that changes how photos are developed bumps `det_epoch` after storing its new setting. Those handlers are RAW mode, output colour, Resolution limit, Adaptive Hi-Res, Simulate GPU memory, and both steps of the GPU-memory recovery ladder (`tick::step_vram_recovery`). Results still in flight under the old setting are then rejected, and the shown-photo record (`support::ShownRec`) sees that the stage is out of date. A new develop-settings handler owes the same bump.
 
 Thumbnails are colour-converted too, but they are not thrown away on a colour change. Each thumbnail carries the conversion key it was baked with (`support::cm_bake_key`). `tick::regamut_invalidate_thumbs` only clears the pending set and bumps the thumbnail counter, so the old tile stays visible until its re-baked replacement arrives. The blur images in `Film.frost` come from unconverted pixels and survive a colour change. See [Colour](#colour).
 
@@ -915,7 +936,7 @@ it, and each bundle has a contract test.
 9. `MainWindow::new()`, then the four bundled Inter font faces are registered with `fontique`.
 10. The launch target is read with `args_os` without touching the file system. The shot list starts empty, so a launch with no target stays empty.
 11. Shared state is created and the workers start: the fast pool (or the Mac elastic pool), derive, detail, zoom, thumbnails, white balance, EXIF, dimensions, upload, GIF, fonts.
-12. The settings-apply block (it reads settings again): default keys plus saved keys, then `dedup_keymap`; platform wording from `platform.rs`; the HEIC codec check and the cleanup of stale HEIC claims; the welcome card; the custom output ICC restore (`install_custom_icc`; a failure keeps the saved path and the session falls back); `apply_theme_transform`; the watermark restore; the version string (`env!("CARGO_PKG_VERSION")`). On Mac this block also sets the native window-button layout before the window exists (see [Platform rules and the Mac](#platform-rules-and-the-mac)).
+12. The settings-apply block (it reads settings again): default keys plus saved keys, then `dedup_keymap`; platform wording from `platform.rs`; the HEIC codec check and the cleanup of stale HEIC claims; the welcome card; on Windows, the versions that have run and the update prompt's decision; the custom output ICC restore (`install_custom_icc`; a failure keeps the saved path and the session falls back); `apply_theme_transform`; the watermark restore; the version string (`env!("CARGO_PKG_VERSION")`). On Mac this block also sets the native window-button layout before the window exists (see [Platform rules and the Mac](#platform-rules-and-the-mac)).
 13. About 175 callback registrations (`app.on_…`).
 14. **One** `on_winit_window_event` hook [a second registration would replace the first]. It carries: the tick snap-back, first; `DroppedFile` → `begin_reload`; `Moved`/`Resized` → the display-move debounce and the `WIN_GEOM` window-size memory. On Mac it also carries the diagnostic input recorder, the input-method diagnostic line, re-applying the Metal layer's colour tag and the window buttons on resize, and trackpad pinch-zoom.
 15. `set_rendering_notifier`: the frame counter and frame-time histograms; the `boot: first frame` line and the separate `boot: first photo rendered` line; display sharpness (`win_sf`). On `RenderingSetup` it captures the wgpu device, records the HEIC limits (`hwheic::note_render_storage_limit`, `note_render_max_texture`), installs `on_uncaptured_error` (GPU out of memory) and `set_device_lost_callback`, hands the device to the upload thread, and on Windows applies the DWM corner preference. On Mac it re-applies the drawing surface's colour tag after each frame.
@@ -974,7 +995,7 @@ Every way out of Falcon runs one save sequence, built once in `main()` before th
 
 `AwaitFileOpBoundary` (Mac immediate quit only: a bounded wait for a copy, move or export to reach a safe point; never emitted on Windows) → `DrainAppliedRotations` → `DrainPickerResults` → `RevertStagedEdits` → `SaveSettings` → `FlushSelection` → `WriterBarrier` → `UnregisterFolder`.
 
-The order matters. Staged (unconfirmed) key and preset edits must be reverted before settings are saved. The two worker hand-offs must be drained before review data is written. The writer barrier must come after both writes, or they may never reach disk. The test `the_shutdown_tail_runs_its_steps_in_the_one_correct_order` pins this order. `SHUTDOWN_ONCE` makes a second arrival do nothing (on Mac, the quit handler and the ⌘Q key are two doors into the same exit). From the start of the tail every log line is written directly (`log_inline_from_now`), after a 2 s barrier that drains already-queued lines so the log stays in order.
+The order matters. Staged (unconfirmed) key and preset edits must be reverted before settings are saved. The two worker hand-offs must be drained before review data is written. The writer barrier must come after both writes, or they may never reach disk. `SaveSettings` and `FlushSelection` write only if something changed since the last load or save, or if that save is still on its way or failed; switching to another folder uses the same rule (see [Several Falcon windows at once](#several-falcon-windows-at-once)). The test `the_shutdown_tail_runs_its_steps_in_the_one_correct_order` pins this order. `SHUTDOWN_ONCE` makes a second arrival do nothing (on Mac, the quit handler and the ⌘Q key are two doors into the same exit). From the start of the tail every log line is written directly (`log_inline_from_now`), after a 2 s barrier that drains already-queued lines so the log stays in order.
 
 After the steps, completed export records are flushed (`stop_and_flush_completed`). Whichever route runs the save sequence first takes it, so it cannot run twice.
 
@@ -1094,7 +1115,7 @@ Two collapsed groups hold the rest:
 | Advanced | Posture benchmark (dev) | — | On demand | Not saved. |
 | Advanced | Filmstrip drag-up tolerance (`film_drag_cone_deg`) | 20° | Live | Tunes how far a filmstrip drag may stray upward. |
 | Advanced | GPU backend (`gpu_backend_override`) | Auto | Next launch | Pins Vulkan or DX12. |
-| Advanced | Simulate VRAM | Auto | Live | Re-sizes the texture budget as if the card had 4, 8 or 12 GB. Not saved. |
+| Advanced | Simulate GPU memory | Auto | Live | Re-sizes the texture budget as if the card had 4, 8 or 12 GB. Not saved. |
 | Legacy | Async frosted blur (decode pool) (`async_blur`) | On | Live | Off: the upload thread makes each 160 px blur image itself (the old serial path). |
 | Legacy | RAM frame cache (L2) (`ram_l2`) | On | Live | Off: nothing is deposited and revisits decode again; the pressure controller still samples. |
 | Legacy | Browse-priority detail scheduling (`detail_sched`) | On | Live | Off: uploads go in arrival order, with the older settle-only neighbour rule. |
@@ -1239,7 +1260,7 @@ The exact definitions:
 - **`modal-open-fs`** is the full-screen gate: `modal-open-base` on macOS (`native-window-controls`), `modal-open` on Windows. On macOS it leaves out the welcome guide, so **F** works on the welcome screen.
 - **`modal-blocking`** is the subset that draws a full-window scrim (dimmed layer) above every panel: About, confirm dialogs, the rotation reminder, the export sheet, the forget-display confirm and the Mac association prompt. It disables the title-bar panel buttons, because their panels would open behind the scrim. Settings and the browse-speed panel are left out because their own buttons close them.
 - **`toast-blocked`** = `modal-blocking || welcome-open || toast-hovered`. The toast countdown pauses while something covers the toast or the pointer rests on it.
-- **`hover-preview-live`** = the hover setting is on, the Review panel is open, and not immersive, not `popup-open`, not compare.
+- **`hover-preview-live`** = the hover setting is on, the Review panel is open, and not immersive, not `popup-open`, not compare, and the Review jump list is not open.
 - **Selection gates:** `bulk-actions-armed` = `count-selected > 0 && !compare && !immersive`. `ctx-rate-armed` adds `ctx-tile-selected`. `sel-affordance-live` = `!opening-photo && !compare && !immersive && !modal-open`.
 
 A gated key or wheel is still accepted, so the event stops there, but it does nothing.
@@ -1602,8 +1623,17 @@ Command-line arguments, drag and drop, the picker, recent folders and Finder ope
 `begin_reload`.
 
 - It retires the previous request and any queued scan before branching, then checks the target on
-  a worker (`support::resolve_existing_target`). A missing target keeps the current session, and a
+  a worker (`support::resolve_existing_target`). A relative command-line path (`Falcon.exe
+  IMG_0001.JPG`) is made absolute first. A missing target keeps the current session, and a
   missing file can never silently open its parent folder and select a different photo.
+- An opened file lands on its own photo, matched by the photos' actual files (`select_match`), never
+  by a review name or a bare stem that another file can share. On Windows and the Mac a different
+  letter case still matches, if exactly one photo fits. A file the folder scan doesn't list (an
+  unsupported type such as `.jfif`, or a link the scan skips) opens its folder at the first photo
+  and says "Couldn't show {name} — opened its folder instead." (`unlisted_target`), with no
+  resume offer beside it.
+- On the Mac, a folder that couldn't be listed because access was denied also says which permission
+  may be missing: the folder's own, or Privacy & Security → Files and Folders (`folder_denied_notice`).
 - The tick accepts only the newest resolved request.
 - For a different folder, the scan worker reads review data once and classifies, pairs and sorts off
   the interface thread. `apply_scan` then swaps the state and restores selection, rotations, panels,
@@ -1768,20 +1798,74 @@ selection or the whole folder) may, only after the user is told how many cloud-o
 download and agrees; without such a question it skips them and says so. An explicit action on one
 photo (viewing it, rotating it, writing to it) may download that one file.
 
-- **Enforced today:** the scan's type check (below); Date-taken sorting, which uses the file's
-  modified time for placeholders; RAW development at export, which refuses a cloud-only RAW; and
-  rotating a selection, which skips a GIF it has not yet checked for animation while the file is
-  still a placeholder (read from the file's attributes at click time, `RotDoor::Selection` in
-  `gif_rotate_verdict`) and says so. A single-photo rotate still checks that one GIF, which may
-  download it; the window waits while it does (the check runs on the interface thread).
-- **Ask first, then download:** Copy and Move count the cloud-only files and say they will be
+**Enforced since the cloud-only round (28 October 2026).** Work that is not for a photo on screen
+only ever reads files that are on this device. The photos on screen are the current photo and both
+Compare halves; viewing them downloads them, as it always has.
+
+```mermaid
+flowchart TB
+  W["A worker is about to read a photo's file<br/>thumbnail, backdrop, preview or full-resolution frame ahead, hover"] --> S{"Is it for a photo on screen?<br/>the current photo or a Compare half<br/>(their stage previews and full-resolution frames)"}
+  S -->|"yes"| R["Read it — viewing may download it"]
+  S -->|"no"| C{"Is the file it reads only in the cloud?<br/>metadata only, just before the read"}
+  C -->|"no"| R2["Read it"]
+  C -->|"yes"| N["Not read: no picture, no failure<br/>the file is noted (Film::cloud_skipped)<br/>and its tile shows the cloud outline"]
+  N --> L["On this device again?<br/>the photo lands on screen,<br/>or the 30 s sweep finds it downloaded"]
+  L -->|"note dropped, the tile asks again"| W
+```
+
+- **Nothing in the background downloads.** Thumbnails (the filmstrip, the folder grid, the Review
+  panel, the blurred backdrop, the whole folder's preparation), the previews and full-resolution
+  frames prepared ahead, and the Review panel's hover preview check the one file they are about to
+  read, just before reading it, on the worker (metadata only; `support::read_file`,
+  `support::speculative_read_refused`). A file that is only in the cloud is not read and is not a
+  failure. The worker notes it (`Film::cloud_skipped`, one note per file: `support::CloudNotes`), and
+  everything that would ask for that file again stops asking for it in this folder. A thumbnail is
+  never read from the cloud, not even the current photo's tile: it turns into the picture once the
+  photo has landed on the stage.
+- **Each kind of work is judged by the file it reads** (owner answer 3). A thumbnail and a browse
+  preview read a RAW + JPEG pair's JPEG; a full-resolution frame in RAW mode reads the RAW. So a pair
+  whose RAW alone is in the cloud still shows its picture, and only its RAW-mode frames ahead are
+  skipped. Copy, Move and export count either file they read, as before. A full-resolution frame
+  looks at RAW mode once (`support::detail_job_mode`), so switching between RAW and JPEG while a
+  frame is being prepared can never make it check one file and then read the other.
+- **What a cloud tile shows** (owner answer 1). The main view's cloud outline (`CloudGlyph`), alone,
+  in the broken-image mark's place, size and grey, on all three tile surfaces (`FilmItem.cloud`). A
+  picture that has landed always wins, and a real failure keeps its broken-image mark. Hovering a
+  cloud tile in the Review panel shows only what is in hand and never says "Loading…". "Never browse
+  onto a blank photo" steps onto a cloud-only photo, which shows Loading while it downloads. The cache
+  meter leaves cloud-only photos out of both numbers.
+- **On this device again** (owner answer 2). When a photo on screen lands (viewing it has downloaded
+  it), its notes are re-checked and dropped, and its tile asks again, so Falcon's own thumbnail
+  replaces the cloud (`tick::step_cloud_landed_with`). Its scan tag is dropped too, once neither file
+  is in the cloud; viewing in JPEG mode downloads only the JPEG, so a pair whose RAW is still in the
+  cloud keeps it, and RAW export still refuses that RAW. A file downloaded outside Falcon (Explorer's
+  "Always keep on this device", a Finder download) comes back within about 30 seconds while it is on
+  screen or near the current photo (the retry sweep, below); further away, once it comes near or the
+  folder is reopened.
+- **Ask first, then download.** Copy and Move count the cloud-only files and say they will be
   downloaded (`copy-cloud-notice`, `move-cloud-notice`); if the person goes ahead, they are.
-- **Not yet enforced:** preparing photos ahead and the filmstrip and grid thumbnails open
-  cloud-only files like any other, which downloads them; Apply rotations writes each pending turn
-  into cloud-only finished files (and reads RAWs without a sidecar) with no cloud check; export of
-  cloud-only non-RAW files reads them. Queued as its own round: show Windows' own thumbnail greyed
-  under a cloud icon when Windows can supply it without downloading, otherwise just the cloud icon,
-  and make export ask before downloading cloud-only files.
+  - **Web export** asks after Export is pressed (and after the "already exist" question), only when
+    the fresh count is above zero: "N cloud-only photos → download, then export", with Cancel (back to
+    the sheet) and Download and export (confirm kind 9). The count is exactly the files the run will
+    read (`support::web_cloud_scan`): not a developed RAW, which RAW export refuses itself, and not a
+    photo whose deliverable is already there and kept. The export sheet's watermark preview samples
+    the first photo to export that is on this device, else the photo on screen
+    (`support::wm_sample_index`).
+  - **Apply rotations** shows Copy and Move's line in its confirm, counting files, since a pair can
+    need both (`falcon_decode::rotation_reads`, asked by `apply-rotations-ask` before kind 5 opens).
+  - A file made online-only after the answer (during a long run) is skipped, not downloaded, and the
+    result says so ("1 file was skipped because it is only in the cloud now."). A RAW that the export
+    develops is never in the count (RAW export never downloads), so a cloud-only one is skipped and
+    reported the same way, not as a failed export.
+- **Also enforced:** the scan's type check (below); Date-taken sorting, which uses the file's
+  modified time for a placeholder and, at a re-sort, for a file freed up since the scan (the metadata
+  the sort already reads says so, and a pair's RAW is checked before it is opened); RAW development
+  at export, which refuses a cloud-only RAW; and rotating a selection, which skips a GIF it has not
+  yet checked for animation while the file is still a placeholder (read from the file's attributes
+  at click time, `RotDoor::Selection` in `gif_rotate_verdict`) and says so. A single-photo rotate
+  still checks that one GIF, which may download it; the window waits while it does (the check runs
+  on the interface thread).
+- **Accepted race.** A file freed up in the instant between the check and the read still downloads.
 
 - **Detection reads metadata only.** The scan already reads each folder entry's metadata. On Windows
   `falcon_decode::is_cloud_placeholder` checks the `RECALL_ON_DATA_ACCESS` attribute. On macOS
@@ -1793,11 +1877,15 @@ photo (viewing it, rotating it, writing to it) may download that one file.
   the warning-coloured card.
 - **Copy and Move warn first.** Their confirm dialogs count the cloud-only files the operation would
   download (`copy-cloud-notice`, `move-cloud-notice`).
-- **The retry sweep** (`tick::step_cloud_retry`) does nothing in a folder with no tagged shots, so
-  local folders pay no cost. At most every 30 seconds it re-checks each tagged shot that has a
-  failure recorded, using metadata only:
-  - **The file has arrived:** the tag is dropped and the shot's failure records are cleared, so
-    every tier tries again.
+- **The retry sweep** (`tick::step_cloud_retry_with`) does nothing in a folder with no tagged shots
+  and no notes, so local folders pay no cost. At most every 30 seconds it re-checks, using metadata
+  only, the notes of photos on screen or near the current one (up to `CLOUD_SWEEP_MAX` = 150, nearest
+  first: a file on this device again loses its note and its tile asks again; one still in the cloud
+  keeps its note, so the tile does not flicker and the file is never read), and each tagged shot that
+  has a failure recorded:
+  - **The file has arrived:** the tag is dropped (from `meta.cloud_tagged` and from the shared
+    shot list's `Shot.cloud_placeholder`, so RAW export reads the live answer), its notes go, and the
+    shot's failure records are cleared, so every tier tries again.
   - **Still a placeholder:** retries are capped and spaced out. The cap is `CLOUD_RETRY_CAP` = 5
     attempts per shot, with waits of 30 s, 60 s, 120 s, then 240 s (`cloud_retry_backoff`). After
     that the shot keeps its card until the folder is reopened, the user retries by hand, or the file
@@ -2189,7 +2277,7 @@ develop-settings epoch:
 
 - The **tier** says whether the pixels came from the detail tier or the preview tier.
 - The **epoch** is `det_epoch`. Every develop-setting change bumps it: RAW/finished mode, output
-  colour space, ICC profile, Resolution limit, Adaptive Hi-Res, Simulate VRAM, and both GPU
+  colour space, ICC profile, Resolution limit, Adaptive Hi-Res, Simulate GPU memory, and both GPU
   out-of-memory steps.
 
 `support::present_decision` is the whole present gate. A new `set_photo` is owed when:
@@ -2389,7 +2477,7 @@ flowchart TB
     I1["clear(): folder swap, output-colour or custom-profile change (drop_developed_caches),<br/>the user's own Faster/Sharper switch"]
     I2["mark_stale_tier(): Eco's Faster-preview release sets every dim to 0<br/>bytes kept as stand-ins, no hits until replaced"]
     I3["A frame decoded under the old Faster/Sharper choice<br/>is refused at the drain (sup tag)"]
-    I4["det_epoch bump: RAW mode, colour, Resolution limit, Adaptive Hi-Res, Simulate VRAM<br/>stops full-detail serves only, preview serves continue"]
+    I4["det_epoch bump: RAW mode, colour, Resolution limit, Adaptive Hi-Res, Simulate GPU memory<br/>stops full-detail serves only, preview serves continue"]
   end
 ```
 
@@ -3824,7 +3912,7 @@ that prepares photos reads the same set:
 | How far ahead previews are decoded | the whole kept window (slow formats: 8 ahead, 3 behind) | 2 s ahead, 0.5 s behind | 1 s ahead, 0.25 s behind; at most 12 and 4 | as Balanced; Unlimited: the whole kept window |
 | Sharp photos kept ready | 3 ahead, 1 behind | the same | the same | your numbers (starts at 3 + 1) |
 | Sharp photos while zoomed or settled | as many as the memory budget holds, up to 16 ahead | within about 2 GB (`BALANCED_DETAIL_BYTES_MAX`) | within about 1 GB, at most 3 ahead and 1 behind | while zoomed, your numbers (starts at 8 + 2); no widening when settled |
-| Thumbnails prepared | the whole folder, within about 2 GB (a cap not shown in the interface) | the whole folder, within about 500 MB | visible and nearby | your choice (starts at the whole folder, within 500 MB; you set 100 MB to 2 GB) |
+| Thumbnails prepared | the whole folder, within about 2 GB (a cap not shown in the interface) | the whole folder, within about 500 MB | visible and nearby | your choice (starts at the whole folder, within about 500 MB; you set 100 MB to 2 GB) |
 | In the background | keeps up to a quarter of the graphics card | keeps only the photos in use | the same as Balanced | your choice, released at once, over 10 s or over 30 s |
 
 Eco also keeps Efficiency mode's other cuts:
@@ -3886,7 +3974,10 @@ the user asked for, zoom regions and the thumbnails on screen are exempt (see
 Round 2b (owner rulings of 25–27 October 2026). The **Custom** card sits under the Mode card and is
 mounted only while Custom is selected, so Settings stays short for everyone else. Its first line says
 what every number means: "The most Falcon prepares; memory limits can lower these." It starts as a
-copy of Balanced.
+copy of Balanced. The groups are 11 px apart, each small heading sits 11 px above its rows, and the
+rows of a group are 7 px apart, so the space around a heading is even and it reads as the start of its
+group (owner, 29 October 2026, after mockups). Settings' card titles (`SettingsGroup`) are SemiBold, a
+step above the one-line switch labels, which stay Medium.
 
 | Row | Starts at | Choices |
 | --- | --- | --- |
@@ -3896,8 +3987,13 @@ copy of Balanced.
 | Sharp photos while zoomed, ahead / behind | 8 / 2 | 3, 8, 16, 32 or type 1–32 / 0, 1, 2, 4 or type 0–8 |
 | Thumbnails | Whole folder | On screen · Nearby · Whole folder, with a line naming the choice in full |
 | Whole folder, up to (only with Whole folder) | 500 MB | Custom (type 100–2,000) · 250 · 500 · 1000 · 2000, in MB; the grey line under it names the choice and the cap |
-| In the background, keep | In use | In use · 10% · 25% · 50%, with a line saying what it keeps |
-| Release over | 10 s | At once · 10 s · 30 s |
+| GPU memory usage limit (in the In the background card) | In use | In use · 10% · 25% · 50%, with a line saying how much it may keep ("Up to 25% of GPU memory.") |
+| Release over (in the In the background card) | 10 s | At once · 10 s · 30 s |
+
+The last two rows are Custom's own but sit in the **In the background** card, under its wait and with
+the same 11 / 11 / 7 rhythm, so all three background settings are together; they mount only while
+Custom is selected (owner, 29 October 2026). The interface says "GPU memory" everywhere, as Windows
+Task Manager does (zh-CN GPU 内存), never "VRAM" or "graphics memory".
 
 How the card looks follows the owner's layout rules:
 
@@ -3990,15 +4086,15 @@ flowchart TB
 - **Never a cloud-only file.** It skips every photo the folder scan tagged as a cloud placeholder
   (`meta.cloud_tagged`), so preparing ahead never downloads anything (AGENTS.md's cloud rule). A file
   made online-only after the scan (Explorer's "Free up space", Storage Sense, the Mac's "Optimise Mac
-  Storage") is not tagged, so each whole-folder request is marked `ThumbReq::whole_folder`, and the
-  thumbnail worker checks the file just before reading it (`support::shot_is_cloud_only`, metadata
-  only, either file of a RAW + JPEG pair, the scan's rule). An online-only file is not read: the worker
-  answers with an empty result (no failure is recorded) and notes it in `film.cloud_skipped`, and the
-  feeder asks for it no more in this folder. The check runs on the worker, not in the tick, so a slow
-  or unreachable network drive cannot hold up the window. A tile on screen still shows its thumbnail as
-  before (one photo may download its own file), and a queued whole-folder job that comes on screen
-  follows that rule too. A file noted this way and later downloaded again is not prepared ahead until
-  the folder is opened again; its thumbnail still appears when it is on screen.
+  Storage") is not tagged, so the thumbnail worker checks the file just before reading it. Since the
+  cloud-only round it checks EVERY thumbnail job this way, whichever feeder asked (see
+  [Cloud-only files](#cloud-only-files-placeholders)), and asks about the one file a thumbnail reads
+  (`support::read_file`: a RAW + JPEG pair's JPEG). An online-only file is not read: the worker
+  answers with an empty result (no failure is recorded) and notes it in `film.cloud_skipped`, and no
+  feeder asks for it again in this folder; its tile shows the cloud outline. The check runs on the
+  worker, not in the tick, so a slow or unreachable network drive cannot hold up the window. A noted
+  file that is on this device again loses its note when its photo lands on screen, or within about
+  30 s while it is on screen or near the current photo.
 - **The cap.** The thumbnail cache keeps `EfficiencyLimits::thumbs_max` thumbnails, the ones nearest
   what is on screen: 400 normally (`THUMB_CACHE_MAX`), about 500 MB (2,855 thumbnails at 175 KB each,
   `WHOLE_FOLDER_THUMBS`) for Balanced's whole folder, Custom's own cap for Custom's (100 MB to 2 GB,
@@ -4283,7 +4379,9 @@ speculative image retention (`memory_pressure`). A low reading immediately pause
 preview/detail preparation and releases expendable texture-cache entries, queued previews and
 parked decoded/uploaded frames. The current photo, comparison photos, hovered preview and awaited
 frame retain their existing explicit-request protections. In-flight work keeps its accounting;
-later expendable arrivals are shed on subsequent ticks. Background work resumes after four calm
+later expendable arrivals are shed on subsequent ticks. A shed that removed previews also empties a
+closed Review panel and a grid hidden by immersive mode, as a mode's trim does (`release_after_trim`;
+see "Panels that are not refreshing" below). Background work resumes after four calm
 samples above the existing recovery band. This uses the existing available-memory approximation,
 not a claim to observe every macOS memory-pressure event. That pressure hold is Mac-only; the
 background release below is on both platforms and reuses its work shedding (`memory_pressure::shed_work`).
@@ -4333,7 +4431,7 @@ The same usable figure picks the sharp-zoom tier (Adaptive Hi-Res, `VramTier`):
 | 11 GB or more (`VRAM_USABLE_HIGH`) | 8192 px | up to 8192 px, decoded at 2× the viewport and shrunk by the GPU |
 
 Region tiles are used only when the source is larger than `detail_cap`. With Adaptive Hi-Res off, the
-whole image loads up to the manual Resolution limit (default 16384 px). The Developer **Simulate VRAM**
+whole image loads up to the manual Resolution limit (default 16384 px). The Developer **Simulate GPU memory**
 control drives the same function, so every tier can be checked on one machine.
 
 ### Sharing the card with other applications
@@ -4365,7 +4463,9 @@ consumer:
   immersive mode, which hides it but keeps its open setting. On every held tick the other models are
   emptied and their keys reset to the boot values (`release_unrefreshed_models`), so the next refresh
   rebuilds as a first open. This runs whether or not that tick's release evicted anything, because an
-  earlier tick or the Mac pressure hold may have evicted the preview a row still holds.
+  earlier tick or the Mac pressure hold may have evicted the preview a row still holds. In the
+  foreground, the Mac pressure hold and a mode's trim do the same on a tick that removed previews
+  (`release_after_trim`).
 - **Coming back** stops the release at once. Previews come back from the RAM cache where it holds them
   (Windows). The full-detail fill waits its usual stillness interval counted from the return.
 - **Targets** follow the mode in effect (`Policy::for_mode`, once per tick). Balanced and Eco
@@ -4483,7 +4583,7 @@ target tier back at once.
 
 Both the degrade step and the restore clear the full-detail failure records only when they really change
 the decode size, so a photo is retried only when it has a new reason to succeed. GPU out-of-memory
-pruning and Simulate VRAM do not touch the RAM keep-alive cache.
+pruning and Simulate GPU memory do not touch the RAM keep-alive cache.
 
 **Losing the graphics device** (a driver reset, or the GPU removed) cannot be repaired in-process,
 because Falcon cannot rebuild Slint's renderer. The first device-lost signal latches
@@ -4543,7 +4643,7 @@ What clears or invalidates the cache:
 - Its switch back up to Sharper keeps the bytes but marks every entry stale (`L2Store::mark_stale_tier`
   sets `dim = 0`, which satisfies no request). The frames stay as stand-ins and are re-decoded through
   the normal path.
-- GPU out-of-memory pruning and Simulate VRAM do not touch it.
+- GPU out-of-memory pruning and Simulate GPU memory do not touch it.
 
 The low-water mark is the larger of 1.5 GiB (`L2_LOW_WATER_MIN`) and 6% of physical RAM. The cache grows
 back only after available memory stays 1.5 GiB above that mark for four samples, so it cannot flip back
@@ -4705,7 +4805,7 @@ itself:
 
 Lowering the limit makes the same file decodable. So every path that changes the full-detail target size
 (`detail_dim_atomic`) clears the failure marks when it actually changes the number. Those paths are the
-Adaptive Hi-Res toggle, the Resolution limit and Simulate VRAM, all through `clear_developed`. The two
+Adaptive Hi-Res toggle, the Resolution limit and Simulate GPU memory, all through `clear_developed`. The two
 steps of `tick::step_vram_recovery` also clear them, but only inside the branches that move the size.
 The marks are also cleared when the user retries the photo (`on_retry_detail`) and on a folder switch.
 
@@ -5294,7 +5394,7 @@ frame may become the sharp frame. It needs all of these:
   `hw_one_decode_want`. Any other cached frame, however large, is never served as full detail. In RAW
   mode, for example, the browsing preview is always the finished JPG while full detail develops the RAW.
 - **`epoch`.** `det_epoch` changes with every setting that changes what "the full-detail frame" means:
-  RAW mode, output colour space, Resolution limit, Adaptive Hi-Res and Simulate VRAM. The token is read
+  RAW mode, output colour space, Resolution limit, Adaptive Hi-Res and Simulate GPU memory. The token is read
   when the decode is **admitted** (`Acquire`, pairing with the setters' `Release`). It is carried in
   `MasterFrame::epoch` or `L2Deposit::FrameIsMaster { epoch }`, and stamped by `l2_deposit_epoch`.
   Reading it at deposit time would be wrong: a master admitted under one Resolution limit and landing
@@ -6059,6 +6159,10 @@ A sixth, hidden category, Selected, shows its chip only while a selection exists
 2. `tick::step_selection` turns that position into the visible rows and pins those shots in `Film.pinned`. The thumbnail cache's farthest-first eviction skips pinned shots.
 3. It requests missing visible thumbnails from the centre outwards. A request for a tile that is scrolled out of the panel (and every other visible window) before its decode starts is retired (`step_retire_thumbs`).
 
+4. While the jump list (below) is open, its photos are on screen too: they are pinned with the visible tiles and requested after them, through the same cloud check, so a cloud-only photo is never downloaded for it. They are asked for from the entry under the pointer outward, or from the current entry when the pointer is not over the list (`review-jump-focus`; owner, testing rc.2: "Thumbnails near the pointer first"). Those already loaded stay pinned while the panel is open, so a reopened list shows them at once ("Keep list thumbnails between opens", at most 128 small thumbnails). With the list closed nothing new is asked for, and those not loaded yet are not pinned, so their queued requests are retired as before (`step_retire_thumbs`) and never hold up the visible tiles.
+
+**Only the rows that changed are rewritten** (owner, testing rc.2: "lighter row updates"). Every thumbnail or preview frame that lands in the folder moves the panel's rebuild key, and on a big folder they land tens of times a second. The rebuild still works out which photos the panel holds, in order, but then gathers only each photo's inputs to its tile (`tick::TileSig`: its picture, rating, flag or reject, rotation, failure, cloud mark, selection and whether it is the current photo) and compares them with the last pass (`tick::SelCache`). With the same photos in the same order, the same filter, folder, rating set and selection, it rewrites only the rows where an input changed; a landing outside the panel rewrites nothing. Anything else, or a model it did not leave as it was, takes the full rebuild. Two empty pictures count as the same here: Slint never counts two empty images as equal, so most rows of a loading folder would otherwise count as changed every pass (and under the old full rewrite they did). A preview frame standing in for a thumbnail is a GPU texture, which Slint never counts as equal either, so its row is still rewritten each pass, as before. While the panel is closed the memory holds no pictures, like the rows the background release empties. A test runs the lighter pass beside a full rebuild after every kind of change and requires the same rows. Measured on a generated 7,000-photo folder with 1,216 photos in Review, one landing per pass (the unoptimised test build): 5.5 ms for the lighter pass against 29.8 ms for the full rebuild.
+
 The panel may queue requests only while fewer than `SEL_FEED_PENDING_MAX` (40) of the 48 thumbnail slots (`THUMB_PENDING_MAX`) are busy. The grid dock's share is 44, and the filmstrip runs first each tick, so the strip always keeps headroom. With the panel closed, or in immersive mode, nothing is pinned or requested. Pins belong to the current folder and are released on a folder swap.
 
 **Mini scroll bar.** `MiniVBar` (`widgets.slint`) is shared by Review, the grid dock and Settings:
@@ -6071,6 +6175,37 @@ The panel may queue requests only while fewer than `SEL_FEED_PENDING_MAX` (40) o
 The horizontal filmstrip bar follows the same paint states. The input bands remain active when their tracks are transparent, and paint transitions use the existing 120 ms timing.
 
 It sits in the panel's 20 px right padding, snapped to whole device pixels in window coordinates. The panel itself starts at x = 3, so snapping in panel coordinates would land off the pixel grid at 125 % and 150 % scaling. The bar mounts only while the grid's content is taller than the panel. A press or drag writes the grid's `viewport-y` directly, so the same observer that handles a wheel scroll updates the copied position, clears the hovered tile and records the input time. The fade at the bottom of the panel keeps its own "more below" test.
+
+**Jump list** (owner, 29 October 2026, after mockups; `PhotoJump` in `widgets.slint`, `support::jump_rows`). The panel shows about six photos at a time, so a long review took ages to scroll through. Rest the pointer by the panel's scroll bar and a column of small photos opens beside the panel, a view of the whole review at once:
+
+```
+ Review panel           bar   jump list (25 entries at a 1080p screen)
+ ┌──────────────────┐   ▐    ┌─────────┐
+ │ [photo] [photo]  │   ▐    │ ▫▫      │  row 0 (photos 1–2)
+ │ [photo] [photo]  │   █    │ ▫▫      │  row 9
+ │ [photo] [photo]  │   ▐    │ ████    │  ← the current entry, on the blue plate
+ │                  │   ▐    │  ▣▣     │  ← under the pointer: 1.8×, "photos 35–36 of 412"
+ └──────────────────┘   ▐    │ ▫▫      │  …
+                              └─────────┘  the entries share the bar's track exactly
+```
+
+- **Each entry is one panel row**, its two photos side by side, 3:2 each. The entries are rows sampled evenly from the first to the last (`support::jump_rows`: entry i is row round(i·(rows − 1)/(n − 1))); with no more rows than entries, every row. **A new pick does not re-sample them** (owner, testing rc.2: "Re-sample after bigger changes"): the rows are kept, the last moved to the new last row, until the row count has moved by one entry's spacing from the count they were sampled for; a new tier, filter or folder samples afresh (`support::jump_rows_kept`). Rust also publishes the row count they were sampled for (`review-jump-basis`), and the current entry is the one whose stretch holds the top row on that count's spacing, so the plate (and where loading starts) stays on the right entry while the rows are kept. Because the panel pairs photos in order, a new pick still shifts the pairs after it by one photo, so one photo of an entry after it can change.
+- **How many entries:** a fixed number per tier, chosen by the scroll bar's real track height in logical pixels (owner: "the logical res not the screen pixels"), and the entries then share that track exactly, so each sits beside its own place on the bar:
+
+  | Track height | Entries | Window height (measured: track = window − 367 px) |
+  | --- | --- | --- |
+  | under 408 px | 12 | under 775 px (a small laptop window) |
+  | 408–599 px | 17 | 775–966 px (an 864 px tall laptop screen) |
+  | 600–959 px | 25 | 967–1,326 px (a 1080p screen) |
+  | 960–1,535 px | 40 | 1,327–1,902 px (1440p, or 4K at 150 %) |
+  | 1,536 px and up | 64 | 1,903 px and up (4K at 100 %) |
+
+  With the Selected chip row showing, the track is 40 px shorter.
+- **Mac Dock-style zoom, at once** (owner: "snappy"): the entry under the pointer is 1.8 times its size, its neighbours 1.48 and 1.16, back to normal 2.5 entries away, with no easing or delay. The column grows up and down around the pointer so the entry under it stays under it. The card keeps its normal width: zoomed entries grow out past its right edge (owner, testing rc.2: "should only zoom the affected thumbnails not the whole menu panel"). Beside the zoomed entry a small badge (the tooltip's) says "photos 35–36 of 412".
+- **Jumping:** a click puts that entry's row at the top of the panel; a drag goes entry by entry. The current entry stands on the solid blue plate, by the Settings list's rules: the entry a jump went to until you scroll, the last at the bottom of the scroll, otherwise the entry whose stretch holds the row at the top. A jump is also forgotten for good when what it was made on changes: the entry no longer goes to the same row (a window height with a different number of entries, a filter that changes the number of rows), the panel holds other photos (a filter or a new folder, even with the same number of rows), or Falcon re-centres the panel (a new folder). A thumbnail arriving, a rating, or the Selected chip row appearing keeps it. Nothing scrolled in those cases, so the jump still describes the panel (Codex review R1; `jr-held`, and the content key `review-rows-key`, a fold over the folder and the photos the panel holds, in order).
+- **Opening, closing and the wheel:** the Settings list's timings (200 ms within 10 px of the bar, inside the panel; closed 120 ms after the pointer leaves the bar, the gap and the list). If the scroll bar goes while the pointer is on it (the rows come to fit), its hover is cleared, so the list cannot open by itself when the rows grow back. The wheel over the list, the bar or 10 px either side of it scrolls the panel. The big hover preview stays off while the list is open: it would sit in the same place (`hover-preview-live`).
+- **Thumbnails:** the panel's own tiles' pictures; a photo not ready yet is an empty well, a cloud-only photo the cloud outline. While the list is open, its photos are pinned and requested (see *Thumbnails load* above).
+- **The plumbing:** the panel's mount became a plain frame the size of the window (`selwrap`) holding the panel and the list, so the list can sit outside the panel (which clips) and still drive its scroll. The Slint side publishes the tier (`review-jump-n`) and whether the list is open (`review-jump-open`); Rust answers with the sampled rows (`review-jump-rows`).
 
 ### Selection and bulk actions
 
@@ -6153,7 +6288,7 @@ A shot the fast tier has failed in this folder is never asked for again, and the
 
 The card's x is 511 (8 px right of the panel), snapped. Its y centres on the tile's picture and is clamped between the 52 px title band and the 110 px filmstrip band. When the browsing frame replaces the thumbnail, the box can move by under a pixel, because the thumbnail's shape is rounded to 256 px.
 
-**The gate** is one Slint expression, `hover-preview-live = hover-to-preview && sel-open && !immersive && !popup-open && !compare`. Rust reads it and never re-states it, and every way it can turn off returns `HoverState::default()`. Pressing the tile, or Esc, hides the card until the pointer leaves that tile.
+**The gate** is one Slint expression, `hover-preview-live = hover-to-preview && sel-open && !immersive && !popup-open && !compare && !review-jump-open`. Rust reads it and never re-states it, and every way it can turn off returns `HoverState::default()`. Pressing the tile, or Esc, hides the card until the pointer leaves that tile.
 
 A folder swap is not a gate term. It is caught in three ways:
 - the published record, `HoverPub`, compared on `(gen, idx, turns, fast, loading, w, h)`, whose "nothing shown" value is the default with `idx == -1` (written by hand, because a derived default would be 0);
@@ -6323,7 +6458,7 @@ When a destination already exists, `dest_verdict` decides:
 - **Attention**: a marker is still present, the file is zero bytes, or its size doesn't match and Falcon has no record of writing it. Attention is counted and logged, never skipped silently, and never redone automatically, so another live window's copy is not disturbed.
 - **Diverged**: the size doesn't match, but the export record explains why (see [The export record](#the-export-record)).
 
-**Recovering an interrupted copy.** A copy interrupted part-way leaves a `.part` marker beside an empty file at the final name. Falcon recovers it only when three things hold: the marker is at least 60 seconds old (`PART_STALE_SECS`), the final file is an ordinary empty file, and the source still exists. Recovery removes the marker's directory entry without opening or truncating it, so a marker that is a link never truncates its target. It then checks again that the claim is still empty, removes the empty file, and claims the name the normal exclusive way (`part_blocks_claim`). Anything else refuses recovery and keeps earlier export-record entries: a non-empty or linked destination, a fresh, future-dated or unreadable time, or a failed clean-up. The 60-second rule is a timeout guess, not proof that the other copy stopped: a copy stalled for over a minute could still race recovery. The second emptiness check narrows that race; there is no lock between processes. If the empty file cannot be removed (another process holds it), it stays without its marker, and `dest_verdict` reports Attention on every later run until someone removes it by hand. Ordinary error clean-up removes only files that call created.
+**Recovering an interrupted copy.** A copy interrupted part-way leaves a `.part` marker beside an empty file at the final name. Falcon recovers it only when three things hold: the marker is at least 60 seconds old (`PART_STALE_SECS`), the final file is an ordinary empty file, and the source still exists. Recovery removes the marker's directory entry without opening or truncating it, so a marker that is a link never truncates its target. It then checks again that the claim is still empty, removes the empty file, and claims the name the normal exclusive way (`part_blocks_claim`). Anything else refuses recovery and keeps earlier export-record entries: a non-empty or linked destination, a fresh, future-dated or unreadable time, or a failed clean-up. The 60-second rule is a timeout guess, not proof that the other copy stopped: a copy stalled for over a minute could still race recovery. The second emptiness check narrows that race; there is no lock between processes. If another program is holding the empty file, Falcon tries again a few times over about a third of a second, checking each time that the file is still empty (`remove_empty_claim_retry`). If it is still held after that, it stays without its marker, and `dest_verdict` reports Attention on every later run until someone removes it by hand. Ordinary error clean-up removes only files that call created.
 
 **One ordering exception: encoded exports** to `./export`. The image encoder writes straight into its output file. So the export creates its temporary file (`<name>.<pid>.<counter>.part`, unique to the process) *before* claiming the final name. The claim, the rename onto Falcon's own placeholder and the never-overwrite rule are the same as for copies. A cheap existence check before decoding still catches the usual "already there" case. A shot that loses the rare race for the claim has its temporary file removed.
 
@@ -6336,7 +6471,7 @@ flowchart TB
   S["Copy to Picks, export, or undo a move: one file"] --> PB{"part_blocks_claim: is a destination.part marker present?"}
   PB -- "no marker" --> CL
   PB -- "marker, and recovery is not allowed:<br/>under 60 s old, unreadable time, destination not an empty regular file, or source missing" --> ATT["Needs attention: counted and logged, nothing replaced, manifest record kept"]
-  PB -- "marker at least 60 s old, empty claim, source exists" --> UN["Unlink the marker without opening it, recheck that the claim is still empty,<br/>then remove the empty claim"]
+  PB -- "marker at least 60 s old, empty claim, source exists" --> UN["Unlink the marker without opening it, recheck that the claim is still empty,<br/>then remove the empty claim (up to 4 tries over ~350 ms, each only while it is still empty)"]
   UN -- "a step fails or the claim changed" --> ATT
   UN -- ok --> CL{"claim_new(destination): exclusive create"}
   CL -- "created: a 0-byte placeholder" --> CP["copy_via_part: create destination.part exclusively, write, fsync, rename onto the placeholder (4 tries)<br/>move: same-volume rename first, across volumes copy through .part, then remove the source"]
@@ -6459,6 +6594,7 @@ The config folder (`config_dir`) is `%LOCALAPPDATA%\Falcon` on Windows and `~/Li
 
 - `ratings.json`, an older rating store read only as a seed for folders with no review data;
 - `open_folders.json`, the registry of open folders (see [Several Falcon windows at once](#several-falcon-windows-at-once));
+- on Windows, the `versions-run` folder: one empty file for each Falcon version that has run (see [The update prompt (Windows)](#the-update-prompt-windows));
 - on Mac, `falcon.lock`;
 - per-process `falcon-<pid>.log` files, written only when diagnostic logging is on.
 
@@ -6476,7 +6612,7 @@ The diagram shows every caller, the one queue, what each message does, and the w
 flowchart TB
   subgraph CALL["Callers"]
     A1["save_selection -> enqueue_review_data(folder, bytes)"]
-    A2["save_settings -> enqueue_write(settings.json, bytes)"]
+    A2["save_settings -> enqueue_settings(settings.json, bytes): its attempt in SETTINGS_SAVES"]
     A3["sync_xmp_ratings -> enqueue_xmp_rating(sidecar, stars)"]
     A4["Open-folders registry: 25 s heartbeat and folder open -> enqueue_write"]
     A5["log_event with diagnostic logging On -> a Log line carrying a permission ticket (any thread)"]
@@ -6484,6 +6620,8 @@ flowchart TB
   Q["One unbounded mpsc channel of WriteMsg<br/>single consumer thread falcon-writer, FIFO: the last write to a file wins"]
   A1 & A2 & A3 & A4 & A5 --> Q
   Q --> W["Write: write_atomic, inside catch_unwind"]
+  Q --> S["Settings: the same write, then completes its attempt (only the newest attempt's answer counts)"]
+  S --> W
   Q --> R["ReviewData: review_write_target(folder) chosen now, on the writer thread<br/>the new name if it exists, else the legacy name if only it exists, else the new name"]
   Q --> X["XmpRating: read the sidecar, change xmp:Rating, write it back (other content kept)"]
   Q --> L["Log: append only if the ticket is still valid, turning logging Off discards queued lines<br/>never retried, never reported"]
@@ -6623,6 +6761,22 @@ Several Falcon processes may run at the same time; there is no single-instance l
 Any failure of the check counts as primary. When diagnostic logging is on, a secondary process writes `falcon-<pid>.log` in the config folder instead of cutting off the primary's log. Per-process logs older than 7 days are removed.
 
 Opening a folder that another live Falcon already has open shows a warning toast and an events entry: "This folder is open in another Falcon window — review edits (ratings, flags, rejects) are last-writer-wins between them". It never blocks the open and never writes into the photo folder.
+
+**A window that changed nothing writes nothing when it closes or opens another folder** (issue #11 batch, 28 October 2026). Every double-click in File Explorer starts a new Falcon, so two windows on one folder are common.
+- **Before:** the window opened first rewrote the folder's review file when it closed or moved to another folder, even if nothing had changed in it. That erased ratings, flags and rotations made in the other window, and the last window to close also put its own settings back.
+- **Now:** each window remembers what it last loaded or saved (`last_ratings_json`, `last_settings_json`). Those final writes happen only if something changed since then, or if that window's last save is still on its way or failed (`final_flush_needed`, `final_review_flush`, `settings_final_save_needed`).
+
+```
+Both windows open a folder: IMG_1 2★
+Window B rates IMG_2 5★ and closes            file: IMG_1 2★, IMG_2 5★
+Window A, untouched, closes   before: rewrote the file without IMG_2 ✗
+                              now:    writes nothing, IMG_2 keeps its 5★ ✓
+```
+
+- **What still counts as a change:** ratings, flags, rejects, rotations, the sort, the panels' layout and the resume position. In a folder with a review file, moving to another photo records the resume position. So a window you browsed but didn't rate still writes its whole view at its next save (about every 15 s, or when it closes). Two windows that both edit stay last-writer-wins. Fixing that would need a merge with the file on disk, which is not part of this change.
+- **A save still on its way or failed is never skipped.** For each folder, the window remembers its newest save attempt, even across a re-sort or a delete (`review_final_status`). It does the same for the settings file (`SETTINGS_SAVES`), so a final save retries it. A folder opened afresh starts clean (`forget_review_attempts`), because its state was just read from disk.
+- **Saved memory still gets saved.** When a folder with a review file takes over its remembered sort, panels or resume position from the settings file, that counts as a change (the load compares against the file's own values, `disk_attrs`), so it is written to the review file soon after.
+- The warning about a folder already open in another window is unchanged.
 
 The warning comes from `open_folders.json` in the config folder. Each process records its pid, its folder and a heartbeat, refreshed about every 25 s while a folder is on screen. Entries older than 90 s are pruned, and on Windows so are entries whose process has exited (`pid_alive`). On macOS the process check always answers "alive", so a crashed window ages out by time alone. The writer, the registry and the review data are plain portable code. Only the primary-instance check differs by platform.
 
@@ -7316,11 +7470,44 @@ Falcon registers itself for photo types per user (Settings → File associations
 
 - **One file type per extension.** Falcon registers one Windows file type (a "ProgID") per extension, such as `Falcon.Image.png`, in the current user's registry (`windows_assoc.rs`). The older shared type `Falcon.Image` stays registered because some people chose it as their default before the per-format types existed, and its open command keeps working for them.
 - **Protected choices stay protected.** Windows protects each user's default-app choice (`UserChoice`). Falcon never edits it and never replaces an open command another app wrote. Upgrading moves Falcon's own extension claims and capability entries to the per-format types, including a move that was interrupted, without touching `UserChoice` or default-extension values.
-- **Only the registered copy changes things automatically.** At startup, the copy of Falcon that Windows has registered may move old registrations to the per-format types, refresh icons, repair the type name and remove stale `.heic`/`.heif` entries. Falcon decides whether it is that copy by comparing the quoted absolute path in the registered open command with its own executable. It resolves both paths and compares them with Windows' ordinal case folding (`owned_command_path`, `canonical_exe`). If the path is missing, malformed or cannot be resolved, Falcon changes nothing until the user presses **Update**. Each existing per-format command gets the same check, and icon references keep the registered command's path even when Falcon was launched through an equivalent spelling or alias.
-- **HEIC clean-up.** The startup HEIC clean-up follows the same ownership check. It removes only stale `.heic`/`.heif` claims and Falcon capability entries, checks both extensions independently, and never rewrites handlers. Other applications' values, and another Falcon copy's per-format handlers, stay intact.
-- **Update and Remove.** **Update** writes open commands and icons together. Families the user switched off stay off. **Remove** deletes both kinds of Falcon registration (the per-format types and the shared type) and leaves other apps' entries alone.
+- **Only the registered copy changes things automatically.** At startup, the copy of Falcon that Windows has registered may move old registrations to the per-format types, refresh icons, repair the type name and remove stale `.heic`/`.heif` entries. Falcon decides whether it is that copy by comparing the quoted absolute path in the registered open command with its own executable. It resolves both paths and compares them with Windows' ordinal case folding (`owned_command_path`, `canonical_exe`). If the path is missing, malformed or cannot be resolved, Falcon changes nothing until the user presses **Update**. A missing path cannot be told apart from an unplugged drive, an offline share or a copy that is about to be moved; if startup re-pointed the registration, whichever copy started first would win. Instead, a newer copy offers the change with [the update prompt](#the-update-prompt-windows), and only the user's **Update** writes it. Each existing per-format command gets the same check, and icon references keep the registered command's path even when Falcon was launched through an equivalent spelling or alias.
+- **HEIC clean-up.** The startup HEIC clean-up follows the same ownership check. It removes only stale `.heic`/`.heif` claims and Falcon capability entries, checks both extensions independently, and never rewrites handlers. Other applications' values, and another Falcon copy's per-format handlers, stay intact. It runs only when the codec check says for certain that no HEIC codec is installed (see the HEIC bullet under [one list for both platforms](#file-associations-one-list-for-both-platforms)).
+- **Update and Remove.** **Update** writes open commands and icons together. Families the user switched off stay off. Since 1.1.0-rc.1 Update also moves everything that still names the old executable to this one: the open command and icon of a switched-off family's type that Windows may still use (its claims and capabilities are not re-added, so the family stays off), and the icon helper's fallback icon when the helper itself can't be installed. A family counts as on when **any** of its extensions is claimed, so a lone `.heif` or `.jpeg` claim is no longer deleted by Update. **Remove** deletes both kinds of Falcon registration (the per-format types and the shared type) and leaves other apps' entries alone.
 - **No type description.** Falcon's file-type classes carry no description (`write_class` deletes the default value), so Explorer keeps each format's own Type text; a one-time repair (`assoc_repair_type_name`) fixes registrations that an older build wrote.
 - **Never write an extension-wide `DefaultIcon`**, because it would override the icon of whichever other app opens that type.
+
+### The update prompt (Windows)
+
+Windows remembers the full path of the `Falcon.exe` that pressed Update. Falcon ships as a zip, and each version is usually extracted to a new folder, so after an update double-clicked photos still open in the old copy, or in nothing if that folder was deleted (public issue #11). So, at every launch, Falcon checks whether the new version should offer to take over. The owner approved this logic on 27 October 2026:
+
+```
+Falcon opens (Windows)
+        |
+Photos set to open in Falcon? --No--> nothing (first launch: welcome guide)
+        | Yes
+Already open in this version? --Yes-> nothing (already up to date)
+        | No
+Older than the newest version used? --Yes-> nothing (go back: Update in Settings)
+        | No
+Running from inside the zip? --Yes-> "Extract it first" message, no Update button
+        | No
+Update to Falcon 1.1.x panel: [Update] [Not now]
+   Update  -> photos open in this version; old leftovers cleaned up
+   Not now -> closes; asks again at the next launch
+```
+
+- **The panel** says "Update to Falcon {version}" and "Photos you double-click are still set to open in the old version of Falcon. Update to open them in this version." **Update** runs the same registration as Settings' Update with the formats the user already chose (`refresh-assoc` loads them from the registry first), then closes. If it fails, the panel stays open with the same failure line as Settings and Update can be pressed again. If photos stopped opening in Falcon after the panel appeared (Remove in another Falcon window, or Windows' own settings), Update finds nothing to update and only closes the panel, so it never sets up photo types the user had removed. **Not now**, or Esc, only closes it: nothing is remembered, so the next launch of that version asks again until photos open in it. Updating means downloading the zip from GitHub and opening it, so someone who does that wants the update; Not now is a mis-click or a developer's test.
+- **When it shows.** Never on top of the welcome guide (which a feature update shows first) or any other panel: like the Mac first-launch question, it is armed at startup and opens when nothing else is open (`update-prompt-armed`, the `changed modal-open` observer). If the welcome guide's **Apply to all**, or Update in Settings, succeeds first, photos already open in this version and the waiting prompt is cancelled (`assoc_apply_ui`). **Remove** in Settings cancels it too, since photos then don't open in Falcon at all (`assoc_remove_ui`).
+- **"Already open in this version"** means the shared type's open command and the command of every claimed format name this exe (`opens_here`, `owned_command_path`). It is read-only: read-only registry opens, one file check per distinct command, no shell notification. A format still opening another copy counts as not up to date, because double-clicking it opens the old one.
+- **The newest version used.** Falcon keeps a `versions-run` folder beside `settings.json`, with one empty file for each version that has run, named by its version (`VERSIONS_RUN_DIR`, `newest_version_boot`). Each launch adds its own file at once and never changes or deletes another, so nothing can lower the newest: not a save from an older window that is still open, and not an older build. A launch older than one that has already run (by version precedence, so 1.1.0-rc.1 < 1.1.0 < 1.1.1; `version_cmp`) never offers to switch photos back; going back on purpose is Settings' Update, as before. (The first build kept this in `settings.json`, where an older window's next save could put its own version back; the 28 October review caught it.)
+
+```
+versions-run/            each launch adds its own file; none is ever changed or deleted
+  1.1.0-rc.1
+  1.1.0-rc.2             newest = 1.1.0-rc.2, so a 1.1.0-rc.1 launch never asks
+```
+- **Inside the zip.** Opening Falcon.exe straight from the zip runs a temporary copy from the temp folder (`exe_under(temp_dir)`). Registering that copy would break as soon as the temp folder is cleaned, so the panel says "Falcon is running from inside the zip file. To update, extract it to a folder first, then open Falcon from that folder." and offers no Update.
+- Only Windows asks, so only Windows records the versions that have run; the Mac stores no path for its default app.
 
 ### File icons
 
@@ -7352,7 +7539,7 @@ Settings → FILE ASSOCIATIONS lets Falcon register itself for photo types in th
 
 ### Registration (corrected text for the old registry paragraph)
 
-Falcon registers one Windows file type per extension (a "ProgID" such as `Falcon.Image.jpg`). The older shared type `Falcon.Image` stays registered because some people chose it as their default before the per-format types existed. Windows protects those default choices (`UserChoice`), so Falcon never edits them and never replaces an open command another app wrote. Automatic changes at startup only happen in the copy of Falcon that Windows has registered. These changes are: moving old registrations to the per-format types, refreshing icons, repairing the type name, and removing stale `.heic`/`.heif` entries. Falcon checks which copy is registered by comparing the quoted absolute path in the registered open command with its own executable. It resolves both paths and ignores letter case the way Windows does (`owned_command_path`, `canonical_exe`). If the path is missing, malformed or ambiguous, Falcon changes nothing until the user presses **Update**. A different copy of Falcon still saves the Distinct RAW-format icons choice. It takes effect when the registered copy next starts, or when Update registers the new copy. Update writes open commands and icons together. Changing the RAW icon choice rewrites only RAW icon entries and never re-runs full registration. Families the user switched off stay off. **Remove** deletes both kinds of Falcon registration and leaves other apps' entries alone. Never write an extension-wide `DefaultIcon`, because it would override the icon of whichever other app opens that type.
+Falcon registers one Windows file type per extension (a "ProgID" such as `Falcon.Image.jpg`). The older shared type `Falcon.Image` stays registered because some people chose it as their default before the per-format types existed. Windows protects those default choices (`UserChoice`), so Falcon never edits them and never replaces an open command another app wrote. Automatic changes at startup only happen in the copy of Falcon that Windows has registered. These changes are: moving old registrations to the per-format types, refreshing icons, repairing the type name, and removing stale `.heic`/`.heif` entries. Falcon checks which copy is registered by comparing the quoted absolute path in the registered open command with its own executable. It resolves both paths and ignores letter case the way Windows does (`owned_command_path`, `canonical_exe`). If the path is missing, malformed or cannot be resolved, Falcon changes nothing until the user presses **Update**; a newer copy offers that Update with [the update prompt](#the-update-prompt-windows). A different copy of Falcon still saves the Distinct RAW-format icons choice. It takes effect when the registered copy next starts, or when Update registers the new copy. Update writes open commands and icons together, and moves a switched-off family's leftover type and the helper's fallback icon to the new copy too. Changing the RAW icon choice rewrites only RAW icon entries and never re-runs full registration. Families the user switched off stay off. **Remove** deletes both kinds of Falcon registration and leaves other apps' entries alone. Never write an extension-wide `DefaultIcon`, because it would override the icon of whichever other app opens that type.
 
 **No type description on Falcon's file classes.** Every class Falcon registers is written with no default value: the legacy `Falcon.Image` class and the per-format `Falcon.Image.<ext>` classes, all written by `write_class` in `windows_assoc.rs`. A class's default value is the shell's description of the file type. If Falcon set one, Explorer would show it as the Type of every photo (for example "Falcon photo" for JPG, CR3 and PNG alike), even where Falcon is not the default app. With no value, Explorer shows its own per-format name ("JPG File", "CR3 File"), as Windows Photos does. Older builds wrote such a description. At startup `assoc_repair_type_name` deletes it from `Falcon.Image`. It acts only in the registered copy, behind the same ownership check as icon upgrades. It never creates a key, and it notifies the shell (`SHChangeNotify`) only when it changed something.
 
@@ -7366,12 +7553,17 @@ The welcome panel also has **File associations → Apply to all** below The keys
 supported formats and reuses the existing handlers: Windows selects all available families
 (excluding HEIC when its system codec is unavailable) and calls `assoc-apply`; Mac calls the
 existing all-formats `assoc-prompt-choice(2)` route, retaining its per-type previous defaults.
+When it works, the button greys out and reads "Applied to all supported formats" until the guide
+closes (owner, 29 October 2026: before, nothing showed that it had worked). On the Mac that needs
+every format to have been set. A failure leaves the button as it was; on Windows the error line
+shows under it (`welcome-assoc-applied`, set by `assoc_apply_ui` and the Mac choice only while the
+guide is open, cleared when it closes).
 The wheel-browsing option lives in The feel above Quick benchmark, with the same saved preference.
 
 `support::ASSOC_FAMILIES` is the single list of formats Falcon can be associated with, in Settings-row order: JPEG, PNG (with APNG), TIFF, HEIC, WebP, GIF, BMP, JPEG XL and RAW (`falcon_decode::RAW_EXTS`). Register, read-back and remove all walk this list. Unsupported formats (AVIF, TGA) are deliberately left out.
 
-- **HEIC on Windows depends on a Store codec.** Windows decodes HEIC only when the Microsoft Store HEVC/HEIF extensions are installed. `heic_codec_present` asks the read-only WIC probe (`falcon_decode::wic_heif_codec_present`, cached per session). When the codec is missing, `gate_heic` forces the HEIC family off in Apply, and the Settings row is faded with the tip "Requires the HEVC/HEIF Image Extensions from the Microsoft Store" (`platform::heic_assoc_missing_tip`). `HEIC_FAMILY_IDX` names that row. On Mac, HEIC is always available.
-- **macOS.** The app's `Info.plist`, written by `scripts/mac-bundle.sh`, declares every family with Falcon as a viewer at the "Alternate" rank (`LSHandlerRank`). That only adds Falcon to Finder's Open With list; it does not make Falcon the default. The Settings card's **Make default** and **Reset** buttons set the per-user double-click default through LaunchServices in `mac_assoc.rs`. Each extension is resolved to its live system type identifier (UTI) at call time with `UTTypeCreatePreferredIdentifierForTag`. Reset returns to the previous default Falcon captured, if that app still exists; otherwise to Preview; otherwise the button is disabled (`assoc_reset_target`). The first-launch question offers None, RAW + JPEG/HEIC, or all formats (`assoc_prompt_families`). `support::MAC_FAMILY_UTIS` is an evidence table, not runtime input; the test `mac_plist_covers_assoc_families` keeps it, the family list and the plist in step. A default only takes effect from the real `.app`, not from an unbundled binary.
+- **HEIC on Windows depends on a Store codec.** Windows decodes HEIC only when the Microsoft Store HEVC/HEIF extensions are installed. `heic_codec_state` asks the read-only WIC probe (`falcon_decode::wic_heif_codec_state`, cached per session), which has three answers: installed, not installed, or unknown (the check failed or was incomplete). Only a definite "not installed" counts as missing (`heic_assoc_available`); unknown leaves the row enabled and every HEIC claim in place, so a failed check can't silently remove a working registration at startup. When the codec is missing, `gate_heic` forces the HEIC family off in Apply, and the Settings row is faded with the tip "Requires the HEVC/HEIF Image Extensions from the Microsoft Store" (`platform::heic_assoc_missing_tip`). `HEIC_FAMILY_IDX` names that row. On Mac, HEIC is always available.
+- **macOS.** The app's `Info.plist`, written by `scripts/mac-bundle.sh`, declares every family with Falcon as a viewer at the "Alternate" rank (`LSHandlerRank`). That only adds Falcon to Finder's Open With list; it does not make Falcon the default. The Settings card's **Make default** and **Reset** buttons set the per-user double-click default through LaunchServices in `mac_assoc.rs`. Each extension is resolved to its live system type identifier (UTI) at call time with `UTTypeCreatePreferredIdentifierForTag`. Reset changes only the types Falcon is currently the default for, so a type the user has given to another app stays with it (`assoc_reset_plan`). For those, it returns to the previous default Falcon captured, if that app still exists; otherwise to Preview; otherwise the button is disabled (`assoc_reset_target`). A successful Reset forgets the captured app, so the next Make default captures afresh (`assoc_reset_step`). The default is bound to the bundle ID, not a path, so moving or replacing `Falcon.app` keeps it; with several copies installed, macOS chooses which one opens, so updating means replacing the old app. The first-launch question offers None, RAW + JPEG/HEIC, or all formats (`assoc_prompt_families`); the welcome guide's **Apply to all** answers it too, so it doesn't ask again. A test or diagnostic build can't set defaults, so it never asks and its Apply to all is disabled (`assoc_popup_allowed`). `support::MAC_FAMILY_UTIS` is an evidence table, not runtime input; the test `mac_plist_covers_assoc_families` keeps it, the family list and the plist in step. A default only takes effect from the real `.app`, not from an unbundled binary.
 - Files opened from Finder arrive through the Apple Events handler in `macos_open.rs` (`install_odoc_handler`).
 - Mac test builds and the automated launch check never change associations (`mac_experiment::associations_allowed`).
 
@@ -7381,12 +7573,12 @@ The app icon and the generic document icon are built with Apple's `iconutil` fro
 
 ## About card
 
-Clicking the version at the bottom of Settings opens the About card (`ui/about.slint`, `about.rs`) on top of Settings. It shows the app icon, the name Falcon Photo Viewer, the running version and the designer credit, then three public links: the GitHub repository (`falcon-photo-viewer`), Instagram (`@hwuphoto`) and LinkedIn. The personal email is not part of the card. The × button, Escape or a click outside closes only the card and returns to Settings as it was.
+Clicking the version at the bottom of Settings opens the About card (`ui/about.slint`, `about.rs`) on top of Settings. It shows the app icon, the name Falcon Photo Viewer, the running version and the designer credit, then a **Check for updates** link and three public links: the GitHub repository (`falcon-photo-viewer`), Instagram (`@hwuphoto`) and LinkedIn. Check for updates only opens the latest-release page in the browser; Falcon makes no network request. The personal email is not part of the card. The × button, Escape or a click outside closes only the card and returns to Settings as it was.
 
 - The card fits its contents. An error message makes it taller, and in a short window the body scrolls (a stretch-1 `Flickable`) while × stays visible.
 - While open it counts as a dialog: it blocks the photo and inspection like other dialogs, and it takes key presses before photo shortcuts or shortcut rebinding. The same open state feeds the shared Windows/Mac toolbar.
 - Its position is snapped to whole device pixels so text stays sharp.
-- `about.rs` maps the three links, by number, to fixed HTTPS profile/repository addresses. Nothing from a photo or from the user is passed to the system's link opener, and a hidden card or an unknown action opens nothing. If opening fails, the error stays visible on the card.
+- `about.rs` maps the four links, by number, to fixed HTTPS addresses (the latest-release page, the repository and two profiles). Nothing from a photo or from the user is passed to the system's link opener, and a hidden card or an unknown action opens nothing. If opening fails, the error stays visible on the card.
 
 The version button is left-aligned with the Settings content; Show welcome stays on the right. Clicking the version still opens the About card. This supersedes the earlier centred-version layout.
 

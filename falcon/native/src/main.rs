@@ -17,6 +17,11 @@
 #[cfg(test)]
 #[path = "../../crates/test-support/fixture_paths.rs"]
 mod fixture_paths;
+// The time limit for the tests that reach the graphics driver (`support::publish_tests`), shared with
+// the other crates' hardware tests.
+#[cfg(test)]
+#[path = "../../crates/test-support/hw_child.rs"]
+mod hw_child;
 // First, so its message macros (`tr_format!`, `tr_plural!`, `tr_noop!`) reach every module below.
 #[macro_use]
 mod i18n;
@@ -1329,8 +1334,10 @@ fn mac_assoc_rows_build() -> Vec<MacAssocRow> {
             let utis = mac_assoc::resolve_utis(exts);
             let legacy_uti = utis.first().cloned().unwrap_or_default();
             let map = support::decode_prev_map(prev[i].as_deref(), &legacy_uti);
+            // 1.1.0-rc.1 (issue #11 batch, M2): only a type Falcon is the default for can be reset.
             let reset_enabled = utis.iter().any(|uti| {
-                assoc_reset_target(map.get(uti).map(String::as_str), &mac_assoc::all_handlers(uti)).is_some()
+                support::assoc_reset_plan(mac_assoc::default_handler(uti).as_deref(),
+                    map.get(uti).map(String::as_str), &mac_assoc::all_handlers(uti)).is_some()
             });
             let note = if !mac_experiment::associations_allowed() { i18n::tr("unavailable in test builds") }
                 else if reset_enabled { "" } else { i18n::tr("no previous default to restore") };
@@ -1350,9 +1357,11 @@ fn mac_assoc_rows_build() -> Vec<MacAssocRow> {
 /// family's per-UTI incumbent map, then set every UTI to Falcon. A multi-vendor RAW user's per-vendor
 /// defaults are each preserved so Reset can restore them independently. One greppable log line.
 #[cfg(target_os = "macos")]
-fn mac_make_default_family(idx: usize) {
-    if !mac_experiment::associations_allowed() { return; }
-    let Some((label, exts)) = ASSOC_FAMILIES.get(idx) else { return };
+/// Returns whether every type of the family now opens in Falcon (2026-10-29: the guide's Apply to all
+/// says so only when all of them did).
+fn mac_make_default_family(idx: usize) -> bool {
+    if !mac_experiment::associations_allowed() { return false; }
+    let Some((label, exts)) = ASSOC_FAMILIES.get(idx) else { return false };
     let utis = mac_assoc::resolve_utis(exts);
     let legacy_uti = utis.first().cloned().unwrap_or_default();
     let mut map = support::decode_prev_map(assoc_prev_snapshot()[idx].as_deref(), &legacy_uti);
@@ -1370,10 +1379,12 @@ fn mac_make_default_family(idx: usize) {
         log_event(&format!(
             "assoc: set default {label} -> {FALCON_BUNDLE_ID} ({ok} UTIs, {captured} incumbent(s) captured)"
         ));
+        true
     } else {
         log_event(&format!(
             "assoc: set default {label} FAILED ({ok} UTIs set, first status {err})"
         ));
+        false
     }
 }
 
@@ -2180,6 +2191,61 @@ fn custom_icc_failure_state(persisted_gamut: i32, path: &str, display: &str) -> 
 /// destroy the remembered selection on the next periodic save.
 fn gamut_pick_clears_hold(live: i32, picked: i32) -> bool {
     live != picked
+}
+
+/// Settings' Update / Add to Open With, the welcome guide's Apply to all and the update prompt's
+/// Update, as ONE body the rig tests drive with a fake `apply` (the `file_icons::wire_preference`
+/// seam). It applies the checkbox properties, which `refresh-assoc` loads from the registry.
+/// 1.1.0-rc.1 (issue #11): a successful apply also cancels a waiting update prompt — photos now open
+/// in this exe, so the prompt must not open after the guide that offered Apply to all closes.
+fn assoc_apply_ui(a: &MainWindow, heic_avail: bool, apply: impl FnOnce(&[bool], bool) -> std::io::Result<()>) {
+    // Index order == support.rs ASSOC_FAMILIES (v0.8.59: +gif/bmp/jxl before raw).
+    let mut on = [
+        a.get_assoc_jpeg(),
+        a.get_assoc_png(),
+        a.get_assoc_tiff(),
+        a.get_assoc_heic(),
+        a.get_assoc_webp(),
+        a.get_assoc_gif(),
+        a.get_assoc_bmp(),
+        a.get_assoc_jxl(),
+        a.get_assoc_raw(),
+    ];
+    // v0.8.71: no codec → HEIC never registers (and a previously-registered HEIC family's
+    // entries are REMOVED by this apply — the unchecked-family cleanup path). The property
+    // is already false (boot force + the row's disable), so this gate is belt-and-braces.
+    // 1.1.0-rc.1 (A5): `heic_avail` is false only for a DEFINITE absence.
+    support::gate_heic(&mut on, heic_avail);
+    match apply(&on, a.get_distinct_raw_icons()) {
+        Ok(()) => {
+            a.set_assoc_registered(true);
+            a.set_assoc_status("".into());
+            a.set_update_prompt_armed(false);
+            // 2026-10-29 (owner: the guide's Apply to all gave no feedback): while the guide is open
+            // only its Apply to all can apply (Settings and the update prompt never stack with it), so
+            // its button now says it worked until the guide closes.
+            if a.get_welcome_open() {
+                a.set_welcome_assoc_applied(true);
+            }
+            log_event(&format!("assoc: registered/updated (families {on:?})"));
+        }
+        Err(e) => {
+            a.set_assoc_status(tr_format!("Couldn't write the registration: {error}", error = e).into());
+            log_event(&format!("assoc: register FAILED: {e}"));
+        }
+    }
+}
+
+/// Settings' Remove, as ONE body the rig tests drive with a fake `remove` (the registry delete).
+/// 1.1.0-rc.1 (review R2): it also cancels a waiting update prompt — photos no longer open in Falcon,
+/// so there is nothing to update (`support::update_prompt`), and the prompt must not open after the
+/// Settings panel the guide closed into.
+fn assoc_remove_ui(a: &MainWindow, remove: impl FnOnce()) {
+    remove();
+    a.set_assoc_registered(false);
+    a.set_assoc_status("".into());
+    a.set_update_prompt_armed(false);
+    log_event("assoc: removed");
 }
 
 /// v0.8.104 (Round-A C8): the boot RESTORE-FAILURE arm as a pure-ish function — the app writes plus
@@ -4410,6 +4476,8 @@ struct FastWorkerCtx {
     /// v0.8.172 (G4): the one-decode master's way out of this thread — the SECOND producer on the
     /// v0.8.115 derive worker's inbox.
     derive_tx: std::sync::mpsc::SyncSender<support::DeriveJob>,
+    /// 2026-10-28 (the cloud-only round): `Film::cloud_skipped`, where a refused job's file is noted.
+    cloud_skipped: Arc<support::CloudNotes>,
 }
 
 /// v0.9.23 (one-pool) — the fast-tier per-job body, so BOTH pool shapes run one implementation.
@@ -4418,7 +4486,15 @@ struct FastWorkerCtx {
 /// worker (v0.8.142 → v0.8.174 — the one-decode arm, the supersession watch, the route-tagged
 /// stats, the panic latch). The extraction is the only difference: main spawns this inline,
 /// macOS's elastic worker calls it too, and there is still exactly one copy of the logic.
-fn run_fast_job(ctx: &FastWorkerCtx, idx: usize, regime_at_pop: u32) -> bool {
+fn run_fast_job(ctx: &FastWorkerCtx, idx: usize, regime_at_pop: u32, local_only: bool) -> bool {
+    run_fast_job_with(ctx, idx, regime_at_pop, local_only, falcon_decode::file_is_cloud_placeholder)
+}
+
+/// [`run_fast_job`] with the cloud probe passed in (the `run_thumb_job_with` seam). `local_only` is
+/// the tick's mark (`support::Pump::local_only_q`): nobody is looking at this photo.
+fn run_fast_job_with(
+    ctx: &FastWorkerCtx, idx: usize, regime_at_pop: u32, local_only: bool, is_cloud: impl Fn(&std::path::Path) -> bool,
+) -> bool {
     let gen_at_pop = ctx.generation.load(Ordering::Relaxed);
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> bool {
         let cur = ctx.cur_atomic.load(Ordering::Relaxed);
@@ -4440,6 +4516,27 @@ fn run_fast_job(ctx: &FastWorkerCtx, idx: usize, regime_at_pop: u32) -> bool {
             let dim = ctx.scrub_dim_atomic.load(Ordering::Relaxed);
             let sup = ctx.fast_super.load(Ordering::Relaxed);
             if let Some(shot) = snap.get(idx) {
+                // ── 2026-10-28 (the cloud-only round, design 4): NOTHING AHEAD IS DOWNLOADED ─────
+                //
+                // A preview nobody is looking at (the tick's mark) reads its file only if it is on
+                // this device: one metadata call, here on the worker so a slow share never holds
+                // the window, and BEFORE the lane door below, which parses the file. The current
+                // photo is never refused (it may have become current since the tick marked it). A
+                // refusal is not a failure: no frame, no latch, the not-sent arm below frees
+                // `inflight`, and the note stops the tick queueing it again this folder.
+                //
+                // FALSIFIER (L28): drop this check and `a_preview_ahead_never_reads_a_cloud_only_file`
+                // reddens with a decoded frame.
+                if let Some(file) = support::speculative_read_refused(
+                    local_only, idx == cur, shot, support::ReadTier::Fast, &is_cloud,
+                ) {
+                    if support::note_cloud(&ctx.cloud_skipped, &ctx.generation, g, idx, file) {
+                        log_event(&format!(
+                            "cloud: #{idx} is only in the cloud — not prepared ahead, not downloaded (any more this folder are noted without a line)"
+                        ));
+                    }
+                    return false;
+                }
                 // ── v0.8.170 (ONE DECODE PER SHOT): THE LANE DOOR'S OWN QUESTION ────────
                 //
                 // Is this file going to decode on the D3D11VA lane, and is the full-res
@@ -4884,7 +4981,7 @@ fn spawn_fixed_fast_pool(nworkers: usize, pool18: bool, ctx: &FastWorkerCtx) {
             // decode gains little from more, measured in the round's `fix/lane_bench`).
             let mut prep = prep_priority::PREP.worker(1);
             loop {
-                let (idx, regime_at_pop) = {
+                let (idx, regime_at_pop, local_only) = {
                     let (m, cv) = &*ctx.pump;
                     let mut p = m.lock().unwrap_or_else(|e| e.into_inner());
                     loop {
@@ -4905,7 +5002,7 @@ fn spawn_fixed_fast_pool(nworkers: usize, pool18: bool, ctx: &FastWorkerCtx) {
                 };
                 // 2026-10-25 (round 3 step a): a preview nobody asked for decodes below normal
                 // priority, its decoder's parallel work with it (`prep_priority`).
-                prep.run(prep_priority::Job::Frame(idx), || run_fast_job(&ctx, idx, regime_at_pop));
+                prep.run(prep_priority::Job::Frame(idx), || run_fast_job(&ctx, idx, regime_at_pop, local_only));
             }
         });
     }
@@ -4929,7 +5026,7 @@ struct ThumbWorkerCtx {
     frost_map: tick::FrostMap, // v0.8.32 (§64): park the 160 px frost mip via Film
     auto_orient: Arc<AtomicBool>, // v0.8.0: gates the per-thumb orientation read
     orient_cache: Arc<Mutex<OrientCache>>, // F2b: shared JPG-side base cache
-    cloud_skipped: Arc<Mutex<HashSet<(u64, usize)>>>, // round 2b: the whole folder's online-only finds, via Film
+    cloud_skipped: Arc<support::CloudNotes>, // the cloud-only round: the files found online-only, via Film
 }
 
 /// ONE thumbnail job, panic-guarded — the pre-v0.9.23 thumb-worker body verbatim (including the
@@ -4941,7 +5038,7 @@ fn run_thumb_job(ctx: &ThumbWorkerCtx, req: support::ThumbReq) {
 /// [`run_thumb_job`] with the cloud probe passed in, so a test can stand in for a placeholder (no test
 /// can make a real one — the `gif_rotate_verdict_with` precedent).
 fn run_thumb_job_with(ctx: &ThumbWorkerCtx, req: support::ThumbReq, is_cloud: impl Fn(&std::path::Path) -> bool) {
-    let support::ThumbReq { idx, gen: req_gen, delta, local_only, .. } = req;
+    let support::ThumbReq { idx, gen: req_gen, delta, .. } = req;
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let (snap, g) = {
             let s = ctx.shots.lock().unwrap_or_else(|e| e.into_inner());
@@ -4951,28 +5048,25 @@ fn run_thumb_job_with(ctx: &ThumbWorkerCtx, req: support::ThumbReq, is_cloud: im
             return; // folder swapped since the request — apply_scan cleared thumb_pending
         }
         if let Some(shot) = snap.get(idx) {
-            // 2026-10-27 (round 2b, owner: "do the check") — THE WHOLE FOLDER READS ONLY WHAT IS STILL
-            // ON THIS DEVICE. The scan's cloud tags miss a file made online-only since (Free up space,
-            // Storage Sense, Optimise Mac Storage), and reading one downloads it: batch work never
-            // does. So a whole-folder job asks the file's metadata just before the read and, for an
-            // online-only file, answers with an empty marker (the pending slot frees) WITHOUT the
-            // failure latch — a tile on screen still asks for its thumbnail as before — and notes it
-            // for the feeder (`Film::cloud_skipped`), which asks for it no more this folder. Here on
+            // 2026-10-27 (round 2b, owner: "do the check") → 2026-10-28 (the cloud-only round, owner:
+            // "stop the downloads") — A THUMBNAIL NEVER READS A FILE THAT IS ONLY IN THE CLOUD,
+            // whatever asked for it: a tile on screen, the backdrop or the whole folder. Reading one
+            // downloads it, and only viewing a photo may (the stage's own decode). So every job asks
+            // the metadata of the ONE file a thumbnail reads (`support::read_file`: the JPEG of a
+            // pair, so a pair whose RAW alone is in the cloud still gets its picture) just before the
+            // read and, for an online-only file, answers with an empty marker (the pending slot frees)
+            // WITHOUT the failure latch, and notes it (`Film::cloud_skipped`) BEFORE the marker, so
+            // the rebuild the marker triggers already draws the cloud mark and asks no more. Here on
             // the worker, not in the tick, so a stalled network share can never hold up the window.
+            // The current photo's tile is not exempt (queued jobs outlive `c` during a scrub): it
+            // turns into the picture when the photo lands (`tick::step_cloud_landed_with`).
             //
-            // FALSIFIER (L28): drop this check and `a_whole_folder_job_skips_a_file_only_in_the_cloud`
+            // FALSIFIER (L28): drop this check and `every_thumbnail_job_skips_a_file_only_in_the_cloud`
             // reddens with the decode attempted and the failure latched.
-            if local_only && support::shot_is_cloud_only(shot, &is_cloud) {
-                let first = {
-                    let mut s = ctx.cloud_skipped.lock().unwrap_or_else(|e| e.into_inner());
-                    // Only for the folder still open, asked under the lock: a swap moves the generation
-                    // before `Film::on_folder_swap` clears this set under the same lock, so an old
-                    // folder's find never lands in the new folder's set or takes its one log line.
-                    ctx.generation.load(Ordering::Relaxed) == g && s.insert((g, idx)) && s.len() == 1
-                };
-                if first {
+            if let Some((file, _)) = support::read_file(shot, support::ReadTier::Thumb).filter(|(_, p)| is_cloud(p)) {
+                if support::note_cloud(&ctx.cloud_skipped, &ctx.generation, g, idx, file) {
                     log_event(&format!(
-                        "whole-folder thumbnails: #{idx} is only in the cloud now — skipped, not downloaded (any more this folder are skipped without a line)"
+                        "thumbnails: #{idx} is only in the cloud — shown as a cloud, not downloaded (any more this folder are noted without a line)"
                     ));
                 }
                 let _ = ctx.thumb_res_tx.send((idx, g, Vec::new(), 0, 0, 0, 0, 0));
@@ -5028,13 +5122,11 @@ fn run_thumb_job_with(ctx: &ThumbWorkerCtx, req: support::ThumbReq, is_cloud: im
                     // the 160 px (BLUR_DIM) frost mip — trivial on the small buffer — and park
                     // it in the shared map so a FAST decode of this shot skips the ~44.8 MB
                     // per-frame downscale. Written UNCONDITIONALLY (the frost_thumb flag gates
-                    // only the READ, so a live flip finds a warm map). Gen-rechecked before the
-                    // insert (like fast_failed) to NARROW the swap window — but the recheck and
-                    // the insert aren't atomic with apply_scan's clear, so a residual race can
-                    // still seed ≤ thumb-worker-count stale mips (one per worker losing
-                    // the recheck race) into the NEW folder's same-index frost; the next swap-
-                    // clear or a drain_thumbs eviction reaps them (apply_scan clears the map on
-                    // swap; drain_thumbs evicts it in lockstep with the thumb cache).
+                    // only the READ, so a live flip finds a warm map). The generation is checked
+                    // UNDER the map's lock (`tick::park_frost_mip`), and apply_scan clears the map
+                    // under that lock after moving the generation, so an old folder's mip can never
+                    // land in the next folder's map (round 2b review P1); drain_thumbs still evicts
+                    // it in lockstep with the thumb cache.
                     // v0.8.106 (Round-A final check): the mip is stamped with ITS OWN source
                     // description. `Lane::Thumb` is the one lane that can serve a HEIC tile through
                     // the embedded-preview door, and that item carries its own `colr` — W5 taught
@@ -5044,13 +5136,12 @@ fn run_thumb_job_with(ctx: &ThumbWorkerCtx, req: support::ThumbReq, is_cloud: im
                     // (the same value the tile transform below uses).
                     let src_gamut = falcon_decode::frame_source_gamut(shot, source);
                     let (mip, mw, mh) = falcon_decode::downscale_frost_rgba(&rgba, w, h, BLUR_DIM);
-                    if ctx.generation.load(Ordering::Relaxed) == g {
-                        let mip: Arc<[u8]> = mip.into();
-                        ctx.frost_map
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(idx, (mip, mw, mh, src_gamut));
-                    }
+                    tick::park_frost_mip(
+                        &ctx.frost_map,
+                        || ctx.generation.load(Ordering::Relaxed) == g,
+                        idx,
+                        (mip.into(), mw, mh, src_gamut),
+                    );
                     // v0.8.0: thumbs are the ONE payload rotated CPU-side at decode
                     // (256 px — sub-ms; every larger tier rotates on the GPU at
                     // upload). Compose with the worker-read RAW base + the request's
@@ -5236,8 +5327,9 @@ fn elastic_pool_worker(
     thumb_done: Arc<AtomicUsize>,
 ) {
     enum Job {
-        /// v0.8.112 (R3): (index, costly-inflight count at pop) — the sample's regime annotation.
-        Fast(usize, u32),
+        /// v0.8.112 (R3): (index, costly-inflight count at pop) — the sample's regime annotation —
+        /// and the cloud-only round's mark (nobody is looking at it).
+        Fast(usize, u32, bool),
         Thumb(support::ThumbReq),
     }
     let try_fast = |ctx: &FastWorkerCtx| -> Option<Job> {
@@ -5246,7 +5338,7 @@ fn elastic_pool_worker(
         // `support::pump_pop`, three callers (this, `spawn_fixed_fast_pool`, and the tick suite's
         // `Rig::pop_all`). v0.8.112 hand-mirrored it here, which is exactly the drift the round's
         // own merge note called load-bearing.
-        support::pump_pop(&mut p).map(|(i, regime)| Job::Fast(i, regime))
+        support::pump_pop(&mut p).map(|(i, regime, local_only)| Job::Fast(i, regime, local_only))
     };
     let try_thumb = || -> Option<Job> {
         // try_recv never blocks; the lock is held only for the dequeue (never nested with the
@@ -5277,8 +5369,8 @@ fn elastic_pool_worker(
             try_fast(&fast_ctx).or_else(try_thumb)
         };
         match job {
-            Some(Job::Fast(idx, costly_regime)) => {
-                if run_fast_job(&fast_ctx, idx, costly_regime) {
+            Some(Job::Fast(idx, costly_regime, local_only)) => {
+                if run_fast_job(&fast_ctx, idx, costly_regime, local_only) {
                     delivered.fetch_add(1, Ordering::Relaxed); // the governor's delivered-fps input
                 }
             }
@@ -7508,7 +7600,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // v0.8.115 (DERIVE-DON'T-DECODE): `(idx, derive)` — the tick's suppression decision rides WITH
     // the detail request, so the worker cannot derive for a shot whose fast decode was dispatched
     // anyway (or fail to derive for one whose decode was suppressed). See `derive_c_fast_frame`.
-    let (req_tx, req_rx) = channel::<(usize, bool)>();
+    // 2026-10-28 (the cloud-only round): `(idx, derive, local_only)` — nobody is looking at it, so the
+    // worker reads its file only if it is on this device (`tick::step_prefetch_detail`).
+    let (req_tx, req_rx) = channel::<(usize, bool, bool)>();
     // v0.8.115: the DERIVE worker's inbox — a RENDEZVOUS channel (capacity 0) fed with `try_send`.
     // That combination is the whole of the derive's resource posture, and it is deliberate:
     //   * `try_send` on a rendezvous channel succeeds ONLY when the derive worker is sitting in
@@ -7870,6 +7964,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         raw_mode: raw_mode.clone(),
         det_epoch: det_epoch.clone(),
         derive_tx: derive_tx.clone(),
+        cloud_skipped: film.cloud_skipped.clone(), // the cloud-only round: the workers' notes, via Film
     };
     // 2026-10-25 (round 3 step a): before the first worker starts; each takes its own place and
     // low-priority pool as it starts (Windows only).
@@ -8054,6 +8149,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let derive_tx = derive_tx.clone();
         let scrub_dim_atomic_d = scrub_dim_atomic.clone();
         let fast_super_d = fast_super.clone();
+        let cloud_skipped_d = film.cloud_skipped.clone(); // the cloud-only round: the workers' notes
         std::thread::spawn(move || {
             // GPU RAW developer, created lazily on first RAW use (its own wgpu device;
             // safe to create now since CUDA/nvJPEG already initialised before any D3D12).
@@ -8079,7 +8175,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // One request per job (the tick only sends when idle, so no chase-drain).
             // v0.8.115: `derive` = the tick suppressed this shot's fast decode, so this master is
             // the ONLY source its scrub-tier frame will have.
-            while let Ok((idx, derive)) = req_rx.recv() {
+            while let Ok((idx, derive, local_only)) = req_rx.recv() {
                 // G2 cancelation: this SOLE worker head-of-line-blocked the landed shot behind a
                 // stale neighbor decode (~140–500 ms). The decode call itself can't be interrupted,
                 // but everything around it can: abandon the job (a) before starting and (b) after
@@ -8128,6 +8224,41 @@ fn main() -> Result<(), Box<dyn Error>> {
                     det_cpu_busy.store(false, Ordering::Relaxed); // v0.8.99 (H4): nothing in flight → no collapse
                     continue;
                 }
+                // ── 2026-10-28 (the cloud-only round, design 4): NOTHING AHEAD IS DOWNLOADED ────────
+                // A neighbour nobody is looking at (the tick's `local_only`) reads its file only if it
+                // is on this device (the RAW in RAW mode): one metadata call before the first read
+                // below. Answered like `jumped_away`: skipped (re-requestable, no failure latch), this
+                // worker free again, and noted so the tick passes over it this folder. The current
+                // photo and the frame a blocked browse waits for are never refused.
+                // R1 (Codex's review, 29 October): the job reads the RAW-mode switch ONCE, in this
+                // check (`support::detail_job_mode`), and every read below takes that answer
+                // (`job_raw_mode`), so a toggle mid-job can never check one file and open the other.
+                // The RAW-mode epoch read above still discards the frame of a job that read the old mode.
+                let job_raw_mode = if let Some(shot) = snap.get(idx) {
+                    let explicit_now = idx == cur_atomic.load(Ordering::Relaxed)
+                        || det_awaited_w.load(Ordering::Relaxed) == idx as i64;
+                    match support::detail_job_mode(
+                        &raw_mode, local_only, explicit_now, shot, falcon_decode::file_is_cloud_placeholder,
+                    ) {
+                        Ok(mode) => mode,
+                        Err(file) => {
+                            if support::note_cloud(&cloud_skipped_d, &generation, g, idx, file) {
+                                log_event(&format!(
+                                    "cloud: full-res #{idx} is only in the cloud — not prepared ahead, not downloaded (any more this folder are noted without a line)"
+                                ));
+                            }
+                            let _ = det_tx.send(Detail {
+                                id: idx, gen: g, epoch: det_ep, rgba: Vec::new(), w: 0, h: 0, ms: 0,
+                                gpu: false, skipped: true, yuv: None, base: 0,
+                            });
+                            det_busy.store(false, Ordering::Relaxed);
+                            det_cpu_busy.store(false, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                } else {
+                    false // out of range (a folder swap): answered below, nothing is read
+                };
                 // 2026-10-25 (round 3 step a): a neighbour nobody asked for decodes with this thread
                 // below normal priority, and its CPU decode and colour conversion run on this
                 // worker's low pool. It owns thread-bound state (the GPU RAW developer, nvJPEG, the
@@ -8152,7 +8283,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     });
                 }
                 if let Some(shot) = snap.get(idx) {
-                    let raw = raw_mode.load(Ordering::Relaxed) && shot.has_raw;
+                    let raw = job_raw_mode && shot.has_raw; // R1: the mode the cloud check used
                     // v0.8.0 (item a): THIS tier's RAW base orientation — raw-aware: in RAW mode it is
                     // the RAW's metadata orientation (rawler raw_metadata().exif.orientation — NOT the
                     // RawImage.orientation stub), else the finished image's EXIF. A RAW+JPG pair may in
@@ -9143,7 +9274,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         auto_orient: auto_orient.clone(), // v0.8.0: gates the per-thumb orientation read
         orient_cache: meta.orient_cache.clone(), // F2b: shared JPG-side base cache
         output_gamut: output_gamut.clone(), // v0.8.104 (Round-A C2): the thumb tier's CM destination
-        cloud_skipped: film.cloud_skipped.clone(), // round 2b: the whole folder's online-only finds, via Film
+        cloud_skipped: film.cloud_skipped.clone(), // the cloud-only round: the files found online-only, via Film
     };
     #[cfg(not(target_os = "macos"))]
     spawn_fixed_thumb_pool(&thumb_rx_shared, &thumb_ctx);
@@ -9377,12 +9508,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         // next launch). Codec absent → the row fades + disables (its explanation line mounts under
         // it) and the persisted-default checked state is forced off so a faded row can never render
         // checked. macOS: always true (Image I/O — the per-platform-availability rule).
-        let heic_avail = heic_codec_present();
+        // 1.1.0-rc.1 (issue #11, A5): only a DEFINITE absence disables the row and runs the cleanup
+        // below; a failed or incomplete check leaves HEIC exactly as it is.
+        let heic_state = heic_codec_state();
+        let heic_avail = heic_assoc_available(heic_state);
         app.set_assoc_heic_avail(heic_avail);
         app.set_assoc_heic_tip(platform::heic_assoc_missing_tip().into());
         if !heic_avail {
             app.set_assoc_heic(false);
             log_event("assoc: WIC HEIF codec absent — HEIC row disabled");
+        } else if heic_state.is_none() {
+            log_event("assoc: HEIC codec check failed — leaving HEIC associations untouched");
         }
         // Remove stale HEIC claims only from the registered copy. This narrow cleanup never
         // invokes full Apply: starting another exe must not replace opening commands or icons.
@@ -9505,12 +9641,47 @@ fn main() -> Result<(), Box<dyn Error>> {
             // surface closes too. Welcome already seen in a prior launch → no welcome, so modal-open
             // never transitions for the observer to catch; the popup opens at boot directly (idle by
             // construction — no panel is up before app.run()). Exactly once, as before.
+            // 1.1.0-rc.1 (issue #11 batch, M4): a test build can't set defaults, so it never asks.
+            let (assoc_arm_now, assoc_open_at_boot) =
+                support::assoc_popup_allowed(assoc_arm_now, assoc_open_at_boot, mac_experiment::associations_allowed());
             if assoc_arm_now {
                 app.set_assoc_prompt_armed(true);
                 log_event("assoc: first-launch popup armed (opens when the UI is idle)");
             } else if assoc_open_at_boot {
                 app.set_assoc_prompt_open(true);
                 log_event("assoc: first-launch popup opened (welcome already shown)");
+            }
+        }
+        // 1.1.0-rc.1 (issue #11): THE UPDATE PROMPT (owner's diagram, 27 October). Every launch of a
+        // version whose photos still open in another copy offers "Update to Falcon {version}", until
+        // they open here; an older version than one already run never offers it. Only Windows asks, so
+        // only Windows records the versions that have run (`VERSIONS_RUN_DIR`, write-once: review R1).
+        #[cfg(windows)]
+        {
+            let older_than_newest = config_dir()
+                .is_some_and(|d| support::newest_version_boot(&d.join(VERSIONS_RUN_DIR), env!("CARGO_PKG_VERSION")));
+            // Cheap inputs first: the registry read and the versions; the file probe and the paths only
+            // when they can still change the answer.
+            let registered = assoc_registered();
+            let open_here = registered && !older_than_newest && assoc_opens_here();
+            let from_temp = registered && !older_than_newest && !open_here && std::env::current_exe()
+                .is_ok_and(|exe| support::exe_under(Some(&std::env::temp_dir()), &exe));
+            let prompt = support::update_prompt(registered, open_here, older_than_newest, from_temp);
+            if prompt != support::UpdatePrompt::Nothing {
+                let zip = prompt == support::UpdatePrompt::ExtractFirst;
+                app.set_update_version(env!("CARGO_PKG_VERSION").into());
+                app.set_update_prompt_zip(zip);
+                // The Mac popup's sequencing: never stacked with the welcome guide or any panel.
+                // Opens when the UI is idle (the `changed modal-open` observer), or now when no guide
+                // shows (idle by construction: nothing is up before app.run()).
+                let why = if zip { "running from the temp folder" } else { "photos open in another copy" };
+                if welcome_open_at_boot {
+                    app.set_update_prompt_armed(true);
+                    log_event(&format!("assoc: update prompt armed ({why}; opens when the UI is idle)"));
+                } else {
+                    app.set_update_prompt_open(true);
+                    log_event(&format!("assoc: update prompt opened ({why})"));
+                }
             }
         }
         // v0.8.69 (E/H2): the "Sync ratings to XMP" toggle (default OFF — absent key == pre-v0.8.69
@@ -10706,7 +10877,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // falsifiers). One body, beside `pump_pop`, for the same reason that one exists.
                 let (m, cv) = &*fast.pump;
                 let mut p = m.lock().unwrap_or_else(|e| e.into_inner());
-                if support::pump_push_front(&mut p, idx, capped) {
+                // The cloud-only round: the jump target is the photo now on screen, so it may download.
+                if support::pump_push_front(&mut p, idx, capped, false) {
                     cv.notify_one();
                 }
             }
@@ -13534,7 +13706,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 a.set_assoc_tiff(st[2]);
                 // v0.8.71: a stale HEIC registration (codec later uninstalled) must not re-check the
                 // now-disabled row; the next Apply's gate then cleans the stale registry entries.
-                a.set_assoc_heic(st[support::HEIC_FAMILY_IDX] && heic_codec_present());
+                a.set_assoc_heic(st[support::HEIC_FAMILY_IDX] && heic_assoc_available(heic_codec_state()));
                 a.set_assoc_webp(st[4]);
                 a.set_assoc_gif(st[5]);
                 a.set_assoc_bmp(st[6]);
@@ -13547,42 +13719,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let awz = app.as_weak();
     app.on_assoc_apply(move || {
         if let Some(a) = awz.upgrade() {
-            // Index order == support.rs ASSOC_FAMILIES (v0.8.59: +gif/bmp/jxl before raw).
-            let mut on = [
-                a.get_assoc_jpeg(),
-                a.get_assoc_png(),
-                a.get_assoc_tiff(),
-                a.get_assoc_heic(),
-                a.get_assoc_webp(),
-                a.get_assoc_gif(),
-                a.get_assoc_bmp(),
-                a.get_assoc_jxl(),
-                a.get_assoc_raw(),
-            ];
-            // v0.8.71: no codec → HEIC never registers (and a previously-registered HEIC family's
-            // entries are REMOVED by this apply — the unchecked-family cleanup path). The property
-            // is already false (boot force + the row's disable), so this gate is belt-and-braces.
-            support::gate_heic(&mut on, heic_codec_present());
-            match assoc_apply(&on, a.get_distinct_raw_icons()) {
-                Ok(()) => {
-                    a.set_assoc_registered(true);
-                    a.set_assoc_status("".into());
-                    log_event(&format!("assoc: registered/updated (families {on:?})"));
-                }
-                Err(e) => {
-                    a.set_assoc_status(tr_format!("Couldn't write the registration: {error}", error = e).into());
-                    log_event(&format!("assoc: register FAILED: {e}"));
-                }
-            }
+            assoc_apply_ui(&a, heic_assoc_available(heic_codec_state()), assoc_apply);
         }
     });
     let awz = app.as_weak();
     app.on_assoc_remove(move || {
         if let Some(a) = awz.upgrade() {
-            assoc_remove();
-            a.set_assoc_registered(false);
-            a.set_assoc_status("".into());
-            log_event("assoc: removed");
+            assoc_remove_ui(&a, assoc_remove);
         }
     });
     app.on_assoc_open_defaults(open_default_apps);
@@ -13609,24 +13752,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             // captured-if-installed → Preview-if-claimant → skip that UTI (+ count). A multi-vendor
             // RAW user gets each vendor's app back on its own extension, not one target smeared over
             // all of them.
+            // 1.1.0-rc.1 (issue #11 batch, M2 + M3): a UTI is reset only while Falcon is its default,
+            // and each successful reset consumes its captured incumbent (`assoc_reset_step`).
             let utis = mac_assoc::resolve_utis(exts);
             let legacy_uti = utis.first().cloned().unwrap_or_default();
-            let map = support::decode_prev_map(assoc_prev_snapshot()[idx].as_deref(), &legacy_uti);
+            let mut map = support::decode_prev_map(assoc_prev_snapshot()[idx].as_deref(), &legacy_uti);
             let (mut restored, mut skipped, mut first_err) = (0usize, 0usize, 0i32);
             for uti in &utis {
-                let handlers = mac_assoc::all_handlers(uti);
-                match assoc_reset_target(map.get(uti).map(String::as_str), &handlers) {
-                    Some(target) => {
-                        let st = mac_assoc::set_default(uti, &target);
-                        if st == 0 {
-                            restored += 1;
-                        } else if first_err == 0 {
-                            first_err = st;
-                        }
-                    }
+                match support::assoc_reset_step(&mut map, uti, mac_assoc::default_handler(uti).as_deref(),
+                    &mac_assoc::all_handlers(uti), |t| mac_assoc::set_default(uti, t)) {
+                    Some((_, 0)) => restored += 1,
+                    Some((_, st)) => { if first_err == 0 { first_err = st; } }
                     None => skipped += 1,
                 }
             }
+            support::assoc_prev_store(idx, support::encode_prev_map(&map));
             if first_err == 0 {
                 log_event(&format!(
                     "assoc: reset {label} — {restored} UTI(s) restored, {skipped} skipped (no target)"
@@ -13639,7 +13779,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             mam.set_vec(mac_assoc_rows_build());
         });
         let mam = mac_assoc_model.clone();
+        let awz = app.as_weak();
         app.on_assoc_prompt_choice(move |choice| {
+            // 1.1.0-rc.1 (issue #11 batch, M4): a test build sets no defaults, so it doesn't claim to.
+            if !mac_experiment::associations_allowed() {
+                log_event("assoc: first-launch choice ignored (test build)");
+                return;
+            }
             let families = assoc_prompt_families(choice);
             log_event(&format!(
                 "assoc: first-launch choice {choice} ({}) — {} family(ies)",
@@ -13650,10 +13796,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 },
                 families.len()
             ));
-            for &fi in families {
-                mac_make_default_family(fi);
-            }
+            // Every family is set even after one fails (no short circuit).
+            let all_set = families.iter().fold(true, |all, &fi| mac_make_default_family(fi) && all);
             mam.set_vec(mac_assoc_rows_build());
+            // 2026-10-29 (owner): the guide's Apply to all (choice 2; the first-launch popup never
+            // stacks with the guide) says it worked, only when every format was set.
+            if let Some(a) = awz.upgrade() {
+                if choice == 2 && all_set && a.get_welcome_open() {
+                    a.set_welcome_assoc_applied(true);
+                }
+            }
         });
     }
 
@@ -15234,6 +15386,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let xmp_journal = xmp_journal.clone(); // v0.8.69 (E/H2): sync pending rating sidecars for the OLD folder
         let undo_stack_fo = undo_stack.clone(); // v0.9.61 (A1.1): the outgoing folder's apply drain prunes undo
         let generation_fo = generation.clone(); // v0.9.61 (A1.1): …and is gen-checked like the tick's
+        let last_ratings_json = last_ratings_json.clone(); // issue #11 batch B1: the final flush's baseline
         let awz_xr = app.as_weak();
         Rc::new(move || {
             // v0.9.61 (A1.1): DRAIN THE APPLY SLOT FOR THE OUTGOING FOLDER FIRST. `RotState::
@@ -15273,7 +15426,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 let mut m = selection_map(&old, &ratings.borrow(), &marks.borrow());
                 merge_selection_extra(&mut m, &sel_extra.borrow()); // N8: keep moved-out entries
-                if let Err(e) = save_selection(Path::new(&old_dir), &m, &rot.rotations_snapshot(), &folder_attrs.borrow()) {
+                // Issue #11 batch B1: an unchanged folder whose last save is on disk is not rewritten,
+                // so a window that changed nothing can't erase another window's edits. Asked here,
+                // before the swap's `begin_review_visit`; the attempt record outlives it anyway.
+                if let Err(e) = support::final_review_flush(
+                    Path::new(&old_dir), &m, &rot.rotations_snapshot(), &folder_attrs.borrow(),
+                    &last_ratings_json, support::enqueue_review_data,
+                ) {
                     log_event(&format!("previous folder's ratings may be unsaved before switch: {e}"));
                 }
             }
@@ -15440,7 +15599,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     &a, &mut done, (&old, *current.borrow()), (&fast, &detail, &film, &roi), &rot, &undo_stack, (&meta,generation.load(Ordering::Relaxed))))
             } else { None };
             let promoted = promotion.is_some();
-            let ScanDone { changed_sources: _, partial, pending_edges, source_order: _, id, dir, shots: new_vec, ratings: rv, marks: mv, start, land, extra, rotations, attrs, had_file, manifest, sort, scan_err } = done;
+            let ScanDone { changed_sources: _, partial, pending_edges, source_order: _, id, dir, shots: new_vec, ratings: rv, marks: mv, start, land, extra, rotations, attrs, had_file, manifest, sort, scan_err, scan_denied, unlisted_target } = done;
             // v0.8.130 (W2-4): the folder's export record rides the scan exactly as `had_file`
             // does, and lands at the same swap -- so the ctx row's availability and the New/Edited
             // classification can never describe the folder we just left.
@@ -15709,6 +15868,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             // next flush (owner rule 3 — such folders consume no cap slots). SAME-FOLDER rescans keep
             // the LIVE attr fields where set — the disk state can lag the async writer by a beat (a
             // sort pick / dwell just before the rescan must not regress).
+            // Issue #11 batch B1: the attrs as the file has them, for this load's baseline below, so
+            // MRU memory migrated into a journal folder and live attrs a rescan keeps stay dirty and
+            // reach the next flush; the gated final flushes would otherwise skip them. A fresh open
+            // reads disk, so this folder's earlier save attempts no longer say anything about it.
+            let disk_attrs = attrs.clone();
+            if !scan_same_folder {
+                support::forget_review_attempts(Path::new(&dir.display().to_string()));
+            }
             {
                 let dir_str = dir.display().to_string();
                 // v0.8.98 (v0.8.97-audit C9): the test reads the SCAN domain's memory, not `cur_dir`
@@ -15829,7 +15996,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             *last_ratings_json.borrow_mut() = {
                 let mut m = selection_map(&new_arc, &ratings.borrow(), &marks.borrow());
                 merge_selection_extra(&mut m, &sel_extra.borrow()); // N8: baseline matches the flushes
-                selection_dirty_json(&m, &rot.rotations_snapshot(), &folder_attrs.borrow()) // v0.8.0: deltas already reloaded above; v0.8.49: attrs seeded above
+                // v0.8.0: deltas already reloaded above. B1: the file's attrs, not the merged live ones.
+                selection_dirty_json(&m, &rot.rotations_snapshot(), &disk_attrs)
             };
             sel_gen.set(sel_gen.get().wrapping_add(1)); // rebuild Selection panel + badges
             // v0.8.123 (I1a) — THE OWNER'S BUG, at its root: the Selection panel's TWO filters are
@@ -15943,6 +16111,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                     );
                 }
             }
+            // 1.1.0-rc.1 (issue #11 batch, M5): on the Mac, a refused listing also says which
+            // permission may be missing. Other systems keep the plain empty state.
+            if scan_err {
+                if let Some(msg) = support::folder_denied_notice(scan_denied, cfg!(target_os = "macos")) {
+                    notif_ap.borrow_mut().push(NotifEntry::warn(i18n::tr(msg), Instant::now()));
+                }
+            }
+            // 1.1.0-rc.1 (issue #11 batch, O2): an opened file the final scan doesn't list says the
+            // folder opened instead (it lands on the first photo), and no resume offer competes with it.
+            if !partial {
+                if let Some(name) = &unlisted_target {
+                    notif_ap.borrow_mut().push(NotifEntry::warn(
+                        tr_format!("Couldn't show {name} — opened its folder instead.", name = name), Instant::now()));
+                }
+            }
             // D2 (v0.3.61): the resume ask — Falcon's settings remember the last-viewed shot for
             // this folder; if it differs from where we land, offer to jump (ask, never auto). A SYNC
             // move/undo/delete/recover re-scan skips it: same folder, user already in place.
@@ -15950,7 +16133,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // genuine async OPEN (id != 0, land = None) offers; ANY rescan carrying a landing hint
             // (land = Some, all post-ops) never does, so a hinted landing is not second-guessed by the
             // saved resume position. (id != 0 alone can't distinguish a hinted post-op from a re-open.)
-            if !partial && support::resume_offer_allowed(id != 0, land.is_some()) && new_len > 0 {
+            if !partial && support::resume_offer_allowed(id != 0, land.is_some()) && new_len > 0 && unlisted_target.is_none() {
                 // v0.8.49: a json folder's memory comes from ITS json attr (migrated above; gated on
                 // the resume cap — 0 = feature off, the attr is ignored, never scrubbed); other
                 // folders use the settings LRU exactly as before.
@@ -16077,13 +16260,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             // v0.8.34 (C3/G1): a post-op rescan (delete/move/undo) supplies an explicit landing index so the
             // viewer stays on the neighbour; a plain re-open passes None → resume via select_start exactly as
             // before (the per-folder resume-position logic is untouched — only the SYNC post-op path differs).
-            let start = match land {
-                Some(desired) => post_op_land(desired, new_vec.len()),
-                None => select_start(&new_vec, &sel),
+            // 1.1.0-rc.1 (issue #11 batch, O2): a plain re-open of a file the scan doesn't list says so
+            // (`unlisted_target`); a post-op landing names no file.
+            let (start, unlisted_target) = match land {
+                Some(desired) => (post_op_land(desired, new_vec.len()), None),
+                None => {
+                    let matched = select_match(&new_vec, &sel);
+                    (matched.unwrap_or(0), support::unlisted_target(false, &sel, matched))
+                }
             };
             let (rv, mv) = apply_selection(&sel_map, &new_vec);
             let extra = if had_file { selection_leftover(sel_map, &new_vec) } else { BTreeMap::new() };
-            apply_scan(ScanDone { changed_sources: HashSet::new(), partial: false, pending_edges: (false, false), source_order: Vec::new(), id: 0, dir, shots: new_vec, ratings: rv, marks: mv, start, land, extra, rotations, attrs, had_file, manifest, sort: (method, desc), scan_err: false }); // v0.8.37 (FIX A3): carry the landing hint so apply_scan suppresses the resume offer on a hinted post-op rescan (M2: reached only on a successful scan — the Err arm returned early)
+            apply_scan(ScanDone { changed_sources: HashSet::new(), partial: false, pending_edges: (false, false), source_order: Vec::new(), id: 0, dir, shots: new_vec, ratings: rv, marks: mv, start, land, extra, rotations, attrs, had_file, manifest, sort: (method, desc), scan_err: false, scan_denied: false, unlisted_target }); // v0.8.37 (FIX A3): carry the landing hint so apply_scan suppresses the resume offer on a hinted post-op rescan (M2: reached only on a successful scan — the Err arm returned early)
         })
     };
 
@@ -16211,7 +16399,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let extra = if had_file { selection_leftover(sel_map.clone(), &early_shots) } else { BTreeMap::new() };
                         let early = ScanDone { changed_sources: HashSet::new(), partial: true, pending_edges: (true, true), source_order: Vec::new(), id, dir: dir.clone(), shots: early_shots,
                             ratings, marks, start: 0, land: Some(0), extra, rotations: rotations.clone(),
-                            attrs: attrs.clone(), had_file, manifest: None, sort: (method, desc), scan_err: false };
+                            attrs: attrs.clone(), had_file, manifest: None, sort: (method, desc), scan_err: false, scan_denied: false, unlisted_target: None };
                         if support::publish_latest(&scan_id, &early_scan, id, early) {
                             log_event(&format!("scan: request {id} first shot ready in {} ms", requested_at.elapsed().as_millis()));
                             // Continue metadata discovery immediately. Preview decoding is an
@@ -16258,7 +16446,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 let nearby = ScanDone { changed_sources: HashSet::new(), partial: true, pending_edges, source_order: Vec::new(), id, dir: dir.clone(),
                                     shots: nearby_shots, ratings, marks, start, land: Some(start), extra,
                                     rotations: rotations.clone(), attrs: attrs.clone(), had_file, manifest: None,
-                                    sort: (method, desc), scan_err: false };
+                                    sort: (method, desc), scan_err: false, scan_denied: false, unlisted_target: None };
                                 if support::publish_latest(&scan_id, &early_scan, id, nearby) {
                                     log_event(&format!("scan: request {id} nearby {count} shots ready in {} ms after first photo; headers={} ms reads={} readers={}",
                                         nearby_at.elapsed().as_millis(), scan.headers_ms, scan.header_reads, scan.readers));
@@ -16278,6 +16466,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if scan_id.load(Ordering::Relaxed) != id { return; }
                 // Stale-temp cleanup follows publication, outside the ready path.
                 let scan_err = scan_res.is_err();
+                // 1.1.0-rc.1 (issue #11 batch, M5): a refused listing gets the Mac permission hint.
+                let scan_denied = matches!(scan_res, Err(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied);
                 if let Err(ref e) = scan_res {
                     log_event(&format!("scan: couldn't read {} ({e}) — showing the unreadable-folder empty state", dir.display()));
                 }
@@ -16294,13 +16484,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let sort_at = Instant::now();
                 sort_scanned_shots(&mut new_vec, method, desc, &sel_map, &metadata);
                 log_event(&format!("scan: request {id} sorted {} shots in {} ms; ready in {} ms", new_vec.len(), sort_at.elapsed().as_millis(), requested_at.elapsed().as_millis()));
-                let start = select_start(&new_vec, &sel);
+                // 1.1.0-rc.1 (issue #11 batch, O2): an opened file the scan doesn't list lands on the
+                // first photo with a notice, never silently.
+                let matched = select_match(&new_vec, &sel);
+                let start = matched.unwrap_or(0);
+                let unlisted_target = support::unlisted_target(scan_err, &sel, matched);
                 let (rv, mv) = apply_selection(&sel_map, &new_vec);
                 // On a scan error don't treat every remembered entry as a "moved-out" leftover (empty scan
                 // ⇒ all would qualify); carry no leftovers so a transient read error can't rewrite state.
                 let extra = if had_file && !scan_err { selection_leftover(sel_map, &new_vec) } else { BTreeMap::new() };
                 let cleanup_dir = dir.clone();
-                let done = ScanDone { changed_sources, partial: false, pending_edges: (false, false), source_order, id, dir, shots: new_vec, ratings: rv, marks: mv, start, land: None, extra, rotations, attrs, had_file, manifest, sort: (method, desc), scan_err }; // v0.8.37 (FIX A3): a genuine async OPEN has no landing hint → the resume offer is allowed
+                let done = ScanDone { changed_sources, partial: false, pending_edges: (false, false), source_order, id, dir, shots: new_vec, ratings: rv, marks: mv, start, land: None, extra, rotations, attrs, had_file, manifest, sort: (method, desc), scan_err, scan_denied, unlisted_target }; // v0.8.37 (FIX A3): a genuine async OPEN has no landing hint → the resume offer is allowed
                 // Publish ONLY if this is still the latest scan (a later open bumped scan_id) and we would
                 // not regress a newer already-pending result. Else a SLOW scan finishing AFTER a faster
                 // LATER one would overwrite the newer ScanDone — the tick then discards it (id mismatch),
@@ -17892,6 +18086,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let marks = marks.clone();
         let shots = shots.clone();
         let folder_attrs = folder_attrs.clone(); // v0.8.49: the forced flush must carry the live attrs
+        let last_ratings_json = last_ratings_json.clone(); // issue #11 batch B1: the forced flush advances it
         let xmp_journal = xmp_journal.clone(); // v0.8.69 (E/H2): flush pending rating sidecars into the same barrier
         let awz_xr = app.as_weak();
         Rc::new(move |applied: Vec<(usize, String, u8, u8)>| {
@@ -17933,8 +18128,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let snap = shots.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let mut m = selection_map(&snap, &ratings.borrow(), &marks.borrow());
                 merge_selection_extra(&mut m, &sel_extra.borrow());
-                if let Err(e) = save_selection(Path::new(&dir), &m, &rot.rotations_snapshot(), &folder_attrs.borrow()) {
-                    log_event(&format!("rotation apply: JSON flush FAILED after write-back: {e}"));
+                let rots = rot.rotations_snapshot();
+                match save_selection(Path::new(&dir), &m, &rots, &folder_attrs.borrow()) {
+                    // Issue #11 batch B1: every review write advances the baseline, so an edit that
+                    // later returns the snapshot to the old baseline still reaches the final flushes.
+                    Ok(_) => *last_ratings_json.borrow_mut() = selection_dirty_json(&m, &rots, &folder_attrs.borrow()),
+                    Err(e) => log_event(&format!("rotation apply: JSON flush FAILED after write-back: {e}")),
                 }
                 // v0.8.69 (E/H2): if XMP sync is ON, enqueue any pending rating deltas BEFORE the barrier
                 // below so the applied shots' rating sidecars are durable alongside the JSON journal.
@@ -17951,6 +18150,38 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
     };
 
+    // 2026-10-28 (the cloud-only round, owner answer 10): APPLY ROTATIONS ASKS FIRST. Its Apply button
+    // asks here instead of raising the confirm itself: the plan the run will write is built, the
+    // files it will read (`falcon_decode::rotation_reads`) are asked fresh (metadata only) whether they
+    // are only in the cloud, and the confirm (kind 5) shows Copy and Move's own line when any are. The
+    // files counted are the ones the user then agrees to download (`apply_cloud_agreed`); the run
+    // skips any other it finds online-only.
+    let apply_cloud_agreed: Rc<RefCell<HashSet<PathBuf>>> = Rc::new(RefCell::new(HashSet::new()));
+    {
+        let shots = shots.clone();
+        let rot = rot.clone();
+        let agreed = apply_cloud_agreed.clone();
+        let awz = app.as_weak();
+        app.on_apply_rotations_ask(move || {
+            let snap = shots.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let plans = support::rotation_apply_plans(&rot, &snap);
+            let cloud: HashSet<PathBuf> = plans
+                .iter()
+                .flat_map(|(_, _, plan)| falcon_decode::rotation_reads(plan))
+                .filter(|p| falcon_decode::file_is_cloud_placeholder(p))
+                .map(Path::to_path_buf)
+                .collect();
+            if !cloud.is_empty() {
+                log_event(&format!("rotation apply: {} cloud-only file(s) would be downloaded — asking", cloud.len()));
+            }
+            let notice = tick::cloud_download_notice(cloud.len()); // "" for none: the line unmounts
+            *agreed.borrow_mut() = cloud;
+            if let Some(a) = awz.upgrade() {
+                a.set_apply_cloud_notice(notice.into());
+                a.set_confirm_kind(5);
+            }
+        });
+    }
     {
         // The Apply worker: build the plan snapshot on the UI thread (RotState is UI-thread only), then
         // patch off-thread. Progress via the export-progress counters (N/M); result via sel_status_slot.
@@ -17964,6 +18195,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let start = start_op.clone();
         let awz = app.as_weak();
         let photo_gate = app.as_weak();
+        let apply_agreed = apply_cloud_agreed.clone(); // the cloud-only round: the ask's answer
         app.on_apply_rotations(move || {
             if photo_gate.upgrade().is_some_and(|a| a.get_opening_photo()) { return; }
             let dir = cur_dir.borrow().clone();
@@ -17977,32 +18209,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             // silently to 0, re-basing that shot a quarter-turn past what the user saw. The apply
             // path now derives the number from `base_turns` and the value it composes on, so there is
             // nothing to probe, nothing to clone, and no failure mode off the UI thread.
-            let mut plans: Vec<(usize, String, falcon_decode::RotApplyPlan)> = Vec::new();
-            {
-                let di = rot.delta_idx.borrow();
-                let base = rot.base.borrow();
-                for (&idx, &t) in di.iter() {
-                    if t & 3 == 0 {
-                        continue;
-                    }
-                    let Some(shot) = snap.get(idx) else { continue };
-                    plans.push((
-                        idx,
-                        shot.name.clone(),
-                        falcon_decode::RotApplyPlan {
-                            // v1.0.0-rc MICRO-TAIL (A-Y3b): `has_jpg` — a RAW's undecodable
-                            // passenger is not the picture and must never be opened `read+write`
-                            // for an EXIF patch. `None` here routes the rotation to the sidecar
-                            // arms, which is what a RAW-only shot has always done.
-                            finished: shot.jpg.clone().filter(|_| shot.has_jpg),
-                            finished_is_jpeg: shot.has_jpg && shot.is_jpeg_source(),
-                            raw: shot.raw.clone(),
-                            base_turns: base.get(&idx).copied().unwrap_or(0),
-                            delta: t & 3,
-                        },
-                    ));
-                }
-            }
+            // 2026-10-28 (the cloud-only round): built by the one function the ask uses too.
+            let plans = support::rotation_apply_plans(&rot, &snap);
+            // …and the files the user agreed to download when the ask counted them (owner answer 10).
+            let agreed = std::mem::take(&mut *apply_agreed.borrow_mut());
             if plans.is_empty() || dir.is_empty() {
                 if let Some(a) = awz.upgrade() {
                     a.set_confirm_kind(0);
@@ -18022,7 +18232,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let _guard = OpGuard { busy: busy.clone(), slot: slot.clone(), kind: -1, origin: None };
                 let mut applied: Vec<(usize, String, u8, u8)> = Vec::new();
                 let mut failed: Vec<String> = Vec::new();
+                let mut cloud_now = 0usize; // the cloud-only round (owner answer 11)
                 for (idx, name, plan) in plans.iter() {
+                    // 2026-10-28 (the cloud-only round, owner answer 11): THE LAST LOOK BEFORE THE
+                    // FIRST READ. A file made online-only after the user's answer, and not among the
+                    // files they agreed to download, is not read: the photo is skipped (its turn
+                    // stays pending) and the result says so.
+                    let freed = support::rotation_freed_files(
+                        &falcon_decode::rotation_reads(plan), &agreed, falcon_decode::file_is_cloud_placeholder,
+                    );
+                    if freed > 0 {
+                        cloud_now += freed;
+                        log_event(&format!("rotation apply {name}: skipped — {freed} file(s) only in the cloud now, not agreed to download"));
+                        continue;
+                    }
                     // v0.8.102 (the F1/F2 RED) / v0.8.103 (V1): `apply_rotation` reports
                     // `new_base_turns` in the app's OWN residual terms — it derives the turns the
                     // platform decoder already consumed from `base_turns` and the absolute value it
@@ -18070,7 +18293,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     )
                 } else {
                     tr_format!("rotation apply: {written} written", written = k)
-                };
+                } + &support::clause_cloud_now(cloud_now);
                 *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((msg, OpSeverity::from_err(f > 0), -1, None));
             });
         });
@@ -19473,13 +19696,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     // The one place a web export is actually dispatched. Both doors — the no-collision fast path and
     // each of the modal's two verbs — call this, so the op toast, the progress arming, the busy
     // latch and the worker spawn cannot drift between them.
-    let launch_web: Rc<dyn Fn(PendingWeb, support::WebCollide)> = {
+    // 2026-10-28 (the cloud-only round, owner answer 9): `agreed` = the photos the user agreed to
+    // download in the cloud question (kind 9); empty when nothing needed asking. The run downloads only
+    // those, and skips any other file it finds only in the cloud (owner answer 11).
+    let launch_web: Rc<dyn Fn(PendingWeb, support::WebCollide, HashSet<usize>)> = {
         let slot = sel_status_slot.clone();
         let busy = sel_busy.clone();
         let start = start_op.clone();
         let progress_lw = export_progress.clone();
         let awz = app.as_weak();
-        Rc::new(move |p: PendingWeb, collide: support::WebCollide| {
+        Rc::new(move |p: PendingWeb, collide: support::WebCollide, agreed: HashSet<usize>| {
             // v0.8.131 (F-P7): the op toast names the SET, from the same composition the sheet's
             // progress card uses (published by the out-column block).
             let base_title = awz
@@ -19511,35 +19737,86 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // clears `running` on the same unwind so the progress card can't get stuck.
                 let _guard = OpGuard { busy: busy.clone(), slot: slot.clone(), kind: 2, origin: Some(p.dir.clone()) };
                 let _run = RunGuard(progress.clone());
-                let (msg, fail) = export_web_run(
+                let (msg, fail) = support::export_web_run_downloading(
                     Path::new(&p.dir), &p.shots, &p.marks, p.filt, 1, p.long, p.quality, p.wm,
                     p.auto_orient, &p.deltas, p.suffix.as_deref(), p.fmt, p.raw_policy,
-                    collide, &progress,
+                    collide, agreed, &progress,
                 );
                 *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((msg, OpSeverity::from_err(fail), 2, Some(p.dir)));
             });
         })
     };
+    // ── 2026-10-28 (the cloud-only round, owner answer 9): THE EXPORT ASKS BEFORE IT DOWNLOADS ─────
+    //
+    // The one gate in front of `launch_web` for its three doors (the no-collision fast path and the
+    // "already exist" modal's two verbs), so the count knows whether existing deliverables will be
+    // kept or replaced. `support::web_cloud_scan` counts, fresh and metadata only, exactly the files
+    // the run will read that are only in the cloud. None: the run launches as before. Some: the run
+    // is parked here and the confirm frame asks (kind 9); "Download and export" launches it with
+    // those photos agreed, Cancel / Esc / Enter drop it and return to the sheet, as kind 8 does.
+    type ParkedCloudRun = (PendingWeb, support::WebCollide, HashSet<usize>); // the run, its answer, the agreed photos
+    let pending_cloud: Rc<RefCell<Option<ParkedCloudRun>>> = Rc::new(RefCell::new(None));
+    let ask_cloud: Rc<dyn Fn(PendingWeb, support::WebCollide)> = {
+        let lw = launch_web.clone();
+        let pc = pending_cloud.clone();
+        let awz = app.as_weak();
+        Rc::new(move |p: PendingWeb, collide: support::WebCollide| {
+            let cloud = support::web_cloud_scan(
+                Path::new(&p.dir), &p.shots, &p.marks, 1, p.suffix.as_deref(), p.fmt, p.raw_policy,
+                collide, falcon_decode::file_is_cloud_placeholder,
+            );
+            if cloud.is_empty() {
+                *pc.borrow_mut() = None;
+                lw(p, collide, HashSet::new());
+                return;
+            }
+            log_event(&format!("web-export: {} cloud-only photo(s) would be downloaded — asking", cloud.len()));
+            if let Some(a) = awz.upgrade() {
+                a.set_web_cloud_count(cloud.len() as i32);
+                a.set_confirm_kind(9);
+            }
+            *pc.borrow_mut() = Some((p, collide, cloud.into_iter().collect()));
+        })
+    };
+    {
+        let pc = pending_cloud.clone();
+        let lw = launch_web.clone();
+        app.on_export_cloud_go(move || {
+            if let Some((p, collide, agreed)) = pc.borrow_mut().take() {
+                log_event("web-export: cloud question — user chose DOWNLOAD AND EXPORT");
+                lw(p, collide, agreed);
+            }
+        });
+    }
+    {
+        let pc = pending_cloud.clone();
+        app.on_export_cloud_cancel(move || {
+            if pc.borrow_mut().take().is_some() {
+                log_event("web-export: cloud question — cancelled, nothing exported or downloaded");
+            }
+        });
+    }
     // The modal's three arms. Cancel drops the parked run and says so; the two verbs take it and
     // dispatch with the answer. All three close the modal (`start_op` clears `confirm-kind` on the
-    // two that launch; Cancel does it in the .slint arm beside the callback).
+    // two that launch; Cancel does it in the .slint arm beside the callback). The cloud-only round:
+    // the two verbs dispatch through the cloud question (`ask_cloud`), which may raise kind 9.
     {
         let pw = pending_web.clone();
-        let lw = launch_web.clone();
+        let ask = ask_cloud.clone();
         app.on_export_collide_skip(move || {
             if let Some(p) = pw.borrow_mut().take() {
                 log_event("web-export: collision modal — user chose SKIP EXISTING");
-                lw(p, support::WebCollide::Skip);
+                ask(p, support::WebCollide::Skip);
             }
         });
     }
     {
         let pw = pending_web.clone();
-        let lw = launch_web.clone();
+        let ask = ask_cloud.clone();
         app.on_export_collide_overwrite(move || {
             if let Some(p) = pw.borrow_mut().take() {
                 log_event("web-export: collision modal — user chose OVERWRITE");
-                lw(p, support::WebCollide::Overwrite);
+                ask(p, support::WebCollide::Overwrite);
             }
         });
     }
@@ -19565,7 +19842,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let path_ex = export_image_path.clone(); // v0.8.151 (F5): the belt's source of truth
         let pending_ew = notif_pending.clone();
         let pending_ex = pending_web.clone(); // v0.8.187 (W1 ii): where a parked run waits
-        let launch_ex = launch_web.clone();
+        let pending_cloud_ex = pending_cloud.clone(); // the cloud-only round: …and its cloud question's
+        let ask_ex = ask_cloud.clone();
         let awz = app.as_weak();
         let photo_gate = app.as_weak();
         app.on_export_web(move || {
@@ -19574,6 +19852,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             if dir.is_empty() {
                 return;
             }
+            *pending_cloud_ex.borrow_mut() = None; // a new export replaces any parked question
             // GUARD (#9): the user asked for a watermark (wm_type != 0) but its logo never rendered
             // (Text failed — e.g. a missing font/glyph — or the Image PNG went missing). Exporting now
             // would silently ship CLEAN, un-watermarked files. Block + tell them so they can fix it,
@@ -19743,7 +20022,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
             if collisions == 0 {
                 *pending_ex.borrow_mut() = None;
-                launch_ex(pending, support::WebCollide::NotAsked);
+                ask_ex(pending, support::WebCollide::NotAsked);
                 return;
             }
             log_event(&format!(
@@ -19961,22 +20240,29 @@ fn main() -> Result<(), Box<dyn Error>> {
             // be live there — that mismatch is recorded for the architect and is NOT invented UI
             // here. What this site owes is a preview when the list is empty for any reason, and the
             // honest source for that is the shot on the stage, as before.
+            // 2026-10-28 (the cloud-only round, owner answer 9): …the first one whose file is on this
+            // device (asked fresh, metadata only, stopping at the first), else the photo on screen:
+            // opening the sheet must not download a photo the export has not asked about yet.
             let c = {
                 let mv = marks_oe.borrow();
-                awz_oe
+                let targets: Vec<usize> = awz_oe
                     .upgrade()
-                    .and_then(|a| {
+                    .map(|a| {
                         support::out_export_target_list(
                             fm_oe.get(),
                             order_oe(&a, true),
                             &mv,
                             a.get_include_rejects(),
                         )
-                        .first()
-                        .copied()
                     })
+                    .unwrap_or_default()
+                    .into_iter()
                     .filter(|&i| i < snap.len())
-                    .unwrap_or_else(|| *cur_oe.borrow())
+                    .collect();
+                support::wm_sample_index(&targets, *cur_oe.borrow(), |i| {
+                    support::read_file(&snap[i], support::ReadTier::Thumb)
+                        .is_some_and(|(_, p)| falcon_decode::file_is_cloud_placeholder(p))
+                })
             };
             let req = req_oe.fetch_add(1, Ordering::Relaxed) + 1;
             *sample_oe.borrow_mut() = None; // don't show a stale-res preview while decoding
@@ -20979,6 +21265,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // so the FIRST open of the session recentres too (a boot that resumes mid-folder lands on the
     // resume shot rather than at row 0).
     let last_sel_view: Cell<(bool, u64)> = Cell::new((false, u64::MAX));
+    let sel_cache = RefCell::new(tick::SelCache::default()); // 2026-10-29 (owner, testing rc.2)
     // v0.8.50 (G1): the folder-grid dock's live window model + its refill key / recenter tracker
     // (see tick::step_folder_grid — the filmstrip window pattern rotated 90°).
     let grid_model = Rc::new(slint::VecModel::<FilmItem>::default());
@@ -22335,7 +22622,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             if custom_seen.replace(Some(custom_now)).is_some_and(|was| was != custom_now) {
                 let limit = support::custom_ceiling(custom_now.fps, bench).0;
                 let shown = if limit.is_finite() { limit.round() as i32 } else { 0 };
-                log_event(&support::custom_log_line(custom_now, shown));
+                log_event(&support::custom_log_line(custom_now, shown, cfg!(target_os = "macos")));
             }
         }
         // N5/N6/N7) A completed file-op (move / undo-move / empty-bin) posts the folder to re-scan.
@@ -23386,7 +23673,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         step_compare_browse_advance(
             &app, now, len, gen_now, &compare_t, &cmp_wacc_t, &cmp_wat_t, &cmp_wadv_t, &lm_t,
             &cmp_a_idx_t, &cmp_b_idx_t, &cur_t, &film_follow_t, &nav_kind_t, &shots_now,
-            &film_t.thumbs, &fast_t.cache, &film_t.failed, &fast_t.failed,
+            &film_t.thumbs, &fast_t.cache, &film_t.failed, &fast_t.failed, &film_t.cloud_skipped,
             // v0.8.195 (consumer 4): the browse-rate ceiling, same term as the other two.
             // v0.8.196 (WAVE 2): …and the ceiling is derived, so all three take the whole value.
             limits,
@@ -23751,8 +24038,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             if memory_hold {
                 let explicit = support::ExplicitSet::new(c, compare_t.get(), cmp_a_idx_t.get(),
                     cmp_b_idx_t.get(), len, fast_t.hover_pin.get(), det_awaited_t.load(Ordering::Relaxed));
-                memory_pressure::shed(&explicit, &fast_t, &detail_t, &fast_gen_t, &drain_buf,
+                let shed_previews = memory_pressure::shed(&explicit, &fast_t, &detail_t, &fast_gen_t, &drain_buf,
                     &parked_full, &det_sent, &parked_done_t);
+                // Round 2c review P1: the previews just shed are let go by the panels that are not
+                // refreshing too (a closed Review panel, a grid hidden by immersive mode), as after a
+                // mode's trim; the refreshing feeds heard it through `fast_gen`, inside the shed.
+                background_memory::release_after_trim(shed_previews, app.get_sel_open(), &sel_model, &last_sel_key,
+                    tick::grid_refills(&app, len), &grid_model, &last_grid_key);
             }
             mac_pool_gov_t.as_ref().map_or(publish_gate,
                 |g| g.memory.borrow().publish_gate(publish_gate))
@@ -24000,7 +24292,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // blocked on, if any. Nothing is stored here — see the single write below both steps.
         let scrub_block = step_scrub_advance(
             &app, now, len, gen_now, &hd_t, &scr_t, &lk_t, &la_t, &lm_t, &cur_t,
-            &shots_now, &film_t.thumbs, &fast_t.cache, &film_t.failed, &fast_t.failed,
+            &shots_now, &film_t.thumbs, &fast_t.cache, &film_t.failed, &fast_t.failed, &film_t.cloud_skipped,
             &detail_t.cache, &detail_t.failed, &detail_fps_t, &detail_pace_t, &nav_kind_t,
             limits, // v0.8.195 (consumer 4); v0.8.196: the derived ceiling
         );
@@ -24013,7 +24305,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // v0.8.125 (C7): the same opt-in wait gate the held-key path runs — one setting, one
             // predicate, both gestures. v0.8.126 (R6b/R6d): three gestures, and the bar is thumb
             // OR a cached fast frame.
-            gen_now, &film_t.thumbs, &fast_t.cache, &film_t.failed, &fast_t.failed, &nav_kind_t,
+            gen_now, &film_t.thumbs, &fast_t.cache, &film_t.failed, &fast_t.failed, &film_t.cloud_skipped, &nav_kind_t,
             // v0.9.8 (Mac issue 3) → v1.0 MERGE (F1-4): a held arrow key OWNS navigation. On a MacBook
             // trackpad, wheel-nav turns resting-finger/inertial scroll events (which a Windows mouse
             // never emits) into pending notches that fight the held-key scrub over `current` — the
@@ -24461,6 +24753,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             // v0.8.196 (WAVE 2, §A): …and the runway and the cap are now DERIVED numbers that ride
             // in the same value as the bit, so the step cannot read one and act on the other.
             limits,
+            // The cloud-only round: the workers' notes of files found only in the cloud.
+            &film_t.cloud_skipped,
         );
         mk!("pf_fast");
         // ── v0.8.157 (§4) + v0.8.160 (P1/U3): THE SETTINGS-THROTTLE POSTURE LINE. ───────────────
@@ -24631,6 +24925,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             // browse steps, so it reads THIS tick's answer — for both of its holds, the RAM serve's
             // publish gate and the dispatch hold.
             &det_awaited_t,
+            // The cloud-only round: the notes, and the file this tier reads (the RAW in RAW mode).
+            &shots_now, raw_t.load(Ordering::Relaxed), &film_t.cloud_skipped,
         );
         mk!("pf_det");
 
@@ -24907,6 +25203,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // wrote itself, so the panel-scroll detector at the head of the tick does not read it
             // as the user's.
             &last_sel_view, &sel_vp_prog, &sel_model, &rot_t, &meta_t.cloud_tagged,
+            &sel_cache, // 2026-10-29 (owner, testing rc.2): the rows' and the jump list's memory
         );
         mk!("sel");
 
@@ -24973,10 +25270,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         mk!("whole_folder");
 
+        // 8b-i) 2026-10-28 (the cloud-only round, design 6): a photo on screen whose frame landed this
+        // tick may have just been downloaded by viewing it — its cloud notes and scan tag are
+        // re-checked (metadata only), so its tile turns into the picture (owner answer 2).
+        tick::step_cloud_landed_with(
+            gen_now, &shots_now, &film_t, &shots_t, &meta_t.cloud_tagged, &cloud_retry_t, &thumb_gen_t,
+            falcon_decode::file_is_cloud_placeholder,
+        );
         // 8b) v0.8.24 (D3): cloud-placeholder retry sweep (~30 s; free on local folders via the is_empty
-        // gate — see step_cloud_retry). Clears the per-session failure latches of tagged shots so an
+        // gate — see step_cloud_retry_with). Clears the per-session failure latches of tagged shots so an
         // offline/paused OneDrive placeholder isn't a permanent dead-end, and drops the tag on hydration.
-        step_cloud_retry(
+        // The cloud-only round: …and re-checks the notes of photos on screen or near the current one,
+        // so a file downloaded outside Falcon comes back within about 30 s.
+        let sweep_pin = film_t.pinned.borrow();
+        let (sweep_pa, sweep_pb) = eff_win.get();
+        let sweep_near = |i: usize| {
+            sweep_pin.contains(&i)
+                || (i as i64 >= strip_window.0 && (i as i64) < strip_window.0 + strip_window.1 as i64)
+                || thumb_keep.iter().any(|&k| i.abs_diff(k) <= 1)
+                || (i + sweep_pb >= c && i <= c + sweep_pa)
+        };
+        step_cloud_retry_with(
             now, gen_now, &shots_now,
             // v1.0.0-rc TAIL (skeptic B, Y2): the swappable shot list itself, so a placeholder that
             // has ARRIVED can be re-classified from its bytes in place. Without it the sweep clears
@@ -24987,7 +25301,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             // v0.8.183 (W7): the per-shot attempt + backoff ledger the sweep now honours. It is NOT a
             // PerShotMeta store — it landed on the trunk after the v0.9.4 fold — so it keeps its own handle.
             &cloud_retry_t,
+            tick::CloudSweep { notes: &film_t.cloud_skipped, c, near: &sweep_near, thumb_gen: &thumb_gen_t },
+            falcon_decode::file_is_cloud_placeholder,
         );
+        drop(sweep_pin);
         mk!("cloud_retry"); // v0.8.151 (ORANGE-1): this bracket was SEVEN steps under one name
 
         // 8c) zoom vs SOURCE pixels for the focus-check badge (100% = true 1:1; see fn doc above).
@@ -25022,7 +25339,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         // meter is handed the finished string. See `support::efficiency_leaf_tip`.
         let leaf_tip = support::efficiency_leaf_tip(limits, app.get_scrub_fps().max(1.0));
         step_cache_meter(&app, c, len, zoomed, &fast_t.cache, &detail_t.cache, &eff_win, &meter_win,
-            det_ahead, det_behind, &leaf_tip, &cache_meter_last);
+            det_ahead, det_behind, &leaf_tip, &cache_meter_last,
+            // The cloud-only round (owner answer 8): found-cloud photos are left out of both numbers.
+            &shots_now, &film_t.cloud_skipped, gen_now, raw_t.load(Ordering::Relaxed));
         mk!("cache_meter");
 
         // 8d) compare mode: feed BOTH halves from their independent indices (see fn doc above).
@@ -25542,8 +25861,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if !dir.is_empty() && !snap.is_empty() {
                         let mut m = selection_map(&snap, &ratings_t.borrow(), &marks_t.borrow());
                         merge_selection_extra(&mut m, &sel_extra_t.borrow());
-                        if let Err(e) = save_selection(Path::new(&dir), &m, &rot_t.rotations_snapshot(), &folder_attrs_t.borrow()) {
-                            log_event(&format!("rescue flush FAILED: {e}"));
+                        let rots = rot_t.rotations_snapshot();
+                        match save_selection(Path::new(&dir), &m, &rots, &folder_attrs_t.borrow()) {
+                            // Issue #11 batch B1: advances the baseline, like every review write.
+                            Ok(_) => *lrj_t.borrow_mut() = selection_dirty_json(&m, &rots, &folder_attrs_t.borrow()),
+                            Err(e) => log_event(&format!("rescue flush FAILED: {e}")),
                         }
                     }
                 }
@@ -26232,6 +26554,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let marks = marks.clone();
         let sel_extra = sel_extra.clone();
         let folder_attrs = folder_attrs.clone();
+        // Issue #11 batch B1: the final saves' comparison baselines.
+        let last_settings_json = last_settings_json.clone();
+        let last_ratings_json = last_ratings_json.clone();
         Box::new(move |route: support::SaveRoute| {
             let started = std::time::Instant::now();
             let (route_name, immediate) = match route {
@@ -26364,8 +26689,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     );
                 }
                 support::ShutdownStep::SaveSettings => {
-                    // best-effort final flush on graceful close
-                    save_settings(&build_settings(
+                    // best-effort final flush on graceful close. Issue #11 batch B1: built once, and
+                    // written only if it changed since the last load or save, or that save is pending
+                    // or failed, so a window that changed nothing can't revert another window's settings.
+                    let s = build_settings(
                         &app,
                         nvjpeg_choice.load(Ordering::Relaxed), // 1.0.15: the choice, not the runtime flag
                         auto_orient.load(Ordering::Relaxed),
@@ -26380,7 +26707,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         &display_colors.borrow(), // v0.8.107
                         display_migrated.get(), // v0.8.108
                         info_view_pref.get(), // v1.0.0-rc (item 33): the FLOOR, not the live view
-                    ));
+                    );
+                    if support::settings_final_save_needed(&last_settings_json.borrow(), &s, support::SETTINGS_SAVES.status()) {
+                        save_settings(&s);
+                    } else {
+                        log_event("shutdown: settings unchanged since the last save — not rewritten");
+                    }
                 }
                 support::ShutdownStep::FlushSelection => {
                     final_shots = shots.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -26396,7 +26728,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         support::sync_xmp_ratings(app.get_xmp_sync(), &final_shots, &ratings.borrow(), &xmp_journal);
                         let mut m = selection_map(&final_shots, &ratings.borrow(), &marks.borrow());
                         merge_selection_extra(&mut m, &sel_extra.borrow()); // N8: keep moved-out entries
-                        if let Err(e) = save_selection(Path::new(&dir), &m, &rot.rotations_snapshot(), &folder_attrs.borrow()) {
+                        // Issue #11 batch B1: the folder switch's gate (`support::final_review_flush`).
+                        if let Err(e) = support::final_review_flush(
+                            Path::new(&dir), &m, &rot.rotations_snapshot(), &folder_attrs.borrow(),
+                            &last_ratings_json, support::enqueue_review_data,
+                        ) {
                             log_event(&format!("final ratings flush failed on shutdown: {e}"));
                         }
                     }
@@ -27323,7 +27659,7 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
         let running = feed.find("prep_priority::PREP.promote_thumb(idx, gen, delta);").expect("the running job's promotion");
         assert!(running > queued && !feed[queued..running].contains("} else"), "both in the pending-tile branch");
         assert_eq!(main.matches("prep_priority::PREP.worker(1);").count(), 2, "one place per preview and per thumbnail worker");
-        once("prep.run(prep_priority::Job::Frame(idx), || run_fast_job(&ctx, idx, regime_at_pop));");
+        once("prep.run(prep_priority::Job::Frame(idx), || run_fast_job(&ctx, idx, regime_at_pop, local_only));");
         let hand = once("take_via(|q| prep.hand_over(|| q.try_take()))");
         let ask = once("let ask = prep_priority::Job::Thumb { idx: job.idx, gen: job.gen, delta: job.delta, on_screen: job.explicit };");
         assert!(hand < ask, "the thumbnail worker takes its job through the hand-over");
@@ -27454,6 +27790,51 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
         let main = read("main.rs");
         let at = main.find("step_persistence(").expect("the periodic save");
         assert!(main[at..at + 200].contains("&nvjpeg_choice_t"), "the periodic save is handed the choice");
+    }
+
+    /// Issue #11 batch B1, the wiring the support tests can't see:
+    /// - both final review flushes (the folder switch's `flush_old`, the shutdown's `FlushSelection`)
+    ///   go through `support::final_review_flush`;
+    /// - the shutdown's settings save goes through `support::settings_final_save_needed` beside its one
+    ///   `build_settings`;
+    /// - a fresh open (not a rescan) forgets the folder's old attempts, and the load's baseline uses
+    ///   the file's attrs;
+    /// - every other review write (the Apply-rotations flush, the panic rescue) advances the baseline.
+    ///
+    /// FALSIFIER (L28): put a direct `save_selection(` back into either final flush, drop the settings
+    /// gate, forget on every scan, baseline the load from `folder_attrs`, or drop a baseline advance,
+    /// and the matching assert reddens.
+    #[test]
+    fn the_final_saves_are_gated_and_every_review_write_advances_the_baseline() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let span = |from: &str, to: &str| {
+            let a = main.find(from).unwrap_or_else(|| panic!("`{from}` is in main.rs"));
+            let b = a + main[a..].find(to).unwrap_or_else(|| panic!("`{to}` follows `{from}`"));
+            &main[a..b]
+        };
+        assert_eq!(main.matches("support::final_review_flush(").count(), 2, "the two final flushes, nothing else");
+        for (from, to) in [
+            ("let flush_old: Rc<dyn Fn()> = {", "let del_pending"),
+            ("support::ShutdownStep::FlushSelection => {", "support::ShutdownStep::WriterBarrier => {"),
+        ] {
+            let body = span(from, to);
+            assert!(body.contains("support::final_review_flush(") && !body.contains("save_selection("), "{from}: gated");
+        }
+        let settings = span("support::ShutdownStep::SaveSettings => {", "support::ShutdownStep::FlushSelection => {");
+        assert!(settings.contains("support::settings_final_save_needed("), "the shutdown's settings save is gated");
+        assert_eq!(settings.matches("build_settings(").count(), 1, "built once");
+        let forget = main.find("support::forget_review_attempts(").expect("a fresh open forgets");
+        assert!(main[..forget].trim_end().ends_with("if !scan_same_folder {"), "only a fresh open forgets");
+        assert!(main.contains("selection_dirty_json(&m, &rot.rotations_snapshot(), &disk_attrs)"), "the load's baseline");
+        let writes: Vec<usize> = main.match_indices("save_selection(").map(|(at, _)| at).collect();
+        assert_eq!(writes.len(), 2, "the Apply-rotations flush and the panic rescue");
+        for at in writes {
+            let after = &main[at..(at + 400).min(main.len())];
+            assert!(after.contains("_json.borrow_mut() = selection_dirty_json(") || after.contains("lrj_t.borrow_mut() = selection_dirty_json("),
+                "a review write advances the baseline: {}", &main[at..(at + 80).min(main.len())]);
+        }
     }
 
     /// 1.0.15 (PR #4 review SAVE-O3): the app flushes files only through the shared durable flush
@@ -27995,9 +28376,9 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
         for ext in ["avif", "tga"] {
             assert!(!all.contains(&ext), "unsupported `{ext}` must NOT be associable");
         }
-        // The exts[0] stability rule: assoc_family_states probes each family's live registry state
-        // on its FIRST extension, so exts[0] must stay the family's long-standing primary ext —
-        // an already-registered family reads back unchanged after any list growth.
+        // The exts[0] stability rule: exts[0] stays the family's long-standing primary ext, for row
+        // and label stability. Since 1.1.0-rc.1 (issue #11) assoc_family_states reads a family as on
+        // when ANY of its extensions is claimed, so a registered family reads back unchanged either way.
         let firsts: Vec<&str> = crate::support::ASSOC_FAMILIES.iter().map(|(_, e)| e[0]).collect();
         assert_eq!(
             firsts,
@@ -28015,6 +28396,16 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
             ["heic", "heif"],
             "HEIC_FAMILY_IDX must point at the HEIC family"
         );
+    }
+
+    /// 1.1.0-rc.1 (issue #11, the plan's A5). Falsifier: treat an unknown codec answer (a failed or
+    /// incomplete check) as "not installed".
+    #[test]
+    fn only_a_definite_heic_absence_disables_the_row() {
+        use crate::support::heic_assoc_available;
+        assert!(heic_assoc_available(Some(true)));
+        assert!(heic_assoc_available(None), "a failed check is not absence");
+        assert!(!heic_assoc_available(Some(false)));
     }
 
     /// v0.8.71 (Round B assoc): the pure HEIC apply-gate — codec absent forces ONLY the HEIC slot
@@ -28228,6 +28619,91 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
             Some(PREVIEW_BUNDLE_ID.to_string()),
             "an uncaptured UTI falls through to Preview"
         );
+    }
+
+    /// Falsifier (1.1.0-rc.1, issue #11 batch M2): reset a type whose current default is another app
+    /// (Photoshop → Preview), or a type with no recorded default, or match Falcon's id by case.
+    #[test]
+    fn assoc_reset_skips_utis_falcon_does_not_own() {
+        use crate::support::{assoc_reset_plan, FALCON_BUNDLE_ID, PREVIEW_BUNDLE_ID};
+        let handlers = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let ps = "com.adobe.Photoshop";
+        assert_eq!(assoc_reset_plan(Some(ps), None, &handlers(&[PREVIEW_BUNDLE_ID, ps])), None, "the user's choice stands");
+        assert_eq!(assoc_reset_plan(None, Some(ps), &handlers(&[ps, PREVIEW_BUNDLE_ID])), None, "no default recorded");
+        assert_eq!(assoc_reset_plan(Some(FALCON_BUNDLE_ID), Some(ps), &handlers(&[ps, PREVIEW_BUNDLE_ID])), Some(ps.to_string()));
+        assert_eq!(assoc_reset_plan(Some(&FALCON_BUNDLE_ID.to_uppercase()), Some(ps), &handlers(&[ps, PREVIEW_BUNDLE_ID])),
+            Some(ps.to_string()), "LaunchServices ids match case-insensitively");
+        assert_eq!(assoc_reset_plan(Some(FALCON_BUNDLE_ID), None, &handlers(&[PREVIEW_BUNDLE_ID])), Some(PREVIEW_BUNDLE_ID.to_string()));
+    }
+
+    /// Falsifier (1.1.0-rc.1, issue #11 batch M3): keep the captured incumbent after a successful
+    /// Reset (a later Reset restores an app the user has since replaced), drop it after a failed one,
+    /// or call the setter for a type Falcon doesn't own.
+    #[test]
+    fn assoc_reset_consumes_capture() {
+        use crate::support::{assoc_reset_step, prev_capture_into, FALCON_BUNDLE_ID};
+        use std::cell::Cell;
+        let handlers = vec!["com.adobe.Photoshop".to_string(), "com.apple.Preview".to_string()];
+        let fresh = || BTreeMap::from([("public.jpeg".to_string(), "com.adobe.Photoshop".to_string())]);
+        let mut map = fresh();
+        assert_eq!(assoc_reset_step(&mut map, "public.jpeg", Some(FALCON_BUNDLE_ID), &handlers, |_| 0),
+            Some(("com.adobe.Photoshop".into(), 0)));
+        assert!(map.is_empty(), "a successful Reset consumes the capture");
+        assert!(prev_capture_into(&mut map, "public.jpeg", "com.pixelmatorteam.pixelmator.x"), "the next Make default captures afresh");
+        let mut map = fresh();
+        assert_eq!(assoc_reset_step(&mut map, "public.jpeg", Some(FALCON_BUNDLE_ID), &handlers, |_| -1),
+            Some(("com.adobe.Photoshop".into(), -1)));
+        assert_eq!(map, fresh(), "a failed Reset keeps it");
+        let mut map = fresh();
+        let calls = Cell::new(0);
+        assert_eq!(assoc_reset_step(&mut map, "public.jpeg", Some("com.adobe.Photoshop"), &handlers, |_| { calls.set(calls.get() + 1); 0 }), None);
+        assert_eq!(calls.get(), 0, "never set a type Falcon doesn't own");
+        assert_eq!(map, fresh());
+    }
+
+    /// Falsifier (1.1.0-rc.1, issue #11 batch M2–M4): the Mac glue (compiled only on macOS) calls the
+    /// old ladder directly, drops the consumed map, or lets a test build arm, open or answer the
+    /// first-launch question. Pinned by source, since the glue can't run on this host.
+    #[test]
+    fn mac_reset_and_first_launch_glue_uses_the_owned_plan_and_the_test_build_gate() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let span = |from: &str, to: &str| {
+            let a = main.find(from).unwrap_or_else(|| panic!("`{from}` is in main.rs"));
+            let b = a + main[a..].find(to).unwrap_or_else(|| panic!("`{to}` follows `{from}`"));
+            &main[a..b]
+        };
+        let rows = span("fn mac_assoc_rows_build() -> Vec<MacAssocRow> {", "fn mac_make_default_family(");
+        assert!(rows.contains("support::assoc_reset_plan(mac_assoc::default_handler(uti)"), "the button follows the plan");
+        let reset = span("app.on_mac_assoc_reset(move |idx| {", "app.on_assoc_prompt_choice(");
+        assert!(reset.contains("support::assoc_reset_step(&mut map, uti, mac_assoc::default_handler(uti)"), "the action follows the plan");
+        assert!(reset.contains("support::assoc_prev_store(idx, support::encode_prev_map(&map));"), "the consumed map is stored");
+        for body in [rows, reset] { assert!(!body.contains("assoc_reset_target("), "never the bare ladder"); }
+        let choice = span("app.on_assoc_prompt_choice(move |choice| {", "assoc_prompt_families(choice)");
+        assert!(choice.contains("if !mac_experiment::associations_allowed() {"), "a test build ignores the choice");
+        // 2026-10-29 (owner: the guide's Apply to all gave no feedback): the Mac arm says it worked
+        // only when every family was set, sets them all even after a failure, and only for the guide.
+        let helper = span("fn mac_make_default_family(idx: usize) -> bool {", "\n}\n");
+        assert!(helper.contains("if err == 0 && ok > 0 {") && helper.matches("false").count() >= 3, "a failure or a test build reports false");
+        let answer = span("assoc_prompt_families(choice)", "app.on_toggle_fullscreen(");
+        assert!(answer.contains("families.iter().fold(true, |all, &fi| mac_make_default_family(fi) && all)"), "every family, no short circuit");
+        assert!(answer.contains("if choice == 2 && all_set && a.get_welcome_open() {"), "only the guide's Apply to all, only when all were set");
+        assert!(answer.contains("a.set_welcome_assoc_applied(true);"));
+        let boot = span("support::assoc_popup_allowed(assoc_arm_now, assoc_open_at_boot, mac_experiment::associations_allowed());",
+            "app.set_assoc_prompt_open(true);");
+        assert!(boot.contains("app.set_assoc_prompt_armed(true);"), "the gate precedes both the arm and the open");
+    }
+
+    /// Falsifier (1.1.0-rc.1, issue #11 batch M4): a test build arms or opens the first-launch popup.
+    #[test]
+    fn assoc_popup_allowed_table() {
+        use crate::support::assoc_popup_allowed;
+        assert_eq!(assoc_popup_allowed(true, false, true), (true, false));
+        assert_eq!(assoc_popup_allowed(false, true, true), (false, true));
+        assert_eq!(assoc_popup_allowed(false, false, true), (false, false));
+        assert_eq!(assoc_popup_allowed(true, false, false), (false, false), "a test build never arms");
+        assert_eq!(assoc_popup_allowed(false, true, false), (false, false), "a test build never opens");
     }
 
     /// v0.9.16 (Round B assoc, Mac): the first-launch popup's choice sets — 1 = the photographer
@@ -29979,7 +30455,7 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
         let plan = falcon_decode::tile_number_plan(&["IMG_0001"]);
         let blank = slint::Image::default();
         let item = |valid: bool, failed: bool| {
-            tick::make_film_item(&s, 0, 0, blank.clone(), valid, 0, 0, 0, &plan, failed, false)
+            tick::make_film_item(&s, 0, 0, blank.clone(), valid, 0, 0, 0, &plan, failed, false, false)
         };
         assert!(item(false, true).failed, "a latched decode failure reaches the model");
         assert!(!item(false, false).failed, "a tile that is merely still decoding is NOT failed");
@@ -29991,6 +30467,16 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
             !item(false, true).unsupported,
             "…and it stays distinct from the scan-time unsupported class in the model"
         );
+        // 2026-10-28 (the cloud-only round, owner answers 1–2): a tile whose file was found only in
+        // the cloud carries the cloud mark only while it has no picture and no failure. FALSIFIER
+        // (L28): drop `&& !valid` and the landed row reddens; drop `&& !failed` and the failed row.
+        let cloud = |valid: bool, failed: bool| {
+            tick::make_film_item(&s, 0, 0, blank.clone(), valid, 0, 0, 0, &plan, failed, false, true)
+        };
+        assert!(cloud(false, false).cloud, "only in the cloud: the cloud mark");
+        assert!(!cloud(true, false).cloud, "a landed picture (or the stage's frame) beats the cloud");
+        assert!(!cloud(false, true).cloud && cloud(false, true).failed, "a real failure keeps its mark");
+        assert!(!item(false, false).cloud, "nothing noted: the loading dots, as before");
     }
 
     /// v0.8.120 (design-sweep Y44): where an op result's "Show" opens. `on_undo_move` published
@@ -30261,6 +30747,7 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
                 inflight: HashSet::new(),
                 costly_q: HashSet::new(),
                 costly_inflight: HashSet::new(),
+                local_only_q: HashSet::new(),
             }),
             Condvar::new(),
         ));
@@ -30286,12 +30773,13 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
             raw_mode: Arc::new(AtomicBool::new(false)),
             det_epoch: Arc::new(AtomicU64::new(0)),
             derive_tx,
+            cloud_skipped: Arc::new(Mutex::new(HashSet::new())),
         };
 
         // ── LEG (a): the hover is asking for index 0, and index 0 is 500 shots from `current`.
         hover_ask.store(0, Ordering::Relaxed);
         pump.0.lock().unwrap().inflight.insert(0); // as `support::pump_pop` would have left it
-        let sent = run_fast_job(&ctx, 0, 1);
+        let sent = run_fast_job(&ctx, 0, 1, false);
         let got = rx.try_recv().ok().map(|d| d.id);
         assert_eq!(
             got,
@@ -30308,27 +30796,157 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
         // ── LEG (b): the same far index with no ask standing — the chase-latest rule, intact.
         pump.0.lock().unwrap().inflight.insert(0);
         hover_ask.store(-1, Ordering::Relaxed);
-        let sent = run_fast_job(&ctx, 0, 1);
+        let sent = run_fast_job(&ctx, 0, 1, false);
         assert!(rx.try_recv().is_err(), "a far job nobody asked for is still skipped");
         assert!(!sent, "…and the worker reports that it sent nothing");
         assert!(
             !pump.0.lock().unwrap().inflight.contains(&0),
             "…and self-clears `inflight`, because no frame will arrive to clear it"
         );
+
+        // ── 2026-10-28 (the cloud-only round, design 4): A PREVIEW AHEAD NEVER READS A FILE THAT
+        // IS ONLY IN THE CLOUD. The same worker, the same real file, the probe standing in for a
+        // placeholder (no test can make one). See `a_preview_ahead_never_reads_a_cloud_only_file`.
+        hover_ask.store(0, Ordering::Relaxed); // within reach, so only the cloud rule can refuse it
+        let cloud = |_: &std::path::Path| true;
+        // (c) marked (nobody is looking at it), not the current photo: refused before any read —
+        //     no frame, nothing latched, `inflight` and the cost mark released, the file noted.
+        {
+            let mut p = pump.0.lock().unwrap();
+            p.inflight.insert(0);
+            p.costly_inflight.insert(0);
+        }
+        let sent = run_fast_job_with(&ctx, 0, 1, true, cloud);
+        assert!(!sent && rx.try_recv().is_err(), "a cloud-only file ahead is not decoded");
+        assert!(ctx.fast_failed.lock().unwrap().is_empty(), "…and is not a failure");
+        {
+            let p = pump.0.lock().unwrap();
+            assert!(!p.inflight.contains(&0) && !p.costly_inflight.contains(&0), "…its slot is free");
+        }
+        assert!(
+            ctx.cloud_skipped.lock().unwrap().contains(&(0, 0, support::CloudFile::Finished)),
+            "…and its file is noted, so the tick asks no more"
+        );
+        // (d) the same job unmarked (a photo on screen): read, as viewing may download.
+        ctx.cloud_skipped.lock().unwrap().clear();
+        pump.0.lock().unwrap().inflight.insert(0);
+        assert!(run_fast_job_with(&ctx, 0, 1, false, cloud), "the photo on screen is decoded");
+        assert_eq!(rx.try_recv().ok().map(|d| d.id), Some(0));
+        // (e) marked, but it has become the current photo since: read.
+        ctx.cur_atomic.store(0, Ordering::Relaxed);
+        assert!(run_fast_job_with(&ctx, 0, 1, true, cloud), "the current photo is never refused");
+        assert_eq!(rx.try_recv().ok().map(|d| d.id), Some(0));
+        // (f) marked and far, the file on this device: read as before.
+        ctx.cur_atomic.store(500, Ordering::Relaxed);
+        assert!(run_fast_job_with(&ctx, 0, 1, true, |_: &std::path::Path| false), "a local file is decoded");
+        assert_eq!(rx.try_recv().ok().map(|d| d.id), Some(0));
+        assert!(ctx.cloud_skipped.lock().unwrap().is_empty());
+        // Production asks the real, metadata-only probe, and both pool shapes pass the pop's mark.
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        assert_eq!(prod.matches("run_fast_job_with(ctx, idx, regime_at_pop, local_only, falcon_decode::file_is_cloud_placeholder)").count(), 1);
+        assert_eq!(prod.matches("run_fast_job(&ctx, idx, regime_at_pop, local_only)").count(), 1, "the fixed pool");
+        assert_eq!(prod.matches("run_fast_job(&fast_ctx, idx, costly_regime, local_only)").count(), 1, "the Mac elastic pool");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 2026-10-27 (round 2b, owner: "do the check") — **A WHOLE-FOLDER JOB NEVER READS A FILE THAT IS
-    /// ONLY IN THE CLOUD NOW.** The worker asks the file's metadata just before the read; an
-    /// online-only file (either file of a pair, the scan's rule) is answered empty, is no failure, and
-    /// is noted for the feeder. A tile on screen, and a whole-folder job for a file on this device,
-    /// read as before. The probe stands in for a placeholder (no test can make one); the photo's path
-    /// does not exist, so a read that is tried fails and latches, which is what tells them apart.
+    /// 2026-10-28 (the cloud-only round, design 4) — the name the plan gives the fast worker's rows,
+    /// which live in `the_fast_worker_decodes_a_far_job_when_it_is_the_hover_ask` (legs c–f) because
+    /// they need its real decodable fixture and worker context; this row pins the ORDER: the check
+    /// sits after the stale test and the snapshot, before the lane door that parses the file.
+    ///
+    /// 2026-10-28 (the cloud-only round, owner answers 9–11) — **EXPORT AND APPLY ROTATIONS ASK
+    /// BEFORE THEY DOWNLOAD, AND THE RUN READS ONLY WHAT WAS AGREED.** Their handlers are closures
+    /// inside `main()` that no rig can install, so the wiring is pinned by source; the counting lives
+    /// in the pure helpers (`support::web_cloud_scan`, `falcon_decode::rotation_reads`,
+    /// `support::rotation_freed_files`), which have their own rows.
+    ///
+    /// FALSIFIER (L28): send a door straight to `launch_web`, launch with an agreed set nobody counted,
+    /// or move the Apply worker's check below `apply_rotation`, and this row reddens.
+    #[test]
+    fn the_export_and_apply_ask_before_they_download() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        // Export: all three doors go through the cloud question, which asks the real probe.
+        assert_eq!(prod.matches("ask_ex(pending, support::WebCollide::NotAsked);").count(), 1, "the no-collision door");
+        assert_eq!(prod.matches("ask(p, support::WebCollide::Skip);").count(), 1, "Skip existing");
+        assert_eq!(prod.matches("ask(p, support::WebCollide::Overwrite);").count(), 1, "Overwrite");
+        assert_eq!(prod.matches("lw(p, support::WebCollide").count(), 0, "no door launches unasked");
+        assert_eq!(prod.matches("collide, falcon_decode::file_is_cloud_placeholder,").count(), 1, "the fresh count");
+        assert_eq!(prod.matches("lw(p, collide, HashSet::new());").count(), 1, "nothing counted: nothing agreed");
+        assert_eq!(prod.matches("lw(p, collide, agreed);").count(), 1, "Download and export: exactly the counted photos");
+        // Apply: the ask and the run build one plan list; the run checks each photo before writing.
+        assert_eq!(prod.matches("support::rotation_apply_plans(&rot, &snap)").count(), 2, "the ask and the run");
+        let body = &prod[prod.find("app.on_apply_rotations(move || {").expect("the Apply handler")..];
+        let check = body.find("support::rotation_freed_files(").expect("the run's last look");
+        let write = body.find("falcon_decode::apply_rotation(plan)").expect("the write");
+        assert!(check < write, "the check comes before the write");
+        assert!(body[check..write].contains("&falcon_decode::rotation_reads(plan), &agreed, falcon_decode::file_is_cloud_placeholder,"));
+    }
+
+    /// FALSIFIER (L28): move the check below `let one_decode =` and this row reddens.
+    #[test]
+    fn a_preview_ahead_never_reads_a_cloud_only_file() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let body = &prod[prod.find("fn run_fast_job_with(").expect("the fast job body")..];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing: {needle}"));
+        let snap = at("let (snap, g) = {");
+        let check = at("support::speculative_read_refused(");
+        let door = at("let one_decode = ");
+        let decode = at("browse_frame_or_superseded(shot, ask.0, ask.1, Lane::Fast)");
+        assert!(snap < check && check < door && door < decode, "the check comes before the first read");
+    }
+
+    /// 2026-10-28 (the cloud-only round, design 4) — **THE FULL-RESOLUTION WORKER CHECKS A FRAME
+    /// AHEAD BEFORE ITS FIRST READ.** The worker is inline in `main()` with no seam, so its order is
+    /// pinned by source: after the `jumped_away` pre-decode skip, before the priority registry's entry
+    /// and the orientation read; it asks the real probe with the request's flag, spares the current
+    /// photo and the awaited frame, and answers like the skip (skipped, the worker free again). R1
+    /// (Codex's review, 29 October): the job reads the RAW-mode switch only in the check, and its reads
+    /// take the checked mode (`support::detail_job_mode` has the behaviour test).
+    ///
+    /// FALSIFIER (L28): move the check below the orientation read, or drop its `skipped: true` or its
+    /// `det_busy` release, or read the switch again at the decode, and this row reddens.
+    #[test]
+    fn the_full_resolution_worker_checks_before_its_first_read() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let body = &prod[prod.find("while let Ok((idx, derive, local_only)) = req_rx.recv() {").expect("the detail loop")..];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing: {needle}"));
+        let jump = at("if jumped_away(\"pre-decode\") {");
+        let check = at("&raw_mode, local_only, explicit_now, shot, falcon_decode::file_is_cloud_placeholder,");
+        let enter = at("let prep = prep_worker.enter(prep_priority::Job::Frame(idx));");
+        let orient = at("cached_base_jpg(&orient_cache, idx, g, shot)");
+        assert!(jump < check && check < enter && enter < orient, "the check comes before the first read");
+        let arm = &body[check..enter];
+        for needle in ["skipped: true", "det_busy.store(false", "det_cpu_busy.store(false", "continue;"] {
+            assert!(arm.contains(needle), "the refusal answers like the skip: {needle}");
+        }
+        let guard = &body[jump..check];
+        assert!(guard.contains("|| det_awaited_w.load(Ordering::Relaxed) == idx as i64"), "the awaited frame is spared");
+        let job = &body[..body.find("// ── adaptive hi-res region worker ──").expect("the next worker")];
+        assert!(!job.contains(&format!("raw_mode.{}(", "load")), "the job never reads the switch a second time");
+        assert!(job[enter..].contains("let raw = job_raw_mode && shot.has_raw;"), "the reads take the checked mode");
+    }
+
+    /// 2026-10-27 (round 2b, owner: "do the check") → 2026-10-28 (the cloud-only round) — **NO
+    /// THUMBNAIL JOB READS A FILE THAT IS ONLY IN THE CLOUD**, whatever asked for it: a tile on screen
+    /// (explicit), the backdrop or the whole folder (speculative). The worker asks the metadata of the
+    /// ONE file a thumbnail reads (the JPEG of a pair) just before the read; an online-only one is
+    /// answered empty, is no failure, and is noted by file. A pair whose RAW alone is in the cloud is
+    /// read (its JPEG is here). The probe stands in for a placeholder (no test can make one); the
+    /// photo's path does not exist, so a read that is tried fails and latches, which tells them apart.
+    ///
+    /// Round 2b's row "a tile on screen reads it as before" is inverted on purpose: that is the
+    /// approved round (owner, 27–28 October). Only the stage's own decode of the photo being viewed
+    /// may download.
     ///
     /// FALSIFIER (L28): drop the check in `run_thumb_job_with` and the first row reddens with the read
-    /// tried and the failure latched; probe only the JPEG and the pair row reddens.
+    /// tried and the failure latched; probe both files (the scan's either-file rule) and the pair row
+    /// reddens with the RAW-freed pair skipped.
     #[test]
-    fn a_whole_folder_job_skips_a_file_only_in_the_cloud() {
+    fn every_thumbnail_job_skips_a_file_only_in_the_cloud() {
         let dir = std::env::temp_dir().join(format!("falcon-2b-cloud-skip-{}", std::process::id()));
         let shot = falcon_decode::Shot {
             id: 0,
@@ -30354,31 +30972,138 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
             orient_cache: Arc::new(Mutex::new(OrientCache::new())),
             cloud_skipped: Arc::new(Mutex::new(HashSet::new())),
         };
-        // The pair's RAW was freed up; its JPEG is still here. The scan tags a pair if either file is
-        // a placeholder, and so does this check.
+        // The pair's JPEG was freed up: every kind of job is answered empty, unread, and noted.
+        let jpg_freed = |p: &std::path::Path| p.extension().is_some_and(|e| e == "JPG");
+        for req in [support::ThumbReq::explicit(0, 7, 0), support::ThumbReq::speculative(0, 7, 0)] {
+            ctx.cloud_skipped.lock().unwrap().clear();
+            run_thumb_job_with(&ctx, req, jpg_freed);
+            let d = res_rx.try_recv().expect("always answered");
+            assert_eq!((d.0, d.1, d.2.len(), d.3), (0, 7, 0, 0), "{req:?}: an empty marker frees the pending slot");
+            assert!(ctx.thumb_failed.lock().unwrap().is_empty(), "{req:?}: no failure — the read was never tried");
+            assert_eq!(
+                *ctx.cloud_skipped.lock().unwrap(),
+                HashSet::from([(7, 0, support::CloudFile::Finished)]),
+                "{req:?}: noted by the file a thumbnail reads"
+            );
+        }
+        // The pair's RAW alone was freed up: a thumbnail reads the JPEG, so it is read (owner answer 3).
+        ctx.cloud_skipped.lock().unwrap().clear();
         let raw_freed = |p: &std::path::Path| p.extension().is_some_and(|e| e == "CR3");
-        run_thumb_job_with(&ctx, support::ThumbReq::whole_folder(0, 7, 0), raw_freed);
-        let d = res_rx.try_recv().expect("always answered");
-        assert_eq!((d.0, d.1, d.2.len(), d.3), (0, 7, 0, 0), "an empty marker frees the pending slot");
-        assert!(ctx.thumb_failed.lock().unwrap().is_empty(), "no failure: the read was never tried");
-        assert!(ctx.cloud_skipped.lock().unwrap().contains(&(7, 0)), "noted for the feeder");
-        // A tile on screen reads it as before (the cloud rule lets one photo download its file).
         run_thumb_job_with(&ctx, support::ThumbReq::explicit(0, 7, 0), raw_freed);
         assert!(res_rx.try_recv().is_ok());
-        assert!(ctx.thumb_failed.lock().unwrap().contains(&(7, 0)), "an explicit job is read (here: no such file)");
-        // …and so is a whole-folder job for a pair still on this device.
+        assert!(ctx.thumb_failed.lock().unwrap().contains(&(7, 0)), "a pair with its JPEG here is read (here: no such file)");
+        assert!(ctx.cloud_skipped.lock().unwrap().is_empty(), "…and nothing is noted");
+        // …and so is a job for a pair still on this device.
         ctx.thumb_failed.lock().unwrap().clear();
-        ctx.cloud_skipped.lock().unwrap().clear();
-        run_thumb_job_with(&ctx, support::ThumbReq::whole_folder(0, 7, 0), |_: &std::path::Path| false);
+        run_thumb_job_with(&ctx, support::ThumbReq::speculative(0, 7, 0), |_: &std::path::Path| false);
         assert!(res_rx.try_recv().is_ok());
         assert!(ctx.thumb_failed.lock().unwrap().contains(&(7, 0)), "a local file is read");
         assert!(ctx.cloud_skipped.lock().unwrap().is_empty());
+        // A RAW-only photo's thumbnail is its RAW's embedded preview: that file is the one asked about.
+        ctx.thumb_failed.lock().unwrap().clear();
+        {
+            let mut s = ctx.shots.lock().unwrap();
+            let v = Arc::make_mut(&mut *s);
+            v[0].jpg = None;
+            v[0].has_jpg = false;
+        }
+        run_thumb_job_with(&ctx, support::ThumbReq::speculative(0, 7, 0), raw_freed);
+        assert!(res_rx.try_recv().is_ok());
+        assert!(ctx.thumb_failed.lock().unwrap().is_empty(), "a cloud-only RAW is not read");
+        assert!(ctx.cloud_skipped.lock().unwrap().contains(&(7, 0, support::CloudFile::Raw)), "…and noted as the RAW");
         // Production asks the real, metadata-only probe, and writes the set the feeder reads (the
         // production part of the file only: this test's own text would match itself).
         let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
         let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
         assert_eq!(prod.matches("run_thumb_job_with(ctx, req, falcon_decode::file_is_cloud_placeholder);").count(), 1);
-        assert_eq!(prod.matches("cloud_skipped: film.cloud_skipped.clone(),").count(), 1, "the feeder's own set");
+        assert_eq!(prod.matches("cloud_skipped: film.cloud_skipped.clone(),").count(), 2, "the thumbnail and preview workers write the feeders' own set");
+        assert_eq!(prod.matches("let cloud_skipped_d = film.cloud_skipped.clone();").count(), 1, "…and so does the full-resolution worker");
+    }
+
+    /// Round 2b review P1 — **AN OLD FOLDER'S BLUR SOURCE NEVER REACHES THE NEXT FOLDER'S PHOTO.** A
+    /// thumbnail job that passed its generation check, then lost the race to a folder switch (the
+    /// generation moved and `Film::on_folder_swap` cleared the map), must not park its blur source in
+    /// the new folder's map, where the new photo at the same index would copy it as its backdrop. The
+    /// switch is injected through the job's own cloud probe, which runs after that check and before
+    /// the decode and the park. The control leg shows a parked source IS what the reader copies.
+    ///
+    /// Honest limit: HEAD's old pre-lock recheck also passes this row (it sees the bump made earlier);
+    /// the gap between the question and the lock is pinned by
+    /// `tick::frost_feed_tests::the_blur_source_is_parked_only_while_its_folder_is_open_asked_under_the_lock`.
+    /// This row pins that the real worker's write goes through the generation-guarded park.
+    ///
+    /// FALSIFIERS: pass `|| true` as the worker's `still_open`, or insert into the map directly, and the
+    /// "old source refused" row reddens.
+    #[test]
+    fn an_old_folders_blur_source_never_reaches_the_next_folders_photo() {
+        let dir = std::env::temp_dir().join(format!("falcon_frost_swap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (64u32, 48u32);
+        let mut rgb = vec![0u8; (w as usize) * (h as usize) * 3];
+        for (i, px) in rgb.iter_mut().enumerate() {
+            *px = ((i * 37) & 0xff) as u8;
+        }
+        let bytes = falcon_decode::encode_jpeg_rgb(&rgb, w, h, 90).expect("encode the fixture");
+        std::fs::write(dir.join("old.jpg"), &bytes).expect("write the fixture");
+        let shots = falcon_decode::scan_folder(&dir).expect("scan the fixture folder");
+        assert_eq!(shots.len(), 1, "premise: one shot at index 0");
+
+        let film = Film::new();
+        let generation = Arc::new(AtomicU64::new(7));
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<tick::ThumbDrop>();
+        let ctx = ThumbWorkerCtx {
+            shots: Arc::new(Mutex::new(Arc::new(shots))),
+            generation: generation.clone(),
+            thumb_res_tx: res_tx,
+            output_gamut: Arc::new(AtomicU32::new(0)),
+            thumb_failed: film.failed.clone(),
+            frost_map: film.frost.clone(),
+            auto_orient: Arc::new(AtomicBool::new(true)),
+            orient_cache: Arc::new(Mutex::new(OrientCache::new())),
+            cloud_skipped: film.cloud_skipped.clone(),
+        };
+        // A different frame for the next folder's photo at index 0: a reader that copies a parked
+        // source returns the parked bytes, never this frame's own blur.
+        let frame: Vec<u8> = (0..w * h).flat_map(|i| [(i % 251) as u8, 40, 200, 255]).collect();
+        let misses = AtomicUsize::new(0);
+
+        // ── Control: no switch. The source parks, and the reader copies exactly it.
+        run_thumb_job_with(&ctx, support::ThumbReq::speculative(0, 7, 0), |_: &std::path::Path| false);
+        let d = res_rx.try_recv().expect("answered");
+        assert!(!d.2.is_empty(), "premise: the thumbnail decoded");
+        let (parked, gamut) = {
+            let m = film.frost.lock().unwrap();
+            let e = m.get(&0).expect("the open folder's source is parked").clone();
+            (e.0, e.3)
+        };
+        let (got, ..) = support::fast_blur_mip(&frame, w, h, 0, gamut, &film.frost, true, &misses, true);
+        assert_eq!((&got[..], misses.load(Ordering::Relaxed)), (&parked[..], 0), "a parked source is what the reader copies");
+
+        // ── The review's interleaving: the job passes its check, then the folder switches (the
+        //    generation moves, the map is cleared), then the job reaches its park.
+        film.on_folder_swap();
+        let switched = std::cell::Cell::new(false);
+        let swap_mid_job = |_: &std::path::Path| {
+            if !switched.replace(true) {
+                generation.fetch_add(1, Ordering::Relaxed);
+                film.on_folder_swap();
+            }
+            false
+        };
+        run_thumb_job_with(&ctx, support::ThumbReq::speculative(0, 7, 0), swap_mid_job);
+        assert!(switched.get(), "premise: the switch ran inside the job, after its generation check");
+        let d = res_rx.try_recv().expect("answered");
+        assert!(!d.2.is_empty() && d.1 == 7, "premise: the job ran on to its park, for the old folder");
+        assert!(film.frost.lock().unwrap().get(&0).is_none(), "the old folder's source is refused");
+        let (got, ..) = support::fast_blur_mip(&frame, w, h, 0, gamut, &film.frost, true, &misses, true);
+        assert_eq!(misses.load(Ordering::Relaxed), 1, "the next folder's photo misses…");
+        assert_eq!(
+            got,
+            falcon_decode::downscale_frost_rgba(&frame, w, h, BLUR_DIM).0,
+            "…and builds its backdrop from its own frame"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// R4 — **BOTH WORKER STALENESS SITES ASK THE ONE PREDICATE, AND `main.rs` KEEPS NO SECOND
