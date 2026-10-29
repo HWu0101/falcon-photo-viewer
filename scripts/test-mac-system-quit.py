@@ -9,9 +9,16 @@ or rotated log to confuse; review R1). Once the folder is open, a small Swift se
 without a reason for the ordinary case (what Dock → Quit sends). The runner never logs out.
 
 System case: the save runs inside `applicationShouldTerminate:`, Falcon answers Now, AppKit ends the
-process (exit 0) with no panic in the native teardown, and the settings and review data on disk were
-written during that save (read back here, from a separate process). Ordinary case: the old route —
-Cancel, the loop ends, the same save runs after it and the process exits cleanly.
+process (exit 0) with no panic in the native teardown, and the review data on disk was written during
+that save (read back here, from a separate process). Ordinary case: the old route — Cancel, the loop
+ends, the same save runs after it and the process exits cleanly.
+
+1.1.0 (issue #11 batch B1): the final saves write only what changed since the window last loaded or
+saved it. So before the quit each case moves to the second photo (`FALCON_DEBUG_STEP=1`, the arrow-tap
+path, at about 6 s), which changes the folder's remembered photo (`resume_shot`). Nothing writes that
+before the final save but the ~15 s backstop, which is counted in ticks from boot and cannot come
+first; so the review data must be written during the save, holding the new photo. The settings may
+have nothing new: they pass if written during the save or if the log says they were unchanged.
 
 If the check cannot run as designed (the folder never opens, the sender fails or is refused
 permission), it fails as SETUP FAILED, which does not claim a Falcon regression (review R3).
@@ -101,10 +108,11 @@ def run_case(app, executable_name, sender, out, name, reason):
     subprocess.run(["ditto", str(app), str(bundle)], check=True)
     executable = bundle / "Contents/MacOS" / executable_name
 
-    result = dict(case=name, reason=reason, setup_error=None, folder_opened=False, sender=None,
+    result = dict(case=name, reason=reason, setup_error=None, folder_opened=False, stepped=False, sender=None,
                   exit_code=None, timed_out=False, killed=False)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("FALCON_", "SLINT_"))}
     env["HOME"] = str(home)
+    env["FALCON_DEBUG_STEP"] = "1"  # 1.1.0: one arrow-tap step, so the final save has a change to write
     proc = None
     # Review R3: everything from the launch on is inside this try, so whatever fails, the Falcon this
     # case started is stopped and reaped before anything deletes its photos.
@@ -120,7 +128,15 @@ def run_case(app, executable_name, sender, out, name, reason):
             if not result["folder_opened"]:
                 result["setup_error"] = "the folder never opened (no `scan: 8 shots` line in this case's log)"
             else:
-                time.sleep(3)  # let the first photo and the folder's saves settle
+                while time.monotonic() < deadline and proc.poll() is None:
+                    if "dbg: FALCON_DEBUG_STEP 1/1" in case_log(case)[1]:
+                        result["stepped"] = True
+                        break
+                    time.sleep(0.25)
+                if not result.get("stepped"):
+                    result["setup_error"] = "the photo step never ran (no `FALCON_DEBUG_STEP 1/1` line)"
+            if result["setup_error"] is None:
+                time.sleep(1)  # the next settled tick records the new photo; the backstop comes seconds later
                 try:
                     sent = subprocess.run([str(sender), str(proc.pid), reason],
                                           capture_output=True, text=True, timeout=30)
@@ -164,11 +180,13 @@ def run_case(app, executable_name, sender, out, name, reason):
         log_file=log_name,
         terminate_lines=[l.split("] ", 1)[-1] for l in log.splitlines() if "terminate:" in l],
         shutdown_lines=[l.split("] ", 1)[-1] for l in log.splitlines() if "shutdown:" in l or "clean shutdown" in l],
+        review_lines=[l.split("] ", 1)[-1] for l in log.splitlines() if "review data:" in l],
         panic="PANIC" in log,
         settings_written_in_save=written_in_save(config / "settings.json"),
         review_written_in_save=written_in_save(review),
         last_dir_is_photos=Path(settings.get("last_dir", "")).resolve() == photos.resolve(),
         seeded_kept=all(saved_review.get("photos", {}).get(k) == v for k, v in SEEDED.items()),
+        resume_saved=saved_review.get("resume_shot"),
     )
     return result, log
 
@@ -208,8 +226,12 @@ def main(executable, output):
     for r in results:
         assert r["log_file"] == "falcon.log", f"{r['case']}: expected one fresh falcon.log: {r}"
         assert not r["timed_out"] and r["exit_code"] == 0 and not r["panic"], f"{r['case']}: exit: {r}"
-        assert r["settings_written_in_save"] and r["review_written_in_save"], f"{r['case']}: not saved: {r}"
+        # 1.1.0 (B1): the settings are written only if they changed; the review data has the step's change.
+        settings_ok = r["settings_written_in_save"] or any(
+            "settings unchanged since the last save" in l for l in r["shutdown_lines"])
+        assert settings_ok and r["review_written_in_save"], f"{r['case']}: not saved: {r}"
         assert r["last_dir_is_photos"] and r["seeded_kept"], f"{r['case']}: saved state: {r}"
+        assert r["resume_saved"] == "test-02", f"{r['case']}: the stepped-to photo was not saved: {r}"
     assert any(l.startswith("terminate: system reason='rlgo' (log out)") for l in system["terminate_lines"]), system
     assert "terminate: reply=now" in " ".join(system["terminate_lines"]), system
     assert any("save sequence begin route=system" in l for l in system["shutdown_lines"]), system

@@ -5550,6 +5550,85 @@ fn panels_writes_are_invisible_to_the_folder_recorder() {
     );
 }
 
+/// 1.1.0 (Codex R1): A PANEL CHANGE IN THE LAST FRAME REACHES BOTH QUIT SAVES. The recorder is a
+/// deferred tick observer and the quit gets no further tick, so the shutdown's SaveSettings step runs
+/// it once before the two snapshots (`the_quit_captures_a_last_frame_panel_change_before_both_snapshots`
+/// pins that call in main.rs). This row drives that call, with main.rs' inputs, on both routes and
+/// with no tick in between:
+/// - a journal folder: without the capture, B1's final review flush skips the file as unchanged;
+///   with it, the flush writes the new arrangement;
+/// - any other folder: the settings MRU (`panel_folders`) gains the arrangement, so the settings
+///   snapshot is no longer equal to the last save.
+///
+/// FALSIFIER (L28): in `tick::record_panel_min_toggle`, drop the `folder_attrs…panel_min = Some(…)`
+/// write and the journal route's "with the capture" assert reddens (the flush stays skipped); drop the
+/// `lru_upsert` and the settings route's MRU assert reddens. The main.rs pin covers the call itself.
+#[test]
+fn a_last_frame_panel_change_reaches_both_quit_saves() {
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+    let app = boot();
+    let cap = crate::support::eff_resume_cap(app.get_sort_cap_custom(), app.get_sort_cap_tier()) as usize;
+    assert!(cap > 0, "precondition: folder memory is on by default");
+    // The shutdown's capture, exactly as the SaveSettings arm calls it.
+    let quit_capture = |pms: &Cell<(bool, bool, i32)>, dir: &str, json: bool, attrs: &RefCell<crate::support::FolderAttrs>,
+                        lru: &RefCell<Vec<(String, String)>>, gen: &Cell<u64>| {
+        crate::tick::record_panel_min_toggle(
+            (app.get_info_min(), app.get_raw_min(), app.get_info_view()),
+            crate::support::eff_resume_cap(app.get_sort_cap_custom(), app.get_sort_cap_tier()) as usize,
+            pms, dir, json, attrs, lru, gen,
+        );
+    };
+
+    // ── The journal route: the folder has a review file, so the arrangement lives in its attrs.
+    let dir = "C:/rig/r1-quit-journal";
+    let pms = panel_seen();
+    crate::tick::reseed_panel_min_seen(&app, &pms); // the folder open seeded the recorder
+    let map = BTreeMap::from([("IMG_1".to_string(), crate::support::Sel { rating: 4, ..Default::default() })]);
+    let rotations = BTreeMap::new();
+    let attrs = RefCell::new(crate::support::FolderAttrs::default());
+    let lru = RefCell::new(Vec::new());
+    let gen = Cell::new(0u64);
+    let baseline = RefCell::new(crate::support::selection_dirty_json(&map, &rotations, &attrs.borrow()));
+    let min = !app.get_info_min();
+    app.set_info_min(min); // the user parks the Info panel in the final frame; no tick follows
+    let flush = |written: &RefCell<Option<Vec<u8>>>| {
+        crate::support::final_review_flush(std::path::Path::new(dir), &map, &rotations, &attrs.borrow(), &baseline,
+            |_, bytes| { *written.borrow_mut() = Some(bytes); Ok(()) })
+    };
+    let written = RefCell::new(None);
+    assert_eq!(flush(&written), Ok(false), "precondition: without the capture, the change reaches no snapshot");
+    quit_capture(&pms, dir, true, &attrs, &lru, &gen);
+    assert_eq!(flush(&written), Ok(true), "with the capture, the final review flush writes the new arrangement");
+    let file: crate::support::SelectionFile =
+        serde_json::from_slice(written.borrow().as_deref().expect("the bytes the flush enqueued")).expect("a review file");
+    assert_eq!(file.info_min, Some(min), "the written file holds the last frame's Info panel state");
+    assert!(lru.borrow().is_empty(), "a journal folder keeps its arrangement in the file, not the settings MRU");
+
+    // ── The settings route: no review file, so the arrangement rides the settings MRU.
+    let dir = "C:/rig/r1-quit-settings";
+    let pms = panel_seen();
+    crate::tick::reseed_panel_min_seen(&app, &pms);
+    let attrs = RefCell::new(crate::support::FolderAttrs::default());
+    let lru = RefCell::new(Vec::<(String, String)>::new());
+    let gen = Cell::new(0u64);
+    let km: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let snapshot = |lru: &[(String, String)]| crate::support::build_settings(
+        &app, true, true, &km, dir, "", &[], &[], "name.asc", &[], lru,
+        &BTreeMap::new(), false, crate::support::INFO_VIEW_STANDARD,
+    );
+    let last_save = serde_json::to_string_pretty(&snapshot(&lru.borrow())).expect("settings serialize");
+    let raw = !app.get_raw_min();
+    app.set_raw_min(raw); // the user parks the RAW panel in the final frame; no tick follows
+    assert!(snapshot(&lru.borrow()).panel_folders.is_empty(), "precondition: without the capture, the MRU is unchanged");
+    quit_capture(&pms, dir, false, &attrs, &lru, &gen);
+    let s = snapshot(&lru.borrow());
+    let saved = s.panel_folders.iter().find(|(d, _)| d == dir).map(|(_, v)| crate::support::decode_panel_min(v));
+    assert_eq!(saved, Some(Some((app.get_info_min(), raw, app.get_info_view()))), "the MRU holds the last frame's arrangement");
+    assert!(crate::support::settings_final_save_needed(&last_save, &s, None), "so the final settings save writes it");
+    assert_eq!((attrs.borrow().panel_min, gen.get()), (None, 0), "a plain folder's attrs and generation stay untouched");
+}
+
 /// v0.8.94 (v0.8.93-audit C14/C20): the info command's three TITLES, pinned across the language
 /// boundary. They render from two places — the photo right-click MenuItem (.slint) and, on macOS,
 /// the View-menu row built from Rust — and a doc comment claimed they were "single-sourced" while

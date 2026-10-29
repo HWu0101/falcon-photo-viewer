@@ -26557,6 +26557,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Issue #11 batch B1: the final saves' comparison baselines.
         let last_settings_json = last_settings_json.clone();
         let last_ratings_json = last_ratings_json.clone();
+        // 1.1.0 (Codex R1): the panel recorder's state, for the last-frame capture in SaveSettings.
+        let panel_min_seen = panel_min_seen.clone();
+        let sel_json_present = sel_json_present.clone();
+        let sel_gen = sel_gen.clone();
         Box::new(move |route: support::SaveRoute| {
             let started = std::time::Instant::now();
             let (route_name, immediate) = match route {
@@ -26689,6 +26693,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                     );
                 }
                 support::ShutdownStep::SaveSettings => {
+                    // 1.1.0 (Codex R1): capture a panel arrangement from the FINAL frame first, as the
+                    // folder switch has since v0.8.90 (apply_scan's pre-flush capture). The tick
+                    // recorder is deferred, and the system route has already stopped the tick, so an
+                    // Info/RAW minimise or Info-view change made after the last tick would reach
+                    // neither snapshot. Once, here: this step precedes FlushSelection, so the journal
+                    // route (`folder_attrs`, read there) and the settings MRU (`panel_lru`, read by
+                    // build_settings below) both see it. The same body as the tick's, so memory off
+                    // (cap 0) and the reseeded programmatic writes behave exactly as they do there.
+                    record_panel_min_toggle(
+                        (app.get_info_min(), app.get_raw_min(), app.get_info_view()),
+                        eff_resume_cap(app.get_sort_cap_custom(), app.get_sort_cap_tier()) as usize,
+                        &panel_min_seen,
+                        &cur_dir.borrow(),
+                        sel_json_present.get(),
+                        &folder_attrs,
+                        &panel_lru,
+                        &sel_gen,
+                    );
                     // best-effort final flush on graceful close. Issue #11 batch B1: built once, and
                     // written only if it changed since the last load or save, or that save is pending
                     // or failed, so a window that changed nothing can't revert another window's settings.
@@ -27835,6 +27857,41 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
             assert!(after.contains("_json.borrow_mut() = selection_dirty_json(") || after.contains("lrj_t.borrow_mut() = selection_dirty_json("),
                 "a review write advances the baseline: {}", &main[at..(at + 80).min(main.len())]);
         }
+    }
+
+    /// 1.1.0 (Codex R1): THE QUIT CAPTURES A LAST-FRAME PANEL CHANGE BEFORE BOTH SNAPSHOTS. The panel
+    /// recorder is a deferred tick observer, the system route stops the tick before its save, and the
+    /// ordinary route has left the loop, so an Info/RAW minimise or Info-view change made after the
+    /// last tick reached neither final save (B1 then skipped both files as unchanged). The shutdown's
+    /// SaveSettings step now runs the recorder first, with the tick's own inputs, and that step runs
+    /// before FlushSelection, so the settings MRU and the journal's attrs both carry it. What the
+    /// capture does on each route is `a_last_frame_panel_change_reaches_both_quit_saves`
+    /// (tipgeom_tests).
+    ///
+    /// FALSIFIER (L28): delete the recorder call from the SaveSettings arm, or move it below
+    /// `build_settings(`, and the first two asserts redden; swap SaveSettings and FlushSelection in
+    /// `support::graceful_shutdown_steps` and the order assert reddens.
+    #[test]
+    fn the_quit_captures_a_last_frame_panel_change_before_both_snapshots() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let a = main.find("support::ShutdownStep::SaveSettings => {").expect("the shutdown's settings step");
+        let b = a + main[a..].find("support::ShutdownStep::FlushSelection => {").expect("then the selection flush");
+        let settings = &main[a..b];
+        let capture = settings.find("record_panel_min_toggle(").expect("the quit captures the final frame's panels");
+        assert!(capture < settings.find("build_settings(").expect("the snapshot"), "captured before the settings snapshot");
+        let call = &settings[capture..];
+        let call = &call[..call.find(");").expect("the call ends")];
+        for input in ["app.get_info_min(), app.get_raw_min(), app.get_info_view()", "app.get_sort_cap_custom()",
+                      "&panel_min_seen", "&cur_dir.borrow()", "sel_json_present.get()", "&folder_attrs", "&panel_lru", "&sel_gen"] {
+            assert!(call.contains(input), "the tick recorder's input `{input}`");
+        }
+        let mut order = Vec::new();
+        support::graceful_shutdown_steps(false, &mut |st| order.push(st));
+        let at = |st: support::ShutdownStep| order.iter().position(|s| *s == st).expect("the step runs");
+        assert!(at(support::ShutdownStep::SaveSettings) < at(support::ShutdownStep::FlushSelection),
+            "the capture in SaveSettings precedes the journal's snapshot");
     }
 
     /// 1.0.15 (PR #4 review SAVE-O3): the app flushes files only through the shared durable flush
