@@ -19,6 +19,15 @@
   " · {n} RAW-only skipped (edit from ./Picks first)": {
     "other": " · 已跳过 {n} 张仅有 RAW 的照片（请先从 ./Picks 编辑）"
   },
+  " · {n} XMP sidecar not copied (see log)": {
+    "other": " · {n} 个 XMP 附属文件未复制（见日志）"
+  },
+  " · {n} XMP sidecar not moved (see log)": {
+    "other": " · {n} 个 XMP 附属文件未移动（见日志）"
+  },
+  " · {n} XMP sidecar not restored (see log)": {
+    "other": " · {n} 个 XMP 附属文件未恢复（见日志）"
+  },
   " · {n} already there": {
     "other": " · {n} 个已存在"
   },
@@ -780,6 +789,7 @@
     "other": "已撤销 {n} 张照片的评分更改"
   },
   "Ratings saved.": "评分已保存。",
+  "Reading capture dates · {done} of {total}": "正在读取拍摄日期 · {done} / {total}",
   "Reading this photo's colour space…": "正在读取此照片的色彩空间…",
   "Recommended": "推荐",
   "Recover": "恢复",
@@ -843,7 +853,9 @@
   "Reveal {n} in {file_manager}": "在{file_manager}中显示 {n} 张照片",
   "Review": "筛选",
   "Review data FAILED to save for {folder} ({err}) — your latest changes may not be on disk": "无法保存 {folder} 的筛选数据（{err}）— 最新更改可能尚未写入磁盘",
-  "Review data was unreadable — couldn't preserve it; starting fresh": "无法读取筛选数据且无法保留原文件 — 已重新开始",
+  "Couldn't read this folder's review data — it may be only in the cloud while you're offline, open in another program, or blocked by folder permissions. It's left untouched, and changes made here won't be saved. Reopen the folder to try again.": "无法读取此文件夹的筛选数据 — 它可能仅存于云端而你当前离线、正被其他程序打开，或被文件夹权限阻止。文件保持原样，在此所做的更改不会被保存。重新打开该文件夹即可再试。",
+  "This folder's review data looks damaged, and Falcon couldn't set it aside — another program may have it open. It's left untouched, and changes made here won't be saved. Reopen the folder to try again.": "此文件夹的筛选数据似乎已损坏，且 Falcon 无法将其移到一旁 — 可能有其他程序正在打开它。文件保持原样，在此所做的更改不会被保存。重新打开该文件夹即可再试。",
+  "This folder's review data is too large to read (over 16 MB), which usually means it's damaged. It's left untouched, and changes made here won't be saved. To start fresh, move falcon_review_data.json out of the folder.": "此文件夹的筛选数据过大，无法读取（超过 16 MB），这通常意味着它已损坏。文件保持原样，在此所做的更改不会被保存。如需重新开始，请将 falcon_review_data.json 移出该文件夹。",
   "Review data was unreadable — kept as {name} and starting fresh": "筛选数据无法读取，已保留为 {name} 并重新开始",
   "Reviewed": "已筛选",
   "Right": "右方向键",

@@ -1385,10 +1385,10 @@ fn photo_first_modes_and_promotion_keep_the_view_and_undo_identity() {
     let mut neighbor = shot.clone();
     neighbor.name = "A".into(); neighbor.jpg = Some(PathBuf::from("A.png"));
     let old = vec![shot.clone()];
-    let mut done = ScanDone { changed_sources: HashSet::new(), partial: true, pending_edges: (true, true), source_order: Vec::new(), id: 1, dir: PathBuf::from("folder"),
+    let mut done = ScanDone { changed_sources: HashSet::new(), stamps: None, partial: true, pending_edges: (true, true), source_order: Vec::new(), id: 1, dir: PathBuf::from("folder"),
         shots: vec![neighbor, shot], ratings: vec![0, 5], marks: vec![0, MARK_FLAG], start: 0,
         land: None, extra: BTreeMap::new(), rotations: BTreeMap::new(), attrs: FolderAttrs::default(),
-        had_file: true, manifest: None, sort: (SortMethod::Name, false), scan_err: false, scan_denied: false, unlisted_target: None };
+        had_file: true, from_ledger: false, identity: None, manifest: None, sort: (SortMethod::Name, false), scan_err: false, scan_denied: false, unlisted_target: None, review_load: crate::support::ReviewLoad::Loaded, taken_pass: None };
     let fast = FastTier::new(); let detail = DetailTier::new(); let rot = RotState::new(true);
     let film = Film::new(); let roi = RoiZoom::new();
     let meta=crate::meta::PerShotMeta::new(2);
@@ -1455,6 +1455,329 @@ fn photo_first_modes_and_promotion_keep_the_view_and_undo_identity() {
     done.id = 0;
     assert!(photo_open::Promotion::take(&app, &mut done, (&old, 0), (&fast, &detail, &film, &roi), &rot, &undo, (&meta,gen)).is_none(),
         "a new same-folder file open must land its requested file, not the earlier preview");
+}
+
+/// Keeping prepared work (2 November): the heart of the round. Real tier stores with a distinct
+/// picture and distinct facts for each photo, driven through take, the swap's real resets and restore
+/// the way `apply_scan` does: a Delete, then a re-sort, then a file another program saved. Nothing may
+/// land under another photo's number, and a saved file loses its pixels but keeps its undo step. The
+/// landing, zoom and pan can't be written: `take` gets the landing by value, and neither end gets
+/// the window (the Promotion row above needs both).
+///
+/// FALSIFIER (L28): omit any one store from `PreparedWork` or `RescanCarry`; rekey by position;
+/// rekey pixels with `identity` instead of `unchanged`; build `order` from anything but the landing.
+#[test]
+fn a_rescan_carries_prepared_work_by_file_and_leaves_landing_and_zoom_alone() {
+    use crate::*;
+    use std::time::{Duration, UNIX_EPOCH};
+    let shot = |name: &str| Shot { id: 0, name: name.into(), raw: None, jpg: Some(PathBuf::from(format!("{name}.png"))),
+        kind: SrcKind::Png, has_raw: false, has_jpg: true, cloud_placeholder: false, sniffed: None };
+    let (a, b, c) = (shot("A"), shot("B"), shot("C"));
+    let frame = |v: u8| {
+        let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(1, 1);
+        pixels.make_mut_bytes().copy_from_slice(&[v, v, v, 255]);
+        slint::Image::from_rgba8(pixels)
+    };
+    // Photo numbers 0, 1, 2 are A, B, C.
+    let image = [frame(10), frame(20), frame(30)];
+    let value = |p: usize| 10 * (p as u8 + 1);
+    let gamut = |p: usize| [Gamut::DisplayP3, Gamut::AdobeRgb, Gamut::Rec2020][p];
+    let (fast, detail, film, roi) = (FastTier::new(), DetailTier::new(), Film::new(), RoiZoom::new());
+    let rot = RotState::new(true);
+    let meta = crate::meta::PerShotMeta::new(3);
+    let l2 = RefCell::new(L2Store::new(1 << 30, 16 << 30));
+    let undo = RefCell::new(UndoRedo::default());
+    let mut gen = 1;
+    meta.on_folder_swap(gen, 3, &[a.clone(), b.clone(), c.clone()]);
+    for (p, picture) in image.iter().enumerate() {
+        let v = value(p);
+        fast.cache.borrow_mut().insert(p, tick::FastEntry { img: picture.clone(), w: 1, h: 1,
+            blur: Arc::from([v; 4]), bw: 1, bh: 1, dim: 2048, turns: v });
+        detail.cache.borrow_mut().insert(p, (picture.clone(), 1, 1));
+        detail.order.borrow_mut().push_back(p);
+        film.thumbs.borrow_mut().insert(p, (picture.clone(), u64::from(v)));
+        film.frost.lock().unwrap().insert(p, (Arc::from([v; 4]), 1, 1, gamut(p)));
+        film.mipless.borrow_mut().insert(p);
+        roi.src.borrow_mut().insert(p, (u32::from(v), u32::from(v)));
+        meta.shot_gamut.borrow_mut().insert(p, gamut(p));
+        meta.file_gamuts.note(gen, p, gamut(p));
+        rot.base.borrow_mut().insert(p, v);
+        rot.base_raw.borrow_mut().insert(p, v + 1);
+        l2.borrow_mut().insert(p, L2Entry { rgba: Arc::from([v; 4]), w: 1, h: 1, blur: Arc::from([]), bw: 0, bh: 0,
+            dim: 2048, gamut: gamut(p), master: false, epoch: 0 }, p, &|_| false);
+    }
+    undo.borrow_mut().undo.push(Act { seq: 1, entry: UndoEntry::Cull { idx: 1, rating: 2, mark: 0 } });
+    undo.borrow_mut().undo.push(Act { seq: 2, entry: UndoEntry::Cull { idx: 2, rating: 3, mark: 0 } });
+    undo.borrow_mut().redo.push(Act { seq: 3, entry: UndoEntry::Rot { name: "A".into(), idx: 0, delta: 1 } });
+    // Index `i` holds exactly photo `p`'s pictures and facts, in every store.
+    let holds = |i: usize, p: usize, gen: u64| {
+        let v = value(p);
+        let what = format!("index {i} holds photo {p}");
+        let entry = |c: &tick::FastCache| { let e = &c[&i]; (e.img.clone(), e.turns, e.blur[0]) };
+        assert_eq!(entry(&fast.cache.borrow()), (image[p].clone(), v, v), "{what}: fast preview");
+        assert_eq!(detail.cache.borrow()[&i].0, image[p], "{what}: sharp frame");
+        assert_eq!(film.thumbs.borrow()[&i], (image[p].clone(), u64::from(v)), "{what}: thumbnail");
+        { let f = film.frost.lock().unwrap(); assert_eq!((f[&i].0[0], f[&i].3), (v, gamut(p)), "{what}: blur image"); }
+        assert!(film.mipless.borrow().contains(&i), "{what}: the trimmed-mip note");
+        assert_eq!(roi.src.borrow()[&i], (u32::from(v), u32::from(v)), "{what}: source size");
+        assert_eq!(meta.shot_gamut.borrow().get(&i), Some(&gamut(p)), "{what}: frame gamut");
+        assert_eq!(meta.file_gamuts.get(gen, i), Some(gamut(p)), "{what}: file gamut");
+        assert_eq!(rot.base.borrow()[&i], v, "{what}: rotation base");
+        assert_eq!(rot.base_raw.borrow()[&i], v + 1, "{what}: RAW rotation base");
+        let store = l2.borrow();
+        let ram = store.get(i, 0).unwrap_or_else(|| panic!("{what}: RAM frame"));
+        assert_eq!((ram.rgba[0], ram.gamut), (v, gamut(p)), "{what}: RAM frame");
+    };
+    // Every store holds `n` photos, so nothing is left behind or left over.
+    let counts = |n: usize, gen: u64| {
+        assert_eq!(fast.cache.borrow().len(), n, "fast previews");
+        assert_eq!(detail.cache.borrow().len(), n, "sharp frames");
+        assert_eq!(detail.order.borrow().len(), n, "sharp frames' order");
+        assert_eq!(film.thumbs.borrow().len(), n, "thumbnails");
+        assert_eq!(film.frost.lock().unwrap().len(), n, "blur images");
+        assert_eq!(film.mipless.borrow().len(), n, "trimmed-mip notes");
+        assert_eq!(roi.src.borrow().len(), n, "source sizes");
+        assert_eq!(meta.shot_gamut.borrow().len(), n, "frame gamuts");
+        assert_eq!(meta.file_gamuts.snapshot(gen).len(), n, "file gamuts");
+        assert_eq!(rot.base.borrow().len(), n, "rotation bases");
+        assert_eq!(rot.base_raw.borrow().len(), n, "RAW rotation bases");
+        assert_eq!(l2.borrow().len(), n, "RAM frames");
+        assert_eq!(l2.borrow().bytes(), 4 * n, "the RAM total follows");
+    };
+    let swap = |old: &[Shot], new: &[Shot], listings: (&support::ListingStamps, &support::ListingStamps), start: usize, gen: &mut u64| {
+        let carry = photo_open::RescanCarry::take((old, new), listings, start, (&fast, &detail, &film, &roi), &l2, &rot, &undo, (&meta, *gen));
+        *gen += 1;
+        meta.on_folder_swap(*gen, new.len(), new);
+        crate::drop_developed_caches(&fast.cache, &detail, &roi, &l2);
+        fast.on_folder_swap(); detail.on_folder_swap(); roi.on_folder_swap(); film.on_folder_swap(); rot.clear_indexed();
+        *undo.borrow_mut() = UndoRedo::default();
+        carry.restore((&fast, &detail, &film, &roi), &l2, &rot, &undo, (&meta, *gen));
+    };
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_000);
+    let stamps = |names: &[&Shot]| -> support::ListingStamps {
+        names.iter().map(|s| (s.jpg.clone().unwrap(), (4u64, t0))).collect()
+    };
+    let culled = |undo: &RefCell<UndoRedo>| -> Vec<(usize, i32)> {
+        undo.borrow().undo.iter().filter_map(|act| match act.entry {
+            UndoEntry::Cull { idx, rating, .. } => Some((idx, rating)),
+            _ => None,
+        }).collect()
+    };
+
+    // A Delete of B, landing on the photo that took its place.
+    let all = stamps(&[&a, &b, &c]);
+    let kept = stamps(&[&a, &c]);
+    swap(&[a.clone(), b.clone(), c.clone()], &[a.clone(), c.clone()], (&all, &kept), 1, &mut gen);
+    holds(0, 0, gen);
+    holds(1, 2, gen);
+    counts(2, gen);
+    assert_eq!(*detail.order.borrow(), VecDeque::from([0, 1]), "farthest from the landing first");
+    assert_eq!(culled(&undo), [(1, 3)], "C's star follows C, and B's undo step left with it");
+    assert_eq!(undo.borrow().undo[0].seq, 2, "the stamp stays");
+    assert!(matches!(&undo.borrow().redo[0].entry, UndoEntry::Rot { name, idx: 0, .. } if name == "A"));
+
+    // A sort change: the same files in a new order, landing on the first.
+    swap(&[a.clone(), c.clone()], &[c.clone(), a.clone()], (&kept, &kept), 0, &mut gen);
+    holds(0, 2, gen);
+    holds(1, 0, gen);
+    counts(2, gen);
+    assert_eq!(*detail.order.borrow(), VecDeque::from([1, 0]), "farthest from the landing first");
+    assert_eq!(culled(&undo), [(0, 3)]);
+    assert!(matches!(&undo.borrow().redo[0].entry, UndoEntry::Rot { name, idx: 1, .. } if name == "A"));
+
+    // Another program saved C: only C loads again, and C keeps its undo step.
+    let mut saved = kept.clone();
+    saved.insert(c.jpg.clone().unwrap(), (4, t0 + Duration::from_secs(60)));
+    swap(&[c.clone(), a.clone()], &[c.clone(), a.clone()], (&kept, &saved), 0, &mut gen);
+    holds(1, 0, gen);
+    counts(1, gen);
+    assert!(!fast.cache.borrow().contains_key(&0) && !detail.cache.borrow().contains_key(&0), "C's old pixels are gone");
+    assert_eq!(culled(&undo), [(0, 3)], "C's undo step stays and still points at C");
+}
+
+/// Date taken sort (R4): a landing that arrives on its own waits for anything it would close, read
+/// from the real window, each term in turn. Export running holds nothing, because it can run for
+/// minutes and its results don't depend on the order, and the zoom tile overlay holds nothing, because
+/// a kept view brings it back.
+///
+/// FALSIFIER (L28): delete any one term from `LandingHolds::any` or `from_window`; add `sel-busy` or
+/// `region-active` back; drop the time from `scrolled_lately`; or land while `pass_landing_due` holds.
+#[test]
+fn a_landing_waits_for_anything_it_would_close() {
+    use crate::support::{pass_landing_due, scrolled_lately, LandingHolds, PassDue, LANDING_SCROLL_SETTLE};
+    let app = boot();
+    let holds = |app: &ui::MainWindow| LandingHolds::from_window(app).any();
+    assert!(!holds(&app), "nothing open");
+    type WindowTerm = (&'static str, fn(&ui::MainWindow, bool));
+    let window_terms: [WindowTerm; 7] = [
+        ("a confirm dialog", |a, on| a.set_confirm_kind(i32::from(on))),
+        ("Settings", |a, on| a.set_settings_open(on)),
+        ("the photo menu", |a, on| a.set_ctx_open(on)),
+        ("the tile menu", |a, on| a.set_sel_ctx_open(on)),
+        ("the sort menu", |a, on| a.set_sort_open(on)),
+        ("the Open menu", |a, on| a.set_open_menu_open(on)),
+        ("Scanning…", |a, on| a.set_scanning(on)),
+    ];
+    for (what, set) in window_terms {
+        set(&app, true);
+        assert!(holds(&app), "{what} holds a landing");
+        set(&app, false);
+        assert!(!holds(&app), "{what} closed");
+    }
+    app.set_opening_photo(true);
+    assert!(holds(&app), "a photo-first open still scanning");
+    app.set_opening_photo(false);
+    // The ones that must not hold: Export or Copy picks running, and a zoom tile on screen.
+    app.set_export_running(true);
+    app.set_sel_busy(true);
+    assert!(!holds(&app), "Export running holds nothing");
+    app.set_export_running(false);
+    app.set_sel_busy(false);
+    app.set_region_active(true);
+    assert!(!holds(&app), "a zoom tile overlay holds nothing");
+    app.set_region_active(false);
+    // The app's own terms.
+    let clear = LandingHolds::default();
+    assert!(!clear.any());
+    for (what, held) in [
+        ("Move rejected, Undo move or Empty running", LandingHolds { position_op: true, ..clear }),
+        ("a file operation's reread posted", LandingHolds { reload_pending: true, ..clear }),
+        ("Apply rotations", LandingHolds { applying_rotations: true, ..clear }),
+        ("a filmstrip drag", LandingHolds { film_dragging: true, ..clear }),
+        ("a filmstrip scrub", LandingHolds { scrubbing: true, ..clear }),
+        ("a free scroll just now", LandingHolds { scrolled_lately: true, ..clear }),
+        ("a reopen scanning", LandingHolds { reopen_pending: true, ..clear }),
+    ] {
+        assert!(held.any(), "{what} holds a landing");
+    }
+    // A reopen holds while it scans, and not forever: one that can't read its folder lands nothing.
+    let mut reopen = crate::support::PendingReopen::default();
+    let at = std::time::Instant::now();
+    assert!(!reopen.holds_landing(at), "no reopen");
+    reopen.start(7, None);
+    assert!(reopen.holds_landing(at));
+    assert!(!reopen.holds_landing(at + std::time::Duration::from_secs(60)), "a reopen that never landed");
+    assert_eq!(reopen.take_landing(7), Some(None));
+    assert!(!reopen.holds_landing(at), "landed");
+    // A scroll holds for a moment, never for as long as the strip stays scrolled.
+    let soon = Some(LANDING_SCROLL_SETTLE - std::time::Duration::from_millis(1));
+    assert!(scrolled_lately(false, false, soon), "the strip, just scrolled");
+    assert!(!scrolled_lately(false, false, Some(LANDING_SCROLL_SETTLE)), "the strip, left scrolled");
+    assert!(!scrolled_lately(false, false, None), "never scrolled");
+    assert!(scrolled_lately(true, true, soon), "the grid, just scrolled");
+    assert!(!scrolled_lately(true, false, soon), "the strip followed a navigation since");
+    // The decision. A pick has no landing before the read ends.
+    assert_eq!(pass_landing_due(false, false, false), PassDue::Reading);
+    assert_eq!(pass_landing_due(false, false, true), PassDue::Reading);
+    assert_eq!(pass_landing_due(true, false, true), PassDue::Hold);
+    assert_eq!(pass_landing_due(true, false, false), PassDue::Land);
+}
+
+/// R8: the reading card holds its longest English sentence, doesn't cover the Compare bar's row or the
+/// Loading pill, stands clear of the Review panel at a normal width, and takes no presses: nothing in it
+/// catches a click meant for the photo.
+///
+/// FALSIFIER (L28): add a `TouchArea` to the card, move it back to Export's `y: 60px`, drop the Review
+/// panel's term from its `x`, or mount it while Export's card or a dialog shows.
+#[test]
+fn the_reading_card_fits_and_keeps_out_of_the_way() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let app = boot();
+    let count_cards = |app: &ui::MainWindow| E::find_by_element_id(app, "MainWindow::datesreading").count();
+    assert_eq!(count_cards(&app), 0, "nothing mounted when nothing is reading");
+    app.set_dates_reading_show(true);
+    app.set_dates_reading_frac(0.25);
+    app.set_dates_reading_text(crate::support::date_card_text(999_999, 999_999).into());
+    hover(&app, 4.0, 700.0); // layout pass, off the card
+    let el = |id: &str| E::find_by_element_id(&app, id).next().unwrap_or_else(|| panic!("{id} is mounted"));
+    let (card, text) = (el("MainWindow::datesreading"), el("MainWindow::datesreadingtext"));
+    let padded = text.absolute_position().x + text.size().width;
+    assert!(padded <= card.absolute_position().x + card.size().width, "the sentence fits at six digits: {padded}");
+    assert_eq!(card.size().width, 300.0, "the Export card's width");
+    // Presses pass through to the photo: no click catcher in the card, read from its markup.
+    let ui = include_str!("../ui/main_window.slint");
+    let markup = ui.split_once("if root.dates-reading-show").expect("the card").1.split_once("// ── unified events").expect("its end").0;
+    assert!(!markup.contains("TouchArea"), "nothing in the card catches a press");
+    // Below the Compare bar's row (stage y 8, height 34) and the Loading pill (stage y 14, height 26).
+    let top = app.get_content_top();
+    assert!(card.absolute_position().y >= top + 46.0, "clear of the bar and the pill: {}", card.absolute_position().y);
+    // Centred on the stage, and right of the Review panel (503 px wide) when it is open.
+    let centre = card.absolute_position().x + card.size().width / 2.0;
+    assert!((centre - (app.get_stage_x() + app.get_stage_w() / 2.0)).abs() < 1.0, "centred on the stage");
+    app.set_sel_open(true);
+    hover(&app, 4.0, 700.0);
+    let left = el("MainWindow::datesreading").absolute_position().x;
+    assert!(left >= 503.0, "right of the Review panel at this width: {left}");
+    app.set_sel_open(false);
+    // It gives way to Export's card and to any dialog.
+    app.set_export_running(true);
+    assert_eq!(count_cards(&app), 0, "Export's card has the spot");
+    app.set_export_running(false);
+    app.set_confirm_kind(1);
+    assert_eq!(count_cards(&app), 0, "a dialog is open");
+    app.set_confirm_kind(0);
+    assert_eq!(count_cards(&app), 1);
+}
+
+/// Keeping the view on a sort change: the view stays only when the photo on screen and both Compare
+/// photos are the same photos after the reread, followed by identity, never by position. A file saved
+/// elsewhere keeps the zoom and loses only its own tiles.
+///
+/// FALSIFIER (L28): remove the `follow(current)? != self.start` line, the `?` on a Compare half, or the
+/// `unchanged` lookup in `RescanCarry::keep_view`.
+#[test]
+fn keep_view_refuses_three_ways_and_keeps_otherwise() {
+    use crate::*;
+    use std::time::{Duration, UNIX_EPOCH};
+    let shot = |name: &str| Shot { id: 0, name: name.into(), raw: None, jpg: Some(PathBuf::from(format!("{name}.png"))),
+        kind: SrcKind::Png, has_raw: false, has_jpg: true, cloud_placeholder: false, sniffed: None };
+    let (a, b, c) = (shot("A"), shot("B"), shot("C"));
+    let (fast, detail, film, roi) = (FastTier::new(), DetailTier::new(), Film::new(), RoiZoom::new());
+    let rot = RotState::new(true);
+    let meta = crate::meta::PerShotMeta::new(3);
+    let l2 = RefCell::new(L2Store::new(1 << 30, 16 << 30));
+    let undo = RefCell::new(UndoRedo::default());
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_000);
+    let stamps = |names: &[&Shot]| -> support::ListingStamps {
+        names.iter().map(|s| (s.jpg.clone().unwrap(), (4u64, t0))).collect()
+    };
+    let carry = |old: &[Shot], new: &[Shot], listings: (&support::ListingStamps, &support::ListingStamps), start: usize| {
+        photo_open::RescanCarry::take((old, new), listings, start, (&fast, &detail, &film, &roi), &l2, &rot, &undo, (&meta, 1))
+    };
+    let tile = |id: usize| RoiTile { id, u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0, src_long: 8192, img: slint::Image::default(), bytes: 4, turns: 0 };
+    let tile_ids = |kept: photo_open::KeptView| {
+        let held = RoiZoom::new();
+        kept.restore_tiles_for_test(&held);
+        let ids: Vec<usize> = held.kept_tiles.borrow().iter().map(|t| t.id).collect();
+        ids
+    };
+    let all = stamps(&[&a, &b, &c]);
+    let (old, resorted) = ([a.clone(), b.clone(), c.clone()], [c.clone(), b.clone(), a.clone()]);
+
+    // A sort change on C's list: B stays B, at its new position, in Compare with A.
+    let sorted = carry(&old, &resorted, (&all, &all), 1);
+    let kept = sorted.keep_view(2.0, (3.0, 4.0), 1, Some((0, 1)), &[tile(0), tile(1), tile(2)]).expect("the same photos");
+    assert_eq!(kept.view_for_test(), (2.0, (3.0, 4.0), Some((2, 1))), "zoom, pan, and Compare's two photos by identity");
+    assert_eq!(tile_ids(kept), [2, 1, 0], "every tile follows its file");
+
+    // Refused: the photo on screen isn't the landing photo.
+    assert!(sorted.keep_view(2.0, (0.0, 0.0), 0, None, &[]).is_none(), "A now sits at 2, the landing is 1");
+    // Refused: the photo on screen left.
+    let gone = carry(&old, &[a.clone(), c.clone()], (&all, &stamps(&[&a, &c])), 1);
+    assert!(gone.keep_view(2.0, (0.0, 0.0), 1, None, &[]).is_none(), "B left");
+    // Refused: a Compare photo left, though the photo on screen stayed.
+    assert!(gone.keep_view(2.0, (0.0, 0.0), 2, Some((1, 2)), &[]).is_none(), "B was one of the Compare pair");
+
+    // A file another program saved keeps the zoom, and only its own tiles go.
+    let mut saved = all.clone();
+    saved.insert(c.jpg.clone().unwrap(), (4, t0 + Duration::from_secs(60)));
+    let changed = carry(&old, &resorted, (&all, &saved), 1);
+    let kept = changed.keep_view(2.0, (0.0, 0.0), 1, None, &[tile(0), tile(1), tile(2)]).expect("B itself didn't change");
+    assert_eq!(tile_ids(kept), [2, 1], "C's tile is gone with its pixels");
+    // Two landings can share a tick. A kept tile's id is a position in the list before the second one.
+    roi.kept_tiles.borrow_mut().push(tile(0));
+    roi.on_folder_swap();
+    assert!(roi.kept_tiles.borrow().is_empty(), "the swap drops them");
 }
 
 /// v0.8.103 (T1): **one honest failure instead of twenty-six misleading ones.**
@@ -9083,7 +9406,7 @@ fn custom_icc_boot_notice_reaches_the_events_centre_once() {
     // THE REAL BOOT BATCH, in main()'s own push order: the A4 warn first, the D2 resume ask second.
     let pending = RefCell::new(vec![
         crate::tick::NotifEntry::warn(warn.clone(), now).with_open_settings(),
-        crate::tick::NotifEntry::info("You were at 12 last time — resume?", now).with_jump_to(12),
+        crate::tick::NotifEntry::info("You were at 12 last time — resume?", now).with_resume(12, "12"),
     ]);
     let log: RefCell<VecDeque<crate::tick::NotifEntry>> = RefCell::new(VecDeque::new());
     let (unread, toast_left, refresh) = (Cell::new(0i32), Cell::new(0i32), Cell::new(0u32));
@@ -9321,7 +9644,7 @@ fn the_events_centre_keeps_its_recover_its_folder_and_its_busy_flag() {
     // bounds-checked against the NEW folder's length, so the click landed on an unrelated photo.
     pending.borrow_mut().push(
         crate::tick::NotifEntry::info("You were at DSC_0912.NEF last time — resume?", now)
-            .with_jump_to(47)
+            .with_resume(47, "DSC_0912")
             .in_dir("D:/shoot"),
     );
     tick(now);
@@ -13220,6 +13543,104 @@ fn a_held_nav_key_owns_the_wheel_only_where_the_platform_says_so() {
         crate::tick::wheel_step_decision(false, false, true, true, 1, false, true),
         WheelStep::AdvanceSharp
     );
+}
+
+/// R4 (1 November safety round) — **A WHEEL NOTCH OR HELD KEY FROM THE FOLDER YOU LEFT NEVER MOVES
+/// THE NEXT ONE.** `apply_scan` accepts a landing before the same tick's `step_wheel_advance`, so a
+/// notch still banked from folder A paid out into folder B and moved it off its landing photo (row
+/// 1, the 1.1.0 mechanism, kept as the control). Rows 2-4 drive `tick::end_gestures_on_folder_change`
+/// (what `apply_scan` runs on an actual folder change; the gate itself is pinned by
+/// `a_folder_change_ends_the_browse_gestures_and_a_same_folder_landing_keeps_them` in main.rs) and
+/// then the REAL step. Row 5 is the empty-folder stop: the step used to return early on `len == 0`
+/// without draining, so a notch made on an empty folder waited there for the next folder.
+///
+/// FALSIFIER (L28): drop the bank, held-key or pace-clock line from `end_gestures_on_folder_change`
+/// and row 2, 3 or 4 reddens; put back `if wheel_accum.get() == 0 || len == 0 { return None; }` and
+/// row 5 reddens.
+#[test]
+fn a_notch_or_held_key_from_the_folder_you_left_never_moves_the_next_one() {
+    use std::cell::{Cell, RefCell};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    let app = boot();
+    app.set_scrub_fps(30.0); // a 33 ms step
+    app.set_zoom(1.0);
+    app.set_zoom_always_sharp(false);
+    app.set_scrub_wait_cache(false);
+    let shots: Vec<falcon_decode::Shot> = (0..4)
+        .map(|i| falcon_decode::Shot {
+            id: i,
+            name: format!("IMG_{i:04}"),
+            has_raw: false,
+            has_jpg: true,
+            raw: None,
+            jpg: Some(std::path::PathBuf::from("C:/f/a.HEIC")),
+            kind: falcon_decode::SrcKind::Heic,
+            cloud_placeholder: false,
+            sniffed: None,
+        })
+        .collect();
+    let thumbs: RefCell<HashMap<usize, crate::tick::ThumbEntry>> = RefCell::new(HashMap::new());
+    let tfail: Mutex<HashSet<(u64, usize)>> = Mutex::new(HashSet::new());
+    let ffail: Mutex<HashSet<(u64, usize)>> = Mutex::new(HashSet::new());
+    let detail: RefCell<crate::tick::DetailCache> = RefCell::new(HashMap::new());
+    let dfail: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    let dfps = Cell::new(0.0f32);
+    let dpace: RefCell<crate::support::DetailPace> = RefCell::new(Default::default());
+    let fastc: RefCell<crate::tick::FastCache> = RefCell::new(HashMap::new());
+    let nkind: Cell<crate::tick::NavKind> = Cell::new(crate::tick::NavKind::Absolute);
+
+    // The gesture's cells as folder A left them: one notch banked by a live spin, 40 ms of pace
+    // credit (more than one 33 ms step), and an arrow key down.
+    let t0 = Instant::now();
+    let gesture = || (Cell::new(1i32), RefCell::new(t0), RefCell::new(t0 - Duration::from_millis(40)), RefCell::new(1i32));
+    // One tick of the real step over a folder of `len` photos that landed on photo 0.
+    let step = |now: Instant, len: usize, cells: &(Cell<i32>, RefCell<Instant>, RefCell<Instant>, RefCell<i32>)| -> usize {
+        let (accum, wheel_at, wheel_adv, _) = cells;
+        let last_motion = RefCell::new(now);
+        let cur = RefCell::new(0usize);
+        let qt = quiet_wheel_toast();
+        crate::tick::step_wheel_advance(
+            &app, now, len, accum, wheel_at, wheel_adv, &last_motion, &cur,
+            &shots, &detail, &dfail, &dfps, &dpace, 0, &thumbs, &fastc, &tfail, &ffail, &Default::default(), &nkind,
+            0, // the held key's own precedence (macOS) is a different row; this one is about the bank
+            crate::support::EfficiencyLimits::RELEASED,
+            crate::tick::WheelToast { counts_unread: &qt.0, left: &qt.1, at: &qt.2 },
+        );
+        cur.into_inner()
+    };
+    let end = |cells: &(Cell<i32>, RefCell<Instant>, RefCell<Instant>, RefCell<i32>)| {
+        crate::tick::end_gestures_on_folder_change(t0, &cells.3, &cells.0, &cells.2);
+    };
+
+    // (1) THE CONTROL: with nothing ended, the old folder's notch moves the new folder.
+    let a = gesture();
+    assert_eq!(step(t0, shots.len(), &a), 1, "control: a banked notch pays into whatever folder is on screen");
+
+    // (2) Ended at the change: the new folder stays on its landing photo and the bank is empty.
+    let b = gesture();
+    end(&b);
+    assert_eq!((step(t0, shots.len(), &b), b.0.get()), (0, 0), "the old folder's notch is gone");
+
+    // (3) …and the held arrow is released, so it cannot keep owning (or scrubbing) the new folder.
+    assert_eq!(*b.3.borrow(), 0, "the held key is released at the change");
+
+    // (4) The old spin's pace credit is gone too: a fresh notch in the new folder waits one step,
+    //     like the first notch after any pause, instead of paying at once on folder A's credit.
+    let c = gesture();
+    end(&c);
+    c.0.set(1); // a notch made in the new folder, with the wheel live
+    assert_eq!(step(t0, shots.len(), &c), 0, "no burst on the old folder's credit");
+    assert_eq!(step(t0 + Duration::from_millis(40), shots.len(), &c), 1, "the notch pays one step later");
+
+    // (5) THE EMPTY-FOLDER STOP: a notch made over an empty folder is spent there, so the next
+    //     folder (even one reached without a folder-change reset) lands where it should.
+    let e = gesture();
+    assert_eq!(step(t0, 0, &e), 0);
+    assert_eq!(e.0.get(), 0, "an empty folder drains the bank");
+    assert_eq!(step(t0, shots.len(), &e), 0, "the next folder stays on its landing photo");
 }
 
 /// v0.8.125 (C7, owner report) — ONE SETTING, BOTH GESTURES.
@@ -23150,6 +23571,7 @@ fn the_pinned_last_action_row_mounts_above_the_list_and_yields_to_it() {
         reveal_path: "".into(),
         undoable: false,
         jump_to: -1,
+        jump_name: "".into(),
         recover: false,
         open_settings: false,
     }]));
@@ -23851,6 +24273,47 @@ fn the_apply_confirm_shows_the_cloud_line_only_when_set() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/main_window.slint")).unwrap();
     assert_eq!(src.matches("clicked => { root.apply-rotations-ask(); }").count(), 1, "the Apply button asks Rust first");
     assert_eq!(src.matches("root.confirm-kind = 5;").count(), 0, "…and nothing raises kind 5 without the count");
+}
+
+/// Safety round review R2 (1 November, owner: grey it out): **APPLY ROTATIONS FADES WHILE THE
+/// FOLDER'S REVIEW FILE COULDN'T BE READ, AND DISCARD STAYS.** With turns pending and
+/// `apply-rotations-waits` set (Rust sets it from `support::apply_rotations_waits` at every landing),
+/// a click on Apply asks nothing; Discard still opens its confirm; once the property clears, the same
+/// click asks Rust again. The handlers' own guards are pinned in `main.rs`
+/// (`apply_rotations_waits_while_the_review_file_cant_be_read`).
+///
+/// FALSIFIER (L28): drop `!root.apply-rotations-waits` from Apply's enablement, or add it to Discard's.
+#[test]
+fn apply_rotations_fades_while_the_review_file_cant_be_read() {
+    use i_slint_core::items::PointerEventButton::Left;
+    let app = boot();
+    app.set_immersive(false);
+    app.set_motion_ui(false);
+    app.set_count_all(40);
+    app.set_count_rotated(4);
+    app.set_sel_open(true);
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+    {
+        let asked = asked.clone();
+        app.on_apply_rotations_ask(move || asked.set(asked.get() + 1));
+    }
+    let press = |label: &str| {
+        hover(&app, 600.0, 400.0); // the rig's layout-solve idiom
+        let btn = i_slint_backend_testing::ElementHandle::find_by_accessible_label(&app, label)
+            .find(|e| e.size().width > 1.0)
+            .unwrap_or_else(|| panic!("{label} is mounted"));
+        let (pos, sz) = (btn.absolute_position(), btn.size());
+        click(&app, pos.x + sz.width / 2.0, pos.y + sz.height / 2.0, Left);
+    };
+    app.set_apply_rotations_waits(true);
+    press("Apply rotations");
+    assert_eq!((asked.get(), app.get_confirm_kind()), (0, 0), "faded: the click asks nothing");
+    press("Discard rotations");
+    assert_eq!(app.get_confirm_kind(), 4, "Discard still opens its confirm");
+    app.set_confirm_kind(0);
+    app.set_apply_rotations_waits(false);
+    press("Apply rotations");
+    assert_eq!(asked.get(), 1, "the file read again: Apply asks Rust as before");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -36111,4 +36574,46 @@ fn visible_only_asks_only_for_the_tiles_on_screen() {
     let retire = prod.find("tick::step_retire_thumbs(&thumb_req_t").expect("the retire pass");
     assert!(retire < whole, "after every visible producer");
     assert_eq!(prod.matches("limits.thumbs_max, // round 2b").count(), 1, "the cache keeps the mode's cap");
+}
+
+/// Nearby photos (2 November): the opening let-through's wiring, as a census because no rig drives the
+/// whole tick and pure rows stay green over wrong wiring (the v0.8.112 lesson, L28). Comment lines are
+/// stripped, so only code counts.
+///
+/// FALSIFIERS (run as NP-14 to NP-24): restore `|| prime_hold` on the collapse argument; pass
+/// `prime_hold && prime_shuts_c` into the thumbnail deferral; drop the `shown_t` read; drop
+/// `opening_hold` from the hold argument; pass `det_ahead` or `det_behind` under the start-up hold; pass
+/// `s.has_raw` alone or the RAW mode alone as the develop term; drop priming from `opening_hold`; pass
+/// `true` for the hold or `false` for the harder hold into the let-through. Each reddens its assert.
+#[test]
+fn the_opening_let_through_is_wired_into_the_tick() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+    let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+    let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+    let once = |needle: &str| {
+        assert_eq!(main.matches(needle).count(), 1, "exactly one `{needle}`");
+        main.find(needle).unwrap()
+    };
+    // Priming shuts the window only where the format says so, and rations everywhere else.
+    once("|| (prime_hold && prime_shuts_c),");
+    once("let opening_hold = thumbnail_startup_hold || (prime_hold && !prime_shuts_c);");
+    // The develop term: RAW mode and a RAW file together, as the worker decides it. Either alone would
+    // silently shut priming on every RAW+JPEG folder, or never for a real develop.
+    let shuts = once("let prime_shuts_c = ");
+    let shuts_end = shuts + main[shuts..].find(';').expect("the statement's end");
+    assert!(main[shuts..shuts_end].contains("support::priming_shuts_window(cfg!(target_os = \"macos\"), s.kind, raw_t.load(Ordering::Relaxed) && s.has_raw)"),
+        "the current photo's format, and a develop only when RAW mode meets a RAW file");
+    // The hold still governs everything further out, and the let-through rides directly behind it.
+    let hold = "holds.frames || opening_hold,";
+    let call = once(hold) + hold.len();
+    let rest = main[call..].trim_start();
+    assert!(rest.starts_with("support::open_let_through("), "the let-through is the next argument");
+    let body = &rest[..rest.find("\n            ),").expect("the call's end")];
+    for term in ["cfg!(target_os = \"macos\")", "opening_hold", "holds.frames", "app.get_photo_ready()", "shown_t.borrow()"] {
+        assert!(body.contains(term), "the let-through reads {term}");
+    }
+    // Unchanged: the thumbnail deferral keeps plain priming, and sharp neighbours stay at 0 under the hold.
+    once("prime_hold, app.get_photo_ready(), det_cpu_t.load(Ordering::Relaxed),");
+    once("if thumbnail_startup_hold { 0 } else { det_ahead }");
+    once("if thumbnail_startup_hold { 0 } else { det_behind }");
 }

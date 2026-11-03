@@ -347,10 +347,13 @@ impl ImageDecoder for ImageIODecoder {
     }
 
     fn decode_scaled(&mut self, shot: &Shot, target_long: u32) -> Result<DecodedPixels, DecodeError> {
-        if !Self::serves(shot.kind) {
+        // Open-time check (2 November): this slot serves only JPEG/HEIC by the bytes; a passenger
+        // falls through to the CPU decoder and the RAW's preview.
+        let checked = crate::shot_by_bytes(shot);
+        if !Self::serves(checked.kind) {
             return Err(DecodeError::Unsupported); // PNG/WebP/GIF/JXL/BMP/TIFF → CPU
         }
-        let path = Self::path(shot)?;
+        let path = Self::path(&checked)?;
         // Image I/O scales on load (the ladder picks a subsample stop ≥ target), so — unlike WicDecoder —
         // there is no caller-side finish here: the buffer is already ≥ target and the render worker's
         // near-stop finish trims it to exact, identical to the nvJPEG on-device-scaled arm.
@@ -366,10 +369,11 @@ impl ImageDecoder for ImageIODecoder {
     }
 
     fn decode_full(&mut self, shot: &Shot) -> Result<DecodedPixels, DecodeError> {
-        if !Self::serves(shot.kind) {
+        let checked = crate::shot_by_bytes(shot); // Open-time check (2 November), as above.
+        if !Self::serves(checked.kind) {
             return Err(DecodeError::Unsupported);
         }
-        let path = Self::path(shot)?;
+        let path = Self::path(&checked)?;
         match crate::imageio_decode_rgb(path, None) {
             Ok((data, w, h)) => Ok(DecodedPixels::Rgb8 { data, w, h }),
             Err(_) => Err(DecodeError::Unsupported),

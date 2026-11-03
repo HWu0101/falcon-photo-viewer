@@ -20,6 +20,14 @@ before the final save but the ~15 s backstop, which is counted in ticks from boo
 first; so the review data must be written during the save, holding the new photo. The settings may
 have nothing new: they pass if written during the save or if the log says they were unchanged.
 
+1.1.0, owner-approved after Codex's and Claude's reviews of the fix:
+- the seeded ratings are keyed by photo name (the file stem, as Falcon keys them), so they are the real
+  photos' ratings and `seeded_kept` shows those survive the save; before, `test-02.png`-style keys
+  matched no photo and only showed that unmatched entries are kept;
+- the change must still be unsaved when the quit goes: if the review data was written after the step
+  (a late folder load's own save, or a slow runner reaching the backstop), the run fails as SETUP
+  FAILED instead of reporting a Falcon fault.
+
 If the check cannot run as designed (the folder never opens, the sender fails or is refused
 permission), it fails as SETUP FAILED, which does not claim a Falcon regression (review R3).
 """
@@ -65,7 +73,8 @@ do {
 }
 '''
 
-SEEDED = {"test-02.png": {"rating": 4}, "test-05.png": {"flag": True}, "test-07.png": {"reject": True}}
+# Keyed by photo name, the file stem, as Falcon keys them (1.1.0): these are the photos' own ratings.
+SEEDED = {"test-02": {"rating": 4}, "test-05": {"flag": True}, "test-07": {"reject": True}}
 
 
 def png(width, height, rows):
@@ -137,6 +146,15 @@ def run_case(app, executable_name, sender, out, name, reason):
                     result["setup_error"] = "the photo step never ran (no `FALCON_DEBUG_STEP 1/1` line)"
             if result["setup_error"] is None:
                 time.sleep(1)  # the next settled tick records the new photo; the backstop comes seconds later
+                # 1.1.0 (owner-approved): the step's change must still be unsaved when the quit goes, or
+                # this run cannot show the quit's own save. Both stamps are wall-clock milliseconds.
+                now_log = case_log(case)[1]
+                step_at, scan_at = stamp(now_log, "dbg: FALCON_DEBUG_STEP 1/1"), stamp(now_log, "scan: 8 shots")
+                result["scan_to_step_ms"] = None if step_at is None or scan_at is None else step_at - scan_at
+                if step_at is None or int(review.stat().st_mtime * 1000) >= step_at:
+                    result["setup_error"] = ("the review data was saved after the photo step, before the quit "
+                                             "(a late folder load or the backstop), so the quit's save cannot be shown")
+            if result["setup_error"] is None:
                 try:
                     sent = subprocess.run([str(sender), str(proc.pid), reason],
                                           capture_output=True, text=True, timeout=30)

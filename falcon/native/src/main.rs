@@ -6753,6 +6753,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // minted, so the boot offer survives and any photo-less landing retires it.
     let scanned_dir: Rc<RefCell<String>> =
         Rc::new(RefCell::new(if len0 > 0 { init_dir_str.clone() } else { String::new() }));
+    // R1 alias (1 November safety round): …and that folder's physical identity, so an explicit open
+    // of it under another spelling is still a same-folder reopen (`support::ShownFolder`).
+    let shown_folder = Rc::new(RefCell::new(support::ShownFolder::default()));
     // v0.3.61: the resume-at-last-shot LRU — (folder, last-viewed shot) pairs in Falcon's OWN
     // settings (NOT the folder JSON, so folders stay clean until culled). Seeded from settings,
     // updated on settle, queried on folder open, serialised via build_settings.
@@ -7049,6 +7052,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // (message, is_error, result-folder kind 0 Selected / 1 Rejected / 2 Web / -1 none).
     let sel_status_slot = Arc::new(Mutex::new(None::<support::OpResult>));
     let sel_busy = Arc::new(AtomicBool::new(false));
+    // Fix round 1 (1 November, F13-apply-4, owner: "Apply rotations only"): raised while an Apply
+    // rotations batch runs (set as it starts, lowered by the worker's `support::FlagGuard` however it
+    // ends). The sort picks grey on it and `apply_pick` refuses on it: a re-sort mid-Apply rescans
+    // the folder, and the drain then drops the photos written after it (turned twice next time).
+    let applying_rotations = Arc::new(AtomicBool::new(false));
     let export_progress = Arc::new(ExportProgress::default()); // #18: live web-export progress + cancel
     // v0.9.61 (A1.3 / round-4 audit C2; ported to the trunk as v0.8.128): the QUIT cancel for the
     // copy/move batch. The web export has had a cancel flag since #18 (its sheet carries a Cancel
@@ -7060,10 +7068,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // and a copy/move op does not show that sheet — sharing it would let an unrelated surface stop
     // a cull batch.
     //
-    // WINDOWS: nothing raises this flag there (there is no ⌘Q and no `applicationShouldTerminate:`),
-    // so the polled arm is inert on that trunk — the reset in `start_op` and the plumbing exist so
-    // the two trunks share ONE `export_marked` body, and so the day a Windows abort path wants a
-    // file-boundary stop it has one to raise.
+    // Fix round 1 (1 November, CS-32): the save sequence raises it too, on every exit route and both
+    // platforms (a Windows force-quit included), and Apply rotations polls it before each photo.
     let op_cancel = Arc::new(AtomicBool::new(false));
     // N8: selection entries for files NOT currently in the folder (moved to ./Rejected, renamed,
     // removed externally) — captured at every selection load, re-merged into every save, so a
@@ -7128,11 +7134,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // post-op rescan (delete/move/undo) passes Some(hint) so the viewer lands on the neighbour, not shot #1;
     // a plain same-folder re-open passes None (resume via select_start). See `post_op_land`.
     let reload_req = Arc::new(Mutex::new(None::<(PathBuf, Option<usize>)>));
-    // v0.8.49: a position-chip sort pick posts (folder, current shot's primary FILE name) here —
-    // possibly from the Date-taken pre-warm thread — and the tick drives the same proven rescan,
-    // landing back on that file via select_start (the index-hint slot above can't express "this
-    // shot in a not-yet-known order"). Folder-tag-guarded at the drain exactly like reload_req.
-    let sort_reload_req = Arc::new(Mutex::new(None::<(PathBuf, Option<String>)>));
+    // v0.8.49: a position-chip sort pick posts the folder here — possibly from the Date-taken
+    // pre-warm thread — and the tick drives the same proven rescan, landing back on the photo on
+    // screen AT THAT MOMENT via select_start (the index-hint slot above can't express "this shot in a
+    // not-yet-known order"). Folder-tag-guarded at the drain exactly like reload_req.
+    let sort_reload_req = Arc::new(Mutex::new(None::<PathBuf>));
     // U1: a completed OFF-THREAD folder scan (the tick applies the swap). `scan_id` tags each scan so a
     // second open started mid-scan supersedes the first (only the latest id is applied).
     let scan_done = Arc::new(Mutex::new(None::<ScanDone>));
@@ -7142,8 +7148,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let scan_id = Arc::new(AtomicU64::new(0));
     let resolved_open = Arc::new(Mutex::new(None::<support::ResolvedOpen>));
     let scan_hud = Rc::new(RefCell::new(support::ScanHudMemory::default()));
+    // R3 (1 November safety round): the explicit reopen of the folder on screen scanning off-thread.
+    let reopen_pending = Rc::new(RefCell::new(support::PendingReopen::default()));
     // Undo-move (#11): the move worker posts (folder, [(orig → moved-to)…]) here; the tick folds it into
-    // `last_move` (UI-thread) ONLY if the tagged folder is still the current one, so the banner's "Undo"
+    // `last_move` (UI-thread) ONLY if the tagged folder is still the one on screen (`scanned_dir`, R2), so the banner's "Undo"
     // can reverse the last "Move rejected". The folder tag is the correctness anchor: a same-folder
     // re-scan keeps the undo valid, while a folder SWITCH invalidates it by identity (no fragile clear).
     let move_slot = Arc::new(Mutex::new(None::<(String, Vec<(PathBuf, PathBuf)>)>));
@@ -7304,10 +7312,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // refusal — the cull gate's idiom, so a held arrow key cannot spray the same sentence.
     let cmp_pin_toast_at: Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
     // Undo stack for cull changes: (shot index, previous rating, previous mark). Ctrl+Z pops
-    // + restores. Cleared on folder swap. Bounded so a long session can't grow it without limit.
+    // + restores. Cleared on folder swap, kept by file across a same-folder rescan
+    // (`photo_open::RescanCarry`). Bounded so a long session can't grow it without limit.
     // Undo + its symmetric redo branch (Ctrl+Z / Ctrl+Shift+Z). Bundled so every existing push_undo call
     // site stays unchanged; a NEW cull edit clears redo (a fresh action discards the branch — the standard
-    // model). Both are per-folder (cleared on reload).
+    // model). Both are per-folder.
     let undo_stack: Rc<RefCell<UndoRedo>> = Rc::new(RefCell::new(UndoRedo::default()));
     // ── v0.8.186 (U1): THE ACT STAMP COUNTER ────────────────────────────────────────────────────
     // ONE monotonic number per undoable act, handed out by `next_act_seq` below. Three histories
@@ -7316,8 +7325,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // actually did last (see `support::Act` for the sequence the old empty-stack proxy got wrong).
     //
     // DECLARED HERE, NOT INSIDE `UndoRedo`, AND THAT PLACEMENT IS THE POINT: `apply_scan` replaces
-    // the whole `UndoRedo` on EVERY scan (including a same-folder post-op rescan), while the two
-    // records deliberately survive it. A counter living in the struct would reset with it, and the
+    // the whole `UndoRedo` at every folder change and every reopen, and a same-folder rescan keeps
+    // only the entries whose photos stayed (`photo_open::remap_history`, stamps unchanged), while the
+    // two records deliberately survive it. A counter living in the struct would reset with it, and the
     // very next edit would claim a LOWER number than the delete record still sitting there — the
     // ordering inverted by the reset, in exactly the state (post-delete, post-move) the ordering
     // exists for. Session-scoped, never reset, so `0` can safely mean "never stamped".
@@ -7345,6 +7355,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let film_dragging = Rc::new(Cell::new(false));
     let film_drag_pos0 = Rc::new(Cell::new(0f32));
     let film_follow = Rc::new(Cell::new(true));
+    // Date taken sort: the last free scroll of the filmstrip or the grid (`support::scrolled_lately`).
+    let free_scroll_at = Rc::new(Cell::new(None::<Instant>));
     let film_target = Rc::new(Cell::new(start0 as f32));
     // v0.8.179 (W4 wave-2 tail 2): the strip's legal position range, published each tick by
     // `step_filmstrip` from its own `clamp_pos` and read by the strip's three input handlers, which
@@ -8599,10 +8611,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                             // failure arm below — `det_failed` is a latch that stops this shot ever
                             // being asked for again in this folder, and nothing is wrong with this
                             // file. It is recorded here and answered where the skip marker is sent.
-                            // 2026-10-25 (round 3 step a): a non-HEIC file never reaches the hardware
-                            // lane or this thread's supersession watch, so its decode (`jpeg-decoder`
-                            // and jxl-oxide split theirs across rayon) runs on the low pool; a HEIC
-                            // stays here with the watch.
+                            // 2026-10-25 (round 3 step a): a file the shot calls non-HEIC runs its decode
+                            // (`jpeg-decoder` and jxl-oxide split theirs across rayon) on the low pool; a
+                            // HEIC stays here with the supersession watch. Open-time check (2 November): a
+                            // HEIC named `.jpg` can reach the hardware lane from the low pool until its
+                            // label corrects, off this watch, so it can't abort mid-grid. Harmless.
                             let cpu = || browse_frame_or_superseded(shot, ddim, true, Lane::Native);
                             let cpu = if shot.kind == SrcKind::Heic { cpu() } else { prep.on_low_pool(cpu) };
                             got = match cpu {
@@ -9438,7 +9451,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // single slot because `picker_busy` already makes the picker single-flight.
     let icc_pick_key: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
 
-    // ── load persisted settings + ratings, apply to UI/runtime ──
+    // ── load persisted settings, apply to UI/runtime ──
     {
         let settings = load_settings();
         // keymap: start from defaults, overlay the saved bindings (so new actions added
@@ -11623,7 +11636,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Ctrl+Z: undo the last cull change — restore the prior rating + mark and jump to that shot so the
     // change is visible. Saves the CURRENT state to the redo branch so the undo is itself redoable.
-    // (Both stacks are cleared on folder swap; see `reload`.)
+    // (Both stacks are cleared on folder swap, and kept by file across a same-folder rescan.)
     let undo_u = undo_stack.clone();
     let rt_u = ratings.clone();
     let mk_u = marks.clone();
@@ -11642,7 +11655,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let np_u = notif_pending.clone();
     let sd_u = scanned_dir.clone();
     let last_move_undo = last_move.clone(); // v0.8.186 (U1): the move record joins the race
-    let cur_dir_undo = cur_dir.clone();
     let photo_gate = app.as_weak();
     app.on_undo(move || {
         if photo_gate.upgrade().is_some_and(|a| a.get_opening_photo() && !a.get_photo_open_edits()) { return; }
@@ -11650,8 +11662,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         //
         // Three, now. v0.8.37 (FIX A2) ordered the cull stack against the delete record by a PROXY
         // — "an EMPTY stack + a live delete record means the delete is the latest reversible
-        // action" — which is sound for those two because the delete's own rescan is what empties
-        // the stack (`apply_scan` replaces `UndoRedo` unconditionally). It cannot order the delete
+        // action" — which was sound for those two while the delete's own rescan emptied the stack
+        // (it no longer does: keeping prepared work, 2 November). It cannot order the delete
         // record against the MOVE record, and this round puts moves on Ctrl+Z (the owner's design:
         // one button, one chord, a label that follows the context). Delete-then-move and
         // move-then-delete are both reachable, both leave the stack empty, and both leave BOTH
@@ -11670,9 +11682,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             support::live_undo_arm(
                 st.top_seq(),
                 rec.as_ref().map(|r| (r.dir.as_str(), r.seq)),
-                &sd_u.borrow(),
+                &sd_u.borrow(), // R2: the folder on screen gates both records
                 mv.as_ref().map(|(f, p, s)| (f.as_str(), p.len(), *s)),
-                &cur_dir_undo.borrow(),
             )
         };
         let seq = match arm {
@@ -11739,8 +11750,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            // v0.8.0: undo a rotation — restore the prior delta by name (idx valid: a re-scan clears
-            // the stack), refresh caches + panel + badges, jump to it so the change is visible.
+            // v0.8.0: undo a rotation — restore the prior delta by name (idx valid: a re-scan moves
+            // it with its file, `photo_open::remap_history`), refresh caches + panel + badges, jump to
+            // it so the change is visible.
             Some(UndoEntry::Rot { name, idx, delta: prev_delta }) => {
                 let cur = rot_u.delta_by_name.borrow().get(&name).copied().unwrap_or(0);
                 undo_u.borrow_mut().redo.push(Act { seq, entry: UndoEntry::Rot { name: name.clone(), idx, delta: cur } });
@@ -12245,6 +12257,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // clock and takes the posture back on the following tick, or from the 3 s tail if the user just
     // stops.
     let li_fs = last_input.clone();
+    let fsa_fs = free_scroll_at.clone();
     let fclamp_fs = film_clamp.clone();
     app.on_film_scroll(move |dir| {
         if dir == 0 {
@@ -12263,6 +12276,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             return;
         };
         li_fs.set(Instant::now());
+        fsa_fs.set(Some(Instant::now()));
         ff_fs.set(false);
         ftgt_fs.set(next);
     });
@@ -12287,8 +12301,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // have, and the reason they need the geometric test instead. A drag against the end is still a
     // drag.
     let li_dm = last_input.clone();
+    let fsa_dm = free_scroll_at.clone();
     app.on_film_drag_move(move |dx| {
         li_dm.set(Instant::now());
+        fsa_dm.set(Some(Instant::now()));
         fdrag_dm.set(true);
         ff_dm.set(false);
         fpos_dm.set(fp0_dm.get() - dx / 128.0); // unclamped; the tick clamps to the ends
@@ -12317,6 +12333,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // scrollbar dragged past either end (or jiggled inside the thumb's own dead zone) reports a
     // fraction that lands exactly where the strip already is.
     let li_sk = last_input.clone();
+    let fsa_sk = free_scroll_at.clone();
     let fclamp_sk = film_clamp.clone();
     app.on_film_seek(move |frac| {
         let len = len_sk.load(Ordering::Relaxed);
@@ -12329,6 +12346,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return;
             };
             li_sk.set(Instant::now());
+            fsa_sk.set(Some(Instant::now()));
             ff_sk.set(false);
             ftgt_sk.set(next);
         }
@@ -15372,7 +15390,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     //   flush_old()  — persist the OUTGOING folder's cull state (N1 guard); runs before we lose it.
     //   apply_scan() — the UI-thread SWAP (Part B): atomic shots swap + generation bump + cache reset.
     //   reload()     — SYNC path (scan on the UI thread) kept for the move/undo RE-scan (reload_req),
-    //                  which operates on the already-open folder; flush → scan → apply.
+    //                  which operates on the already-open folder; flush → scan → apply. (R3: an explicit
+    //                  reopen of the folder on screen no longer comes here; see `support::reopen_scan`.)
     //   begin_reload — ASYNC path for OPEN/drop: flush → show "Scanning…" → spawn a scan worker whose
     //                  ScanDone the tick drains and applies. This is the fix for the large-folder freeze.
     let flush_old: Rc<dyn Fn()> = {
@@ -15455,7 +15474,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     // the invariant; `apply_scan` captures a clone.
     let parked_done: Rc<RefCell<Vec<support::UploadDone>>> = Rc::new(RefCell::new(Vec::new()));
 
+    // Keeping the view on a sort change: set around the sort's own reread, cleared afterwards because
+    // `reload` can return early with no landing. Delete, Move rejected and Undo move keep today's reset
+    // until the Delete round.
+    let keep_view_req = Rc::new(Cell::new(false));
+    // Date taken sort: the date read of the folder on screen (`support::TakenPass`), and the operations
+    // that end in a position landing, which a landing arriving on its own waits for
+    // (`support::LandingHolds`, with `free_scroll_at`).
+    let taken_pass = Rc::new(RefCell::new(None::<support::ActivePass>));
+    let position_op = Arc::new(AtomicBool::new(false));
+    // Keeping prepared work (2 November): the last landed listing's file stamps. Keyed by path, so it
+    // has no position to keep correct. `apply_scan` is its one writer; a date read takes a copy.
+    let listing_stamps = Rc::new(RefCell::new(None::<support::ListingStamps>));
     let apply_scan: Rc<dyn Fn(ScanDone)> = {
+        let keep_view_req = keep_view_req.clone();
+        let taken_pass = taken_pass.clone();
+        let listing_stamps = listing_stamps.clone();
+        let (cmp_a_idx, cmp_b_idx) = (cmp_a_idx.clone(), cmp_b_idx.clone());
         let photo_open_id = photo_open_id.clone();
         let shots = shots.clone();
         let generation = generation.clone();
@@ -15466,6 +15501,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // swap-clears run via `fast.on_folder_swap()` below (was four scattered `.clear()` lines).
         let fast = fast.clone();
         let l2 = l2.clone(); // v0.7.7: the RAM L2 is per-folder — cleared on swap alongside the VRAM cache
+        let applying_at_swap = applying_rotations.clone(); // `rescan_carries`' guard for Recover during Apply
         // v0.8.30 (§64): the detail tier (cache + order + failed + uploading) — one clone; its swap-clears
         // run via `detail.on_folder_swap()` below (was three .clear() lines routed through
         // drop_developed_caches + a scattered det_uploading.set(None)).
@@ -15531,6 +15567,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let cmp_half_b = cmp_half_b.clone();
         let cmp_wheel_accum = cmp_wheel_accum.clone();
         let nav_kind = nav_kind.clone();
+        // R4 (1 November safety round): the single view's held key, wheel bank and wheel pace clock.
+        let (held_dir, wheel_accum, wheel_advance) = (held_dir.clone(), wheel_accum.clone(), wheel_advance.clone());
         let flush_old = flush_old.clone();
         let notif_ap = notif_pending.clone(); // D2: the resume-ask toast
         let viewed_lru = viewed_lru.clone(); // D2 (v0.3.61): per-folder resume memory (settings)
@@ -15547,6 +15585,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         // v0.8.98 (v0.8.97-audit C9): the scan domain's own folder memory — the same-folder test.
         let last_scanned_dir = last_scanned_dir.clone();
         let scanned_dir = scanned_dir.clone(); // v0.8.121 (F20): …and its plain-string twin
+        let shown_folder = shown_folder.clone(); // R1 alias: …and its identity
+        let reopen_pending = reopen_pending.clone(); // R3: an explicit reopen's landing
         let aw = app.as_weak();
         Rc::new(move |done: ScanDone| {
             // v0.8.90 (v0.8.89-audit FIX 3): capture a floating-panel toggle from the FINAL frame
@@ -15586,6 +15626,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             let scan_same_folder =
                 !last_scanned_dir.borrow().opens_new_folder(&done.dir.display().to_string());
             let mut done = done;
+            // Open-time check (2 November): a rescan reads names only, so what readers learned from
+            // the bytes goes back on both lists first, from one snapshot. Identity checks and
+            // promotion below then compare like with like, and no rescan undoes a correction.
+            if let Some(learned) = falcon_decode::BytesLearned::snapshot() {
+                tick::correct_list_from(&learned, &shots);
+                for s in done.shots.iter_mut() {
+                    if let Some(fixed) = learned.corrected(s) {
+                        *s = fixed;
+                    }
+                }
+            }
+            // R3 (1 November safety round): an explicit reopen of this folder, scanned off-thread.
+            let reopen = reopen_pending.borrow_mut().take_landing(done.id);
+            // R6 (1 November safety round): reopening a folder whose review data couldn't be read
+            // tries again. If it reads now, the visit starts afresh from the file: the live state,
+            // which was never saved, is not carried. If it still can't, the live state stays.
+            let review_dir = PathBuf::from(done.dir.display().to_string());
+            let retry = reopen.is_some() && support::review_data_unresolved(&review_dir);
+            let scan_same_folder =
+                scan_same_folder && (!retry || matches!(done.review_load, support::ReviewLoad::Unresolved(_)));
             if scan_same_folder && !done.scan_err {
                 let old = shots.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 support::carry_live_review_on_rescan(
@@ -15593,13 +15653,50 @@ fn main() -> Result<(), Box<dyn Error>> {
                     rot.rotations_snapshot(),
                 );
             }
+            if (scan_same_folder && !done.scan_err) || retry {
+                // R3: its order was sorted by what it read; sort again by the carried ratings, land
+                // on the requested photo, and accept it as the synchronous rescan it replaces (id 0).
+                // R6: a retry that starts afresh lands the same way.
+                if let Some(requested) = &reopen {
+                    photo_open::settle_reopen(&mut done, requested);
+                }
+            }
+            // R6: a fresh visit (or that retry) records what its review read found. While the file
+            // couldn't be read, nothing is saved to the folder (`support::save_selection_via`), and
+            // the person is told once, amber, when the folder lands with photos.
+            if !scan_same_folder || retry {
+                if let Some(warning) = support::note_review_load(&review_dir, done.review_load) {
+                    if !done.shots.is_empty() {
+                        notif_ap.borrow_mut().push(NotifEntry::warn(warning, Instant::now()));
+                    }
+                }
+            }
             let old = shots.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let promotion = if scan_same_folder {
                 aw.upgrade().and_then(|a| photo_open::Promotion::take(
                     &a, &mut done, (&old, *current.borrow()), (&fast, &detail, &film, &roi), &rot, &undo_stack, (&meta,generation.load(Ordering::Relaxed))))
             } else { None };
             let promoted = promotion.is_some();
-            let ScanDone { changed_sources: _, partial, pending_edges, source_order: _, id, dir, shots: new_vec, ratings: rv, marks: mv, start, land, extra, rotations, attrs, had_file, manifest, sort, scan_err, scan_denied, unlisted_target } = done;
+            // Keeping prepared work (2 November): a same-folder rescan keeps what is ready, by file
+            // identity. Taken before the swap (`old` still holds the list every store's index
+            // addresses) and put back at the end of this call, around every reset below.
+            let new_stamps = done.stamps.take();
+            let rescan_carry = match (listing_stamps.borrow().as_ref(), new_stamps.as_ref()) {
+                (Some(previous), Some(listed)) if photo_open::rescan_carries(done.id, reopen.is_some(), scan_same_folder, applying_at_swap.load(Ordering::SeqCst)) => {
+                    Some(photo_open::RescanCarry::take((&old, &done.shots), (previous, listed), done.start,
+                        (&fast, &detail, &film, &roi), &l2, &rot, &undo_stack, (&meta, generation.load(Ordering::Relaxed))))
+                }
+                _ => None,
+            };
+            // Read before the swap, while `old` is what every index addresses.
+            let kept_view = if keep_view_req.take() { rescan_carry.as_ref() } else { None }.and_then(|carry| {
+                let a = aw.upgrade()?;
+                carry.keep_view(a.get_zoom(), (a.get_pan_x(), a.get_pan_y()), *current.borrow(), view.compare.get().then(|| (cmp_a_idx.get(), cmp_b_idx.get())), &roi.tiles.borrow())
+            });
+            // L43: replaced at every landing, so a partial stage or an unreadable folder clears it
+            // and the next landing sets it.
+            *listing_stamps.borrow_mut() = new_stamps;
+            let ScanDone { changed_sources: _, stamps: _, partial, pending_edges, source_order: _, id, dir, shots: new_vec, ratings: rv, marks: mv, start, land, extra, rotations, attrs, had_file, from_ledger, identity, manifest, sort, scan_err, scan_denied, unlisted_target, review_load, taken_pass: handed_over } = done;
             // v0.8.130 (W2-4): the folder's export record rides the scan exactly as `had_file`
             // does, and lands at the same swap -- so the ctx row's availability and the New/Edited
             // classification can never describe the folder we just left.
@@ -15639,14 +15736,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             //
             // THE EDGE ENUMERATION (L27 — every route that reaches this line, not just the ones the
             // ruling names). Two callers construct a `ScanDone`:
-            //   • `id != 0` — the off-thread scan: Open button, drag-and-drop, argv re-open, the
-            //     async picker, and the re-sort. Every one of these is a folder (re)OPEN in the
-            //     user's terms, so all of them refresh. A re-sort refreshing costs nothing: the
-            //     plan is order-independent by construction (`falcon_decode::tile_number_plan`), so
-            //     it re-derives an IDENTICAL plan.
-            //   • `id == 0` — the sync `reload` path, which is the post-op rescan and nothing else:
-            //     move-rejects, undo-move, delete, recover. These are exactly the mid-session
-            //     reconciliations the ruling names, and they now keep the plan.
+            //   • `id != 0` — the off-thread scan: Open button, drag-and-drop, argv re-open and the
+            //     async picker. Every one of these is a folder OPEN in the user's terms, so all of
+            //     them refresh.
+            //   • `id == 0` — the sync `reload` path: move-rejects, undo-move, delete, recover and
+            //     (corrected 2 November, it was listed above) the re-sort, plus a settled reopen.
+            //     These are exactly the mid-session reconciliations the ruling names, and they keep
+            //     the plan. A re-sort keeping it changes nothing: the plan is order-independent by
+            //     construction (`falcon_decode::tile_number_plan`).
             // `!scan_same_folder` is ORed in as a belt: if any future route ever reached the sync
             // path with a different directory, that is a folder change however it arrived, and the
             // badges must describe the folder on screen.
@@ -15665,6 +15762,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 support::begin_review_visit();
                 *s = new_arc.clone();
                 generation.fetch_add(1, Ordering::Relaxed);
+            }
+            // Date taken sort: leaving the folder, or the list leaving Date taken, stops its read. A
+            // Delete during the read doesn't (the old generation guard lost the re-sort, known issue O1).
+            {
+                let mut slot = taken_pass.borrow_mut();
+                if slot.as_ref().is_some_and(|p| !support::pass_survives_landing(scan_same_folder, sort.0 == SortMethod::Taken, p.pick.is_some())) {
+                    *slot = None;
+                }
+                if let Some(handle) = handed_over {
+                    *slot = Some(support::ActivePass::handed_over(handle, generation.load(Ordering::Relaxed)));
+                }
             }
             len_atomic.store(new_len, Ordering::Relaxed);
             // v0.9.4 (§66/P4a): the per-shot-metadata tier's swap clear+reseed, BY CONSTRUCTION (see
@@ -15785,7 +15893,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             // reset anywhere, so a class learned in a folder of 12 MP HEICs governed the next
             // folder's open.) Placed at the same chokepoint as the tier swap-clears, deliberately:
             // one place to read, one place that can rot.
-            if !promoted { support::reset_fast_cost(); }
+            // Keeping prepared work (2 November): a carrying rescan is the same folder, so it keeps
+            // its learned cost and the HEIC service record, with fewer decodes to relearn them from.
+            if !promoted && rescan_carry.is_none() { support::reset_fast_cost(); }
             // v0.8.196 fix tail (skeptic A, O4): …and the efficiency posture's LATENCY estimate, which
             // takes the NEW generation rather than merely emptying: in-flight decodes are not
             // cancelled at a swap, and `latency_ewma_update(None, s)` seeds OUTRIGHT, so without the
@@ -15872,6 +15982,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // MRU memory migrated into a journal folder and live attrs a rescan keeps stay dirty and
             // reach the next flush; the gated final flushes would otherwise skip them. A fresh open
             // reads disk, so this folder's earlier save attempts no longer say anything about it.
+            // R1: an attempt whose bytes are still unsaved is kept (this open read those bytes).
             let disk_attrs = attrs.clone();
             if !scan_same_folder {
                 support::forget_review_attempts(Path::new(&dir.display().to_string()));
@@ -15896,7 +16007,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 } else {
                     attrs
                 };
-                if had_file {
+                // R6 (1 November safety round): a folder whose review file couldn't be read keeps its
+                // settings memory, since nothing can be saved into that file this visit.
+                if had_file && !matches!(review_load, support::ReviewLoad::Unresolved(_)) {
                     if fa.resume_shot.is_none() {
                         fa.resume_shot = lru_get(&viewed_lru.borrow(), &dir_str);
                     }
@@ -15959,7 +16072,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Latched process-wide, so opening ten HEIC folders still logs one line. On macOS the
             // probe is a stub line (Image I/O has no codec registry to interrogate).
             probe_heic_once(&new_arc);
-            *undo_stack.borrow_mut() = UndoRedo::default(); // undo + redo history is per-folder
+            // Undo + redo history is per-folder. A carrying same-folder rescan took its stack out above
+            // and puts it back, remapped by file, at the end of this call (keeping prepared work).
+            *undo_stack.borrow_mut() = UndoRedo::default();
             // (move-undo pairs are folder-TAGGED, so a folder switch invalidates them by identity in the
             //  tick's step #11 — no explicit clear here, which previously also wiped a same-folder re-scan)
             // v0.9.4 (§66/P4a): the view/nav transients' swap reset, BY CONSTRUCTION (see
@@ -15986,6 +16101,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             cmp_half_b.set(HalfFrame::default());
             cmp_wheel_accum.set(0); // banked compare-wheel notches are per-folder
             nav_kind.set(NavKind::Absolute);
+            // R4 (1 November safety round): a held arrow and banked wheel notches belong to the
+            // folder being left; this tick's wheel step runs after this landing. Same-folder landings
+            // (the photo-first promotion, re-sorts, post-op rescans) keep them.
+            if !scan_same_folder {
+                tick::end_gestures_on_folder_change(Instant::now(), &held_dir, &wheel_accum, &wheel_advance);
+            }
             // v0.9.63 (merge): the trunk's twelve loose lines here — last_seen, the backdrop-key
             // invalidate, the widened last_film_key sentinel, and the whole filmstrip gesture reset
             // — are `view.reset_for_swap(start)` above on this branch (v0.9.4 §66/P4a). The merge
@@ -15993,7 +16114,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             // the two trunks now reset the SAME state through one call instead of twelve.
             // v0.8.26 (§64): the pool prefetch QUEUE was cleared above by `fast.on_folder_swap()` (queue
             // only — `inflight` is left for the worker/drain to clear under the new gen; see its doc).
-            *last_ratings_json.borrow_mut() = {
+            // R1 (1 November safety round): a map read from this process's unsaved save bytes is
+            // newer than the file, so the baseline starts dirty (empty never matches a snapshot) and
+            // the backstop and the final flush write it again, whatever became of that save.
+            let adopted = support::adopted_baseline_stays_dirty(
+                from_ledger, new_len > 0, scan_same_folder, &last_ratings_json.borrow());
+            *last_ratings_json.borrow_mut() = if adopted { String::new() } else {
                 let mut m = selection_map(&new_arc, &ratings.borrow(), &marks.borrow());
                 merge_selection_extra(&mut m, &sel_extra.borrow()); // N8: baseline matches the flushes
                 // v0.8.0: deltas already reloaded above. B1: the file's attrs, not the merged live ones.
@@ -16023,9 +16149,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             // min-state restore twenty lines above uses, recomputed here because that one is scoped
             // to its own block; `last_scanned_dir.record` runs BELOW, so this still reads the
             // PREVIOUS scan. Deliberate consequence, stated: a same-folder RE-OPEN through the
-            // picker or a drag-drop now keeps the filter too — `begin_reload` routes it to the same
-            // sync `reload` and it is indistinguishable from a post-op rescan here, which is exactly
-            // the panel_min precedent's ruling applied to the two filters.
+            // picker or a drag-drop now keeps the filter too — it lands as the same id-0 same-folder
+            // rescan (R3: scanned off-thread since 1 November, `photo_open::settle_reopen`) and it is
+            // indistinguishable from a post-op rescan here, which is exactly the panel_min
+            // precedent's ruling applied to the two filters.
             //
             // The decision is logged, not just taken: it is the only observable proof from a boot
             // log that the wiring survives (see `support::reset_folder_filters_on_scan`, whose rig
@@ -16052,7 +16179,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             // what let an empty-folder detour make the return trip look like a rescan.
             last_scanned_dir.borrow_mut().record(&dir.display().to_string(), new_len > 0);
             *scanned_dir.borrow_mut() = dir.display().to_string(); // v0.8.121 (F20): same rule, same line
+            shown_folder.borrow_mut().record(&dir.display().to_string(), identity); // R1 alias: recorded at acceptance
             if let Some(a) = aw.upgrade() {
+                // Safety round review R2 (1 November, owner: grey it out): Apply rotations is faded while
+                // the folder it acts on is marked unreadable. Set at every landing, after the mark
+                // (`note_review_load` above) and `cur_dir` are written, the only places either input
+                // changes, so it clears exactly when the mark does or Apply's folder changes.
+                a.set_apply_rotations_waits(support::apply_rotations_waits(&cur_dir.borrow()));
                 a.set_path_text(hud_dir(&dir).into());
                 // v0.8.116 (D-A): the swap publishes the FOLDER; the tick fills all three tiers on the
                 // first shot. Cleared together so the outgoing folder's filename can never be shown
@@ -16095,8 +16228,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // v0.8.49: the swap also invalidates the position-chip sort menu (same C2 rule) and
                 // syncs the menu's marks to the sort actually APPLIED to the swapped-in list.
                 a.set_sort_open(false);
-                a.set_sort_method(sort.0.as_i32());
-                a.set_sort_desc(sort.1);
+                let menu = support::menu_sort(sort, taken_pass.borrow().as_ref().and_then(|p| p.pick));
+                a.set_sort_method(menu.0.as_i32());
+                a.set_sort_desc(menu.1);
                 // (v0.8.50's title-bar path menu was closed here too, for the same C2 reason — its
                 // "Copy path" read the CURRENT shot. v0.8.192 retired the menu; the pill's click
                 // reads `cur` at dispatch time, so there is nothing left to invalidate at the swap.)
@@ -16149,7 +16283,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         if idx != start {
                             notif_ap.borrow_mut().push(
                                 NotifEntry::info(tr_format!("You were at {photo} last time — resume?", photo = lv), Instant::now())
-                                    .with_jump_to(idx as i32)
+                                    .with_resume(idx as i32, &lv)
                                     .in_dir(&dir.display().to_string()), // v0.8.120 (O6)
                             );
                         }
@@ -16168,6 +16302,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             if let (Some(promotion), Some(a)) = (promotion, aw.upgrade()) {
                 promotion.restore(&a, &fast, &detail, &film, &rot, &undo_stack, &roi, (&meta,generation.load(Ordering::Relaxed)));
             }
+            // Keeping prepared work (2 November): after every reset above, the unconditional Undo wipe
+            // included, so a refused carry is exactly today's wipe.
+            if let Some(carry) = rescan_carry {
+                carry.restore((&fast, &detail, &film, &roi), &l2, &rot, &undo_stack, (&meta, generation.load(Ordering::Relaxed)));
+            }
+            // After every reset above, like the carry itself. The next tick's `step_bookkeeping` then
+            // captures the kept zoom as a normal pan carry, and the tick moves the kept tiles in right
+            // after its clear.
+            if let (Some(kept), Some(a)) = (kept_view, aw.upgrade()) {
+                kept.restore(&a, &view.compare, (&cmp_a_idx, &cmp_b_idx), &roi);
+            }
             eprintln!("opened {} ({} shots)", dir.display(), new_len);
         })
     };
@@ -16177,6 +16322,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let reload: Rc<dyn Fn(PathBuf, Option<usize>)> = {
         let flush_old = flush_old.clone();
         let apply_scan = apply_scan.clone();
+        let (reopen_pending, scan_id, scan_done) = (reopen_pending.clone(), scan_id.clone(), scan_done.clone()); // R3
+        let taken_pass = taken_pass.clone();
         let sel_status_slot = sel_status_slot.clone();
         let shots = shots.clone();
         let ratings = ratings.clone();
@@ -16192,20 +16339,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         let folder_attrs = folder_attrs.clone();
         let aw = app.as_weak();
         Rc::new(move |path: PathBuf, land: Option<usize>| {
+            // R3 (1 November safety round): this rescan reads the folder after the file operation or
+            // sort pick that asked for it, so an explicit reopen still scanning it (an older listing)
+            // is retired and never lands after it. A pending open of another folder is left alone.
+            if reopen_pending.borrow_mut().superseded_by_rescan(scan_id.load(Ordering::Relaxed)) {
+                support::begin_explicit_scan(&scan_id, &scan_done);
+            }
             let (dir, sel) = resolve_target(path);
             flush_old();
             // v0.8.49: the selection loads FIRST now (the Rating method needs the map; the json
             // `sort` attr feeds the spec), the fresh scan is sorted, and only then is the landing
-            // resolved over the SORTED order. N8: only adopt leftovers from an ACTUAL file — the
-            // legacy-seed fallback holds foreign folders' names that must not become this folder's
-            // preserved state.
+            // resolved over the SORTED order. N8: only adopt leftovers from a file that was actually
+            // read (R6: `ReviewLoad::Loaded`, not merely present).
             // v0.8.134 (F-4): the conversion ladder resolves ONCE per open and both readers
             // take that value (see `review_data_present_with`). The WRITER thread is untouched - it
             // must keep probing at write time, which is the whole point of F-P3 rule 6.
             let review_st = review_data_state(&dir); // v0.8.130 (W2-5): converts a legacy name first
             let had_file = review_data_present(review_st, &dir);
             let manifest = read_export_manifest(&dir).map(|m| m.files); // v0.8.130 (W2-4): side-effect-free
-            let (mut sel_map, rotations, attrs) = load_selection(review_st, &dir, &sel_status_slot);
+            // R1 (1 November safety round): through this process's unsaved save bytes first.
+            let (mut sel_map, rotations, attrs, from_ledger, review_load) =
+                support::load_selection_through_ledger(review_st, &dir, &sel_status_slot);
             let cap = aw
                 .upgrade()
                 .map(|a| eff_resume_cap(a.get_sort_cap_custom(), a.get_sort_cap_tier()) as usize)
@@ -16255,8 +16409,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             support::log_scan_timing(&dir, &scan);
             let mut new_vec = scan.shots;
             let sort_at = Instant::now();
+            // A reread never starts a date read, and its sort reads nothing. With no read running, it
+            // reads a few dates here: a photo saved beside the original sorts to its real date. During
+            // a read it reads none, so the order on screen doesn't change under a position landing.
+            if method == SortMethod::Taken && taken_pass.borrow().is_none() {
+                support::read_dates_inline(&new_vec, &scan.metadata, support::INLINE_DATE_READS);
+            }
             sort_scanned_shots(&mut new_vec, method, desc, &sel_map, &scan.metadata);
             log_event(&format!("scan: sort {} shots in {} ms", new_vec.len(), sort_at.elapsed().as_millis()));
+            let stamps = support::listing_stamps(scan.metadata); // keeping prepared work (2 November)
             // v0.8.34 (C3/G1): a post-op rescan (delete/move/undo) supplies an explicit landing index so the
             // viewer stays on the neighbour; a plain re-open passes None → resume via select_start exactly as
             // before (the per-folder resume-position logic is untouched — only the SYNC post-op path differs).
@@ -16270,8 +16431,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             };
             let (rv, mv) = apply_selection(&sel_map, &new_vec);
-            let extra = if had_file { selection_leftover(sel_map, &new_vec) } else { BTreeMap::new() };
-            apply_scan(ScanDone { changed_sources: HashSet::new(), partial: false, pending_edges: (false, false), source_order: Vec::new(), id: 0, dir, shots: new_vec, ratings: rv, marks: mv, start, land, extra, rotations, attrs, had_file, manifest, sort: (method, desc), scan_err: false, scan_denied: false, unlisted_target }); // v0.8.37 (FIX A3): carry the landing hint so apply_scan suppresses the resume offer on a hinted post-op rescan (M2: reached only on a successful scan — the Err arm returned early)
+            // R6 (1 November safety round): leftovers come from a review file that was read, or, on a
+            // same-folder rescan, from the live map above (whatever this read of the file found).
+            let extra = if same_folder || review_load == support::ReviewLoad::Loaded { selection_leftover(sel_map, &new_vec) } else { BTreeMap::new() };
+            apply_scan(ScanDone { changed_sources: HashSet::new(), stamps: Some(stamps), partial: false, pending_edges: (false, false), source_order: Vec::new(), id: 0, dir, shots: new_vec, ratings: rv, marks: mv, start, land, extra, rotations, attrs, had_file, from_ledger, identity: None, manifest, sort: (method, desc), scan_err: false, scan_denied: false, unlisted_target, review_load, taken_pass: None }); // v0.8.37 (FIX A3): carry the landing hint so apply_scan suppresses the resume offer on a hinted post-op rescan (M2: reached only on a successful scan — the Err arm returned early)
         })
     };
 
@@ -16299,16 +16462,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         let scan_done = scan_done.clone();
         let early_scan = early_scan.clone();
         let scan_id = scan_id.clone();
-        let reload = reload.clone();
         let cur_dir = cur_dir.clone();
         let len_atomic = len_atomic.clone();
         let sel_status_slot = sel_status_slot.clone();
         // v0.8.49 sort inputs, SNAPSHOTTED at spawn (v0.8.61: json attr → MRU → Name; the worker
         // reads the target folder's own json attr itself via load_selection).
         let sort_lru = sort_lru.clone();
+        let folder_attrs = folder_attrs.clone(); // R3: a reopen sorts by the live attr, as `reload`
+        let reopen_pending = reopen_pending.clone(); // R3
+        let taken_pass = taken_pass.clone();
         let aw = app.as_weak();
         Rc::new(move |resolved: support::ResolvedOpen| {
-            let support::ResolvedOpen { id, path, requested_at, target } = resolved;
+            let support::ResolvedOpen { id, path, requested_at, target, identity, shown_alias } = resolved;
             if scan_id.load(Ordering::Relaxed) != id { return; }
             let (dir, sel) = match target {
                 Ok(target) => target,
@@ -16324,19 +16489,63 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
             // (v0.9.21, item 6: the v0.9.12 macOS falcon.log re-point into the opened folder is
             // RETIRED — the log lives at the ONE central home next to Falcon.app; see support.rs.)
-            // Re-opening the ALREADY-open folder → do it SYNC. The async worker snapshots the selection JSON
-            // at spawn time; a rating typed during a SAME-folder scan would be clobbered by that stale
-            // snapshot on apply (audit ORANGE). A same-folder refresh still performs a synchronous scan. A
+            // Re-opening the ALREADY-open folder is a same-folder RESCAN, never a fresh open: the scan
+            // reads the selection JSON, and a rating typed meanwhile would be clobbered by that stale
+            // snapshot on apply (audit ORANGE), so `apply_scan` carries the live state over it. A
             // DIFFERENT folder reads a different JSON, so the async edit-capture (apply_scan's flush) is sound.
             // v0.3.60 review: gate on len>0 — on an empty launch cur_dir is SEEDED to the remembered
-            // folder without loading it, so opening THAT folder must take the ASYNC (id != 0) path or
-            // the D2 resume-ask is skipped. With nothing loaded there are no live edits to clobber.
-            if len_atomic.load(Ordering::Relaxed) > 0 && dir == PathBuf::from(&*cur_dir.borrow()) {
+            // folder without loading it, so opening THAT folder must take the fresh-open (id != 0) path
+            // or the D2 resume-ask is skipped. With nothing loaded there are no live edits to clobber.
+            // R1 alias (1 November safety round): the same folder under another spelling (a case
+            // variant, a junction or link, a mapped drive, a trailing separator) is a reopen too, and
+            // it rescans with the ON-SCREEN spelling, so the string-keyed same-folder tests in
+            // `apply_scan` carry the live edits. Its own statement: the `cur_dir` borrow ends here.
+            let again = support::reopen_on_screen(
+                len_atomic.load(Ordering::Relaxed) > 0, &cur_dir.borrow(), &dir, shown_alias.as_deref(), sel.as_deref());
+            if let Some((dir, sel)) = again {
                 if let Some(a) = aw.upgrade() {
                     let live = shots.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     scan_hud.borrow_mut().restore(&a, live.get(*current.borrow()));
                 }
-                reload(path, None); // explicit reopen superseded pending scans; internal reloads do not
+                // R3 (1 November safety round): the rescan used to run here, on the interface thread
+                // (`reload`), so a slow or stalled folder froze the window. It runs on a worker now
+                // (`support::reopen_scan`). The list on screen stays live (no "Scanning…", no
+                // first-photo stage); `apply_scan` carries what changed meanwhile and settles the
+                // order (`photo_open::settle_reopen`); a file operation's rescan first retires it.
+                // An explicit reopen superseded pending scans (begin_reload); internal reloads retire
+                // only this reopen of their own folder.
+                reopen_pending.borrow_mut().start(id, sel.clone());
+                let (scan_done, scan_id, sel_status_slot) = (scan_done.clone(), scan_id.clone(), sel_status_slot.clone());
+                let live_sort = folder_attrs.borrow().sort.clone(); // `reload`'s same-folder sort rule
+                let start_date_read = taken_pass.borrow().is_none();
+                let sort_lru_snap = sort_lru.borrow().clone();
+                let sort_cap = aw
+                    .upgrade()
+                    .map(|a| eff_resume_cap(a.get_sort_cap_custom(), a.get_sort_cap_tier()) as usize)
+                    .unwrap_or(0);
+                let worker = std::thread::Builder::new().name("falcon-scan".into()).spawn(move || {
+                    if scan_id.load(Ordering::Relaxed) != id { return; }
+                    let local_warn: Mutex<Option<support::OpResult>> = Mutex::new(None); // landed scans only
+                    let cancelled = || scan_id.load(Ordering::Relaxed) != id;
+                    let read = |dir: &Path| falcon_decode::scan_folder_with_metadata_cancellable(dir, cancelled);
+                    let date_read = start_date_read.then_some(&cancelled as &dyn Fn() -> bool);
+                    match support::reopen_scan(id, dir.clone(), sel, live_sort, &sort_lru_snap, sort_cap, date_read, &local_warn, read) {
+                        Ok(done) => {
+                            if support::publish_latest(&scan_id, &scan_done, id, done) {
+                                if let Some(w) = local_warn.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                                    *sel_status_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
+                                }
+                                support::reap_stale_temps(&dir);
+                            }
+                        }
+                        // M2, as `reload`: a rescan that can't read the folder keeps the current list.
+                        Err(e) if !cancelled() => log_event(&format!("scan: couldn't read {} ({e}) — keeping the current folder", dir.display())),
+                        Err(_) => {}
+                    }
+                });
+                if let Err(e) = worker {
+                    log_event(&format!("scan: couldn't start scan worker ({e}) — keeping the current folder"));
+                }
                 return;
             }
             // NOTE: the OLD folder's flush happens in apply_scan (just before the swap), NOT here — so an
@@ -16378,9 +16587,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let review_st = review_data_state(&dir); // N8 (see the sync reload note); v0.8.130 (W2-5): converts a legacy name first
                 let had_file = review_data_present(review_st, &dir);
                 // Export provenance is collection work; read after the early photo has landed.
-                let (sel_map, rotations, attrs) = load_selection(review_st, &dir, &local_warn);
-                // v0.8.49: sort the fresh scan (off-thread — a cold Date-taken pass hides behind the
-                // "Scanning…" overlay), THEN land: select_start resolves over the sorted order.
+                // R1 (1 November safety round): a folder left with its save still queued or failed
+                // reads those bytes, not the older file. One read serves every batch below.
+                let (sel_map, rotations, attrs, from_ledger, review_load) =
+                    support::load_selection_through_ledger(review_st, &dir, &local_warn);
+                // R6 (1 November safety round): moved-out leftovers only from a review file that was read.
+                let read_review = review_load == support::ReviewLoad::Loaded;
+                // v0.8.49: sort the fresh scan (off-thread), THEN land: select_start resolves over the
+                // sorted order.
                 let (method, desc) = resolve_sort_spec(
                     attrs.sort.as_deref(),
                     &sort_lru_snap,
@@ -16396,10 +16610,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if let Some(shot) = early_shot {
                         let early_shots = vec![shot];
                         let (ratings, marks) = apply_selection(&sel_map, &early_shots);
-                        let extra = if had_file { selection_leftover(sel_map.clone(), &early_shots) } else { BTreeMap::new() };
-                        let early = ScanDone { changed_sources: HashSet::new(), partial: true, pending_edges: (true, true), source_order: Vec::new(), id, dir: dir.clone(), shots: early_shots,
+                        let extra = if read_review { selection_leftover(sel_map.clone(), &early_shots) } else { BTreeMap::new() };
+                        let early = ScanDone { changed_sources: HashSet::new(), stamps: None, partial: true, pending_edges: (true, true), source_order: Vec::new(), id, dir: dir.clone(), shots: early_shots,
                             ratings, marks, start: 0, land: Some(0), extra, rotations: rotations.clone(),
-                            attrs: attrs.clone(), had_file, manifest: None, sort: (method, desc), scan_err: false, scan_denied: false, unlisted_target: None };
+                            attrs: attrs.clone(), had_file, from_ledger, identity, manifest: None, sort: (method, desc), scan_err: false, scan_denied: false, unlisted_target: None, review_load, taken_pass: None };
                         if support::publish_latest(&scan_id, &early_scan, id, early) {
                             log_event(&format!("scan: request {id} first shot ready in {} ms", requested_at.elapsed().as_millis()));
                             // Continue metadata discovery immediately. Preview decoding is an
@@ -16441,12 +16655,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 sort_scanned_shots(&mut nearby_shots, method, desc, &sel_map, &scan.metadata);
                                 let start = select_start(&nearby_shots, &sel);
                                 let (ratings, marks) = apply_selection(&sel_map, &nearby_shots);
-                                let extra = if had_file { selection_leftover(sel_map.clone(), &nearby_shots) } else { BTreeMap::new() };
+                                let extra = if read_review { selection_leftover(sel_map.clone(), &nearby_shots) } else { BTreeMap::new() };
                                 let count = nearby_shots.len();
-                                let nearby = ScanDone { changed_sources: HashSet::new(), partial: true, pending_edges, source_order: Vec::new(), id, dir: dir.clone(),
+                                let nearby = ScanDone { changed_sources: HashSet::new(), stamps: None, partial: true, pending_edges, source_order: Vec::new(), id, dir: dir.clone(),
                                     shots: nearby_shots, ratings, marks, start, land: Some(start), extra,
-                                    rotations: rotations.clone(), attrs: attrs.clone(), had_file, manifest: None,
-                                    sort: (method, desc), scan_err: false, scan_denied: false, unlisted_target: None };
+                                    rotations: rotations.clone(), attrs: attrs.clone(), had_file, from_ledger, identity, manifest: None,
+                                    sort: (method, desc), scan_err: false, scan_denied: false, unlisted_target: None, review_load, taken_pass: None };
                                 if support::publish_latest(&scan_id, &early_scan, id, nearby) {
                                     log_event(&format!("scan: request {id} nearby {count} shots ready in {} ms after first photo; headers={} ms reads={} readers={}",
                                         nearby_at.elapsed().as_millis(), scan.headers_ms, scan.header_reads, scan.readers));
@@ -16460,8 +16674,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // M2: a genuine async OPEN of an unreadable folder must not read as "No photos". Capture
                 // the IO error, log it WITH the folder path, and publish an empty, scan_err-flagged
                 // ScanDone so the "Scanning…" overlay clears to the honest "Couldn't read this folder"
-                // empty-state. (This path only replaces a DIFFERENT folder — a same-folder rescan takes
-                // the SYNC path, which keeps its list on error — so the swap-to-error-state is correct.)
+                // empty-state. (This path only replaces a DIFFERENT folder — a same-folder reopen takes
+                // `reopen_scan` (R3), which keeps its list on error — so the swap-to-error-state is correct.)
                 let scan_res = catalogue.and_then(|mut c| c.finish(|| scan_id.load(Ordering::Relaxed) != id));
                 if scan_id.load(Ordering::Relaxed) != id { return; }
                 // Stale-temp cleanup follows publication, outside the ready path.
@@ -16481,6 +16695,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 };
                 if scan_id.load(Ordering::Relaxed) != id { return; }
                 let source_order = if method == SortMethod::Rating { new_vec.iter().map(|s| s.name.clone()).collect() } else { Vec::new() };
+                // Date taken: read what's unread, bounded. A folder that settled lands in the right
+                // order, and a read that outlives the wait lands in file-date order and goes along.
+                let taken_pass = (method == SortMethod::Taken && !scan_err).then(|| {
+                    let input = support::PassInput { dir: dir.clone(), shots: Arc::new(new_vec.clone()), stamps: support::listing_stamps_of(&metadata), order_desc: Some(desc), write_allowed: sort_cap > 0 };
+                    support::taken_before_sort(input, &|| scan_id.load(Ordering::Relaxed) != id)
+                }).flatten();
                 let sort_at = Instant::now();
                 sort_scanned_shots(&mut new_vec, method, desc, &sel_map, &metadata);
                 log_event(&format!("scan: request {id} sorted {} shots in {} ms; ready in {} ms", new_vec.len(), sort_at.elapsed().as_millis(), requested_at.elapsed().as_millis()));
@@ -16492,9 +16712,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let (rv, mv) = apply_selection(&sel_map, &new_vec);
                 // On a scan error don't treat every remembered entry as a "moved-out" leftover (empty scan
                 // ⇒ all would qualify); carry no leftovers so a transient read error can't rewrite state.
-                let extra = if had_file && !scan_err { selection_leftover(sel_map, &new_vec) } else { BTreeMap::new() };
+                let extra = if read_review && !scan_err { selection_leftover(sel_map, &new_vec) } else { BTreeMap::new() };
                 let cleanup_dir = dir.clone();
-                let done = ScanDone { changed_sources, partial: false, pending_edges: (false, false), source_order, id, dir, shots: new_vec, ratings: rv, marks: mv, start, land: None, extra, rotations, attrs, had_file, manifest, sort: (method, desc), scan_err, scan_denied, unlisted_target }; // v0.8.37 (FIX A3): a genuine async OPEN has no landing hint → the resume offer is allowed
+                let done = ScanDone { changed_sources, stamps: (!scan_err).then(|| support::listing_stamps(metadata)), partial: false, pending_edges: (false, false), source_order, id, dir, shots: new_vec, ratings: rv, marks: mv, start, land: None, extra, rotations, attrs, had_file, from_ledger, identity, manifest, sort: (method, desc), scan_err, scan_denied, unlisted_target, review_load, taken_pass }; // v0.8.37 (FIX A3): a genuine async OPEN has no landing hint → the resume offer is allowed
                 // Publish ONLY if this is still the latest scan (a later open bumped scan_id) and we would
                 // not regress a newer already-pending result. Else a SLOW scan finishing AFTER a faster
                 // LATER one would overwrite the newer ScanDone — the tick then discards it (id mismatch),
@@ -16533,6 +16753,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let resolved_open = resolved_open.clone();
         let early_scan = early_scan.clone();
         let photo_presented = photo_presented.clone();
+        let shown_folder = shown_folder.clone();
         let aw = app.as_weak();
         Rc::new(move |path: PathBuf| {
             if !mac_experiment::allows_open(&path) {
@@ -16549,10 +16770,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             // On an invalid argv target this also preserves the empty-launch state.
             let request = scan_id.clone();
             let pending = resolved_open.clone();
+            let shown = shown_folder.borrow().clone(); // R1 alias: the folder on screen, for the worker
             let worker = std::thread::Builder::new().name("falcon-open".into()).spawn(move || {
                 if request.load(Ordering::Relaxed) != id { return; }
                 let target = support::resolve_existing_target(&path);
-                support::publish_latest(&request, &pending, id, support::ResolvedOpen { id, path, requested_at, target });
+                // R1 alias (1 November safety round): the target folder's identity, and whether it
+                // is the folder on screen under another spelling. Read here, never on the interface
+                // thread; the on-screen folder is probed only when the identities already match.
+                let identity = target.as_ref().ok().and_then(|(dir, _)| support::folder_identity(dir));
+                let shown_alias = shown.alias_of(identity, support::folder_identity);
+                support::publish_latest(&request, &pending, id, support::ResolvedOpen { id, path, requested_at, target, identity, shown_alias });
             });
             if let Err(e) = worker {
                 log_event(&format!("scan: couldn't start target worker ({e})"));
@@ -16567,26 +16794,34 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // ── v0.8.49: the position-chip SORT menu picks ──────────────────────────────────────────────
     // A pick re-sorts by re-scanning through the PROVEN folder-swap path (reload → apply_scan): the
-    // sort layer re-orders the fresh scan and the CURRENT SHOT is re-selected BY FILE NAME
-    // (select_start over the file-carrying request path), so "the current shot stays selected" holds
-    // by construction — only its position number changes and the view follows it. Persistence: the
+    // sort layer re-orders the fresh scan and the photo on screen when the reread runs is re-selected
+    // BY FILE NAME (select_start over the file-carrying request path), so "the current shot stays
+    // selected" holds by construction — only its position number changes and the view follows it,
+    // keeping zoom and Compare (`keep_view_req`). Persistence: the
     // GLOBAL last-used spec always updates (an explicit pick is the one writer); the per-folder
-    // memory routes json-attr vs capped MRU (owner rule 3). Date taken pre-warms its folder-wide
-    // EXIF cache OFF-thread first, so the UI-thread rescan's sort is a pure cache walk.
+    // memory routes json-attr vs capped MRU (owner rule 3). Date taken reads its folder's capture dates
+    // OFF-thread first (`support::TakenPass`): the order and that memory change once, when the read ends.
     {
         let awz = app.as_weak();
         let cur_dir_sp = cur_dir.clone();
-        let current_sp = current.clone();
         let shots_sp = shots.clone();
         let sort_lru_sp = sort_lru.clone();
         let sort_last_sp = sort_last_used.clone();
         let folder_attrs_sp = folder_attrs.clone();
         let sel_json_present_sp = sel_json_present.clone();
         let sort_rl = sort_reload_req.clone();
-        let generation_sp = generation.clone();
+        let taken_pass_sp = taken_pass.clone();
+        let listing_stamps_sp = listing_stamps.clone();
+        let applying_sp = applying_rotations.clone(); // fix round 1: no re-sort while Apply rotations runs
+        let (reopen_pending_sp, scan_id_sp, scan_done_sp) = (reopen_pending.clone(), scan_id.clone(), scan_done.clone());
         let apply_pick = Rc::new(move |method: SortMethod, desc: bool| {
             let Some(a) = awz.upgrade() else { return };
             a.set_sort_open(false);
+            // Fix round 1 (1 November, F13-apply-4): the authoritative atomic, not the greyed rows'
+            // property (a tick behind). Both sort callbacks and the Mac menu bar's Sort rows land here.
+            if applying_sp.load(Ordering::SeqCst) {
+                return;
+            }
             if method.as_i32() == a.get_sort_method() && desc == a.get_sort_desc() {
                 return; // picked the already-active spec — nothing to re-sort
             }
@@ -16599,45 +16834,41 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return; // empty state: the pick still primes the global default for the next open
             }
             let cap = eff_resume_cap(a.get_sort_cap_custom(), a.get_sort_cap_tier()) as usize;
-            if cap > 0 {
-                if sel_json_present_sp.get() {
-                    // json folder: the attr IS the memory (flushed with the selection; rule 3).
-                    folder_attrs_sp.borrow_mut().sort = Some(spec);
-                } else {
-                    lru_upsert(&mut sort_lru_sp.borrow_mut(), &dir, &spec, cap);
-                }
-            }
             let snap = shots_sp.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            // A Date taken pick is remembered at its landing, so a reread during the read uses the old
+            // order and closing Falcon leaves the old order for next time.
+            if method != SortMethod::Taken || snap.is_empty() {
+                support::remember_sort(cap, sel_json_present_sp.get(), &mut folder_attrs_sp.borrow_mut(), &mut sort_lru_sp.borrow_mut(), &dir, spec);
+            }
             if snap.is_empty() {
                 return;
             }
-            // Land back on the CURRENT shot: its primary file name re-selects it in the new order
-            // (select_start also falls back to the shot NAME for a pathless shot — defensive).
-            let land_file = snap.get(*current_sp.borrow()).map(|s| {
-                s.jpg
-                    .as_ref()
-                    .or(s.raw.as_ref())
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| s.name.clone())
-            });
             let dir_pb = PathBuf::from(&dir);
             if method == SortMethod::Taken {
-                // First Date-taken use on a cold folder = a folder-wide EXIF header pass — run it
-                // off-thread, then post the rescan. The generation guard drops a warm whose folder
-                // was swapped away mid-pass (the drain's folder-tag check is the second gate).
-                let gen0 = generation_sp.load(Ordering::Relaxed);
-                let generation_bg = generation_sp.clone();
-                let sort_rl_bg = sort_rl.clone();
-                std::thread::spawn(move || {
-                    warm_taken_dates(&snap);
-                    if generation_bg.load(Ordering::Relaxed) == gen0 {
-                        *sort_rl_bg.lock().unwrap_or_else(|e| e.into_inner()) = Some((dir_pb, land_file));
-                    }
-                });
+                support::cancel_date_cache_removal(&dir_pb); // the person came back within the 20 seconds
+                // This reread lands seconds from now, so a reopen still scanning would land before it,
+                // an older listing that puts the menu back on the old sort (known issue O1). Retire it
+                // now, as `reload` does when it runs.
+                if reopen_pending_sp.borrow_mut().superseded_by_rescan(scan_id_sp.load(Ordering::Relaxed)) {
+                    support::begin_explicit_scan(&scan_id_sp, &scan_done_sp);
+                }
+                // What the person chose changes once: the read runs off-thread, the menu already shows
+                // the pick, and the tick lands it when the read ends. A warm pick ends at once. A
+                // direction flip during a read only updates the pick, with no landing of its own.
+                let mut slot = taken_pass_sp.borrow_mut();
+                if let Some(active) = slot.as_mut() {
+                    active.pick = Some(desc);
+                    return;
+                }
+                let stamps = listing_stamps_sp.borrow().clone().unwrap_or_default();
+                let handle = support::TakenPass::start(support::PassInput { dir: dir_pb, shots: snap, stamps, order_desc: None, write_allowed: cap > 0 });
+                *slot = Some(support::ActivePass::picked(handle, desc));
             } else {
-                *sort_rl.lock().unwrap_or_else(|e| e.into_inner()) = Some((dir_pb, land_file));
+                if support::date_cache_removal_wanted(method, desc) {
+                    support::schedule_date_cache_removal(&dir_pb);
+                }
+                *taken_pass_sp.borrow_mut() = None; // another sort stops the read; what it read stays
+                *sort_rl.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir_pb);
             }
         });
         {
@@ -17920,6 +18151,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         let nav_ok_sj = nav_allowed.clone();
         let refuse_sj = refuse_nav.clone();
         let awz_sj = app.as_weak();
+        // R6: the Resume offer's button. The order can change on its own after the offer was made
+        // (`support::TakenPass`), so the photo's name goes with the offer and its position is worked out
+        // here. If the photo has gone, nothing happens.
+        let shots_rj = shots.clone();
+        let awz_rj = app.as_weak();
+        app.on_resume_jump(move |name| {
+            let live = shots_rj.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let (Some(idx), Some(a)) = (support::resume_index(&live, name.as_str()), awz_rj.upgrade()) {
+                a.invoke_sel_jump(idx as i32);
+            }
+        });
         app.on_sel_jump(move |idx| {
             // v0.8.34 (C2 belt-and-suspenders): a stale menu index can't jump the viewer while a modal is open.
             if let Some(a) = awz_sj.upgrade() {
@@ -18161,8 +18403,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         let shots = shots.clone();
         let rot = rot.clone();
         let agreed = apply_cloud_agreed.clone();
+        let cur_dir = cur_dir.clone(); // safety round review R2: the folder Apply acts on
         let awz = app.as_weak();
         app.on_apply_rotations_ask(move || {
+            // Safety round review R2 (1 November, owner: grey it out): while this folder's review file
+            // couldn't be read, Apply isn't asked (its button is faded too); the confirm never opens.
+            if support::apply_rotations_waits(&cur_dir.borrow()) {
+                return;
+            }
             let snap = shots.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let plans = support::rotation_apply_plans(&rot, &snap);
             let cloud: HashSet<PathBuf> = plans
@@ -18193,12 +18441,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         let apply_slot = rot.apply_slot.clone(); // v0.9.4 (§66/P4a): the worker→tick hand-off, now a RotState field
         let generation = generation.clone(); // finding #5: pin the folder gen into the batch
         let start = start_op.clone();
+        let op_cancel_ap = op_cancel.clone(); // fix round 1 (CS-32): the quit latch, polled per photo
+        let applying = applying_rotations.clone(); // fix round 1 (F13-apply-4): the sort picks' switch
         let awz = app.as_weak();
         let photo_gate = app.as_weak();
         let apply_agreed = apply_cloud_agreed.clone(); // the cloud-only round: the ask's answer
         app.on_apply_rotations(move || {
             if photo_gate.upgrade().is_some_and(|a| a.get_opening_photo()) { return; }
             let dir = cur_dir.borrow().clone();
+            // Safety round review R2 (1 November, owner: grey it out): the same answer as the button and
+            // the ask, so a confirm left open writes nothing to a photo whose review file can't take
+            // the save that follows; it just closes.
+            if support::apply_rotations_waits(&dir) {
+                if let Some(a) = awz.upgrade() {
+                    a.set_confirm_kind(0);
+                }
+                return;
+            }
             let snap = shots.lock().unwrap_or_else(|e| e.into_inner()).clone();
             // Pin the folder generation with the plan snapshot — the drain drops the batch if a folder
             // swap bumps this before it lands (finding #5).
@@ -18222,18 +18481,41 @@ fn main() -> Result<(), Box<dyn Error>> {
             if !start(i18n::tr("Applying rotations…")) {
                 return; // another op already running
             }
+            // Fix round 1 (1 November, F13-apply-4): the sort picks grey from this instant (the tick
+            // re-derives the property from the atomic after that). The guard is made here, so even a
+            // spawn that never runs lowers the switch, and moved into the worker below.
+            applying.store(true, Ordering::SeqCst);
+            if let Some(a) = awz.upgrade() {
+                a.set_applying_rotations(true);
+            }
+            let applying_guard = support::FlagGuard(applying.clone());
             // Feedback matches the sibling Selection batch ops (copy/move): the "Applying rotations…"
             // toast + sel-busy dim while the worker runs, then the result line. NOT the export-progress
             // card (that gates the web-export sheet); the op is a handful of 2-byte patches — near-instant.
             let (slot, busy, apply_slot) = (slot.clone(), busy.clone(), apply_slot.clone());
+            let cancel = op_cancel_ap.clone();
             std::thread::spawn(move || {
                 // Drop guard clears sel_busy (+ a failure banner) even if the worker panics. kind = -1:
                 // an in-place write-back has no result folder to "reveal".
                 let _guard = OpGuard { busy: busy.clone(), slot: slot.clone(), kind: -1, origin: None };
+                // Fix round 1: bound after `_guard`, so it drops first — the sort switch is down
+                // before `sel_busy` lets another Apply raise it again.
+                let _applying = applying_guard;
                 let mut applied: Vec<(usize, String, u8, u8)> = Vec::new();
                 let mut failed: Vec<String> = Vec::new();
                 let mut cloud_now = 0usize; // the cloud-only round (owner answer 11)
-                for (idx, name, plan) in plans.iter() {
+                for (i, (idx, name, plan)) in plans.iter().enumerate() {
+                    // Fix round 1 (1 November, CS-32): Falcon is quitting (any route, both platforms;
+                    // the save sequence raises the latch, then waits for this worker). Stop before
+                    // this photo's first read; its turn and the rest stay pending, and the photos
+                    // already written are published, so the shutdown's drain takes every one.
+                    if cancel.load(Ordering::SeqCst) {
+                        log_event(&format!(
+                            "rotation apply: stopped for quit — {} photo(s) not written, their turns stay pending",
+                            plans.len() - i
+                        ));
+                        break;
+                    }
                     // 2026-10-28 (the cloud-only round, owner answer 11): THE LAST LOOK BEFORE THE
                     // FIRST READ. A file made online-only after the user's answer, and not among the
                     // files they agreed to download, is not read: the photo is skipped (its turn
@@ -18495,8 +18777,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let snap = shots_cp.lock().unwrap_or_else(|e| e.into_inner()).clone();
             // v0.8.69 (E/H2): when XMP sync is ON, enqueue any pending rating deltas onto the durable writer
-            // before the copy handoff, so the picks' rating sidecars are on their way to disk (sidecar-only
-            // this round — the copied image bytes themselves carry no embedded rating yet).
+            // before the copy handoff (the copied image bytes themselves carry no embedded rating).
+            // Fix round 1 (1 November, CS-26): the worker waits for them (`writer_barrier`) and then
+            // carries each copied file's XMP sidecar into ./Picks, so the stars and applied turns travel.
             if let Some(a) = awz_cp.upgrade() {
                 support::sync_xmp_ratings(a.get_xmp_sync(), &snap, &ratings_cp.borrow(), &xmp_journal_cp);
             }
@@ -18556,7 +18839,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             std::thread::spawn(move || {
                 // Drop guard clears sel_busy (+ surfaces a banner) even if the copy panics.
                 let _guard = OpGuard { busy: busy.clone(), slot: slot.clone(), kind: 0, origin: None };
-                let (ok, sk, fail, nc, att, (dv_dest, dv_src), (unopen, unopen_fmts), _moves) = export_marked(
+                // Fix round 1 (1 November, CS-26): the star writes queued above land before the
+                // sidecars are carried (bounded, logged on timeout; the Delete path's barrier).
+                support::writer_barrier(std::time::Duration::from_secs(10));
+                let (ok, sk, fail, nc, att, (dv_dest, dv_src), (unopen, unopen_fmts), (_side_ok, side_not), _moves) = export_marked(
                     // v0.8.130 (W2-4): manifest = TRUE. ./Picks is a Falcon-created output
                     // folder, and the record it leaves is what makes "Select new / edited" answerable.
                     Path::new(&dir), &snap, &mv, 1, PICKS_SUBFOLDER, false, content, &cancel, true,
@@ -18594,7 +18880,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // it "needs attention" in error styling described the feature as a fault. Neither
                 // says "edited": intent is unobservable, and a size that differs is all we know.
                 let msg = format!(
-                    "{head}{}{}{}{}{}{}",
+                    "{head}{}{}{}{}{}{}{}",
                     support::clause_already_there(sk),
                     no_content,
                     // v1.0.0-rc (queue item 27, sheet 2.2b, OWNER RULING): the copy KEPT the file and
@@ -18607,6 +18893,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     // which the MOVE composer below also consumes and the F-8 row asserts - the
                     // COUNTED half of F-P9's "counted AND logged" rule had no test at all.
                     divergence_clauses(dv_dest, dv_src),
+                    // Fix round 1 (1 November, CS-26, owner's wording): sidecars that did not travel.
+                    // Not an error colour on its own — the photos arrived.
+                    support::clause_side_files(side_not, support::SideVerb::Copied),
                     support::clause_need_attention(att),
                     support::clause_failed(fail)
                 );
@@ -18686,7 +18975,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         let shots_mv = shots.clone();
         let marks_mv = marks.clone();
         let cur_mv = current.clone(); // v0.8.34 (C3/G1): landing hint — stay near the current position
-        let cur_dir_mv = cur_dir.clone();
+        // R2 (safety round): the folder ON SCREEN — the one the shots and marks below belong to, and
+        // the tag the undo fold, the predicate and Undo move compare against (`cur_dir` is only
+        // next-launch memory; it is the same string whenever there are rejects to move).
+        let sd_mv = scanned_dir.clone();
         let slot = sel_status_slot.clone();
         let busy = sel_busy.clone();
         let rl = reload_req.clone();
@@ -18696,15 +18988,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         let notice_mv = rot_move_notice.clone();
         let notif_mv = notif_pending.clone();
         let op_cancel_mv = op_cancel.clone(); // v0.8.128 (A1.3)
+        let position_op_mv = position_op.clone();
+        let ratings_mv = ratings.clone(); // fix round 1 (CS-26): pending stars land before the sidecars move
+        let xmp_journal_mv = xmp_journal.clone();
         let photo_gate = app.as_weak();
         app.on_move_rejects(move || {
             if photo_gate.upgrade().is_some_and(|a| a.get_opening_photo()) { return; }
-            let dir = cur_dir_mv.borrow().clone();
+            let dir = sd_mv.borrow().clone();
             if dir.is_empty() || !start(i18n::tr("Moving rejects…")) {
                 return;
             }
+            position_op_mv.store(true, Ordering::SeqCst); // its landing is a position in this order
+            let position_guard = support::FlagGuard(position_op_mv.clone());
             let snap = shots_mv.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let mv = marks_mv.borrow().clone();
+            // Fix round 1 (1 November, CS-26): as the copy does — queue the pending star writes now and
+            // let the worker wait for them, so none lands on an old `IMG.xmp` after it has moved (a
+            // fresh orphan) and the moved sidecar holds the latest star.
+            if let Some(a) = photo_gate.upgrade() {
+                support::sync_xmp_ratings(a.get_xmp_sync(), &snap, &ratings_mv.borrow(), &xmp_journal_mv);
+            }
             // S2 (review item 6): one-time notice if any MOVED reject still carries an unapplied rotation.
             if !notice_mv.get() {
                 let pend = mv.iter().enumerate().filter(|(i, m)| **m & MARK_REJECT != 0 && rot_mv.delta_of(*i) != 0).count();
@@ -18726,12 +19029,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             std::thread::spawn(move || {
                 // Drop guard clears sel_busy (+ surfaces a banner) even if the move panics.
                 let _guard = OpGuard { busy: busy.clone(), slot: slot.clone(), kind: 1, origin: None };
+                let _position = position_guard;
+                support::writer_barrier(std::time::Duration::from_secs(10)); // fix round 1 (CS-26), as the copy
                 // v0.8.130 (W2-4, spec R-C): manifest = FALSE. A `falcon_export.json` in ./Rejected
                 // would be recycled by Empty-to-Bin, would permanently arm that button's
                 // `count-bin > 0` enablement and would corrupt the count its confirm leads with.
                 // (v0.8.131, J14: the block's indentation is straightened — it was one of the three
                 // the audit's test-integrity finder listed.)
-                let (ok, sk, fail, _nc, att, (dv_dest, dv_src), _un, moves) = export_marked(
+                let (ok, sk, fail, _nc, att, (dv_dest, dv_src), _un, (_side_ok, side_not), moves) = export_marked(
                     Path::new(&dir), &snap, &mv, MARK_REJECT, "Rejected", true, CopyContent::Both,
                     &cancel, false,
                 );
@@ -18739,16 +19044,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // copy. ./Rejected carries no manifest of its own, so `dv_dest` is only ever
                 // non-zero where one exists — but the clause is here so the two paths cannot drift.
                 let msg = format!(
-                    "{}{}{}{}{}",
+                    "{}{}{}{}{}{}",
                     support::moved_to_rejected_text(ok), // language packs (round 2): whole messages
                     support::clause_skipped(sk),
                     divergence_clauses(dv_dest, dv_src), // v0.8.134 (F-8): the copy path's own composer
+                    support::clause_side_files(side_not, support::SideVerb::Moved), // fix round 1 (CS-26)
                     support::clause_need_attention(att),
                     support::clause_failed(fail)
                 );
                 // Hand the undo pairs (tagged with THIS op's folder) to the tick — the tick only accepts
-                // them if that folder is still current, so a folder switch mid-move can't produce a
-                // wrong-folder undo. Only when this run actually moved something — a no-op re-move
+                // them if that folder is still on screen, so a folder switch mid-move (an empty
+                // folder included, R2) can't produce a wrong-folder undo. Only when this run actually moved something — a no-op re-move
                 // (everything already in ./Rejected) must not wipe a still-valid undo from a prior move.
                 if !moves.is_empty() {
                     *mv_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((dir.clone(), moves));
@@ -18764,8 +19070,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let busy = sel_busy.clone();
         let rl = reload_req.clone();
         let start = start_op.clone();
-        let cur_dir_um = cur_dir.clone();
         let cur_um = current.clone(); // v0.8.34 (C3/G1): landing hint — stay near position after undo-move
+        let position_op_um = position_op.clone();
         let last_move_um = last_move.clone();
         // v0.8.186 (fix wave, review finding 5): the refusal channel. Every invoker of this body —
         // the events-row pill, the toast pill, the header pill, both context menus and Ctrl+Z —
@@ -18779,7 +19085,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         app.on_undo_move(move || {
             if photo_gate.upgrade().is_some_and(|a| a.get_opening_photo()) { return; }
             let entry = last_move_um.borrow().clone();
-            let dir = cur_dir_um.borrow().clone();
+            // R2 (safety round): the folder ON SCREEN. `cur_dir` stays on the last folder with photos
+            // after an empty landing, so it let an A move be undone while empty B was showing.
+            let dir = sd_um.borrow().clone();
             // Only undo the CURRENT folder's move (the tag must match — defensive; the button is already
             // gated on the same check via can_undo_move).
             // v0.8.186 (U1): the same `move_undo_live` the tick publishes `can-undo-move` from and
@@ -18817,6 +19125,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 return;
             }
+            position_op_um.store(true, Ordering::SeqCst); // its landing is a position in this order
+            let position_guard = support::FlagGuard(position_op_um.clone());
             *last_move_um.borrow_mut() = None; // consume — the reversed files re-appear as rejects on reload
             let land = *cur_um.borrow(); // v0.8.34 (C3/G1): capture on the UI thread; stored with the reload req
             let (slot, busy, rl) = (slot.clone(), busy.clone(), rl.clone());
@@ -18829,12 +19139,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // "Undo": `undoable_now` requires kind 1, and an undo has already consumed
                 // `last_move`, so that pill was only ever going to be dead.
                 let _guard = OpGuard { busy: busy.clone(), slot: slot.clone(), kind: 3, origin: None };
-                let (ok, sk, fail) = undo_moves(&moves);
+                let _position = position_guard;
+                // Fix round 1 (1 November, CS-26): photos first, then their XMP sidecars; the counts
+                // are photo files, `side_not` the sidecars that could not come back.
+                let (ok, sk, fail, side_not) = undo_moves(&moves);
                 let msg = format!(
-                    "{}{}{}",
+                    "{}{}{}{}",
                     // Language packs (round 2): whole counted messages ("file(s)" for every count).
                     tr_plural!(ok, "Undid — restored {n} file(s) to the folder", "Undid — restored {n} file(s) to the folder"),
                     support::clause_skipped(sk),
+                    support::clause_side_files(side_not, support::SideVerb::Restored),
                     support::clause_failed(fail)
                 );
                 if !dir.is_empty() {
@@ -18849,19 +19163,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         let slot = sel_status_slot.clone();
         let busy = sel_busy.clone();
         let start = start_op.clone();
-        let cur_dir_er = cur_dir.clone();
+        // R2 (safety round): the folder ON SCREEN, never `cur_dir`. An empty landing or a plain launch
+        // ("No folder open") leaves `cur_dir` on the previous or remembered folder, and Empty recycled
+        // THAT folder's ./Rejected. With no folder open this is "" and the guard below refuses.
+        let sd_er = scanned_dir.clone();
         let last_move_er = last_move.clone();
+        let position_op_er = position_op.clone();
         let photo_gate = app.as_weak();
         app.on_empty_rejected(move || {
             if photo_gate.upgrade().is_some_and(|a| a.get_opening_photo()) { return; }
-            let dir = cur_dir_er.borrow().clone();
+            let dir = sd_er.borrow().clone();
             if dir.is_empty() || !start(i18n::tr("Emptying ./Rejected…")) {
                 return;
             }
             *last_move_er.borrow_mut() = None; // recycling the moved files makes the undo invalid
+            position_op_er.store(true, Ordering::SeqCst);
+            let position_guard = support::FlagGuard(position_op_er.clone());
             let (slot, busy) = (slot.clone(), busy.clone());
             std::thread::spawn(move || {
                 let _guard = OpGuard { busy: busy.clone(), slot: slot.clone(), kind: -1, origin: None };
+                let _position = position_guard;
                 let (_ok, fail, msg) = empty_rejected_to_bin(Path::new(&dir));
                 *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((msg, OpSeverity::from_err(fail > 0), -1, None));
             });
@@ -18979,7 +19300,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         // delete-recycle(): the danger button. Ordering matches the proven sync move-rescan discipline —
         // flush the current folder's selection FIRST, then recycle the shot's file(s) + sidecars, then set
         // reload_req so the tick drives the SAME rescan (flush_old → scan_folder → apply_scan) every move op
-        // uses: shot list / generation / caches / latches all reset by that one path. We never hand-mutate
+        // uses: shot list / generation / latches all reset by that one path, and what is ready for the
+        // files that stayed is carried across it (`photo_open::RescanCarry`). We never hand-mutate
         // the live shot list, so the last-shot-in-folder case rescans to the normal empty-folder state.
         let shots_dr = shots.clone();
         let cur_dir_dr = cur_dir.clone();
@@ -21479,6 +21801,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let notif_log_t = notif_log.clone();
     let notif_pending_t = notif_pending.clone();
     let sel_busy_t = sel_busy.clone(); // v0.8.120 (O7): the tick re-derives the UI busy flag from it
+    let applying_rotations_t = applying_rotations.clone(); // fix round 1: …and the sort picks' Apply-only switch
     let toast_jump_dir_t = toast_jump_dir.clone(); // v0.8.120 (O6)
     let toast_counts_unread_t = toast_counts_unread.clone(); // v0.8.120 (Y43)
     let delete_record_t = delete_record.clone(); // v0.8.120 (O5): publishes `can-recover`
@@ -21494,7 +21817,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // does — and an unconditional `set_` on a string property marks the events panel's layout dirty
     // every tick it is open. The key is (target stamp, matched row), which is exactly what the
     // sentence is a function of: one stamp is one act, so an unchanged stamp is an unchanged
-    // sentence, and a rescan (which could change the NAME) clears the stack and moves the key.
+    // sentence. A rescan keeps an entry only for the same file (`same_photo`), so its name can't
+    // change under its stamp; an entry whose file changed name drops, which moves the key.
     let hist_ui_memo_t: Rc<RefCell<(Option<u64>, i32, String, String)>> =
         Rc::new(RefCell::new((None, i32::MIN, String::new(), String::new())));
     let upload_degraded_t = upload_degraded.clone(); // D4: drained into the events centre
@@ -21527,6 +21851,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let panel_min_seen_t = panel_min_seen.clone();
     let info_view_pref_t = info_view_pref.clone(); // v1.0.0-rc (item 33): the persisted FLOOR
     let sort_reload_t = sort_reload_req.clone();
+    let keep_view_req_t = keep_view_req.clone();
+    let taken_pass_t = taken_pass.clone();
+    let date_card_counts_t = Cell::new((usize::MAX, usize::MAX));
+    let position_op_t = position_op.clone();
+    let free_scroll_at_t = free_scroll_at.clone();
+    let reopen_pending_t = reopen_pending.clone();
+    let scrubbing_t = scrubbing.clone();
     // v0.8.99 (R0c): the SCAN domain's folder memory drives the two post-op rescan drains' N7
     // folder-tag guard — `cur_dir` went stale on a photo-less detour. See LastScannedDir::still_on_screen.
     let last_scanned_t = last_scanned_dir.clone();
@@ -21915,6 +22246,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // hold was armed for; `open_prime` = when it was armed (`None` = disarmed). Keying on the
     // generation arms it at EVERY folder land — the boot scan and every `apply_scan` swap alike —
     // without a second latch to keep in step with the scan chokepoints.
+    //
+    // Nearby photos (2 November): the collapse below now applies only to HEIC, a RAW develop and the
+    // Mac (`support::priming_shuts_window`). On other formats the hold keeps the window and rations the
+    // asks to two photos each side (`support::open_let_through`). Arming and release are unchanged.
     //
     // While the hold is on, the fast window collapses to the DISPLAYED shot, so that shot's full-res
     // decode is dispatched before 18 workers take multi-second HEVC decodes of photos nobody has
@@ -22646,17 +22981,73 @@ fn main() -> Result<(), Box<dyn Error>> {
                 (&*reload_t)(p, land); // v0.8.34 (C3/G1): carry the post-op landing hint into the rescan
             }
         }
-        // v0.8.49: a position-chip sort pick posts (folder, current shot's primary FILE name) here —
-        // possibly from the Date-taken pre-warm thread. Same folder-tag guard as reload_req; the
-        // file-carrying path makes select_start land the re-sorted scan on the SAME shot (its
-        // position number changes, the view follows). land=None + id==0 ⇒ no resume offer.
-        if let Some((p, sel_file)) = sort_reload_t.try_lock().ok().and_then(|mut g| g.take()) {
+        // v0.8.49: a position-chip sort pick posts the folder here — possibly from the Date-taken
+        // pre-warm thread. Same folder-tag guard as reload_req; the file-carrying path makes
+        // select_start land the re-sorted scan on the photo on screen NOW, not the one at the pick
+        // (its position number changes, the view follows). land=None + id==0 ⇒ no resume offer.
+        if let Some(p) = sort_reload_t.try_lock().ok().and_then(|mut g| g.take()) {
             if last_scanned_t.borrow().still_on_screen(&p.display().to_string()) {
-                let path = match &sel_file {
+                let snap = shots_t.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let path = match support::landing_file(&snap, *cur_t.borrow()) {
                     Some(f) => p.join(f),
                     None => p.clone(),
                 };
+                keep_view_req_t.set(true);
                 (&*reload_t)(path, None);
+                keep_view_req_t.set(false); // `reload` can return early, with no landing to take it
+            }
+        }
+        // Date taken sort: a `falcon.cache` whose 20 seconds are up goes to the writer.
+        support::send_due_date_cache_removals(now);
+        // Date taken sort: a read that has ended lands once nothing it would close is open. This runs
+        // after the file operations' reread above, which lands by position in the order on screen.
+        let pass_ended = taken_pass_t.borrow_mut().as_mut().map(|p| {
+            let on_screen = shots_t.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            (p.handle.ended(), p.order_is_settled(gen_t.load(Ordering::Relaxed), &on_screen))
+        });
+        if let Some((ended, settled)) = pass_ended {
+            let holds = support::LandingHolds {
+                position_op: position_op_t.load(Ordering::SeqCst),
+                reload_pending: reload_req_t.try_lock().map_or(true, |g| g.is_some()),
+                applying_rotations: applying_rotations_t.load(Ordering::SeqCst),
+                film_dragging: film_dragging_t.get(),
+                scrubbing: *scrubbing_t.borrow(),
+                scrolled_lately: support::scrolled_lately(film_follow_t.get(), app.get_grid_open(), free_scroll_at_t.get().map(|at| now.saturating_duration_since(at))),
+                reopen_pending: reopen_pending_t.borrow().holds_landing(now),
+                ..support::LandingHolds::from_window(&app)
+            };
+            match support::pass_landing_due(ended, settled, holds.any()) {
+                support::PassDue::Reading | support::PassDue::Hold => {}
+                support::PassDue::Settled => {
+                    let settled_pass = taken_pass_t.borrow_mut().take();
+                    if let Some(active) = settled_pass {
+                        active.handle.merge_finished();
+                        log_event("date read: the order on screen is already right, no landing");
+                    }
+                }
+                support::PassDue::Land => {
+                    // Its own statement: `reload` and `apply_scan` read the slot.
+                    let landing_pass = taken_pass_t.borrow_mut().take();
+                    if let Some(active) = landing_pass {
+                        active.handle.merge_finished();
+                        let p = active.handle.dir().to_path_buf();
+                        let dir = p.display().to_string();
+                        if last_scanned_t.borrow().still_on_screen(&dir) {
+                            if let Some(desc) = active.pick {
+                                let cap = eff_resume_cap(app.get_sort_cap_custom(), app.get_sort_cap_tier()) as usize;
+                                support::remember_sort(cap, sel_json_present_t.get(), &mut folder_attrs_t.borrow_mut(), &mut sort_lru_t.borrow_mut(), &dir, encode_sort_spec(SortMethod::Taken, desc));
+                            }
+                            let snap = shots_t.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            let path = match support::landing_file(&snap, *cur_t.borrow()) {
+                                Some(f) => p.join(f),
+                                None => p.clone(),
+                            };
+                            keep_view_req_t.set(true);
+                            reload_t(path, None);
+                            keep_view_req_t.set(false);
+                        }
+                    }
+                }
             }
         }
         mk!("reload_req");
@@ -22723,7 +23114,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // drag-drop use (a file → its parent folder, landing on the file via `select_start`). At cold
         // launch the event arrives just after `app.run()` starts, so the first tick after it opens the
         // delivered folder; while already open it switches folders (begin_reload's same-folder guard
-        // makes a redundant re-open a cheap sync refresh). v0.9.16 (Round B item 6): a MULTI-file
+        // makes a redundant re-open a same-folder rescan, off the interface thread since R3). v0.9.16 (Round B item 6): a MULTI-file
         // open takes the FIRST path only — the spike's per-path loop made the LAST selection win and
         // thrashed begin_reload N times for a single Finder gesture. The handler's log line already
         // records the full URL count; the drop is logged here too so a field report can see it.
@@ -22773,19 +23164,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .collect()
             };
             let mut snap = {
-                // Mirrors on_undo's own preference order (empty cull/rot stack + a live delete
-                // record → the next ⌘Z recovers the delete).
+                // Keeping prepared work (2 November): `on_undo`'s own question, because the stack now
+                // survives a Delete and "empty stack" no longer means the delete is next. A record in
+                // another folder still counts: ⌘Z answers it with the honest refusal.
                 let undo_kind = {
                     let u = menu_undo_t.borrow();
-                    if u.undo.is_empty() {
-                        if menu_delrec_t.borrow().is_some() {
-                            mm::UndoKind::Delete
-                        } else {
-                            mm::UndoKind::None
-                        }
-                    } else {
-                        mm::UndoKind::Other
-                    }
+                    let rec = menu_delrec_t.borrow();
+                    let mv = last_move_t.borrow();
+                    mm::undo_kind_for(
+                        support::live_undo_arm(
+                            u.top_seq(),
+                            rec.as_ref().map(|r| (r.dir.as_str(), r.seq)),
+                            &scanned_dir_t.borrow(),
+                            mv.as_ref().map(|(f, p, s)| (f.as_str(), p.len(), *s)),
+                        ),
+                        rec.is_some(),
+                    )
                 };
                 mm::MenuSnapshot {
                     has_photo: !app.get_empty_state(),
@@ -22793,6 +23187,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     modal: app.get_modal_open(),
                     context: (app.get_ctx_open() || app.get_sel_ctx_open()).then(|| context_serial_t.get()),
                     opening_photo: app.get_opening_photo(),
+                    // Fix round 1 (1 November, L21/L26): the Sort rows grey on the same switch as
+                    // the in-app rows; `apply_pick` refuses on its atomic.
+                    applying_rotations: app.get_applying_rotations(),
                     inspect_open: app.get_opening_photo() && app.get_photo_ready() && !app.get_inspection_blocked(),
                     // v0.9.67 (OWNER RULING 08-08 (ii)): `modal-open` minus welcome — the fullscreen
                     // row's own gate, from the same .slint property the key arms read.
@@ -23310,6 +23707,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         mk!("rot_apply");
+        // Open-time check (2 November): the photo you are looking at (both halves in Compare) takes
+        // what its bytes said. `current` from last tick is fine: a label lags one tick at most.
+        tick::step_checked_kind(*cur_t.borrow(), &shots_t, &thumb_gen_t);
+        if compare_t.get() {
+            tick::step_checked_kind(cmp_a_idx_t.get(), &shots_t, &thumb_gen_t);
+            tick::step_checked_kind(cmp_b_idx_t.get(), &shots_t, &thumb_gen_t);
+        }
         // per-tick snapshot of the (swappable) shot list + its generation, read under one
         // lock so gen_now always matches shots_now (consistent with the worker reads, B1/B2).
         let (shots_now, gen_now) = {
@@ -23620,6 +24024,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         app.set_export_filename(export_status.filename.into());
         app.set_export_phase(i18n::tr(export_status.phase).into()); // language packs (round 2): the worker's English id, translated where shown
         app.set_export_stopping(export_progress_t.cancel.load(Ordering::Relaxed));
+        // Date taken sort: the capture-date read's card. Not part of the quit gate (closing is never
+        // delayed by it), and the text is composed only when the count moves.
+        let date_read = taken_pass_t.borrow().as_ref().map(|p| p.handle.progress());
+        let (done, total, elapsed, running) = date_read.unwrap_or_default();
+        let show_card = support::date_card_shows(running, elapsed, done, total);
+        if app.get_dates_reading_show() != show_card {
+            app.set_dates_reading_show(show_card);
+        }
+        if show_card && date_card_counts_t.replace((done, total)) != (done, total) {
+            app.set_dates_reading_text(support::date_card_text(done, total).into());
+            app.set_dates_reading_frac(done as f32 / total.max(1) as f32);
+        }
 
         // 0/0b/0c/0d/0e) drain off-thread worker results into UI state (see fn docs above).
         mk!("export_prog"); // v0.8.151: the prologue's tail — `prologue` itself is now 12 labels
@@ -23687,6 +24103,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             &app, now, &cur_t, &seen_t, &lm_t, &roi_t.region, &roi_t.tiles, &shots_now,
             &ratings_t, &marks_t, &compare_t, &pan_carry_t,
         );
+        // `step_bookkeeping` just cleared the tiles, as it does on any new `last_seen`: a kept view's
+        // tiles come back here.
+        roi_t.tiles.borrow_mut().append(&mut roi_t.kept_tiles.borrow_mut());
         // 2026-10-25 (round 3 step a): the photos the user asked for, published to the decode workers
         // as soon as the current photo is known and before any step dispatches work. A running job
         // that just became one of them is raised to normal priority here. `det_awaited_t` is written
@@ -23958,6 +24377,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             grid_vp_prog.set(grid_next);
             if sel_stamp || grid_stamp {
                 li_t.set(now);
+            }
+            if grid_stamp {
+                free_scroll_at_t.set(Some(now));
             }
         }
         // …and the terms themselves. `last_motion` carries the browse gestures (held-arrow scrub,
@@ -24424,6 +24846,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         // still holds: the DISPLAYED shot's full-res decode being underway ends it, and so does
         // OPEN_PRIME_MAX_MS. Disarm on the same tick it stops holding, so it is one-shot per folder.
         // Under FALCON_CLASSIC_POSTURE it is never armed (`posture_on` false) — v0.8.110 ordering.
+        // Nearby photos (2 November): it arms on every format, but it shuts the window only where
+        // `prime_shuts_c` says so (the current photo is HEIC or a RAW develop, or the app is on the Mac).
+        // Read once per tick, above the log line that reports it.
+        let prime_shuts_c = shots_now.get(c).is_some_and(|s| {
+            support::priming_shuts_window(cfg!(target_os = "macos"), s.kind, raw_t.load(Ordering::Relaxed) && s.has_raw)
+        });
         if primed_gen.get() != gen_now {
             primed_gen.set(gen_now);
             primed_c.set(c); // v0.8.112 (R4): the shot the hold belongs to
@@ -24444,7 +24872,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             // released, and every question about the folder-open ordering had to be inferred from
             // decode timings. One line each way, with the reason.
             if posture_on && len > 0 {
-                log_event(&format!("pool posture: open-priming armed on #{c} (fast window collapsed)"));
+                let window = if prime_shuts_c { "fast window collapsed" } else { "nearest photos may pass" };
+                log_event(&format!("pool posture: open-priming armed on #{c} ({window})"));
             }
         }
         // v0.8.151 (ORANGE-1): the ARM is one of the two places in this bracket that can call
@@ -24699,6 +25128,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             thumb_gen_t.set(thumb_gen_t.get().wrapping_add(1));
         }
         let thumbnail_startup_hold = film_t.startup_hold(now);
+        // Nearby photos (2 November): the one term both let-through inputs read. Where priming shuts
+        // the window it is the collapse's business, so this equals the start-up hold alone.
+        let opening_hold = thumbnail_startup_hold || (prime_hold && !prime_shuts_c);
         step_prefetch_fast(
             c, len, &shots_now, &cur_atomic_t, &drain_buf, &fast_t,
             // v0.8.179 (W4 wave 2): the compare state, for the dispatch hold's exemption — both
@@ -24734,11 +25166,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             // open `last_motion` is the boot instant, so H4 reads the app as MOVING and declines to
             // collapse anything for SETTLE_MS, and the window went straight back into exactly that
             // gap — 2913 ms against 1351 ms on the same file.)
+            // Nearby photos (2 November): priming collapses it only where `prime_shuts_c` says so. On
+            // other formats the window stays real and the asks are rationed below. The two photos each
+            // side can then overlap the current photo's real decode on normal routes (a plain open,
+            // Delete or sort change on JPEG; a photo-first PNG whose list lands later). That is accepted
+            // because they are few and below normal priority, not because they cannot overlap. With the
+            // window real, the frost feeder can also run on it for a moment once the start-up hold has
+            // ended and `defer_thumbs` is off: speculative, below normal, inside its own pending share.
             collapse_fast_window(
                 roi_busy_t.load(Ordering::Relaxed),
                 det_cpu_t.load(Ordering::Relaxed),
                 moving,
-            ) || prime_hold,
+            ) || (prime_hold && prime_shuts_c),
             interactive_busy,
             derive_c,
             &c_serves, // v0.8.117 (F12): the step's own answer about `c`, out
@@ -24746,7 +25185,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             // v0.8.179 (W4 wave 2): the dispatch hold's term, and deliberately a SEPARATE argument
             // from `settings_throttle` above — that one governs the costly concurrency budget (the
             // sheet's ruling), this one holds the ask itself while a gesture is live.
-            holds.frames || thumbnail_startup_hold,
+            holds.frames || opening_hold,
+            // Nearby photos (2 November): …which still governs everything further out. Once the current
+            // photo's own frame is on stage, its neighbours may pass an opening hold, never a gesture,
+            // memory or background hold. The upload side keeps `holds.frames` alone, so they publish.
+            support::open_let_through(
+                cfg!(target_os = "macos"), opening_hold, holds.frames, app.get_photo_ready(),
+                shown_t.borrow().as_ref().map(|(i, _, _)| *i), c,
+            ),
             // v0.8.195 (EFFICIENCY MODE, consumers 3 + 5): every format on the costly runway + cap,
             // and no stale-upgrade ask leaves after a scrub-dim grow. Both cuts compose with
             // machinery this step already owns; see its own parameter doc.
@@ -25056,9 +25502,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         // #11) fold a just-finished move's undo pairs into last_move — but ONLY if its tagged folder is
         // still the current one (a folder switch mid-move must not yield a wrong-folder undo). can_undo_move
-        // is likewise gated on the tag matching cur_dir, so it self-clears on a switch with no explicit reset.
+        // is likewise gated on the tag matching the folder on screen, so it self-clears on a switch with
+        // no explicit reset. R2 (safety round): "current" is `scanned_dir`, not `cur_dir`, which an
+        // empty landing leaves on the previous folder — that armed a late move from A while B showed.
         if let Some((folder, pairs)) = move_slot_t.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            if folder == *cur_dir_t.borrow() {
+            if folder == *scanned_dir_t.borrow() {
                 *last_move_t.borrow_mut() = Some((folder, pairs, next_act_seq(&act_seq_t)));
             }
         }
@@ -25068,7 +25516,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             last_move_t
                 .borrow()
                 .as_ref()
-                .is_some_and(|(f, p, _)| support::move_undo_live(f, p.len(), &cur_dir_t.borrow())),
+                .is_some_and(|(f, p, _)| support::move_undo_live(f, p.len(), &scanned_dir_t.borrow())),
         );
         mk!("display");
 
@@ -25185,7 +25633,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // leads with the number and the button's enablement is `count > 0` (unchanged).
                 // The headline PHRASE is composed beside it so its singular/plural and its
                 // platform trash noun can never disagree with the count they sit next to.
-                let n = rejected_file_count(Path::new(&*cur_dir_t.borrow()));
+                // R2 (safety round): count the folder ON SCREEN, the one the Empty handler recycles —
+                // and nothing when no folder is open: `Path::new("")` would join to a ./Rejected
+                // under the process's working directory.
+                let n = match scanned_dir_t.borrow().as_str() {
+                    "" => 0,
+                    sd => rejected_file_count(Path::new(sd)),
+                };
                 app.set_count_bin(n as i32);
                 app.set_empty_confirm_title(platform::empty_confirm_title(n).into());
                 last_rejected_gen.set(gen_now);
@@ -25535,6 +25989,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             // op-result row is tagged with the act its Undo pill reverses.
             last_move_t.borrow().as_ref().map(|(_, _, s)| *s),
         );
+        // Fix round 1 (1 November, F13-apply-4): the sort rows' Apply-only switch, re-derived from
+        // its atomic every tick like `sel-busy` inside step_notifs, so it comes down the frame after
+        // the Apply worker ends, however it ends.
+        let applying_now = applying_rotations_t.load(Ordering::SeqCst);
+        if app.get_applying_rotations() != applying_now {
+            app.set_applying_rotations(applying_now);
+        }
         // v0.8.120 (design-sweep O5): publish the delete-recovery liveness — a record still held AND
         // the folder it ran in still open. The events row's Recover pill ANDs with it, so a logged
         // delete stops offering a recovery the moment `on_recover_delete` would refuse one, instead
@@ -25581,9 +26042,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 st.top_seq(),
                 st.redo.len(),
                 rec.as_ref().map(|r| (r.dir.as_str(), r.seq)),
-                &scanned_dir_t.borrow(),
+                &scanned_dir_t.borrow(), // R2: the folder on screen gates both records
                 mv.as_ref().map(|(f, p, s)| (f.as_str(), p.len(), *s)),
-                &cur_dir_t.borrow(),
             );
             // v0.8.186 (fix wave, review finding 5): ENABLEMENT, not just armedness. The move arm
             // is the one whose handler can still refuse after it is armed (`start_op` vs a live
@@ -26515,8 +26975,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // guard. Owned clones, not borrows: the Mac keeps it in main-thread storage during the loop.
     let save_sequence: support::SaveSequence = {
         let app = app.clone_strong();
-        #[cfg(target_os = "macos")]
+        // Fix round 1 (1 November, CS-32): both platforms — every exit stops and waits for a file op.
         let sel_busy = sel_busy.clone();
+        let op_cancel = op_cancel.clone();
         let tick = tick.clone();
         let export_progress = export_progress.clone();
         let rot = rot.clone();
@@ -26586,6 +27047,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Any loop-exit route (including device loss) stops unfinished export work. UI Cancel remains
             // nonblocking; completed output provenance is flushed below after the existing shutdown tail.
             export_progress.cancel.store(true, Ordering::Relaxed);
+            // Fix round 1 (1 November, CS-32): …and Copy picks, Move rejected and Apply rotations stop
+            // after the file or photo in flight, on every route (before, only ⌘Q and the Mac terminate
+            // hook raised it; a Windows force-quit killed the worker wherever it was).
+            op_cancel.store(true, Ordering::SeqCst);
+            // Date taken sort: closing is never delayed by a date read. A cancelled read writes nothing.
+            *taken_pass.borrow_mut() = None;
 
             // ── THE SHUTDOWN TAIL (v0.8.128, J10 + A1.2) ──────────────────────────────────────────────────
             // Every route out of the event loop lands here (1.0.16: and a Mac system log-out, restart or
@@ -26599,17 +27066,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             // `applicationShouldTerminate:` hook and the ⌘Q key equivalent are two doors into this one exit —
             // from re-running the whole flush over state a first pass already wrote.
             let mut final_shots: Arc<Vec<Shot>> = Arc::new(Vec::new());
-            support::graceful_shutdown(immediate, &mut |st| match st {
+            // Fix round 1 (1 November, CS-32): wait whenever a file operation is still running, not
+            // only after ⌘Q — a second × mid-Apply on Windows, a device-lost exit.
+            let wait_for_op = support::shutdown_waits_for_file_op(immediate, sel_busy.load(Ordering::SeqCst));
+            support::graceful_shutdown(wait_for_op, &mut |st| match st {
                 support::ShutdownStep::AwaitFileOpBoundary => {
                     // v0.9.59 (OWNER RULING 08-02 — ⌘Q): the immediate-quit path exits the loop the instant
                     // the key is pressed, so a copy/move/export worker can still be mid-write here. The
                     // WINDOW is already gone (nothing is being deferred in front of the user); this bounded
                     // wait exists so the process does not tear a worker off mid-file. v0.9.61 (A1.3): the
                     // copy/move worker polls a cancel flag between FILES now, so this converges after one
-                    // file rather than being bounded only by the stopwatch. Every other route (window ×,
-                    // quit-when-idle, the reminder's "Close anyway", a device-lost exit) already guarantees
-                    // idleness, so their behaviour is unchanged — and on Windows the step is never emitted.
-                    #[cfg(target_os = "macos")]
+                    // file rather than being bounded only by the stopwatch.
+                    // Fix round 1 (1 November, CS-32): every platform, whenever a file operation is still
+                    // running at exit (a Windows second × or device-lost exit included). Apply rotations
+                    // polls `op_cancel` (raised above) before each photo, so this returns after the photo
+                    // in flight, and the drain below then takes every photo the worker wrote.
                     support::await_file_op_boundary(&sel_busy, std::time::Duration::from_secs(10));
                 }
                 support::ShutdownStep::DrainAppliedRotations => {
@@ -26759,6 +27230,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
+                support::ShutdownStep::RemoveDateCaches => {
+                    support::close_date_cache_removals();
+                }
                 support::ShutdownStep::WriterBarrier => {
                     // v0.8.36 (ITEM 1, barrier c): DRAIN the writer so the final settings + selection saves
                     // above are durable before the process exits (the writer thread would otherwise be torn
@@ -26834,7 +27308,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "macos")]
     let immediate = immediate_quit.get() || macos_open::terminate_was_requested();
     #[cfg(not(target_os = "macos"))]
-    let immediate = false; // no ⌘Q, no terminate hook — the step is never emitted on this trunk
+    let immediate = false; // no ⌘Q, no terminate hook; fix round 1: a file op in flight still waits (save sequence)
     let saved = match save_sequence {
         Ok(save) => {
             save(support::SaveRoute::AfterLoop { immediate });
@@ -27235,6 +27709,104 @@ mod tests {")
         // PRE-increment: the first act of a session is 1, so `0` is free to mean "never stamped"
         // — which `DeleteRecord::seq`'s unwrap_or(0) fallback depends on losing every race.
         assert_eq!(draws[0], 1, "the first stamp is 1, leaving 0 as the never-stamped sentinel");
+    }
+
+    /// R2 (1 November safety round): **EMPTY AND UNDO MOVE ACT ON THE FOLDER ON SCREEN.** `cur_dir`
+    /// is the last folder that had photos (next-launch memory, the picker's start); `scanned_dir` is
+    /// the folder on screen. A plain launch ("No folder open") seeds `cur_dir` with the remembered
+    /// folder, and opening a folder with no photos leaves it on the previous one. So every reader
+    /// below that used `cur_dir` reached a folder the user was not looking at: Empty counted and
+    /// recycled that folder's ./Rejected (S1, and the empty-B case), Undo move was offered and
+    /// performed there, and a Move rejected finishing after an empty landing was armed (S2). The
+    /// control case (every reject moved out of A, A on screen with no photos left) keeps working
+    /// because `scanned_dir` is A there; row (g) of `the_cull_history_rows_are_armed_by_on_undos_own_branches`
+    /// is that state at the predicate level. The handlers are closures inside `main`, so the wiring
+    /// is pinned by source, the census pattern of `the_final_saves_are_gated_...`.
+    ///
+    /// FALSIFIER (L28), `build/falsify.py` cases R2-*: bind any of the three handlers' folder from
+    /// `cur_dir.clone()`, compare the fold, the `can-undo-move` publish or the Undo arm against
+    /// `cur_dir_t`, read the Empty count from `cur_dir_t`, or drop the count's `""` arm, and this
+    /// test reddens.
+    #[test]
+    fn empty_and_undo_move_act_on_the_folder_on_screen() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let span = |from: &str, to: &str| {
+            let a = main.find(from).unwrap_or_else(|| panic!("`{from}` is in main.rs"));
+            let b = a + main[a..].find(to).unwrap_or_else(|| panic!("`{to}` follows `{from}`"));
+            main[a..b].to_string()
+        };
+        // The three handlers: the folder each acts on is bound from `scanned_dir`, and nothing
+        // before the worker starts reads `cur_dir`.
+        for handler in ["app.on_move_rejects(move", "app.on_undo_move(move", "app.on_empty_rejected(move"] {
+            let body = span(handler, "std::thread::spawn(move");
+            assert!(!body.contains("cur_dir"), "{handler}: no `cur_dir` before the worker:\n{body}");
+            let read = body.split_once("let dir = ").unwrap_or_else(|| panic!("{handler} binds `dir`")).1;
+            let cell = &read[..read.find(".borrow()").expect("`dir` is read from a cell")];
+            let binding = format!("let {cell} = ");
+            assert_eq!(main.matches(&binding).count(), 1, "{handler}: `{cell}` is bound once");
+            assert!(main.contains(&format!("{binding}scanned_dir.clone();")), "{handler}: `{cell}` is the folder on screen");
+        }
+        // The Ctrl+Z dispatch and the tick's one derivation take the folder on screen (their only
+        // folder parameter since R2).
+        for (from, to, cell) in [("support::live_undo_arm(", "};", "sd_u"), ("support::cull_undo_armed(", ");", "scanned_dir_t")] {
+            let call = span(from, to);
+            assert!(!call.contains("cur_dir") && call.contains(&format!("&{cell}.borrow()")), "{from} gates on the folder on screen:\n{call}");
+            assert_eq!(main.matches(&format!("let {cell} = ")).count(), 1, "{from}: `{cell}` is bound once");
+            assert!(main.contains(&format!("let {cell} = scanned_dir.clone();")), "{from}: `{cell}` is the folder on screen");
+        }
+        // The tick's fold (S2: a late move is armed only while its folder is on screen) and the
+        // `can-undo-move` publish (the pills, the toast's Undo).
+        let fold = span("move_slot_t.lock()", "app.set_can_undo_move(");
+        assert!(!fold.contains("cur_dir") && fold.contains("folder == *scanned_dir_t.borrow()"), "the fold:\n{fold}");
+        let publish = span("app.set_can_undo_move(", "mk!(\"display\")");
+        assert!(
+            !publish.contains("cur_dir") && publish.contains("support::move_undo_live(f, p.len(), &scanned_dir_t.borrow())"),
+            "the publish:\n{publish}"
+        );
+        // The Empty count: the folder on screen, and nothing at all with no folder open (S1).
+        assert_eq!(main.matches("rejected_file_count(").count(), 1, "one count probe");
+        let at = main.find("rejected_file_count(").unwrap();
+        let probe = &main[main[..at].rfind("let n = ").expect("the probe binds `n`")..at];
+        assert!(
+            !probe.contains("cur_dir") && probe.contains("scanned_dir_t.borrow()") && probe.contains("\"\" => 0,"),
+            "the Empty count:\n{probe}"
+        );
+    }
+
+    /// Fix round 1 (1 November, CS-26): Copy picks and Move rejected queue the pending star writes
+    /// on the UI thread and their workers wait for them before the XMP sidecars travel, so a carried
+    /// sidecar holds the latest star and no write lands on a moved-away `IMG.xmp`. Each result line
+    /// carries the owner's sidecar clause, and only a failed photo makes it an error.
+    /// FALSIFIERS: R1F2-F13 / F14 (a barrier removed), R1F2-F15 (Move never queues the stars),
+    /// R1F2-F18 (the move line drops the clause), R1F2-F19 (a sidecar-only problem turns it red).
+    #[test]
+    fn the_side_files_travel_after_the_pending_star_writes() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let span = |from: &str, to: &str| {
+            let a = main.find(from).unwrap_or_else(|| panic!("`{from}` is in main.rs"));
+            let b = a + main[a..].find(to).unwrap_or_else(|| panic!("`{to}` follows `{from}`"));
+            main[a..b].to_string()
+        };
+        for (handler, verb) in [("app.on_copy_picks(move", "Copied"), ("app.on_move_rejects(move", "Moved")] {
+            let before = span(handler, "std::thread::spawn(move");
+            assert!(before.contains("support::sync_xmp_ratings("), "{handler}: queues the pending stars first");
+            let worker = span(handler, "*slot.lock()");
+            let worker = &worker[worker.find("std::thread::spawn(move").unwrap()..];
+            let wait = worker.find("support::writer_barrier(").unwrap_or_else(|| panic!("{handler}: the worker waits"));
+            assert!(wait < worker.find("export_marked(").unwrap(), "{handler}: …before anything is carried");
+            assert!(worker.contains(&format!("support::clause_side_files(side_not, support::SideVerb::{verb})")), "{handler}: the clause");
+        }
+        let undo = span("app.on_undo_move(move", "*slot.lock()");
+        assert!(undo.contains("support::clause_side_files(side_not, support::SideVerb::Restored)"), "Undo move: the clause");
+        for handler in ["app.on_copy_picks(move", "app.on_move_rejects(move", "app.on_undo_move(move"] {
+            let store = span(handler, "OpSeverity::");
+            let at = main.find(handler).unwrap() + store.len();
+            assert!(main[at..].starts_with("OpSeverity::from_err(fail > 0)"), "{handler}: only a failed photo is an error");
+        }
     }
 
     fn ld(key: &str, dev: Option<&str>, origin: Option<(i32, i32)>, id: Option<u32>) -> support::LiveDisplay {
@@ -27762,7 +28334,7 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
         let hide = once("let _ = app.hide();");
         let mac_cleanup = once("support::guard_teardown(\"restoring the Mac title bar\", mac_experiment::shutdown);");
         assert!(system < guarded_hide && guarded_hide < stop, "the hide is guarded");
-        let tail = once("support::graceful_shutdown(immediate, &mut |st| match st {");
+        let tail = once("support::graceful_shutdown(wait_for_op, &mut |st| match st {");
         let flush = once("export_progress.stop_and_flush_completed();");
         let registered = once("macos_open::register_save_sequence(save_sequence);");
         let hook = once("macos_open::install_terminate_handler();");
@@ -27857,6 +28429,278 @@ mod tests {").map_or(src.as_str(), |(p, _)| p);
             assert!(after.contains("_json.borrow_mut() = selection_dirty_json(") || after.contains("lrj_t.borrow_mut() = selection_dirty_json("),
                 "a review write advances the baseline: {}", &main[at..(at + 80).min(main.len())]);
         }
+    }
+
+    /// R1 (1 November safety round), the wiring the support tests
+    /// (`a_quick_return_reads_the_queued_save_not_the_older_file` and its neighbours) can't see:
+    /// - both folder-open loaders (the sync `reload`, the async scan worker) read through the save
+    ///   record, and nothing in main.rs calls `load_selection` directly;
+    /// - every `ScanDone` built carries that read's `from_ledger` (the photo-first batches too);
+    /// - `apply_scan` asks `adopted_baseline_stays_dirty` with the landing's facts, in its own
+    ///   statement (a `borrow()` held into the `borrow_mut()` would panic), and an adoption makes the
+    ///   load's baseline empty.
+    ///
+    /// FALSIFIER (L28): call `load_selection(` in either loader, build a `ScanDone` with
+    /// `from_ledger: false`, pass `false` for `from_ledger`, or baseline an adoption from the map.
+    #[test]
+    fn both_folder_opens_read_through_the_save_record_and_an_adoption_starts_dirty() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        assert_eq!(main.matches("load_selection(").count(), 0, "no folder open reads the file around the record");
+        for (owner, call) in [
+            ("let reload: Rc<dyn Fn(PathBuf, Option<usize>)> = {", "support::load_selection_through_ledger(review_st, &dir, &sel_status_slot);"),
+            ("let begin_resolved: Rc<dyn Fn(support::ResolvedOpen)> = {", "support::load_selection_through_ledger(review_st, &dir, &local_warn);"),
+        ] {
+            let at = main.find(owner).unwrap_or_else(|| panic!("`{owner}` is in main.rs"));
+            let end = at + main[at..].find("\n    };").expect("the closure ends");
+            let body = &main[at..end];
+            assert_eq!(body.matches("support::load_selection_through_ledger(").count(), 1, "{owner}: one read");
+            // R6 (1 November safety round): the read's outcome (`review_load`) is bound beside it.
+            assert!(body.contains(&format!("let (mut sel_map, rotations, attrs, from_ledger, review_load) =\n                {call}"))
+                || body.contains(&format!("let (sel_map, rotations, attrs, from_ledger, review_load) =\n                    {call}")), "{owner}: `from_ledger` is bound from it");
+        }
+        let built: Vec<&str> = main.match_indices("ScanDone {").map(|(at, _)| &main[at..]).filter(|s| !s.starts_with("ScanDone { changed_sources: _")).collect();
+        assert_eq!(built.len(), 4, "the sync reload, the first photo, the nearby batch, the final scan");
+        for s in built {
+            let body = &s[..s.find('}').expect("closed")];
+            assert!(body.contains(" had_file, from_ledger,"), "a ScanDone carries the read's from_ledger: {}", &body[..body.len().min(160)]);
+        }
+        assert!(main.contains("let adopted = support::adopted_baseline_stays_dirty(\n                from_ledger, new_len > 0, scan_same_folder, &last_ratings_json.borrow());"),
+            "apply_scan asks with the landing's facts");
+        assert!(main.contains("*last_ratings_json.borrow_mut() = if adopted { String::new() } else {"), "an adoption starts dirty");
+    }
+
+    /// R6 (1 November safety round), the wiring the support rows
+    /// (`a_review_file_that_cant_be_read_is_never_replaced` and its neighbours) can't see:
+    /// - every `ScanDone` carries the read's outcome (`review_load`), and moved-out leftovers are taken
+    ///   only from a `Loaded` read (the sync rescan's live map excepted), never from file existence;
+    /// - `apply_scan` records the outcome on a fresh visit or on an explicit reopen of a folder already
+    ///   marked (the retry), and warns only when photos land; a retry that reads the file starts the
+    ///   visit afresh (no live carry) and still lands as the rescan it replaces;
+    /// - the settings memory is not moved into a review file that can't be saved;
+    /// - the tick's flush shows nothing more for a refused save (the landing already warned).
+    ///
+    /// FALSIFIER (L28): gate a leftover on `had_file`, never record the outcome, drop the retry or let
+    /// it carry the live state, migrate the memory regardless, or give a refusal the red notice.
+    #[test]
+    fn an_unreadable_review_file_is_recorded_at_the_landing_and_never_saved_over() {
+        let read = |name: &str| {
+            let src = std::fs::read_to_string(format!("{}/src/{name}", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+            let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p).to_owned();
+            prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+        };
+        let (main, support, tick) = (read("main.rs"), read("support.rs"), read("tick.rs"));
+        let built: Vec<&str> = main.match_indices("ScanDone {").map(|(at, _)| &main[at..]).filter(|s| !s.starts_with("ScanDone { changed_sources: _")).collect();
+        assert_eq!(built.len(), 4);
+        for s in built {
+            assert!(s[..s.find('}').expect("closed")].contains("review_load"), "every ScanDone carries the outcome");
+        }
+        assert!(!main.contains("if had_file { selection_leftover(") && !main.contains("if had_file && !scan_err { selection_leftover("));
+        assert!(main.contains("let read_review = review_load == support::ReviewLoad::Loaded;"), "the worker's one gate");
+        assert_eq!(main.matches("let extra = if read_review ").count(), 3, "first photo, nearby, final");
+        assert!(main.contains("let extra = if same_folder || review_load == support::ReviewLoad::Loaded { selection_leftover(sel_map, &new_vec) }"),
+            "the sync rescan");
+        assert!(support.contains("let extra = if review_load == ReviewLoad::Loaded { selection_leftover(sel_map, &shots) }"), "the reopen worker");
+        let at = main.find("    let apply_scan: Rc<dyn Fn(ScanDone)> = {").expect("apply_scan");
+        let apply = &main[at..at + main[at..].find("\n    };").expect("its end")];
+        // The outgoing flush runs first: a retry must never clear the mark before it (it would
+        // write the unsaved live state over the file that now reads).
+        let order = [
+            "flush_old();",
+            "let reopen = reopen_pending.borrow_mut().take_landing(done.id);",
+            "let retry = reopen.is_some() && support::review_data_unresolved(&review_dir);",
+            "scan_same_folder && (!retry || matches!(done.review_load, support::ReviewLoad::Unresolved(_)));",
+            "if scan_same_folder && !done.scan_err {\n                let old = shots.lock().unwrap_or_else(|e| e.into_inner()).clone();\n                support::carry_live_review_on_rescan(",
+            "if (scan_same_folder && !done.scan_err) || retry {",
+            "photo_open::settle_reopen(&mut done, requested);",
+            "if !scan_same_folder || retry {\n                if let Some(warning) = support::note_review_load(&review_dir, done.review_load) {\n                    if !done.shots.is_empty() {\n                        notif_ap.borrow_mut().push(NotifEntry::warn(warning, Instant::now()));",
+            "support::begin_review_visit();",
+        ];
+        let at: Vec<usize> = order.iter().map(|s| apply.find(s).unwrap_or_else(|| panic!("apply_scan: {s}"))).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "apply_scan's order: {at:?}");
+        assert!(apply.contains("if had_file && !matches!(review_load, support::ReviewLoad::Unresolved(_)) {"), "memory stays in settings");
+        let refused = tick.find("Err(crate::support::ReviewSaveError::Unreadable) => {}").expect("a refusal is quiet in flush_sel");
+        assert!(refused < tick.find("tr_format!(\"⚠ Ratings not saved — {error}\", error = e)").expect("the failure notice"));
+    }
+
+    /// Safety round review R2 (1 November, owner: grey it out), the wiring the support row
+    /// (`apply_rotations_waits_exactly_while_the_review_file_cant_be_read`) and the rig row
+    /// (`apply_rotations_fades_while_the_review_file_cant_be_read`, tipgeom_tests) can't see. The two
+    /// handlers are closures inside `main()` that no rig can install, so their order is pinned here:
+    /// - the ask returns on `support::apply_rotations_waits` for Apply's folder (`cur_dir`) before it
+    ///   builds a plan or raises kind 5;
+    /// - the run asks the same function for the `dir` it writes and saves to, after the opening-photo
+    ///   gate and before the plan, the busy start and the worker, closing a confirm left open;
+    /// - `apply_scan` sets the button's property from the same function at every landing, after the
+    ///   mark (`note_review_load`) and `cur_dir` are written, so it clears when the mark does.
+    ///
+    /// FALSIFIER (L28): drop either handler's guard, move it below the plan, set the property only
+    /// while it is true, or set it before the landing writes the mark or `cur_dir`.
+    #[test]
+    fn apply_rotations_waits_while_the_review_file_cant_be_read() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        assert_eq!(main.matches("support::apply_rotations_waits(").count(), 3, "the ask, the run and the button");
+        let body = |head: &str| {
+            let at = main.find(head).unwrap_or_else(|| panic!("{head}"));
+            &main[at..at + main[at..].find("\n        });").expect("the handler ends")]
+        };
+        let pos = |body: &str, needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing: {needle}"));
+        let ask = body("app.on_apply_rotations_ask(move || {");
+        let guard = pos(ask, "if support::apply_rotations_waits(&cur_dir.borrow()) {\n                return;\n            }");
+        assert!(guard < pos(ask, "support::rotation_apply_plans(&rot, &snap)") && guard < pos(ask, "a.set_confirm_kind(5);"),
+            "the ask waits before its plan and its confirm");
+        let run = body("app.on_apply_rotations(move || {");
+        let guard = pos(run, "if support::apply_rotations_waits(&dir) {\n                if let Some(a) = awz.upgrade() {\n                    a.set_confirm_kind(0);\n                }\n                return;\n            }");
+        assert!(pos(run, "a.get_opening_photo()") < guard && pos(run, "let dir = cur_dir.borrow().clone();") < guard);
+        for later in ["support::rotation_apply_plans(&rot, &snap)", "if !start(", "std::thread::spawn(move ||", "falcon_decode::apply_rotation(plan)"] {
+            assert!(guard < pos(run, later), "the run waits before {later}");
+        }
+        let at = main.find("    let apply_scan: Rc<dyn Fn(ScanDone)> = {").expect("apply_scan");
+        let apply = &main[at..at + main[at..].find("\n    };").expect("its end")];
+        let set = "a.set_apply_rotations_waits(support::apply_rotations_waits(&cur_dir.borrow()));";
+        assert_eq!(main.matches("set_apply_rotations_waits(").count(), 1, "one setter");
+        let order = [
+            "support::note_review_load(&review_dir, done.review_load)",
+            "*cur_dir.borrow_mut() = dir.display().to_string();",
+            set,
+        ];
+        let at: Vec<usize> = order.iter().map(|s| pos(apply, s)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "the property follows the mark and cur_dir: {at:?}");
+        let line = apply[..pos(apply, set)].rfind('\n').expect("its line");
+        assert_eq!(apply[line..pos(apply, set)].trim(), "", "set unconditionally, true or false");
+    }
+
+    /// Fix round 1 (1 November, CS-32): QUITTING MID-APPLY STOPS AFTER THE PHOTO IN FLIGHT, ON EVERY
+    /// PLATFORM. The decision is `support::a_file_operation_in_flight_makes_every_exit_wait_first`;
+    /// this pins the wiring inside `main()` that no rig can install:
+    /// a. the Apply worker reads `op_cancel` as the first statement for each photo, before the cloud
+    ///    last look and before `apply_rotation`, and stops the batch;
+    /// b. the save sequence raises `op_cancel`, then asks `shutdown_waits_for_file_op` with
+    ///    `sel_busy`, and hands that answer to the tail;
+    /// c. the `AwaitFileOpBoundary` arm waits on every platform (no `cfg`);
+    /// d. the save sequence's `sel_busy` clone is not Mac-only.
+    ///
+    /// FALSIFIER (L28): delete the worker's cancel check (a), the `op_cancel.store(true…)` or the
+    /// `shutdown_waits_for_file_op` call (b), or put `#[cfg(target_os = "macos")]` back on the wait (c).
+    #[test]
+    fn quitting_mid_apply_stops_after_the_photo_in_flight_on_every_platform() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let pos = |body: &str, needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing: {needle}"));
+        // a. the worker's check
+        assert_eq!(main.matches("let op_cancel_ap = op_cancel.clone();").count(), 1, "Apply holds the quit latch");
+        let at = pos(&main, "app.on_apply_rotations(move || {");
+        let run = &main[at..at + main[at..].find("\n        });").expect("the handler ends")];
+        assert!(run.contains("let cancel = op_cancel_ap.clone();"), "the worker gets the latch");
+        let head = "for (i, (idx, name, plan)) in plans.iter().enumerate() {";
+        let lp = pos(run, head);
+        let first = &run[lp + head.len()..lp + pos(&run[lp..], "support::rotation_freed_files(")];
+        assert!(first.trim_start().starts_with("if cancel.load(Ordering::SeqCst) {"), "the check is each photo's first statement");
+        assert!(first.contains("break;"), "a raised latch ends the batch");
+        assert!(lp < pos(run, "falcon_decode::apply_rotation(plan)"), "checked before the photo is written");
+        // b. the save sequence raises the latch and asks whether to wait
+        let s0 = pos(&main, "let save_sequence: support::SaveSequence = {");
+        let tail = s0 + pos(&main[s0..], "support::graceful_shutdown(");
+        let seq = &main[s0..tail];
+        assert!(seq.contains("let op_cancel = op_cancel.clone();"), "the save sequence holds the latch");
+        let raise = pos(seq, "op_cancel.store(true, Ordering::SeqCst);");
+        let ask = pos(seq, "let wait_for_op = support::shutdown_waits_for_file_op(immediate, sel_busy.load(Ordering::SeqCst));");
+        assert!(raise < ask, "the latch is up before the wait starts");
+        assert!(main[tail..].starts_with("support::graceful_shutdown(wait_for_op, &mut |st| match st {"), "the tail takes that answer");
+        // c. the wait runs everywhere
+        let a0 = pos(&main, "support::ShutdownStep::AwaitFileOpBoundary => {");
+        let arm = &main[a0..a0 + pos(&main[a0..], "support::ShutdownStep::DrainAppliedRotations")];
+        assert!(arm.contains("support::await_file_op_boundary(&sel_busy, std::time::Duration::from_secs(10));"), "the arm waits");
+        assert!(!arm.contains("cfg(target_os"), "on every platform");
+        // d. the clone the wait reads is on every platform
+        let clone = pos(seq, "let sel_busy = sel_busy.clone();");
+        let above = seq[..clone].trim_end().lines().last().expect("a line above");
+        assert!(!above.contains("cfg("), "the save sequence's sel_busy is not Mac-only: {above}");
+    }
+
+    /// Fix round 1 (1 November, F13-apply-4, owner: "Apply rotations only"): THE SORT PICKS WAIT WHILE
+    /// APPLY ROTATIONS RUNS, and only then (Copy, Move and the rest leave them lit). A re-sort mid-Apply
+    /// rescans the folder, and the drain then drops the photos written after it. Pins:
+    /// - the nine in-app sort rows grey on `applying-rotations` (beside `opening-photo`); "Scroll to
+    ///   current" is unchanged;
+    /// - `apply_pick` returns on the atomic before it changes the spec, its memories or posts a rescan;
+    /// - the Apply run raises the switch after `start(` and before the worker; the worker binds its
+    ///   `FlagGuard` after its `OpGuard`, so the switch drops first;
+    /// - the tick re-derives the property from the atomic, and the Mac menu bar reads the property
+    ///   (its rows: `menubar_model::the_sort_rows_grey_while_apply_rotations_runs`).
+    ///
+    /// FALSIFIER (L28): drop `&& !root.applying-rotations` from any row, delete `apply_pick`'s guard,
+    /// delete the `applying.store(true…)`, bind `_applying` before `_guard`, or delete the tick's
+    /// `set_applying_rotations(applying_now)`.
+    #[test]
+    fn the_sort_picks_wait_while_apply_rotations_runs() {
+        let ui = std::fs::read_to_string(format!("{}/ui/main_window.slint", env!("CARGO_MANIFEST_DIR"))).expect("ui readable");
+        let rows: Vec<&str> = ui.lines().filter(|l| l.contains("root.sort-pick(") || l.contains("root.sort-dir-pick(")).collect();
+        assert_eq!(rows.len(), 9, "seven methods and two directions");
+        let gated = rows.iter().filter(|l| l.contains("enabled: !root.opening-photo && !root.applying-rotations;")).count();
+        assert_eq!(gated, 9, "every sort row greys while Apply rotations runs");
+        assert!(ui.contains("\"Scroll to current\"); enabled: root.film-visible || root.grid-open;"), "Scroll to current is unchanged");
+
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let pos = |body: &str, needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing: {needle}"));
+        // apply_pick refuses on the atomic, first
+        assert_eq!(main.matches("let applying_sp = applying_rotations.clone();").count(), 1, "apply_pick holds the switch");
+        let at = pos(&main, "let apply_pick = Rc::new(move |method: SortMethod, desc: bool| {");
+        let pick = &main[at..at + main[at..].find("\n        });").expect("apply_pick ends")];
+        let guard = pos(pick, "if applying_sp.load(Ordering::SeqCst) {\n                return;\n            }");
+        for later in ["a.set_sort_method(", "*sort_last_sp.borrow_mut()", "support::remember_sort(", "*sort_rl.lock()"] {
+            assert!(guard < pos(pick, later), "apply_pick refuses before {later}");
+        }
+        // the Apply run raises it and its worker lowers it
+        assert_eq!(main.matches("let applying = applying_rotations.clone();").count(), 1, "the Apply run holds the switch");
+        let at = pos(&main, "app.on_apply_rotations(move || {");
+        let run = &main[at..at + main[at..].find("\n        });").expect("the handler ends")];
+        let order = [
+            "if !start(",
+            "applying.store(true, Ordering::SeqCst);",
+            "a.set_applying_rotations(true);",
+            "let applying_guard = support::FlagGuard(applying.clone());",
+            "std::thread::spawn(move || {",
+            "let _guard = OpGuard {",
+            "let _applying = applying_guard;",
+            "for (i, (idx, name, plan)) in plans.iter().enumerate() {",
+        ];
+        let at: Vec<usize> = order.iter().map(|s| pos(run, s)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "raised after start, lowered by a guard bound after OpGuard: {at:?}");
+        assert_eq!(main.matches("applying.store(").count(), 1, "the one raise; the guard is the one lowering");
+        // the tick re-derives the property; the Mac menu bar reads it
+        assert!(main.contains("        let applying_now = applying_rotations_t.load(Ordering::SeqCst);\n        if app.get_applying_rotations() != applying_now {\n            app.set_applying_rotations(applying_now);\n        }"),
+            "the tick re-derives the property from the atomic");
+        assert_eq!(main.matches("set_applying_rotations(").count(), 2, "the start and the tick");
+        assert!(main.contains("applying_rotations: app.get_applying_rotations(),"), "the Mac menu bar's snapshot reads it");
+    }
+
+    /// R4 (1 November safety round), the wiring the rig row
+    /// (`a_notch_or_held_key_from_the_folder_you_left_never_moves_the_next_one`, tipgeom_tests) can't
+    /// see: `apply_scan`, the landing every folder open passes through, ends the held key, the wheel
+    /// bank and its pace clock on an actual folder change (`!scan_same_folder`) and only then, so a
+    /// photo-first promotion, a re-sort and a post-op rescan keep a gesture in progress. Nothing else
+    /// in main.rs calls the reset.
+    ///
+    /// FALSIFIER (L28): delete the call, or make it unconditional.
+    #[test]
+    fn a_folder_change_ends_the_browse_gestures_and_a_same_folder_landing_keeps_them() {
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).expect("source readable");
+        let prod = src.split_once("\nmod tests {").map_or(src.as_str(), |(p, _)| p);
+        let main = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        assert_eq!(main.matches("end_gestures_on_folder_change(").count(), 1, "one reset, in apply_scan");
+        let at = main.find("let apply_scan: Rc<dyn Fn(ScanDone)> = {").expect("apply_scan");
+        let body = &main[at..at + main[at..].find("\n    };").expect("the closure ends")];
+        assert!(body.contains("let (held_dir, wheel_accum, wheel_advance) = (held_dir.clone(), wheel_accum.clone(), wheel_advance.clone());"),
+            "apply_scan holds the single view's gesture cells");
+        assert!(body.contains("            if !scan_same_folder {\n                tick::end_gestures_on_folder_change(Instant::now(), &held_dir, &wheel_accum, &wheel_advance);\n            }"),
+            "the gestures end on an actual folder change only");
     }
 
     /// 1.1.0 (Codex R1): THE QUIT CAPTURES A LAST-FRAME PANEL CHANGE BEFORE BOTH SNAPSHOTS. The panel

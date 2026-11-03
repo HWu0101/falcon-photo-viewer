@@ -77,14 +77,27 @@ pub(crate) const TAG_RECENT_BASE: i32 = 100; // + index into MenuSnapshot.recent
 pub(crate) const RECENTS_MAX: usize = 10;
 
 /// What the next ⌘Z would undo — drives the Edit item's honest dynamic title (L17: a control's
-/// label is a contract). `Delete` mirrors on_undo's own preference order (main.rs: empty cull/rot
-/// undo stack + a live delete record → recover); `Other` is a rating/flag/rotation undo.
+/// label is a contract). `Delete` is on_undo's own answer ([`undo_kind_for`]); `Other` is a
+/// rating/flag/rotation undo or a move.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum UndoKind {
     #[default]
     None,
     Delete,
     Other,
+}
+
+/// Keeping prepared work (2 November): the arm `on_undo` would take (`support::live_undo_arm`). The
+/// stack now survives a Delete, so "empty stack" no longer says the delete is next. No arm but a
+/// live record is a delete from another folder: ⌘Z answers it with the honest refusal.
+pub(crate) fn undo_kind_for(arm: Option<crate::support::UndoArm>, has_record: bool) -> UndoKind {
+    use crate::support::UndoArm;
+    match arm {
+        Some(UndoArm::Delete(_)) => UndoKind::Delete,
+        Some(UndoArm::Stack(_) | UndoArm::Move(_)) => UndoKind::Other,
+        None if has_record => UndoKind::Delete,
+        None => UndoKind::None,
+    }
 }
 
 /// The LIVE display keys (already pretty-formatted via `support::menu_shortcut` — the same single
@@ -133,6 +146,10 @@ pub(crate) struct MenuSnapshot {
     pub(crate) modal_fs: bool,
     pub(crate) context: Option<u64>, // identity of an open photo context for queued key equivalents
     pub(crate) opening_photo: bool, // folder-wide sort is unavailable in either early-edit mode
+    /// Fix round 1 (1 November, F13-apply-4, L21/L26): Apply rotations is running, so sorting is
+    /// unavailable (`apply_pick` refuses then). The `.slint` `applying-rotations` property the
+    /// in-app sort rows grey on.
+    pub(crate) applying_rotations: bool,
     pub(crate) inspect_open: bool, // ready photo may be inspected while View only blocks collection actions
     pub(crate) compare: bool,
     pub(crate) at_fit: bool, // single-view zoom == 1.0 (±0.01 — on_photo_clicked's own tolerance); drives the honest Zoom 1:1 / Zoom to Fit enablement split (L17)
@@ -368,8 +385,8 @@ pub(crate) fn top_menus(s: &MenuSnapshot) -> Vec<(TopMenu, Vec<ItemDef>)> {
     ];
 
     // Edit — the Undo title is DYNAMIC: "Undo Delete" exactly when the next ⌘Z recovers the deleted
-    // shot (on_undo's own preference order), plain "Undo" for a rating/flag/rotation undo. The ⌘Z
-    // equivalent routes to the SAME invoke_undo() as the in-app key, so behavior is identical.
+    // shot (`undo_kind_for`, on_undo's own answer), plain "Undo" for a rating/flag/rotation undo or a
+    // move. The ⌘Z equivalent routes to the SAME invoke_undo() as the in-app key, so behavior is identical.
     let undo_title = match s.undo {
         UndoKind::Delete => i18n::tr("Undo Delete"),
         _ => i18n::tr("Undo"),
@@ -681,9 +698,10 @@ pub(crate) fn enabled_for(tag: i32, s: &MenuSnapshot) -> bool {
         // v0.9.67 (OWNER RULING 08-08 (ii)): the ONE row that reads `modal_fs` — the welcome screen
         // stops disabling Enter Full Screen, and nothing else about the modal gate moves.
         TAG_FULLSCREEN => !s.modal_fs,
-        TAG_SORT_PARENT => photo_ok && !s.opening_photo,
-        t if (TAG_SORT_M0..=TAG_SORT_M6).contains(&t) => photo_ok && !s.opening_photo,
-        TAG_SORT_ASC | TAG_SORT_DESC => photo_ok && !s.opening_photo,
+        // Fix round 1 (1 November): sorting also waits while Apply rotations runs (`apply_pick`'s guard).
+        TAG_SORT_PARENT => photo_ok && !s.opening_photo && !s.applying_rotations,
+        t if (TAG_SORT_M0..=TAG_SORT_M6).contains(&t) => photo_ok && !s.opening_photo && !s.applying_rotations,
+        TAG_SORT_ASC | TAG_SORT_DESC => photo_ok && !s.opening_photo && !s.applying_rotations,
         _ => true, // unknown/structural tags never block (defensive)
     }
 }
@@ -825,6 +843,7 @@ pub(crate) fn probe_literal() -> MenuSnapshot {
         modal: true,
         modal_fs: true, // v0.9.67 (OWNER RULING 08-08 (ii))
         opening_photo: true,
+        applying_rotations: true, // fix round 1
         inspect_open: true,
         context: Some(1),
         modal_blocking: true,
@@ -1017,6 +1036,7 @@ mod tests {
             // welcome guide would leave "Enter Full Screen" disabled until some other field moved.
             ("modal_fs", MenuSnapshot { modal_fs: true, ..Default::default() }),
             ("opening_photo", MenuSnapshot { opening_photo: true, ..Default::default() }),
+            ("applying_rotations", MenuSnapshot { applying_rotations: true, ..Default::default() }), // fix round 1
             ("inspect_open", MenuSnapshot { inspect_open: true, ..Default::default() }),
             ("context", MenuSnapshot { context: Some(1), ..Default::default() }),
             ("modal_blocking", MenuSnapshot { modal_blocking: true, ..Default::default() }),
@@ -1527,6 +1547,37 @@ mod tests {
         assert_eq!(build_menus(&s)[1].1[0].title, "Undo");
         s.undo = UndoKind::None;
         assert!(!enabled_for(TAG_UNDO, &s));
+    }
+
+    /// Keeping prepared work (2 November): star a photo, delete another, and the row still reads
+    /// "Undo Delete" with a star on the stack. This is what stands between the surviving stack and
+    /// a label that lies.
+    ///
+    /// FALSIFIER (L28): map `Some(Delete)` to `Other`, map `Some(Move)` to `Delete` or `None`, or
+    /// drop the `has_record` term so another folder's record goes quiet.
+    #[test]
+    fn the_undo_row_says_what_the_next_undo_reaches() {
+        use crate::support::{live_undo_arm, UndoArm};
+        for (arm, record, want) in [
+            (Some(UndoArm::Delete(5)), true, UndoKind::Delete),
+            (Some(UndoArm::Stack(5)), true, UndoKind::Other),
+            (Some(UndoArm::Stack(5)), false, UndoKind::Other),
+            (Some(UndoArm::Move(5)), false, UndoKind::Other),
+            (None, true, UndoKind::Delete),
+            (None, false, UndoKind::None),
+        ] {
+            assert!(undo_kind_for(arm, record) == want, "{:?} record={record}", arm.map(|a| a.seq()));
+        }
+        // The sequence itself: a surviving star, then a newer delete of another photo.
+        let d = "folder";
+        let starred_then_deleted = live_undo_arm(Some(1), Some((d, 2)), d, None);
+        assert!(undo_kind_for(starred_then_deleted, true) == UndoKind::Delete);
+        // A star made after the delete pops first, while the record stays live.
+        let deleted_then_starred = live_undo_arm(Some(3), Some((d, 2)), d, None);
+        assert!(undo_kind_for(deleted_then_starred, true) == UndoKind::Other);
+        // A record from another folder, with nothing on the stack.
+        let elsewhere = live_undo_arm(None, Some(("other", 2)), d, None);
+        assert!(undo_kind_for(elsewhere, true) == UndoKind::Delete);
     }
 
     /// Recents: empty list → disabled parent + the disabled placeholder row; entries surface
@@ -2092,6 +2143,27 @@ mod tests {
         }
         s.opening_photo=false; s.modal=false;
         assert!(enabled_for(TAG_SORT_M0,&s));
+    }
+
+    /// Fix round 1 (1 November, F13-apply-4, owner: "Apply rotations only"; L21/L26): the Mac Sort
+    /// rows grey while Apply rotations runs, mirroring `apply_pick`'s guard, which refuses then.
+    /// Other file operations don't set the switch, so they leave the rows lit.
+    ///
+    /// FALSIFIER (L28): drop `&& !s.applying_rotations` from any of the three sort arms in
+    /// `enabled_for` → the matching tag's assert reddens.
+    #[test]
+    fn the_sort_rows_grey_while_apply_rotations_runs() {
+        let tags = [TAG_SORT_PARENT, TAG_SORT_M0, TAG_SORT_M0 + 1, TAG_SORT_M0 + 2, TAG_SORT_M0 + 3, TAG_SORT_M0 + 4,
+            TAG_SORT_M0 + 5, TAG_SORT_M6, TAG_SORT_ASC, TAG_SORT_DESC];
+        assert_eq!(TAG_SORT_M6 - TAG_SORT_M0, 6, "seven method rows");
+        let mut s = MenuSnapshot { has_photo: true, count: 5, applying_rotations: true, ..Default::default() };
+        for tag in tags {
+            assert!(!enabled_for(tag, &s), "sort tag {tag} lit while Apply rotations runs");
+        }
+        s.applying_rotations = false;
+        for tag in tags {
+            assert!(enabled_for(tag, &s), "sort tag {tag} grey with no Apply running");
+        }
     }
 
     /// Language packs, round 2 (PLAN §4): the bar finds Help, File and View by their ids, never by

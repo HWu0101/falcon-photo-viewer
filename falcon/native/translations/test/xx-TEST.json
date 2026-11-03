@@ -23,6 +23,18 @@
     "one": "⟦ · {n} RAW-only skipped (edit from ./Picks first)⟧",
     "other": "⟦ · {n} RAW-only skipped (edit from ./Picks first)⟧"
   },
+  " · {n} XMP sidecar not copied (see log)": {
+    "one": "⟦ · {n} XMP sidecar not copied (see log)⟧",
+    "other": "⟦ · {n} XMP sidecars not copied (see log)⟧"
+  },
+  " · {n} XMP sidecar not moved (see log)": {
+    "one": "⟦ · {n} XMP sidecar not moved (see log)⟧",
+    "other": "⟦ · {n} XMP sidecars not moved (see log)⟧"
+  },
+  " · {n} XMP sidecar not restored (see log)": {
+    "one": "⟦ · {n} XMP sidecar not restored (see log)⟧",
+    "other": "⟦ · {n} XMP sidecars not restored (see log)⟧"
+  },
   " · {n} already there": {
     "one": "⟦ · {n} already there⟧",
     "other": "⟦ · {n} already there⟧"
@@ -356,6 +368,7 @@
   "Couldn't read ./Rejected ({error})": "⟦Couldn't read ./Rejected ({error})⟧",
   "Couldn't read that file — is the drive connected?": "⟦Couldn't read that file — is the drive connected?⟧",
   "Couldn't read this folder": "⟦Couldn't read this folder⟧",
+  "Couldn't read this folder's review data — it may be only in the cloud while you're offline, open in another program, or blocked by folder permissions. It's left untouched, and changes made here won't be saved. Reopen the folder to try again.": "⟦Couldn't read this folder's review data — it may be only in the cloud while you're offline, open in another program, or blocked by folder permissions. It's left untouched, and changes made here won't be saved. Reopen the folder to try again.⟧",
   "Couldn't recover {name} — it's no longer in the {bin}": "⟦Couldn't recover {name} — it's no longer in the {bin}⟧",
   "Couldn't recover {name} — the {bin} is unavailable": "⟦Couldn't recover {name} — the {bin} is unavailable⟧",
   "Couldn't restore the previous icons: {error}": "⟦Couldn't restore the previous icons: {error}⟧",
@@ -894,6 +907,7 @@
     "other": "⟦Rating reverted on {n} photos⟧"
   },
   "Ratings saved.": "⟦Ratings saved.⟧",
+  "Reading capture dates · {done} of {total}": "⟦Reading capture dates · {done} of {total}⟧",
   "Reading this photo's colour space…": "⟦Reading this photo's colour space…⟧",
   "Recommended": "⟦Recommended⟧",
   "Recover": "⟦Recover⟧",
@@ -966,7 +980,6 @@
   "Reveal {n} in {file_manager}": "⟦Reveal {n} in {file_manager}⟧",
   "Review": "⟦Review⟧",
   "Review data FAILED to save for {folder} ({err}) — your latest changes may not be on disk": "⟦Review data FAILED to save for {folder} ({err}) — your latest changes may not be on disk⟧",
-  "Review data was unreadable — couldn't preserve it; starting fresh": "⟦Review data was unreadable — couldn't preserve it; starting fresh⟧",
   "Review data was unreadable — kept as {name} and starting fresh": "⟦Review data was unreadable — kept as {name} and starting fresh⟧",
   "Reviewed": "⟦Reviewed⟧",
   "Right": "⟦Right⟧",
@@ -1137,6 +1150,8 @@
   "This file type can't be previewed yet": "⟦This file type can't be previewed yet⟧",
   "This folder is open in another Falcon window — review edits (ratings, flags, rejects) are last-writer-wins between them": "⟦This folder is open in another Falcon window — review edits (ratings, flags, rejects) are last-writer-wins between them⟧",
   "This folder's review data is locked by another program — Falcon is reading it in place and will rename it when the folder is free.": "⟦This folder's review data is locked by another program — Falcon is reading it in place and will rename it when the folder is free.⟧",
+  "This folder's review data is too large to read (over 16 MB), which usually means it's damaged. It's left untouched, and changes made here won't be saved. To start fresh, move falcon_review_data.json out of the folder.": "⟦This folder's review data is too large to read (over 16 MB), which usually means it's damaged. It's left untouched, and changes made here won't be saved. To start fresh, move falcon_review_data.json out of the folder.⟧",
+  "This folder's review data looks damaged, and Falcon couldn't set it aside — another program may have it open. It's left untouched, and changes made here won't be saved. Reopen the folder to try again.": "⟦This folder's review data looks damaged, and Falcon couldn't set it aside — another program may have it open. It's left untouched, and changes made here won't be saved. Reopen the folder to try again.⟧",
   "This format is currently unsupported": "⟦This format is currently unsupported⟧",
   "This result is from a generated {mp} MP target-size test, not the current folder.": "⟦This result is from a generated {mp} MP target-size test, not the current folder.⟧",
   "This result is from the current folder's photos, not a generated target-size test.": "⟦This result is from the current folder's photos, not a generated target-size test.⟧",

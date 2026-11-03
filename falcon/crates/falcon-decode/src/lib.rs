@@ -1806,7 +1806,8 @@ pub struct Shot {
     /// v1.0.0-rc TAIL (skeptic B, R2): the container the file's own BYTES declared, when it
     /// DISAGREED with the extension. `None` when the two agreed, when the magic was unrecognised
     /// (rule (3)), and for a cloud placeholder — which is never read at all. Runtime state, like
-    /// `cloud_placeholder`, so it is never serialized to the UI.
+    /// `cloud_placeholder`, so it is never serialized to the UI. Open-time check (2 November): also
+    /// `None` when no reader has read the file yet, which is the usual state until a photo is viewed.
     ///
     /// IT EXISTS BECAUSE `Unsupported` HAS NO FORMAT NOUN OF ITS OWN. Without it,
     /// [`Shot::finished_format`]'s `Unsupported` arm falls back to the EXTENSION — and for an AVIF
@@ -1894,8 +1895,9 @@ impl Shot {
     /// (e.g. `JPG`, `PNG`, `TIFF`, `HEIC`). `None` for a RAW-only shot (its finished image is the
     /// embedded preview, which has no standalone file extension).
     ///
-    /// v1.0.0-rc (BYTES OVER NAMES): the label names the **kind**, and since the scan sniffs, the
-    /// kind is the container the file's own bytes declare — so a PNG named `53d879f01a3f481c.JPG`
+    /// v1.0.0-rc (BYTES OVER NAMES): the label names the **kind**. Open-time check (2 November): once
+    /// a reader has checked the file (until then, its name's format), the kind is the container the
+    /// file's own bytes declare — so a PNG named `53d879f01a3f481c.JPG`
     /// badges **PNG** while the header still shows the user their real filename. This is the L26
     /// rule applied to a format noun: gate a shared answer and you owe the mirror on every invoker.
     /// It also removes a second format table — [`kind_tag`] is now the only one, so the badge, the
@@ -2281,6 +2283,43 @@ fn heic_scan_kind_here() -> SrcKind {
     heic_scan_kind(cfg!(target_os = "macos") || (cfg!(windows) && wic_heif_codec_present()))
 }
 
+/// What a finished file's lowercased extension says it is; `None` for anything that isn't an image.
+/// The one table: the scan's listing and [`shot_by_bytes`]'s baseline both read it.
+fn finished_name_kind(e: &str, heic: impl FnOnce() -> SrcKind) -> Option<SrcKind> {
+    if JPEG_EXTS.contains(&e) {
+        Some(SrcKind::Jpeg)
+    } else if PNG_EXTS.contains(&e) {
+        Some(SrcKind::Png)
+    } else if TIFF_EXTS.contains(&e) {
+        Some(SrcKind::Tiff)
+    } else if WEBP_EXTS.contains(&e) {
+        Some(SrcKind::Webp)
+    } else if HEIC_EXTS.contains(&e) {
+        // Decodable via the OS codec — WIC on Windows, Image I/O (CGImageSource) on macOS
+        // (v0.9.9). A badge-only Unsupported on platforms with no HEVC/HEIF system decoder.
+        // v0.8.99 (H3b): on WINDOWS that is now a fact, not an assumption — the Store
+        // HEVC/HEIF Image Extension is not shipped with Windows, so the codec registry is
+        // asked (once per scan, lazily). macOS needs no such gate: Image I/O decodes HEIC
+        // natively with nothing to install, so it short-circuits to "decodable".
+        Some(heic())
+    } else if JXL_EXTS.contains(&e) {
+        Some(SrcKind::Jxl)
+    } else if BMP_EXTS.contains(&e) {
+        Some(SrcKind::Bmp)
+    } else if GIF_EXTS.contains(&e) {
+        Some(SrcKind::Gif)
+    } else if UNSUPPORTED_IMG_EXTS.contains(&e) {
+        Some(SrcKind::Unsupported)
+    } else {
+        None // not an image file — ignore
+    }
+}
+
+/// The name-group key: the same `file_stem()` the scan's `map` uses, so `A.tif.png` counts as `A.tif`.
+fn file_stem_key(p: &Path) -> &str {
+    p.file_stem().and_then(|s| s.to_str()).unwrap_or("")
+}
+
 /// The scan-time classification of ONE finished-image candidate — the three rules of the
 /// BYTES OVER NAMES round, stated where they are enforced.
 ///
@@ -2289,14 +2328,17 @@ fn heic_scan_kind_here() -> SrcKind {
 ///     design (`entry.file_type()`, `entry.metadata()`, no data read anywhere) exists to avoid
 ///     exactly that. `head` is a CLOSURE for this reason and no other: the row
 ///     `the_sniff_never_touches_a_cloud_placeholder` proves the arm is taken by proving the closure
-///     is never called. A placeholder keeps its extension kind; when it hydrates, the next scan of
-///     that folder sniffs it (see the stated residue in the round record: the 30 s
-///     `step_cloud_retry` sweep clears the failure LATCHES but does not re-classify in place).
+///     is never called. A placeholder keeps its extension kind; when it hydrates, the app's cloud
+///     sweep re-classifies it in place ([`reclassify_hydrated`]).
 ///  2. **THE BYTES WIN.** A recognised magic that disagrees with the extension replaces the kind
 ///     for every consumer, because there is exactly one `kind` and all nine subsystems read it.
 ///  3. **UNKNOWN MAGIC DEGRADES TO THE NAME.** An unreadable file, a short read, or a magic
 ///     [`sniff_kind`] does not know keeps the extension's answer — so no existing corpus can be
 ///     reclassified by this change, and a `.tga` (a format with no signature) is unaffected.
+///
+/// Open-time check (2 November): a scan now hands this function bytes only for names shared by two
+/// or more finished files and for the double-clicked photo's own name. Every other file reaches
+/// rule (3) with no head, and [`shot_by_bytes`] asks the same question when a reader opens it.
 ///
 /// Returns the kind to STAMP and, when the bytes disagreed with the name, the container the bytes
 /// DECLARED. Those two are not always the same value, which is why both are returned: a HEIC named
@@ -2352,27 +2394,147 @@ fn placeholder_naming_line(file_name: &str, ext_kind: SrcKind) -> String {
 /// whether anything downstream needs to notice. Emits the same honesty line the chokepoint does,
 /// through the same capped family and the same per-path key — so a file that is re-classified here
 /// says it once, and never says it twice if the folder is later rescanned.
+///
+/// Open-time check (2 November): this is [`shot_by_bytes`] with a write-back, so its answer also
+/// reaches the session table and survives the name-only rescans.
 pub fn reclassify_hydrated(shot: &mut Shot) -> bool {
-    let Some(path) = shot.jpg.clone() else { return false };
-    // v1.0.0-rc TAIL 3 (verifier Y1): the kind of the FILE, which is not always the kind of the
-    // SHOT. For a passenger the shot's `kind` describes the RAW, so the file's last-known kind is
-    // "undecodable" — the only thing that could have made it a passenger in the first place.
-    let file_kind = if shot.has_jpg { shot.kind } else { SrcKind::Unsupported };
-    let (file_now, sniffed) = scan_classify(file_kind, false, || read_head(&path), heic_scan_kind_here);
-    // …and the SHOT's state comes from the same mint the scan uses, never from the sniff alone.
-    let (kind, has_jpg) = mint_finished(Some(file_now), shot.has_raw);
-    if kind == shot.kind && has_jpg == shot.has_jpg && sniffed.is_none() {
-        return false;
+    let now = match by_bytes_with(shot, read_head, file_is_cloud_placeholder) {
+        std::borrow::Cow::Owned(now) => now,
+        std::borrow::Cow::Borrowed(_) => return false,
+    };
+    let changed = now.kind != shot.kind || now.has_jpg != shot.has_jpg;
+    take_checked_kind(shot, &now);
+    changed
+}
+
+/// Open-time check (2 November): what each misnamed file's bytes said this session, by path. Only
+/// paths whose bytes disagreed at least once are here (about 150 B each); a later agreeing read
+/// overwrites the entry. Never read during classification, so a scan's answer does not depend on
+/// what ran before it: the app applies it with [`BytesLearned`] and [`learned_from_bytes`].
+type LearnedTable = std::collections::HashMap<PathBuf, (SrcKind, Option<SrcKind>)>;
+static BYTES_LEARNED: std::sync::Mutex<Option<LearnedTable>> = std::sync::Mutex::new(None);
+/// Lets a folder with no misnamed files skip the lock on every check and every tick.
+static BYTES_LEARNED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn remember_bytes(path: &Path, stamped: SrcKind, sniffed: Option<SrcKind>) {
+    use std::sync::atomic::Ordering;
+    if sniffed.is_none() && !BYTES_LEARNED_ANY.load(Ordering::Acquire) {
+        return;
     }
-    let changed = kind != shot.kind || has_jpg != shot.has_jpg;
-    shot.kind = kind;
-    shot.has_jpg = has_jpg;
-    shot.sniffed = sniffed;
+    let mut g = BYTES_LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let table = g.get_or_insert_with(Default::default);
+    if sniffed.is_some() {
+        table.insert(path.to_path_buf(), (stamped, sniffed));
+        BYTES_LEARNED_ANY.store(true, Ordering::Release);
+    } else if let Some(entry) = table.get_mut(path) {
+        *entry = (stamped, None);
+    }
+}
+
+/// The table's answer for one shot, re-minted: `None` when the shot has no entry or already agrees.
+fn minted_from_entry(shot: &Shot, entry: (SrcKind, Option<SrcKind>)) -> Option<Shot> {
+    let (stamped, sniffed) = entry;
+    let (kind, has_jpg) = mint_finished(Some(stamped), shot.has_raw);
+    if kind == shot.kind && has_jpg == shot.has_jpg && sniffed == shot.sniffed {
+        return None;
+    }
+    Some(Shot { kind, has_jpg, sniffed, ..shot.clone() })
+}
+
+/// The three fields the bytes decide. Everything else about a shot (name, paths, id, cloud flag)
+/// comes from its name and stays, so ratings, marks, undo and the order are untouched.
+pub fn take_checked_kind(into: &mut Shot, from: &Shot) {
+    into.kind = from.kind;
+    into.has_jpg = from.has_jpg;
+    into.sniffed = from.sniffed;
+}
+
+/// True once any file this session has turned out to be misnamed. One atomic load, for the tick.
+pub fn bytes_learned_any() -> bool {
+    BYTES_LEARNED_ANY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// What a reader already learned about this shot's file, with no file access. `None` when nothing
+/// was learned or the shot already says it.
+pub fn learned_from_bytes(shot: &Shot) -> Option<Shot> {
+    if !bytes_learned_any() {
+        return None;
+    }
+    let path = shot.jpg.as_deref()?;
+    let g = BYTES_LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = *g.as_ref()?.get(path)?;
+    drop(g);
+    minted_from_entry(shot, entry)
+}
+
+/// One snapshot of the session table, so a list install corrects the live list and the incoming
+/// scan from the same answers even while workers keep recording.
+pub struct BytesLearned(LearnedTable);
+
+impl BytesLearned {
+    /// `None` while no file this session has been misnamed: the ordinary case, and free.
+    pub fn snapshot() -> Option<Self> {
+        if !bytes_learned_any() {
+            return None;
+        }
+        let g = BYTES_LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().filter(|t| !t.is_empty()).map(|t| Self(t.clone()))
+    }
+
+    pub fn corrected(&self, shot: &Shot) -> Option<Shot> {
+        let entry = *self.0.get(shot.jpg.as_deref()?)?;
+        minted_from_entry(shot, entry)
+    }
+}
+
+/// Open-time check (2 November): the one check a reader runs before it opens a finished file. The
+/// scan no longer reads single names, so the shot may carry only what the name says; this reads the
+/// file's first 32 bytes and answers through the scan's own rules ([`scan_classify`] with its HEIC
+/// gate, then [`mint_finished`]). The baseline is the NAME's kind, never the shot's, so `sniffed`
+/// keeps meaning "the bytes disagree with the name" and a corrected shot comes back unchanged.
+///
+/// It reads only what a reader would read, or what the cloud rule allows:
+///   * a RAW-only shot and a passenger: nothing, their picture is the RAW;
+///   * a sole file whose name says unsupported: nothing if the scan flagged it or it is online-only
+///     right now, because a visible tile's thumbnail job reaches here with no cloud check of its own;
+///   * a finished picture: its file, whatever the shot-level flag says, because that flag may
+///     describe only the RAW and the caller's own cloud gate has already allowed this read.
+///
+/// If the bytes would make a pair's file a passenger while its RAW is online-only right now, the
+/// shot comes back unchanged and nothing is recorded, so no prefetch can download that RAW.
+pub fn shot_by_bytes(shot: &Shot) -> std::borrow::Cow<'_, Shot> {
+    by_bytes_with(shot, read_head, file_is_cloud_placeholder)
+}
+
+fn by_bytes_with<'a>(
+    shot: &'a Shot,
+    read: impl FnOnce(&Path) -> Option<Vec<u8>>,
+    is_cloud: impl Fn(&Path) -> bool,
+) -> std::borrow::Cow<'a, Shot> {
+    use std::borrow::Cow;
+    let Some(path) = shot.jpg.as_deref() else { return Cow::Borrowed(shot) };
+    if !shot.has_jpg && (shot.has_raw || shot.cloud_placeholder || is_cloud(path)) {
+        return Cow::Borrowed(shot);
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let Some(name_kind) = finished_name_kind(&ext, heic_scan_kind_here) else {
+        return Cow::Borrowed(shot);
+    };
+    let Some(head) = read(path) else { return Cow::Borrowed(shot) };
+    let (stamped, sniffed) = scan_classify(name_kind, false, || Some(head), heic_scan_kind_here);
+    let (kind, has_jpg) = mint_finished(Some(stamped), shot.has_raw);
+    if shot.has_jpg && !has_jpg && shot.raw.as_deref().is_some_and(&is_cloud) {
+        return Cow::Borrowed(shot);
+    }
+    remember_bytes(path, stamped, sniffed);
     if let Some(bytes_say) = sniffed {
         let shown = sanitize_one_line(path.file_name().and_then(|s| s.to_str()).unwrap_or_default());
-        note_sniff_disagreement(&path, &shown, bytes_say, file_now, file_kind);
+        note_sniff_disagreement(path, &shown, bytes_say, stamped, name_kind);
     }
-    changed
+    if kind == shot.kind && has_jpg == shot.has_jpg && sniffed == shot.sniffed {
+        return Cow::Borrowed(shot);
+    }
+    Cow::Owned(Shot { kind, has_jpg, sniffed, ..shot.clone() })
 }
 
 /// v1.0.0-rc TAIL (skeptic B, Y1 + Y2): the ONE place the disagreement line is parked, so the
@@ -2584,6 +2746,9 @@ pub struct FolderCatalogue {
     dir: PathBuf,
     entries: Vec<CatalogueEntry>,
     heads: std::collections::HashMap<PathBuf, Option<Vec<u8>>>,
+    /// Open-time check (2 November): the name group of the photo being opened. It stays for every
+    /// later stage of this opening, so that photo classifies the same at each one.
+    wanted: std::collections::HashSet<String>,
     touched: std::collections::HashSet<PathBuf>,
     changed: std::collections::HashSet<PathBuf>,
     simple_keys: std::cell::Cell<Option<bool>>,
@@ -2608,13 +2773,14 @@ impl FolderCatalogue {
             }
         }
         scan_io::check_cancelled(&cancelled)?;
-        Ok(Self { dir: dir.to_path_buf(), entries, heads: std::collections::HashMap::new(), touched: std::collections::HashSet::new(), changed: std::collections::HashSet::new(), simple_keys: std::cell::Cell::new(None), enumerate_ms: start.elapsed().as_millis() })
+        Ok(Self { dir: dir.to_path_buf(), entries, heads: std::collections::HashMap::new(), wanted: std::collections::HashSet::new(), touched: std::collections::HashSet::new(), changed: std::collections::HashSet::new(), simple_keys: std::cell::Cell::new(None), enumerate_ms: start.elapsed().as_millis() })
     }
 
     pub fn requested_shot(&mut self, path: &Path, cancelled: impl Fn() -> bool + Sync) -> std::io::Result<Option<Shot>> {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { return Ok(None) };
         if path.parent() != Some(self.dir.as_path()) || is_appledouble_sidecar(stem)
             || (!self.has_simple_keys() && (stem.contains('.') || stem.contains('('))) { return Ok(None); }
+        self.wanted.insert(stem.to_owned());
         let stems = std::collections::HashSet::from([stem.to_owned()]);
         let scan = scan_catalogue_subset(self, Some(1), &cancelled, Some(&stems))?;
         Ok(scan.shots.into_iter().find(|s| s.jpg.as_deref() == Some(path) || s.raw.as_deref() == Some(path)))
@@ -2715,7 +2881,8 @@ fn scan_folder_with_readers(
 }
 
 /// Resolve only the opened file's complete same-stem group, using the normal
-/// content classification, pairing and cloud gates. Other files are listed but
+/// classification, pairing and cloud gates (its bytes are read only if the stem is
+/// shared by two or more finished files). Other files are listed but
 /// never stat'ed or opened. Ambiguous dotted rating namespaces defer to the full
 /// scan: an early picture must never borrow another photo's persisted edits.
 pub fn scan_requested_shot(
@@ -2914,33 +3081,7 @@ fn scan_catalogue_subset(
             if let Some(m) = entry_meta { metadata.insert(p.clone(), m); }
             slot.0.push(p); // collect EVERY same-stem RAW (was `= Some(p)`, which dropped all but the last)
         } else {
-            let kind = if JPEG_EXTS.contains(&e) {
-                Some(SrcKind::Jpeg)
-            } else if PNG_EXTS.contains(&e) {
-                Some(SrcKind::Png)
-            } else if TIFF_EXTS.contains(&e) {
-                Some(SrcKind::Tiff)
-            } else if WEBP_EXTS.contains(&e) {
-                Some(SrcKind::Webp)
-            } else if HEIC_EXTS.contains(&e) {
-                // Decodable via the OS codec — WIC on Windows, Image I/O (CGImageSource) on macOS
-                // (v0.9.9). A badge-only Unsupported on platforms with no HEVC/HEIF system decoder.
-                // v0.8.99 (H3b): on WINDOWS that is now a fact, not an assumption — the Store
-                // HEVC/HEIF Image Extension is not shipped with Windows, so the codec registry is
-                // asked (once per scan, lazily). macOS needs no such gate: Image I/O decodes HEIC
-                // natively with nothing to install, so it short-circuits to "decodable".
-                Some(*heic_kind.get_or_insert_with(heic_scan_kind_here))
-            } else if JXL_EXTS.contains(&e) {
-                Some(SrcKind::Jxl)
-            } else if BMP_EXTS.contains(&e) {
-                Some(SrcKind::Bmp)
-            } else if GIF_EXTS.contains(&e) {
-                Some(SrcKind::Gif)
-            } else if UNSUPPORTED_IMG_EXTS.contains(&e) {
-                Some(SrcKind::Unsupported)
-            } else {
-                None // not an image file — ignore
-            };
+            let kind = finished_name_kind(e, || *heic_kind.get_or_insert_with(heic_scan_kind_here));
             if let Some(ext_kind) = kind {
                 if let Some(m) = entry_meta { metadata.insert(p.clone(), m); }
                 let placeholder = cloud_paths.contains(&p);
@@ -2950,7 +3091,23 @@ fn scan_catalogue_subset(
     }
     let enumerate_ms = catalogue.enumerate_ms + phase.elapsed().as_millis();
     let phase = std::time::Instant::now();
-    let unread: Vec<_> = candidates.iter().filter(|c| !catalogue.heads.contains_key(&c.0)).cloned().collect();
+    // Open-time check (2 November): the scan reads a file only where the bytes decide the listing
+    // itself, a name shared by two or more finished files (which file a RAW pairs with, and the
+    // split shots), or where the photo is being opened right now. Everything else takes the name
+    // here (rule (3) of `scan_classify`) and is checked by `shot_by_bytes` when a reader opens it.
+    // The count is a pure function of the listing, and subsets keep whole name groups, so every
+    // opening stage gets the same answer.
+    let unread: Vec<_> = {
+        let mut finished_per_stem: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for c in &candidates {
+            *finished_per_stem.entry(file_stem_key(&c.0)).or_default() += 1;
+        }
+        let read_now = |p: &Path| {
+            let stem = file_stem_key(p);
+            finished_per_stem.get(stem).is_some_and(|&n| n >= 2) || catalogue.wanted.contains(stem)
+        };
+        candidates.iter().filter(|c| read_now(&c.0) && !catalogue.heads.contains_key(&c.0)).cloned().collect()
+    };
     let header_reads = unread.iter().filter(|c| !c.2).count();
     let readers = readers.unwrap_or_else(|| scan_io::reader_count(header_reads));
     let new_heads = scan_io::read_heads(&unread, readers, is_cancelled)?;
@@ -2968,16 +3125,21 @@ fn scan_catalogue_subset(
         scan_io::check_cancelled(is_cancelled)?;
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
         let slot = map.entry(stem).or_default();
-        // v1.0.0-rc (BYTES OVER NAMES): THE CHOKEPOINT. This is the single classification
-        // authority in the tree — nine subsystems read the `SrcKind` minted here — so it is
-        // the one place the file's own bytes get a vote. `scan_classify` states the three
-        // rules; the two closures are what make rule (1) provable and rule (3) cheap.
+        // v1.0.0-rc (BYTES OVER NAMES): the scan's half of the classification. Nine subsystems read
+        // the `SrcKind` minted here, and `scan_classify` states the three rules; the two closures
+        // are what make rule (1) provable and rule (3) cheap. Open-time check (2 November): a file
+        // with no head (a single name that isn't being opened) takes its name; `shot_by_bytes`
+        // gives the bytes their vote at the reader, and what was read here goes to the same table.
+        let had_head = head.is_some();
         let (kind, disagreed) = scan_classify(
             ext_kind,
             placeholder,
             || head,
             || *heic_kind.get_or_insert_with(heic_scan_kind_here),
         );
+        if had_head && !placeholder {
+            remember_bytes(&p, kind, disagreed);
+        }
         let shown = || sanitize_one_line(p.file_name().and_then(|s| s.to_str()).unwrap_or_default());
         let mut verdict = NoteVerdict::Repeat;
         if let Some(sniffed) = disagreed {
@@ -4202,7 +4364,15 @@ pub fn reference_frame_rgba(shot: &Shot, max_dim: u32) -> Result<(Vec<u8>, u32, 
 /// (header-only). Returns
 /// `None` for a RAW-only shot (no finished-image path — its embedded preview is small) and for
 /// unsupported shots.
+///
+/// Open-time check (2 November): the bytes are checked first, before the `!has_jpg` answer, because
+/// this is the probe every settled photo gets with no kind gate: a JPEG named `.avif` is found here.
 pub fn source_dimensions(shot: &Shot) -> Option<(u32, u32)> {
+    source_dimensions_checked(&shot_by_bytes(shot))
+}
+
+/// [`source_dimensions`] for a shot that has already been through [`shot_by_bytes`].
+fn source_dimensions_checked(shot: &Shot) -> Option<(u32, u32)> {
     // v1.0.0-rc MICRO-TAIL (A-Y3b): a passenger is not the picture, so it has no dimensions to
     // report — the same `None` a RAW-only shot has always answered here.
     if !shot.has_jpg {
@@ -4460,7 +4630,14 @@ pub fn develop_raw_rgb_full(shot: &Shot) -> Result<(Vec<u8>, u32, u32)> {
 /// raw container (CR3). Public so the native nvJPEG path can feed the GPU decoder
 /// the exact same source the CPU tiers decode (wraps the private [`jpeg_source`]).
 pub fn jpeg_bytes(shot: &Shot) -> Result<Vec<u8>> {
-    jpeg_source(shot)
+    // Open-time check (2 November): the GPU decoder admits on the shot it was handed, which may
+    // carry only the name. This refusal sends it to the CPU decoder (`DecodeError::Unsupported`),
+    // so its parser never sees bytes that aren't a JPEG.
+    let checked = shot_by_bytes(shot);
+    if !checked.is_jpeg_source() {
+        bail!("not a JPEG by its bytes");
+    }
+    jpeg_source(&checked)
 }
 
 // ───────────────────────────────────── EXIF ──────────────────────────────────
@@ -4654,6 +4831,10 @@ pub fn read_orientation(shot: &Shot, want_raw: bool) -> Option<u32> {
         let p = shot.raw.as_deref()?;
         return apply::sidecar_orientation(p, true).map(u32::from).or_else(|| raw_orientation(p));
     }
+    // Open-time check (2 November): a HEIC named `.jpg` needs its real kind for the turns its
+    // decoder consumes, and a passenger needs the RAW's orientation.
+    let checked = shot_by_bytes(shot);
+    let shot: &Shot = &checked;
     // v1.0.0-rc TAIL 3 (verifier R1 — this one showed the user a sideways photograph): `has_jpg`,
     // not `jpg.is_some()`. A passenger is not the picture, so the picture's orientation is the
     // RAW's — the arm above, which this fn's own doc already reserves for a RAW-only shot.
@@ -4680,6 +4861,8 @@ pub fn read_orientation(shot: &Shot, want_raw: bool) -> Option<u32> {
 /// The native app caches the residual from `read_orientation`; Apply derives consumed turns
 /// from that cached residual and the fresh absolute tag, without a second decoder probe.
 pub fn decoder_consumed_turns(shot: &Shot) -> u8 {
+    let checked = shot_by_bytes(shot); // Open-time check (2 November), as `read_orientation`.
+    let shot: &Shot = &checked;
     // v1.0.0-rc TAIL 3 (verifier Y2): a passenger was never handed to a decoder, so no decoder
     // consumed any turns for it — the RAW-only answer (0) is the true one.
     match shot.jpg.as_deref().filter(|_| shot.has_jpg) {
@@ -4702,7 +4885,7 @@ fn decoder_consumed_turns_at(shot: &Shot, path: &Path) -> u8 {
     if orientation_to_turns(o) & 1 == 0 {
         return 0;
     }
-    let (Some(stored), Some(decoded)) = (exif_stored_dims(path), source_dimensions(shot)) else {
+    let (Some(stored), Some(decoded)) = (exif_stored_dims(path), source_dimensions_checked(shot)) else {
         return 0;
     };
     decoder_consumed_turns_from_dims(o, stored, decoded)
@@ -5672,6 +5855,10 @@ fn tiff_icc(path: &Path) -> Option<Vec<u8>> {
 /// profile-less file, a RAW-only shot's embedded preview, or an unrecognised profile all fall back to
 /// sRGB. (RAW *develop* output is sRGB regardless — the caller passes `Gamut::Srgb` and never calls this.)
 pub fn shot_source_gamut(shot: &Shot) -> falcon_color::Gamut {
+    // Open-time check (2 November): a Display P3 PNG named `.jpg` must take the PNG door. The JPEG
+    // door would bail on its first bytes and answer sRGB (the v0.8.140 C2 bug, by a filename).
+    let checked = shot_by_bytes(shot);
+    let shot: &Shot = &checked;
     // v1.0.0-rc MICRO-TAIL (A-Y3b): `has_jpg` — a RAW carrying an undecodable sibling is
     // rendering its RAW's embedded preview, which is sRGB, and the sibling's profile describes a
     // picture nobody is looking at.
@@ -5884,6 +6071,10 @@ fn note_profile_missed_tolerance(tag: &ColorTag, r: &falcon_color::GamutResoluti
 pub fn exif_rows(shot: &Shot, turns: u8) -> Vec<(String, String)> {
     use exif::{In, Tag};
 
+    // Open-time check (2 November): the panel names the real format and a passenger's RAW from its
+    // first build. The size lookups below use `source_dimensions_checked` on this same answer.
+    let checked = shot_by_bytes(shot);
+    let shot: &Shot = &checked;
     let mut rows: Vec<(String, String)> = Vec::new();
     let raw_sz = shot.raw.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
     let jpg_sz = shot.jpg.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
@@ -5911,7 +6102,7 @@ pub fn exif_rows(shot: &Shot, turns: u8) -> Vec<(String, String)> {
             // exactly those, while a readable EXIF-less file gets its honest panel IMMEDIATELY
             // instead of 5 blank retries (~11 s) first. (A RAW-only shot has no finished path →
             // `source_dimensions` is None → empty → retry, unchanged — real raws carry EXIF.)
-            if let Some((w, h)) = source_dimensions(shot) {
+            if let Some((w, h)) = source_dimensions_checked(shot) {
                 // Same oriented-swap rule as the EXIF-present Dimensions fallback below.
                 let (w, h) = if turns & 1 == 1 { (h, w) } else { (w, h) };
                 rows.push(("Dimensions".to_string(), format!("{w} × {h}")));
@@ -5999,7 +6190,7 @@ pub fn exif_rows(shot: &Shot, turns: u8) -> Vec<(String, String)> {
     // row happened to look right for the wrong reason (the double-applied orientation made `swap`
     // true); with the rotation fixed, reading the tags would print the transpose of what the user
     // is looking at. `source_dimensions` is the frame the tiers actually decode, on both platforms.
-    let heic_dims = (shot.kind == SrcKind::Heic).then(|| source_dimensions(shot)).flatten();
+    let heic_dims = (shot.kind == SrcKind::Heic).then(|| source_dimensions_checked(shot)).flatten();
     if let Some((w, h)) = heic_dims {
         let (w, h) = if swap { (h, w) } else { (w, h) };
         rows.push(("Dimensions".to_string(), format!("{w} × {h}")));
@@ -6007,7 +6198,7 @@ pub fn exif_rows(shot: &Shot, turns: u8) -> Vec<(String, String)> {
         let (x, y) = (trim_quotes(&x).to_string(), trim_quotes(&y).to_string());
         let (x, y) = if swap { (y, x) } else { (x, y) };
         rows.push(("Dimensions".to_string(), format!("{x} × {y}")));
-    } else if let Some((w, h)) = source_dimensions(shot) {
+    } else if let Some((w, h)) = source_dimensions_checked(shot) {
         // EXIF PixelXDimension is optional (edited JPGs, all PNG/TIFF) — fall back to the header size.
         let (w, h) = if swap { (h, w) } else { (w, h) };
         rows.push(("Dimensions".to_string(), format!("{w} × {h}")));
@@ -6670,12 +6861,15 @@ fn decode_source_rgb_lane(
     scale_to: Option<u32>,
     lane: Lane,
 ) -> Result<Option<(Vec<u8>, u32, u32, FrameSource, DecodeRoute)>> {
+    // Open-time check (2 November): the lane follows the bytes, checked once for this decode.
+    let checked = shot_by_bytes(shot);
+    let shot: &Shot = &checked;
     if !matches!(shot.kind, SrcKind::Heic) {
         // v0.8.171: a non-HEIC shot can never be superseded — nothing but the hardware HEIC lane
         // has a mid-decode abort — so this arm is `Some` unconditionally, which is the byte-pin
         // that keeps every other format's path unchanged.
-        let (rgb, w, h) = decode_source_rgb(shot, scale_to)?;
-        return Ok(Some((rgb, w, h, FrameSource::MainImage, DecodeRoute::Cpu)));
+        let (px, w, h) = decode_checked_keep(shot, scale_to, Keep::NONE)?;
+        return Ok(Some((px.into_rgb8()?, w, h, FrameSource::MainImage, DecodeRoute::Cpu)));
     }
     let path = shot.jpg.as_ref().context("HEIC shot has no path")?;
     decode_heic_lane(path, scale_to, lane)
@@ -6702,7 +6896,15 @@ fn decode_source_rgb(shot: &Shot, scale_to: Option<u32>) -> Result<(Vec<u8>, u32
 /// channel and the sample depth the FILE holds instead of the flattened RGB8 every other caller
 /// wants. [`Keep::NONE`] -- what [`decode_source_rgb`] passes, and what every tier in the app
 /// reaches this dispatch with -- takes each arm's shipped path; see [`Keep`].
+///
+/// Open-time check (2 November): every pixel tier comes through here or the lane above, so a PNG
+/// named `.JPG` decodes as a PNG the first time any tier touches it, and nothing latches a failure.
 fn decode_source_keep(shot: &Shot, scale_to: Option<u32>, keep: Keep) -> Result<(Pixels, u32, u32)> {
+    decode_checked_keep(&shot_by_bytes(shot), scale_to, keep)
+}
+
+/// [`decode_source_keep`]'s dispatch, for a shot that has already been through [`shot_by_bytes`].
+fn decode_checked_keep(shot: &Shot, scale_to: Option<u32>, keep: Keep) -> Result<(Pixels, u32, u32)> {
     match shot.kind {
         SrcKind::Jpeg => {
             // JPEG has no alpha channel and this decoder is 8-bit, so `keep` has nothing to ask
@@ -13659,8 +13861,8 @@ mod bytes_over_names {
     use super::{
         bmff_image_kind, decode_full_rgb, jpeg_sof_dims, placeholder_naming_line,
         read_head, scan_classify, scan_folder, sniff_disagreement_line, sniff_kind, source_dimensions,
-        browse_frame_or_superseded, browse_frame_rgba, shot_source_gamut, Lane, RotApplyPlan, Shot,
-        SrcKind, SNIFF_HEAD_BYTES,
+        browse_frame_or_superseded, browse_frame_rgba, by_bytes_with, learned_from_bytes,
+        shot_by_bytes, shot_source_gamut, Lane, RotApplyPlan, Shot, SrcKind, SNIFF_HEAD_BYTES,
     };
     use std::path::{Path, PathBuf};
 
@@ -13929,17 +14131,22 @@ mod bytes_over_names {
     /// The pixel assertions are exact because PNG is lossless — a flat or garbage buffer cannot
     /// pass them.
     ///
-    /// L28 — REDDENED BY: reverting the chokepoint in `scan_folder_counted` to
-    /// `slot.1.push((p, ext_kind))` (the shot is stamped `Jpeg` and `jpeg-decoder` refuses the PNG
-    /// signature at every tier: "invalid JPEG format: first two bytes are not an SOI marker").
+    /// Open-time check (2 November): the scan only names this file now, so the shot under test is
+    /// the one a never-viewed photo has, and every decode below proves its reader checks the bytes.
+    ///
+    /// L28 — REDDENED BY: removing `shot_by_bytes` from `decode_source_keep` or
+    /// `decode_source_rgb_lane` (`jpeg-decoder` refuses the PNG signature at every tier: "invalid
+    /// JPEG format: first two bytes are not an SOI marker"), or from `source_dimensions` (`None`).
     #[test]
     fn a_png_named_jpg_opens_at_every_tier() {
         let dir = fresh_dir("row1");
         place(&dir, "png_named_jpg.jpg", "53d879f01a3f481c.JPG");
         let shot = only_shot(&dir);
 
-        assert_eq!(shot.kind, SrcKind::Png, "the scan classifies by the BYTES");
-        assert_eq!(source_dimensions(&shot), Some((16, 16)), "the header probe follows the kind");
+        assert_eq!((shot.kind, shot.sniffed), (SrcKind::Jpeg, None), "the scan goes by the NAME");
+        assert_eq!(source_dimensions(&shot), Some((16, 16)), "the header probe checks the bytes");
+        let checked = shot_by_bytes(&shot);
+        assert_eq!((checked.kind, checked.sniffed), (SrcKind::Png, Some(SrcKind::Png)));
 
         for lane in [Lane::Fast, Lane::Thumb] {
             let f = browse_frame_or_superseded(&shot, 256, false, lane)
@@ -13965,18 +14172,30 @@ mod bytes_over_names {
     /// round a real JPEG that happened to be named `.png` could never reach the hardware decoder —
     /// the silent half of the same bug, and the reason the fix is "the bytes decide", not "PNG wins".
     ///
-    /// L28 — REDDENED BY: the same chokepoint revert as row 1 (the shot is stamped `Png`,
-    /// `is_jpeg_source()` is false, and the GPU lane declines a file it can decode).
+    /// Open-time check (2 November): the scan only names the file, so the GPU lane opens up once a
+    /// reader has checked it. The mirror is the safety half: the GPU feed, handed a shot that says
+    /// JPEG, never returns a PNG's bytes.
+    ///
+    /// L28 — REDDENED BY: removing the `is_jpeg_source` refusal from `jpeg_bytes` (the PNG's bytes
+    /// come back), or its `shot_by_bytes` call (the JPEG named `.png` is refused).
     #[test]
     fn a_jpeg_named_png_admits_the_gpu_lane() {
         let dir = fresh_dir("row2");
         place(&dir, "jpeg_named_png.png", "export.png");
         let shot = only_shot(&dir);
-        assert_eq!(shot.kind, SrcKind::Jpeg);
-        assert!(shot.is_jpeg_source(), "the nvJPEG / ROI-YUV admission predicate reads the BYTES");
+        assert_eq!(shot.kind, SrcKind::Png, "the scan goes by the NAME");
+        assert!(shot_by_bytes(&shot).is_jpeg_source(), "the nvJPEG / ROI-YUV predicate, once checked");
+        let bytes = super::jpeg_bytes(&shot).expect("the GPU feed takes a JPEG by its bytes");
+        assert!(bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
         assert_eq!(source_dimensions(&shot), Some((16, 16)));
         let (_, w, h) = decode_full_rgb(&shot).expect("and the CPU spine takes it as a JPEG");
         assert_eq!((w, h), (16, 16));
+
+        // The mirror: a shot that says JPEG holding a PNG.
+        place(&dir, "png_named_jpg.jpg", "liar.JPG");
+        let liar = scan_folder(&dir).unwrap().into_iter().find(|s| s.name == "liar").unwrap();
+        assert!(liar.is_jpeg_source(), "the GPU lane admits on this answer");
+        assert!(super::jpeg_bytes(&liar).is_err(), "so the feed itself refuses, and the CPU decodes it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13999,6 +14218,9 @@ mod bytes_over_names {
         let neighbour = shots.iter().find(|s| s.name == "neighbour").expect("the neighbour");
 
         assert_eq!(junk.kind, SrcKind::Jpeg, "an unknown magic keeps the NAME's answer");
+        let _ = drain_decode_notes();
+        assert_eq!(shot_by_bytes(junk).kind, SrcKind::Jpeg, "…at the scan and when a reader checks it");
+        assert!(drain_decode_notes().is_empty(), "and the check has nothing to say about it");
         assert!(!junk.is_unsupported(), "and is not silently re-badged as unsupported");
         assert_eq!(source_dimensions(junk), None);
         assert!(decode_full_rgb(junk).is_err(), "it still fails — honestly");
@@ -14014,8 +14236,9 @@ mod bytes_over_names {
         assert!(about_junk.is_empty(), "an unknown container is silent, not chatty: {about_junk:?}");
 
         // The neighbour is untouched: no shared latch, no shared classification, nothing borrowed.
-        assert_eq!(neighbour.kind, SrcKind::Png);
+        assert_eq!(neighbour.kind, SrcKind::Jpeg, "a single name is only named at the scan");
         assert_eq!(decode_full_rgb(neighbour).map(|(_, w, h)| (w, h)).unwrap(), (16, 16));
+        assert_eq!(shot_by_bytes(neighbour).kind, SrcKind::Png);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14025,8 +14248,12 @@ mod bytes_over_names {
     /// deliverable was demoted to a split shot. The stem rule itself is unchanged (pairing is by
     /// stem, which is a user/camera convention and not a format claim); only the RANK moves.
     ///
-    /// L28 — REDDENED BY: the chokepoint revert (both finished siblings then rank 8, the tie breaks
-    /// on path order, and `IMG_1.JPG` sorts before `IMG_1.jpeg` — so the impostor takes the slot).
+    /// Open-time check (2 November): this is why a name shared by two finished files is still read
+    /// up front. The pairing can't wait for a viewer.
+    ///
+    /// L28 — REDDENED BY: skipping the up-front read for stems with two or more finished files (both
+    /// siblings then rank 8, the tie breaks on path order, and `IMG_1.JPG` sorts before `IMG_1.jpeg`
+    /// — so the impostor takes the slot).
     #[test]
     fn pairing_ranks_the_bytes_not_the_name() {
         let dir = fresh_dir("row5");
@@ -14052,14 +14279,19 @@ mod bytes_over_names {
     /// the header is untouched — the user keeps seeing `53d879f01a3f481c.JPG`, which is what the file
     /// is actually called — while the FORMAT noun tells the truth.
     ///
+    /// Open-time check (2 November): a never-viewed tile badges its name; the owner accepted that.
+    /// The label is right once a reader has checked the file.
+    ///
     /// L28 — REDDENED BY: reverting `Shot::finished_format` to its extension table (the badge reads
-    /// `JPG` on a PNG again). It is also reddened by the chokepoint revert, because the label is now
-    /// derived from the kind that revert would get wrong.
+    /// `JPG` on a checked PNG), or by removing `kind` from what `by_bytes_with` stamps.
     #[test]
     fn badge_and_panel_name_the_bytes() {
         let dir = fresh_dir("row6");
         place(&dir, "png_named_jpg.jpg", "53d879f01a3f481c.JPG");
-        let shot = only_shot(&dir);
+        let named = only_shot(&dir);
+        assert_eq!(named.badge_label(), "JPG", "before any reader has looked, the name's format");
+        let checked = shot_by_bytes(&named);
+        let shot: &Shot = &checked;
         assert_eq!(shot.finished_format().as_deref(), Some("PNG"), "the info panel's Format row");
         assert_eq!(shot.badge_label(), "PNG", "the tile badge");
         assert_eq!(
@@ -14084,8 +14316,11 @@ mod bytes_over_names {
     /// 500-file folder logs 500 facts and not 500 × 18 workers, and a rescan of the same folder does
     /// not repeat itself.
     ///
-    /// L28 — REDDENED BY: deleting the `note_once(…)` call at the chokepoint (nothing is said at all),
-    /// or by keying it on something other than the path — a per-format key would report the first
+    /// Open-time check (2 November): the line now comes when a reader opens the file, not at the scan.
+    ///
+    /// L28 — REDDENED BY: deleting the `note_sniff_disagreement` call in `by_bytes_with` (nothing is
+    /// said at all), by the scan reading single names again (the line appears at the scan), or by
+    /// keying it on something other than the path — a per-format key would report the first
     /// mismatched file in a folder and stay silent about the rest.
     #[test]
     fn the_disagreement_speaks_once_per_file() {
@@ -14097,6 +14332,10 @@ mod bytes_over_names {
 
         let shots = scan_folder(&dir).unwrap();
         assert_eq!(shots.len(), 2);
+        assert!(drain_decode_notes().is_empty(), "the scan read neither file, so it has nothing to say");
+        for s in &shots {
+            let _ = shot_by_bytes(s);
+        }
         let mine: Vec<String> =
             drain_decode_notes().into_iter().filter(|l| l.starts_with("bon_row7_")).collect();
         assert_eq!(
@@ -14105,11 +14344,14 @@ mod bytes_over_names {
             "exactly one line, for the one file whose bytes and name disagree"
         );
 
-        // A second scan of the same folder repeats nothing.
+        // A second check and a second scan of the same folder repeat nothing.
+        for s in &shots {
+            let _ = shot_by_bytes(s);
+        }
         let _ = scan_folder(&dir).unwrap();
         let again: Vec<String> =
             drain_decode_notes().into_iter().filter(|l| l.starts_with("bon_row7_")).collect();
-        assert!(again.is_empty(), "once per file per session — a rescan is silent: {again:?}");
+        assert!(again.is_empty(), "once per file per session — a repeat is silent: {again:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14130,6 +14372,8 @@ mod bytes_over_names {
         let shots = scan_folder(kit).unwrap();
         assert!(shots.len() >= 18, "the standard testkit should hold at least its 18 shots");
         for s in &shots {
+            // Open-time check (2 November): the checked answer, or this row compares a name with itself.
+            let s = shot_by_bytes(s);
             let Some(p) = s.jpg.as_ref() else { continue };
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
             // The pre-round table, re-typed here on purpose: this row's whole job is to compare the
@@ -14155,14 +14399,14 @@ mod bytes_over_names {
     /// answers sRGB — so a Display-P3 PNG named `.jpg` was silently colour-managed as sRGB. That is
     /// exactly the v0.8.140 C2 bug this door was built to close, re-opened by a filename.
     ///
-    /// L28 — REDDENED BY: the chokepoint revert (the kind is `Jpeg`, the JPEG ICC door bails on the
-    /// missing SOI, and the gamut falls back to sRGB).
+    /// L28 — REDDENED BY: removing the check from `shot_source_gamut` (the kind stays `Jpeg`, the
+    /// JPEG ICC door bails on the missing SOI, and the gamut falls back to sRGB).
     #[test]
     fn the_colour_door_follows_the_sniff() {
         let dir = fresh_dir("row9");
         place(&dir, "p3_png_named_jpg.jpg", "wide_gamut.jpg");
         let shot = only_shot(&dir);
-        assert_eq!(shot.kind, SrcKind::Png);
+        assert_eq!(shot.kind, SrcKind::Jpeg, "the scan goes by the NAME; the door asks the bytes");
         assert_eq!(
             shot_source_gamut(&shot),
             falcon_color::Gamut::DisplayP3,
@@ -14171,37 +14415,173 @@ mod bytes_over_names {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Row 10 — **rotate-apply never opens a non-JPEG for write.** `RotApplyPlan::finished_is_jpeg`
-    /// (built at `main.rs:16851` from `shot.is_jpeg_source()` and nowhere else) is the ONLY gate on
-    /// the in-place arm at `apply.rs:998`, which opens the user's file `read+write` and patches its
-    /// EXIF. On a PNG named `.JPG` that arm was entered and was saved only by an INCIDENTAL SOI check
-    /// inside `locate_jpeg_orientation` — a write handle on a foreign file, opened before anything
-    /// looked at the bytes.
+    /// Row 10 — **rotate-apply never opens a non-JPEG for write.** Open-time check (2 November): a
+    /// never-viewed PNG named `.JPG` now reaches Apply with `finished_is_jpeg` true, so this row pins
+    /// the safety where it actually lives, at the apply layer against real PNG bytes (L32).
+    /// `check_rotation_write_access` runs `jpeg_route` on a read-only handle, and only a located JPEG
+    /// orientation is ever opened read+write. The file is read-only here, so a write probe fails the
+    /// run, and the row also compares its bytes.
     ///
-    /// L28 — REDDENED BY: the chokepoint revert (`is_jpeg_source()` becomes true and the plan routes
-    /// the PNG into `patch_jpeg_orientation`).
+    /// L28 — REDDENED BY: `jpeg_route` answering `JpegRoute::Patch` when the locate fails (the
+    /// read+write probe refuses the read-only original and the report is not ok).
     #[test]
     fn rotate_apply_never_opens_a_non_jpeg_for_write() {
         let dir = fresh_dir("row10");
-        place(&dir, "png_named_jpg.jpg", "53d879f01a3f481c.JPG");
-        let shot = only_shot(&dir);
+        let photo = place(&dir, "png_named_jpg.jpg", "53d879f01a3f481c.JPG");
+        let before = std::fs::read(&photo).unwrap();
+        let mut read_only = std::fs::metadata(&photo).unwrap().permissions();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&photo, read_only.clone()).unwrap();
+
         let plan = RotApplyPlan {
-            finished: shot.jpg.clone(),
-            finished_is_jpeg: shot.is_jpeg_source(), // the mirror of main.rs:16851
-            raw: shot.raw.clone(),
+            finished: Some(photo.clone()),
+            finished_is_jpeg: true, // what a never-viewed shot gives main.rs: its name says JPEG
+            raw: None,
             base_turns: 0,
             delta: 1,
         };
-        assert!(
-            !plan.finished_is_jpeg,
-            "the in-place EXIF patch (apply.rs:998) must not be reachable for PNG bytes"
-        );
-        // And the mirror: a genuine JPEG still takes the in-place route it has always taken.
-        let dir2 = fresh_dir("row10b");
-        place(&dir2, "jpeg_named_png.png", "real.jpg");
-        assert!(only_shot(&dir2).is_jpeg_source());
+        let report = super::apply_rotation(&plan);
+        assert!(report.ok, "the turn is saved: {:?}", report.finished_action);
+        assert_eq!(report.finished_action, super::SideAction::SidecarCreated, "beside the file, not in it");
+        assert!(dir.join("53d879f01a3f481c.JPG.xmp").is_file(), "the side file the non-JPEG arm uses");
+        assert_eq!(std::fs::read(&photo).unwrap(), before, "not one byte of the photo changed");
+
+        #[allow(clippy::permissions_set_readonly_false)]
+        read_only.set_readonly(false);
+        std::fs::set_permissions(&photo, read_only).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    // ══════════════════════════ the open-time check (2 November) ══════════════════════════
+
+    fn lone(dir: &Path, file: &str) -> Shot {
+        Shot {
+            id: 0,
+            name: "x".into(),
+            has_raw: false,
+            has_jpg: true,
+            raw: None,
+            jpg: Some(dir.join(file)),
+            kind: SrcKind::Jpeg,
+            cloud_placeholder: false,
+            sniffed: None,
+        }
+    }
+
+    /// **The check reads only what a reader would read, and never downloads.** Driven through
+    /// `by_bytes_with`, whose reader and cloud probe are injected. Paths are unique to this row, so
+    /// the session table can't be touched by a parallel row.
+    ///
+    /// L28 — REDDENED BY: removing the passenger guard, the sole-file placeholder guard or the live
+    /// `is_cloud` term of the sole arm (the panicking reader fires); adding a shot-level flag guard
+    /// for a finished picture (the RAW-online PNG stays `Jpeg`); removing the online-only RAW guard
+    /// (a passenger comes back while the RAW is online-only); or using `shot.kind` as the baseline
+    /// instead of the name (a corrected shot comes back Owned with `sniffed` `None`).
+    #[test]
+    fn the_open_time_check_reads_only_what_a_reader_would_read() {
+        use std::borrow::Cow;
+        let dir = fresh_dir("ot_reads");
+        let png = || Some(b"\x89PNG\r\n\x1a\n".to_vec());
+        let avif = || {
+            let mut v = vec![0u8, 0, 0, 24];
+            v.extend_from_slice(b"ftypavif\0\0\0\0mif1miaf");
+            Some(v)
+        };
+        let never = |_: &Path| -> Option<Vec<u8>> { panic!("this shot's file must not be opened") };
+        let local = |_: &Path| false;
+
+        // A passenger, a RAW-only shot, a sole .avif the scan flagged, and one online-only right now.
+        let passenger = Shot {
+            has_raw: true,
+            has_jpg: false,
+            raw: Some(dir.join("p.CR3")),
+            ..lone(&dir, "p.jpg")
+        };
+        assert!(matches!(by_bytes_with(&passenger, never, local), Cow::Borrowed(_)));
+        let raw_only = Shot { has_raw: true, has_jpg: false, raw: Some(dir.join("r.CR3")), jpg: None, ..lone(&dir, "r") };
+        assert!(matches!(by_bytes_with(&raw_only, never, local), Cow::Borrowed(_)));
+        let flagged = Shot { has_jpg: false, kind: SrcKind::Unsupported, cloud_placeholder: true, ..lone(&dir, "s.avif") };
+        assert!(matches!(by_bytes_with(&flagged, never, local), Cow::Borrowed(_)));
+        let gone_online = Shot { has_jpg: false, kind: SrcKind::Unsupported, ..lone(&dir, "t.avif") };
+        assert!(matches!(by_bytes_with(&gone_online, never, |_: &Path| true), Cow::Borrowed(_)));
+
+        // A finished picture is read exactly once, even when the shot's flag is set because only its
+        // RAW is online-only: the caller's own gate already allowed this read.
+        let reads = std::cell::Cell::new(0usize);
+        let raw_online = Shot {
+            has_raw: true,
+            raw: Some(dir.join("u.CR3")),
+            cloud_placeholder: true,
+            ..lone(&dir, "u.JPG")
+        };
+        let checked = by_bytes_with(&raw_online, |_| { reads.set(reads.get() + 1); png() }, local);
+        assert_eq!(reads.get(), 1);
+        assert_eq!((checked.kind, checked.has_jpg, checked.sniffed), (SrcKind::Png, true, Some(SrcKind::Png)));
+
+        // A failed read changes nothing, and an already corrected shot comes back as it is.
+        assert!(matches!(by_bytes_with(&lone(&dir, "v.JPG"), |_| None, local), Cow::Borrowed(_)));
+        let corrected = checked.into_owned();
+        assert!(matches!(by_bytes_with(&corrected, |_| png(), local), Cow::Borrowed(_)));
+
+        // Bytes that would make the picture the RAW while the RAW is online-only: unchanged, and
+        // nothing is remembered. With the RAW here, it becomes a passenger.
+        let held = Shot { has_raw: true, raw: Some(dir.join("w.CR3")), ..lone(&dir, "w.jpg") };
+        assert!(matches!(by_bytes_with(&held, |_| avif(), |_: &Path| true), Cow::Borrowed(_)));
+        assert!(learned_from_bytes(&held).is_none(), "nothing recorded for the declined flip");
+        let flipped = by_bytes_with(&held, |_| avif(), local);
+        assert_eq!((flipped.kind, flipped.has_jpg), (SrcKind::Jpeg, false), "a passenger");
+        assert_eq!(flipped.sniffed, Some(SrcKind::Unsupported));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A JPEG named `.avif` is checked when viewed.** `tick.rs` asks `source_dimensions` for every
+    /// settled photo with no kind gate, so that is the hook for a file the tiers skip by its name.
+    ///
+    /// L28 — REDDENED BY: moving the check in `source_dimensions` below the `!shot.has_jpg` answer
+    /// (`None`), or by dropping the sole-file arm from `by_bytes_with`.
+    #[test]
+    fn a_jpeg_named_avif_is_checked_when_viewed() {
+        let dir = fresh_dir("ot_avif");
+        place(&dir, "jpeg_named_png.png", "x.avif");
+        let shot = only_shot(&dir);
+        assert_eq!((shot.kind, shot.has_jpg), (SrcKind::Unsupported, false), "the scan goes by the NAME");
+        assert_eq!(source_dimensions(&shot), Some((16, 16)));
+        let learned = learned_from_bytes(&shot).expect("the check was recorded for the label");
+        assert_eq!((learned.kind, learned.has_jpg, learned.sniffed), (SrcKind::Jpeg, true, Some(SrcKind::Jpeg)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **What a reader learned stays for later lists.** A rescan only names files, so this table is
+    /// what stops it putting the name back. A later agreeing read overwrites a replaced file.
+    /// Outcomes only, so parallel rows can't interfere.
+    ///
+    /// L28 — REDDENED BY: `by_bytes_with` no longer calling `remember_bytes` (`None`), or dropping
+    /// its "overwrite an existing entry on agreement" arm (a stale `Png`).
+    #[test]
+    fn what_a_reader_learned_is_kept_for_later_lists() {
+        let dir = fresh_dir("ot_learned");
+        place(&dir, "png_named_jpg.jpg", "liar.JPG");
+        let photo = place(&dir, "jpeg_named_png.png", "honest.jpg");
+        let shots = scan_folder(&dir).unwrap();
+        let liar = shots.iter().find(|s| s.name == "liar").unwrap();
+        let honest = shots.iter().find(|s| s.name == "honest").unwrap();
+
+        assert!(learned_from_bytes(liar).is_none(), "nothing has read it yet");
+        let _ = shot_by_bytes(liar);
+        let _ = shot_by_bytes(honest);
+        let learned = learned_from_bytes(liar).expect("the disagreement is kept");
+        assert_eq!((learned.kind, learned.has_jpg, learned.sniffed), (SrcKind::Png, true, Some(SrcKind::Png)));
+        assert_eq!((&learned.name, &learned.jpg, &learned.raw), (&liar.name, &liar.jpg, &liar.raw));
+        assert!(learned_from_bytes(honest).is_none(), "a file that never disagreed has no entry");
+        assert!(learned_from_bytes(&learned).is_none(), "and a corrected shot has nothing more to take");
+
+        // The file is replaced by a real JPEG: the next read agrees, and the entry follows it.
+        let liar_path = liar.jpg.clone().unwrap();
+        std::fs::copy(&photo, &liar_path).unwrap();
+        assert_eq!(shot_by_bytes(&learned).kind, SrcKind::Jpeg);
+        let back = learned_from_bytes(&learned).expect("the corrected shot takes the new answer");
+        assert_eq!((back.kind, back.sniffed), (SrcKind::Jpeg, None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ══════════════════════════ the riders (the report's §5) ══════════════════════════
@@ -14383,8 +14763,9 @@ mod bytes_over_names {
     /// five, because gating a shared answer owes the mirror on every invoker (L26).
     ///
     /// L28 — REDDENED BY: deleting `Shot::sniffed` and letting the `Unsupported` arm fall back to
-    /// the extension (every assert below reads `JPG`), or by having it answer `kind_tag(kind)`,
-    /// which is the log token `UNSUP` and not a format noun.
+    /// the extension (every assert below reads `JPG`), by having it answer `kind_tag(kind)`, which is
+    /// the log token `UNSUP` and not a format noun, or by `by_bytes_with` stamping the sniffed kind
+    /// without `mint_finished` or dropping `sniffed`.
     #[test]
     fn an_unsupported_container_never_says_jpg() {
         let dir = fresh_dir("tail_r2");
@@ -14395,10 +14776,15 @@ mod bytes_over_names {
         avif.extend_from_slice(&[0, 0, 0, 0]);
         avif.extend_from_slice(b"mif1miaf");
         std::fs::write(dir.join("holiday.jpg"), &avif).unwrap();
-        let shot = only_shot(&dir);
+        let named = only_shot(&dir);
+        assert_eq!((named.kind, named.sniffed), (SrcKind::Jpeg, None), "the scan goes by the NAME");
+        assert!(decode_full_rgb(&named).is_err(), "and the decode asks the bytes first");
+        let checked = shot_by_bytes(&named);
+        let shot: &Shot = &checked;
 
         assert_eq!(shot.kind, SrcKind::Unsupported, "the bytes are a container we cannot decode");
-        assert_eq!(shot.sniffed, Some(SrcKind::Unsupported), "and the scan remembered that it READ them");
+        assert!(!shot.has_jpg, "minted, not just stamped");
+        assert_eq!(shot.sniffed, Some(SrcKind::Unsupported), "and the check remembered that it READ them");
         // (1) the info panel / (2) the stage note / (3) the badge / (4) the menu row / (5) the toast.
         // All five compose from `finished_format`, so `None` is what makes every one of them fall to
         // the generic form it already has — "This format is currently unsupported", `IMG`,
@@ -14453,19 +14839,30 @@ mod bytes_over_names {
     /// IS this file", and the tile badge — scanned at a glance across a filmstrip — stays a single
     /// clean noun.
     ///
-    /// L28 — REDDENED BY: dropping the `named` argument from `fmt_files`, or by returning `Some`
+    /// Open-time check (2 November): the panel gets this from its first build, on a shot that carries
+    /// only the name.
+    ///
+    /// L28 — REDDENED BY: dropping the `named` argument from `fmt_files`, by returning `Some`
     /// from `named_ext_when_bytes_disagree` for a file whose name and bytes agree (the second half
-    /// of this row, which is what keeps the qualifier off 99.9 % of photographs).
+    /// of this row, which is what keeps the qualifier off 99.9 % of photographs), or by removing the
+    /// check from `exif_rows` (the Files row reads `JPG` with no qualifier).
     #[test]
     fn the_files_row_says_what_the_file_is_called() {
         let dir = fresh_dir("tail_o1");
-        place(&dir, "png_named_jpg.jpg", "53d879f01a3f481c.JPG");
-        let shot = only_shot(&dir);
-        assert_eq!(shot.named_ext_when_bytes_disagree().as_deref(), Some("JPG"));
-        let files = super::fmt_files(None, Some(892_913), "PNG", shot.named_ext_when_bytes_disagree().as_deref());
+        let photo = place(&dir, "png_named_jpg.jpg", "53d879f01a3f481c.JPG");
+        let named = only_shot(&dir);
+        let rows = super::exif_rows(&named, 0);
+        let row = rows.iter().find(|(k, _)| k == "Files").map(|(_, v)| v.as_str()).expect("a Files row");
+        let size = std::fs::metadata(&photo).unwrap().len();
+        let files = super::fmt_files(None, Some(size), "PNG", Some("JPG"));
+        assert_eq!(Some(row), files.as_deref(), "the panel's own row, from its first build");
+        assert!(row.starts_with("PNG ") && row.ends_with("(named .JPG)"), "{row}");
+        let checked = shot_by_bytes(&named);
+        assert_eq!(checked.named_ext_when_bytes_disagree().as_deref(), Some("JPG"));
+        let files = super::fmt_files(None, Some(892_913), "PNG", checked.named_ext_when_bytes_disagree().as_deref());
         assert_eq!(files.as_deref(), Some("PNG 893 KB (named .JPG)"));
         // The badge is NOT qualified — that is the ruled division.
-        assert_eq!(shot.badge_label(), "PNG");
+        assert_eq!(checked.badge_label(), "PNG");
 
         // An agreeing file is untouched, on both the RAW-paired and the lone shapes.
         let dir2 = fresh_dir("tail_o1b");
@@ -14637,7 +15034,8 @@ mod bytes_over_names {
     /// The doc claimed "a crafted file cannot make it read forever", and the two FF-search loops
     /// ended only at EOF, one `read_exact` of one byte at a time: A measured `FF D8` + 32 MB of
     /// `0x00` at 36.9 ms (~1.15 ms/MB). `source_dimensions` runs on the UI thread and rule (2) makes
-    /// any `FF D8 FF` file a `Jpeg` by content, so a 2 GB one was a ~2.3 s stall. The walk now
+    /// any `FF D8 FF` file a `Jpeg` by content (at the scan then; at the reader's check now), so a
+    /// 2 GB one was a ~2.3 s stall. The walk now
     /// block-scans and charges every byte it reads or seeks to a 16 MiB budget.
     ///
     /// It is pinned by BYTES CONSUMED and never by time — a timing assert on a shared CI box is a
@@ -14846,11 +15244,16 @@ mod bytes_over_names {
         std::fs::copy(kit, with_dir.join("IMG_1.CR3")).unwrap();
         std::fs::write(with_dir.join("IMG_1.jpg"), &avif).unwrap();
         let alone = only_shot(&alone_dir);
+        // Open-time check (2 November): `with` is what the scan gives a never-viewed pair, the
+        // file's name says it is the picture. Every reader below checks the bytes, so each must
+        // still answer as the RAW alone does; `passenger_now` is that same check's answer.
         let with = only_shot(&with_dir);
+        assert!(with.has_jpg, "the scan went by the name");
+        let passenger_now = shot_by_bytes(&with);
 
         // ── THE PICTURE SURFACES: every one of these must agree. ──
-        assert_eq!(with.has_jpg, alone.has_jpg, "neither shot's picture is a finished file");
-        assert_eq!(with.kind, alone.kind, "both decode through the RAW-preview arm");
+        assert_eq!(passenger_now.has_jpg, alone.has_jpg, "neither shot's picture is a finished file");
+        assert_eq!(passenger_now.kind, alone.kind, "both decode through the RAW-preview arm");
         assert_eq!(
             super::read_orientation(&with, false),
             super::read_orientation(&alone, false),
@@ -14896,15 +15299,15 @@ mod bytes_over_names {
             );
             assert_eq!(super::read_date_taken(&passenger), super::read_date_taken(&alone));
         }
-        assert_eq!(with.finished_format(), alone.finished_format(), "the badge names the RAW");
-        assert_eq!(with.badge_label(), alone.badge_label());
+        assert_eq!(passenger_now.finished_format(), alone.finished_format(), "the badge names the RAW");
+        assert_eq!(passenger_now.badge_label(), alone.badge_label());
         let (dw, da) = (decode_full_rgb(&with).unwrap(), decode_full_rgb(&alone).unwrap());
         assert_eq!((dw.1, dw.2), (da.1, da.2), "the same pixels, at the same size");
         assert!(da.1 > 0 && da.2 > 0, "…and it is a real picture, not an empty agreement");
 
         // ── THE FILE SURFACES: these must DIFFER, or the file would be invisible again. ──
         assert!(alone.jpg.is_none() && with.jpg.is_some(), "the passenger is on the shot");
-        assert_eq!(with.finished_file_format(), None, "an AVIF has no noun this build can print");
+        assert_eq!(passenger_now.finished_file_format(), None, "an AVIF has no noun this build can print");
         assert_eq!(alone.finished_file_format(), None);
         // Delete's own collector shape: `[shot.jpg, shot.raw]`, so the passenger costs one file.
         let files = |s: &Shot| s.jpg.iter().chain(s.raw.iter()).count();
@@ -14956,7 +15359,14 @@ mod bytes_over_names {
         std::fs::copy(kit, dir.join("IMG_1.CR3")).unwrap();
         std::fs::write(dir.join("IMG_1.jpg"), &avif).unwrap();
         let shots = scan_folder(&dir).unwrap();
-        let paired = shots.iter().find(|s| s.has_raw).expect("the RAW's shot");
+        let named = shots.iter().find(|s| s.has_raw).expect("the RAW's shot");
+        // Open-time check (2 November): the scan goes by the name, and the check makes it a passenger.
+        assert!(named.has_jpg, "the scan's answer for a single finished name");
+        let (_, w, h) = decode_full_rgb(named).expect("a reader checks first, so the RAW is the picture");
+        assert!(w > 0 && h > 0, "the RAW's embedded preview decoded from the name shot: {w}×{h}");
+        assert_eq!(source_dimensions(named), None, "and the header probe checks too");
+        let checked = shot_by_bytes(named);
+        let paired: &Shot = &checked;
 
         // (1) THE FILE IS KEPT — this is A-Y3, and it is what makes the shot's delete take both.
         assert_eq!(
@@ -14979,6 +15389,7 @@ mod bytes_over_names {
         let dir2 = fresh_dir("mt_ay3b_sole");
         std::fs::write(dir2.join("holiday.jpg"), &avif).unwrap();
         let sole = only_shot(&dir2);
+        let sole = shot_by_bytes(&sole);
         assert!(sole.is_unsupported(), "with no RAW behind it, the file IS the shot");
         assert!(sole.jpg.is_some(), "…and it is still visible and deletable");
         assert_eq!(sole.finished_format(), None, "…and still never says JPG (B-R2)");

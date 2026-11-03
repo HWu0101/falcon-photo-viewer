@@ -157,8 +157,8 @@ fn raw_export_modes_share_admission_and_keep_finished_pairs_byte_identical() {
     f.raw("PASS.CR3");
     // Unsupported sibling: this is a RAW picture with a passenger, not a finished pair.
     let avif = b"\0\0\0\x18ftypavif\0\0\0\0mif1miaf";
-    std::fs::write(f.0.join("PASS.JPG"), avif).unwrap();
-    std::fs::write(f.0.join("BAD.JPG"), avif).unwrap();
+    std::fs::write(f.0.join("PASS.avif"), avif).unwrap();
+    std::fs::write(f.0.join("BAD.avif"), avif).unwrap();
     let shots = f.shots();
     assert_eq!(shots.len(), 5);
     let marks = vec![1; shots.len()];

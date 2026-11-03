@@ -59,6 +59,10 @@ pub(crate) struct RoiZoom {
     pub(crate) region: RefCell<Option<RegionState>>,
     pub(crate) failed: Arc<Mutex<HashSet<(u64, usize)>>>,
     pub(crate) src: RefCell<HashMap<usize, (u32, u32)>>,
+    /// Keeping the view on a sort change: the tiles of a kept view, waiting for the next tick's
+    /// `step_bookkeeping` to finish its clear (a swap resets `last_seen`, so that tick clears `tiles`).
+    /// The tick moves them into `tiles` right after it.
+    pub(crate) kept_tiles: RefCell<Vec<RoiTile>>,
 }
 
 impl RoiZoom {
@@ -68,6 +72,7 @@ impl RoiZoom {
             region: RefCell::new(None),
             failed: Arc::new(Mutex::new(HashSet::new())),
             src: RefCell::new(HashMap::new()),
+            kept_tiles: RefCell::new(Vec::new()),
         }
     }
 
@@ -125,6 +130,8 @@ impl RoiZoom {
         self.region.borrow_mut().take();
         self.failed.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.src.borrow_mut().clear();
+        // Two landings can share a tick, and a kept tile's id is a position in the list before this swap.
+        self.kept_tiles.borrow_mut().clear();
     }
 }
 

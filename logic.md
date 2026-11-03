@@ -88,9 +88,9 @@ How to read the tables:
 | --- | --- | --- | --- | --- |
 | Open an image | Toolbar **Open ▾ → Image…** (`open-folder`, a file picker that also lets you browse into any folder); drop a file on the window; a file passed at launch, for example by double-clicking an associated file; on Mac, Finder's open-document event | Always available. Launching with nothing to open shows the empty window. | Opens that file's folder with the clicked photo first, before the rest of the folder is scanned (see [Opening and inspection](#opening-and-inspection)) | `begin_reload`, `resolve_target`, `photo_open.rs`, `macos_open.rs` |
 | Open a folder | **Open ▾ → Folder…** (`open-folder-direct`, a true folder picker); drop a folder on the window | Always available | The current folder (`cur_dir`), the shot list (`shots`), the folder-open counter (`generation`) and every per-folder cache, through `apply_scan` | `begin_reload`, `apply_scan` |
-| Folder scan | Part of every open | — | Builds the `Shot` list. A file's first 32 bytes decide its type (`sniff_kind`, `SNIFF_HEAD_BYTES`); the extension is only the fallback. A RAW and a finished file with the same name pair into one shot, and `finished_rank` picks the finished partner. Mac `._*` companion files are skipped (`is_appledouble_sidecar`). Cloud placeholders (files a sync service lists but has not downloaded) are tagged and never read, so they keep their extension's type. Header reads are bounded and may overlap (`scan_io.rs`). | `scan_folder_with_metadata`, `scan_classify` |
-| Sort | Toolbar sort menu (`sort-pick`, `sort-dir-pick`): Name, Date taken, Date modified, Date created, Size, Type or Rating, ascending or descending. Name uses natural order, like Explorer (`a2` before `a10`). | Unavailable while a photo-first open is still scanning the folder (`opening-photo`) | Re-orders `shots` under one folder-open counter. Date-taken values are remembered across folders in `TAKEN_CACHE` (up to 50,000 files). Each folder's sort is remembered (see folder memories). | `sort-method`, `TAKEN_CACHE` |
-| Folder change | Any open, re-sort, or rescan after a file operation | — | One chokepoint, `apply_scan`: every decode tier's `on_folder_swap`, the per-shot metadata (`meta.on_folder_swap`) and the view state are reset; an open confirm dialog and the photo menus close; a pending delete is forgotten. A rescan of the same folder carries the selection and live review edits across by file name. See [Switching folders](#switching-folders). | `apply_scan` |
+| Folder scan | Part of every open | — | Builds the `Shot` list. A file's type comes from its name while listing; names shared by two finished files and the photo being opened are checked during the scan, and every photo is checked from its first 32 bytes when something opens it (`shot_by_bytes`, `sniff_kind`, `SNIFF_HEAD_BYTES`). A RAW and a finished file with the same name pair into one shot, and `finished_rank` picks the finished partner. Mac `._*` companion files are skipped (`is_appledouble_sidecar`). Cloud placeholders (files a sync service lists but has not downloaded) are tagged and never read, so they keep their extension's type. Header reads are bounded and may overlap (`scan_io.rs`). | `scan_folder_with_metadata`, `scan_classify` |
+| Sort | Toolbar sort menu (`sort-pick`, `sort-dir-pick`): Name, Date taken, Date modified, Date created, Size, Type or Rating, ascending or descending. Name uses natural order, like Explorer (`a2` before `a10`). | Unavailable while a photo-first open is still scanning the folder (`opening-photo`), or while Apply rotations is running (`applying-rotations`; a re-sort mid-Apply would lose track of the photos written after it). Copy picks, Move rejected and the other file operations leave it available. | Re-orders `shots` under one folder-open counter. Date taken reads capture dates in the background and changes the order once, when the read ends (see [The date read](#the-date-read)). Date-taken values are remembered across folders in `TAKEN_CACHE` (up to 50,000 files). Each folder's sort is remembered (see folder memories). | `sort-method`, `TakenPass`, `TAKEN_CACHE` |
+| Folder change | Any open, re-sort, or rescan after a file operation | — | One chokepoint, `apply_scan`: every decode tier's `on_folder_swap`, the per-shot metadata (`meta.on_folder_swap`) and the view state are reset; an open confirm dialog and the photo menus close; a pending delete is forgotten. A rescan of the same folder carries the selection and live review edits across by file name, and keeps what is already prepared and Undo for its unchanged photos. See [Switching folders](#switching-folders). | `apply_scan` |
 | Window size and position | At launch, when **Remember window size & position** is on (Settings → DISPLAY, default Off) | `remember_geometry` | `win_geom` in settings. A watchdog re-applies maximize on the window's own monitor. | `SavedWinGeom` |
 | Panel layout | At launch and on folder open; **Restore panels** (`restore-panels`) | Settings → DISPLAY → **Floating panels**: Hidden, Minimised or On (`panels_default`) | `info_open_v2`, `raw_open`, `grid_open`, `film_visible`. A folder you have read before reopens in its remembered info view (Simple, Standard or Full). The launch default `info_view` changes only through Settings → DISPLAY → **Info panel view**, never through the panel's own header buttons. | `PanelsSegCell`, `InfoView` |
 | Folder memories | Opening a folder seen before | Settings → INPUT → **Resume position memory** (off, last 3, last 10 or a custom number; `resume-cap-changed`) and **Remember sorting and panel layout** (same choices, default 10; `sort-cap-changed`; 0 turns those memories off) | A toast offers **Resume**, which jumps to the photo you last viewed (`last_viewed`, most recent first). The folder's sort, info view and minimised panels come back. Ratings, flags, rejects and pending rotations always reload from the folder's review file, whatever these settings say. | `trim_resume_lru`, `sort_folders`, `panel_folders` |
@@ -133,9 +133,9 @@ How to read the tables:
 | Bulk rate, flag, reject, unmark, delete, rotate, reveal, copy | The same keys (including **r** / **Shift+R** and **Ctrl+C**), or the counted rows in either photo menu: Flag N, Reject N, Unmark N, Delete N photos…, Rotate N right/left, Reveal N in Explorer/Finder and the counted Copy rows. Counted rows appear only when at least two photos are selected and the menu's own photo is one of them (`ctx-plural`); otherwise the single-photo rows show. | `bulk-actions-armed` = something selected, not in compare, not immersive. This one property decides whether the keys act on one photo or on the selection, and every plural label and shortcut hint follows it. Bulk rating asks first (`BulkAsk`) unless **Direct bulk rating** (DEVELOPER → Advanced) is on. | `ratings` / `marks` over `bulk_targets`; delete uses the normal recycle path | `bulk_actions_allowed`, `bulk_targets`, `BulkAsk` |
 | Review panel | **s** (`toggle-sel-panel`), the toolbar's Review button, the Picks and Rejects count chips, the rotation reminder's **Open Review** | Shares the top-left area with Settings and the browse-speed panel: one at a time | Filters: **Reviewed** (rated, flagged or rejected), **Picks**, **Rejects**, **Rated** (with per-star chips) and **Rotated**, plus a hidden **Selected** filter whose chip appears only while something is selected. The generic open lands on Selected when a selection exists, otherwise on Reviewed. It loads and pins its own thumbnails. Its output area holds Copy and Export (for whatever it displays), Move rejected, Empty to Recycle Bin/Trash, the Rotations Apply and Discard buttons, and **XMP sync**. | `sel_open`, `filter-mode`, `out_col1_label` |
 | Hover preview | Rest the pointer on a Review thumbnail | **Hover to preview** (Settings → REVIEW, default On); **Appears**: after a short rest (333 ms, `HOVER_REST_MS`) or at once. Off in compare, in immersive, under any dialog or menu, and while the Review jump list is open (`hover-preview-live`). No room below about 759 px of window width. **Esc** hides it. | Shows the photo larger beside the panel, using the browsing preview (a preview decode on a miss, never full resolution). The box keeps the photo's shape: a 3:2 photo is half the window wide, other shapes get the same area, capped at 60 % of the window width and 80 % of the height between toolbar and filmstrip. The hovered frame is protected from eviction. | `hover_box`, `hover_preview_step`, `fast_evict_protected` |
-| Undo / redo | **Ctrl+Z**; **Ctrl+Shift+Z** or **Ctrl+Y** (`undo`, `redo`); the events centre's Undo and Redo buttons | Per folder, up to 500 steps. Blocked by any dialog or menu (`popup-open`), because undo jumps `current` to the edited photo. While a photo menu is open, the keys act on that menu's photo. There is no redo of a delete or a move. | One history: the `UndoRedo` stack plus the last delete and the last move, ordered by `Act.seq`, so Ctrl+Z always undoes the most recent of them | `undo_arm`, `UndoRedo`, `UndoEntry` |
+| Undo / redo | **Ctrl+Z**; **Ctrl+Shift+Z** or **Ctrl+Y** (`undo`, `redo`); the events centre's Undo and Redo buttons | Per folder, up to 500 steps. A delete, move or sort change in the same folder keeps the steps for the photos that stayed (`remap_history`). Blocked by any dialog or menu (`popup-open`), because undo jumps `current` to the edited photo. While a photo menu is open, the keys act on that menu's photo. There is no redo of a delete or a move. | One history: the `UndoRedo` stack plus the last delete and the last move, ordered by `Act.seq`, so Ctrl+Z always undoes the most recent of them | `undo_arm`, `UndoRedo`, `UndoEntry` |
 | Rotate | **r** / **Shift+R** (`rotate-shot`), both photo menus. With a selection armed, `bulk-rotate(dir)` makes one undo step for the whole batch and skips animated GIFs, GIFs it could not check and unchecked GIFs that are still cloud-only, saying so. | Automatic EXIF orientation combines with the manual turn | `RotState` holds turns over unrotated cached pixels: rotation is applied when drawing, so it never throws away decoded pixels | `RotState`, `UndoEntry::BulkRot` |
-| Apply rotations | Review panel → Rotations → **Apply** or **Discard** (`apply-rotations`, `discard-rotations`), each with a counted confirm. Closing the app with turns pending shows a reminder: **Open Review** or **Close anyway**. | Pending turns exist | Writes the original. A JPEG gets a 2-byte orientation patch at a re-parsed, verified position, checked before and after the write (compare-and-swap). RAW files, finished PNG, TIFF, WebP and HEIC, and JPEGs without a usable EXIF orientation get an XMP sidecar instead. See [Orientation and rotation](#orientation-and-rotation). | `apply_rotation`, `patch_jpeg_orientation`, `write_xmp_sidecar` |
+| Apply rotations | Review panel → Rotations → **Apply** or **Discard** (`apply-rotations`, `discard-rotations`), each with a counted confirm. Closing the app with turns pending shows a reminder: **Open Review** or **Close anyway**. | Pending turns exist. **Apply** also waits (faded) while the folder's review file couldn't be read | Writes the original. A JPEG gets a 2-byte orientation patch at a re-parsed, verified position, checked before and after the write (compare-and-swap). RAW files, finished PNG, TIFF, WebP and HEIC, and JPEGs without a usable EXIF orientation get an XMP sidecar instead. See [Orientation and rotation](#orientation-and-rotation). | `apply_rotation`, `patch_jpeg_orientation`, `write_xmp_sidecar` |
 | XMP rating sync | Review panel → **XMP sync** (`toggle-xmp-sync`); turning it on can offer to write sidecars for existing ratings (`xmp-backfill-confirm`) | `xmp_sync_ratings`, default Off | `<photo>.xmp` `xmp:Rating` through the writer. A name-keyed record, reloaded for each folder, stops existing ratings from being rewritten in bulk. | `write_xmp_rating_sidecar` |
 | Retry a failed photo | Tap the failure card ("Tap to retry — the other photos are unaffected") or the "Full-res unavailable — tap to retry" pill (`retry-detail`) | A failure is latched for this photo | Clears this photo's failure marks in all four tiers: preview (`fast.failed`), full resolution (`detail.failed`), thumbnail, and zoomed region (`roi.failed`) | `on_retry_detail` |
 
@@ -145,10 +145,10 @@ How to read the tables:
 | --- | --- | --- | --- | --- |
 | Copy a photo's files to the clipboard | Photo menu **Copy <format>**, **Copy RAW**, **Copy both** (`copy-files`); **Ctrl+C** / **⌘C** (`copy-shortcut`) | Rows appear only for the pair's real files (`ctx-has-finished`, `ctx-has-raw`). Ctrl+C copies the first choice that applies from the ordered preference in Settings → COPY SHORTCUT; one function, `ranked_copy_mode`, decides both what Ctrl+C does and which row shows the shortcut hint, so they cannot disagree. | The system clipboard, as files (on Mac, file URLs plus a plain-text path on the general pasteboard). The first row is named from the classified format ("Copy JPG", "Copy HEIC"), else "Copy image". With a selection armed the family goes plural: counted rows (`copy-selected(kind)`) appear in both menus, and Ctrl+C copies the whole set with one clipboard write and one toast. | `ranked_copy_mode`, `bulk_copy_paths`, `do_copy_kind_bulk` |
 | Copy a name or path | Click the photo menu's header, which is the photo's name (`copy-ctx-name`); click the name in the info panel (`copy-name`); click the toolbar's path pill (`copy-path`) | — | Clipboard text | — |
-| Copy the displayed photos | Review panel → **Copy picks** (the label follows the panel's filter: picks, rated, selected or displayed) opens a counted confirm (`copy-picks`) | Something to copy in the current filter; the Rejects filter says "Nothing to copy" | Copies the original bytes into `./Picks` using the `.part` protocol (write under a temporary name, then rename). The confirm chooses **RAW + image**, **RAW only** or **Image only**; can include rejected photos in the set (off by default); warns about unapplied rotations, because a copy carries the original bytes; and counts cloud files that must download first. The finish message also counts copied files this computer cannot open, judged from the classified bytes, never the extension — for example "· 3 HEIC files this PC can't open — a Mac or phone can". | `PICKS_SUBFOLDER`, `out_col1_label` |
-| Move rejected | Review panel → **Move rejected** (`move-rejects`), with a counted confirm | Rejected photos exist | Moves them into `./Rejected`. That folder deliberately has no export manifest, because Empty would recycle it. | `result_subfolder` |
-| Empty to Recycle Bin / Trash | Review panel (`empty-rejected`), with a confirm | `./Rejected` is not empty | Recycles the folder's contents after a writer barrier (a wait until every queued save has reached disk) | — |
-| Undo a move | The toast's **Undo** (`undo-move`); **Ctrl+Z** | The last file operation was a move | Moves the files back; across drives it falls back to the same `.part` protocol | `undo_moves` |
+| Copy the displayed photos | Review panel → **Copy picks** (the label follows the panel's filter: picks, rated, selected or displayed) opens a counted confirm (`copy-picks`) | Something to copy in the current filter; the Rejects filter says "Nothing to copy" | Copies the original bytes into `./Picks` using the `.part` protocol (write under a temporary name, then rename). The confirm chooses **RAW + image**, **RAW only** or **Image only**; can include rejected photos in the set (off by default); warns about unapplied rotations, because a copy carries the original bytes; and counts cloud files that must download first. Each copied file takes its own XMP sidecar (a small side file, `IMG.xmp` or `IMG.JPG.xmp`, where Falcon keeps an applied RAW or HEIC turn and synced stars) along, never overwriting one already there; sidecars are not counted as photos and not listed in the export record (see [Side files](#side-files)). The finish message also counts copied files this computer cannot open, judged from what Falcon knows about each file: its name, or its bytes once they have been read — for example "· 3 HEIC files this PC can't open — a Mac or phone can". | `PICKS_SUBFOLDER`, `out_col1_label` |
+| Move rejected | Review panel → **Move rejected** (`move-rejects`), with a counted confirm | Rejected photos exist | Moves them and their XMP sidecars into `./Rejected`. That folder deliberately has no export manifest, because Empty would recycle it. | `result_subfolder` |
+| Empty to Recycle Bin / Trash | Review panel (`empty-rejected`), with a confirm | `./Rejected` is not empty | Recycles the contents of `./Rejected` in the folder on screen (`scanned_dir`) after a writer barrier (a wait until every queued save has reached disk), including the XMP sidecars moved there, which the confirm's count includes. With no folder open there is nothing to empty. | — |
+| Undo a move | The toast's **Undo** (`undo-move`); **Ctrl+Z** | The last file operation was a move, made in the folder on screen | Moves the files back, photos first and then their XMP sidecars; across drives it falls back to the same `.part` protocol | `undo_moves` |
 | Web export | Review panel → **Export…** (`open-export`); the export sheet (`export-web`, `cancel-export`) | A recipe that names a watermark image needs that file; the export refuses if it is missing | Writes `./export` atomically (`.part`, then rename) with a progress bar, **Cancel**, and a `falcon_export.json` manifest. Every exported file is newly encoded from the original. Format: **JPG** (default; quality tier; embedded sRGB profile) or **PNG** (lossless at `png::Compression::Fast`; tagged with the `sRGB` chunk rather than an embedded profile; keeps the source's transparency and 16-bit depth). One pipeline, `export_web_file`: resize → convert to sRGB → stamp the watermark → encode, so the sRGB watermark never passes through the colour transform. Copy and move always carry original bytes (`CopyOriginal`); only export converts colour. Optional **Append the preset name to filenames** writes `<name>_<preset>.<ext>` through one name builder, `web_deliverable_name`, whose extension comes from the run's format. Before anything is decoded, a collision check asks **Cancel / Skip existing / Overwrite** when files of the same format already exist. RAW-only shots follow the run's **Skip / Camera preview / Develop RAW** choice. See [Export](#export). | `EXPORT_SUBFOLDER`, `WebFormat`, `export_web_file`, `web_deliverable_name` |
 | Watermark and presets | In the export sheet: watermark None, Image or Text (`set-wm-type`); choose the image (`choose-watermark`); text and font (`wm-text-changed`, `set-wm-font`); custom size and opacity (`set-wm-custom`); live preview (`wm-request-sample`); presets (`save-preset`, `apply-preset`, `delete-preset`, `new-preset`) | — | A preset is a complete recipe, not a partial overlay. Each saved preset shows four chips — format, size, quality and watermark (`PresetBrief`) — so you can see what it will do before running a large batch. | `WmPreset`, `PresetBrief` |
 | Delete to Recycle Bin / Trash | **Del** or **Backspace** (`delete-key`), both photo menus (`delete-shot`) | A three-button dialog: **Cancel**, **Mark as rejected**, **Move to Recycle Bin** / **Move to Trash** (danger colour). **Enter cancels.** | Captures the photo's identity — folder-open counter, folder, position and name — and checks it again before acting. Recycles the pair's files and their XMP sidecars after a writer barrier; the rescan lands on the neighbouring photo. See [File operations, delete and recovery](#file-operations-delete-and-recovery). | `DeleteRecord`, `del_pending` |
@@ -269,7 +269,7 @@ Each of these is a real, deliberate coupling.
 | **RAW mode** is on for a pair | The full-resolution tier develops the RAW while the preview tier still shows the finished image. That is why the full-resolution tier's RAM-cache shortcut is switched off in RAW mode (the `!raw` term beside `l2::full_res_serves`). |
 | A shot is a **cloud placeholder** | Its failure card is the calm cloud, and its tiles show the cloud outline. It is the one kind of file the scan may not read, so it keeps its extension's type and says so in one log line. A retry sweep clears its failure marks after 30 s, then 60, 120 and 240 s, up to five times (`CLOUD_RETRY_CAP`); a completed download is noticed at once and the file's bytes are then read to classify it (`reclassify_hydrated`). Copy, Move, web export and Apply rotations count it as needing a download first. |
 | The **output colour** (gamut or ICC profile) changes | `drop_developed_caches` drops every developed cache, every interface colour (48 theme tokens) is converted again (`apply_theme_transform`), and every `cm_bake_key` changes, so old colour bakes cannot be reused. See [Colour changes versus folder switches](#colour-changes-versus-folder-switches). |
-| The **folder changes** | `apply_scan` closes any open confirm, forgets a pending delete, resets every tier, and drops the upload drain's carried work together with its in-flight marks. |
+| The **folder changes** | `apply_scan` closes any open confirm, forgets a pending delete, resets every tier, and drops the upload drain's carried work together with its in-flight marks. On a rescan of the same folder, what is still true for unchanged photos is then put back (`RescanCarry`). |
 
 ### Destructive acts: how you start them and how you get back
 
@@ -293,7 +293,7 @@ This is a statement about the product, not a to-do list. Everything here is deli
 
 ### Deliberate gaps
 
-- **No catalogue, library or database.** Falcon works on the folder in front of it. There is no import step, no library across folders, no keywords, captions or faces, and no rating search across shoots. Saved state is per folder: a review file beside the photos (`falcon_review_data.json`) and optional XMP sidecars.
+- **No catalogue, library or database.** Falcon works on the folder in front of it. There is no import step, no library across folders, no keywords, captions or faces, and no rating search across shoots. Saved state is per folder: a review file beside the photos (`falcon_review_data.json`) and optional XMP sidecars. A folder of 2,000 photos or more that has settled on Date taken also keeps its capture dates in a small `falcon.cache` beside the photos, which is only ever a cache.
 - **No editing.** Rotation is the only change Falcon makes to an original photo. There is no crop, exposure or white-balance editing and no develop settings. RAW "development" means decoding for display or export with the camera's own white balance, not an editable recipe.
 - **No stacking, virtual copies or collections** beyond ratings, flags, rejects and the selection.
 - **Export is deliberately narrow.** Copy the displayed photos' original files, move the rejects away, or make new web copies in **JPG or PNG** (`WebFormat` in `falcon-decode`; sRGB, optional watermark, optional RAW development for RAW-only shots). There is no WebP export: the linked `image-webp` encoder writes only lossless WebP, and a useful lossy WebP would need libwebp, a C library, which would be a project of its own. There is no TIFF, PSD or GIF export: none of them is a format for handing photos over for the web, even though the `tiff` and `gif` libraries are already linked for decoding. There is no print module and there are no upload targets.
@@ -339,8 +339,8 @@ These are current design facts, not unfinished work:
 - **Select new / edited** compares each file's size and modification time with the export manifest and keeps no clock of its own, so a cloud sync that touches files can make them look edited.
 - **Cloud-placeholder detection reads file metadata only,** so it cannot see a file that is partway through downloading.
 - **A cut-off JPEG looks like a normal photo.** When a JPEG ends early (a missing end marker, an interrupted copy or sync), the pure-Rust decoder refuses it. `decode_jpeg_arm` in `falcon-decode` then gives the operating system's codec a second chance (`os_codec_decode_rgb`), but only for that error class (`jpeg_err_is_truncation`) and only for a real standalone file (`shot.has_jpg`). A RAW's embedded preview never gets the second chance, and genuine corruption still fails. The OS codec decodes what arrived and fills the missing rows (grey on Windows). Nothing on screen says the picture is incomplete; only the optional diagnostic log has a `jpeg-truncated` line, capped at 200 per session. The suggested fix is an "incomplete file" note on the info panel and badge, using the same mechanism that already shows a misnamed file as `PNG 893 KB (named .JPG)`.
-- **AVIF and TGA are recognised but not decoded.** The byte check identifies AVIF as `SrcKind::Unsupported`, and the `.avif` and `.tga` extensions get the same verdict (`UNSUPPORTED_IMG_EXTS`). HDR-to-SDR handling for AVIF has not been designed, and Falcon never silently clips HDR. A `Shot` carries no format name for an unsupported file, so menus and badges use generic wording instead of naming a format they cannot open.
-- **`is_heic_path` checks only the extension, on purpose.** It drives the start-up HEIC codec check, which must run on a Windows machine with no HEIF codec, where the scan classifies the same files as unsupported. As a result, a HEIC renamed to `.jpg` does not trigger the check, although the scan still classifies the file correctly by its bytes.
+- **AVIF and TGA are recognised but not decoded.** The byte check, when a file is opened, identifies AVIF as `SrcKind::Unsupported`, and the `.avif` and `.tga` extensions get the same verdict (`UNSUPPORTED_IMG_EXTS`). HDR-to-SDR handling for AVIF has not been designed, and Falcon never silently clips HDR. A `Shot` carries no format name for an unsupported file, so menus and badges use generic wording instead of naming a format they cannot open.
+- **`is_heic_path` checks only the extension, on purpose.** It drives the start-up HEIC codec check, which must run on a Windows machine with no HEIF codec, where the scan classifies the same files as unsupported. As a result, a HEIC renamed to `.jpg` does not trigger the check, although its type is still found correctly from its bytes when it is opened.
 - **The byte check decides how a file is decoded, not whether it is listed.** It runs only for names that already pass the folder scan's image-extension filter, so a PNG named `scan001` or `page.dat` stays invisible.
 - **Fujifilm X-Trans RAW files** are developed on the CPU with Markesteijn demosaicing (a high-quality method for Fujifilm's 6×6 sensor pattern), for both viewing and export (`xtrans.rs`). The RAW library's default for X-Trans is a simpler bilinear method, which gives a green colour cast. This path is verified on a real X70 file and on synthetic phase, colour and crop cases; it is not certified for every Fujifilm model.
 - **Two Falcon windows on one folder.** Falcon keeps `open_folders.json` in its configuration folder, so that a second running copy can warn that a folder is already open ("review edits … are last-writer-wins"). Each copy refreshes its entry every 25 s (`heartbeat_open_folder`); an entry older than 90 s (`OPEN_FOLDER_STALE_MS`), or one from a process that has exited, is ignored. The heartbeat and folder-open writes go through the durable writer; only the removal at exit writes inline, because it runs after the writer has been drained. The update is a read-modify-write with no lock between processes. If two copies write at the same moment, one entry can be lost. It corrects itself at the next heartbeat, and the only cost is a missed or spurious warning.
@@ -404,7 +404,7 @@ The durable writer's queue (`WriteMsg`, `writer_loop` in `support.rs`) is the ex
 Related limits that do exist:
 
 - The date-taken memo (`TAKEN_CACHE`) has a size cap (see [Switching folders](#switching-folders)).
-- `settings.json`, the folder's review file and the export manifest each refuse to read more than 16 MiB (`CONFIG_MAX_BYTES`, `SELECTION_MAX_BYTES`, `EXPORT_MANIFEST_MAX_BYTES`).
+- `settings.json`, the folder's review file, the export manifest and `falcon.cache` each refuse to read more than 16 MiB (`CONFIG_MAX_BYTES`, `SELECTION_MAX_BYTES`, `EXPORT_MANIFEST_MAX_BYTES`, `DATE_CACHE_MAX_BYTES`).
 
 #### Hardware acceleration answers that are fixed at compile time
 
@@ -429,16 +429,9 @@ Each of these is a scheduling decision. Replace them with runtime tests of wheth
 
 After a delete, move or undo, the operation stores a request in `reload_req`. The next tick runs the synchronous `reload` in `main.rs`, but only if the user is still on that folder (checked with `last_scanned_dir.still_on_screen`). `reload` calls `falcon_decode::scan_folder_with_metadata` on the interface thread.
 
-That scan reads the first bytes of every file again to classify it by content. It has no memory of the reads it made a moment earlier: `FolderCatalogue` keeps header results only for one opening.
+Since the owner's decision of 2 November 2026 (check a photo's type when it is opened), that scan lists the folder and reads no file contents for ordinary names, so it is quick on any drive. It still reads names shared by two or more finished files. A folder of exported pairs (`X.jpg` beside `X.png` for every photo) therefore still reads every file: about 15 µs per file on a local SSD, one round trip per file on a network share, one head seek per file on a cold external hard disk, so the interface can pause there. See [File type detection](#file-type-detection-bytes-over-names).
 
-Measured on a local SSD, this costs about 15 µs per file and is not noticeable. On a network share it costs one round trip per file. On a cold external hard disk it costs one head seek per file, so the interface can pause.
-
-Possible fixes:
-
-- Make the rescan adaptive, with a slow-drive fallback and a short-lived memo of the reads.
-- Move the content read to the photo's first decode.
-
-A memo is a cache, so its invalidation (for example, a file replaced under the same name) needs a design, not a one-line change. Changing when files are classified is a product decision, not a refactor.
+Since the owner's choice of 2 November 2026 (keeping prepared photos and undo), this rescan no longer throws away what is ready for unchanged photos: see [Switching folders](#switching-folders). It stays on the interface thread for now, so the list stays true to the disk and its brief pause stays.
 
 #### No RAM keep-alive for full-detail frames, and no disk cache
 
@@ -503,7 +496,7 @@ Paths are relative to `falcon/native/src/` unless shown in full.
 | Mac menu bar: what the menus contain and enable (pure, tested on Windows), and the native menu | `menubar_model.rs`, `mac_menu.rs` |
 | Mac title-bar toolbar: route choice, the AppKit host and the hidden toolbar window (`mac_titlebar_window_attributes` in `main.rs`). The word "experiment" in these names does not mean optional: this is the normal Mac toolbar. Diagnostic-only variants sit beside it. | `mac_experiment.rs`, `mac_experiment_native.rs`, `ui/mac_toolbar.slint`; diagnostics: `mac_chrome_compat.rs`, `mac_experiment_ui.rs`, `ui/mac_experiment.slint` |
 | Interface markup (18 `.slint` files). `MainWindow` (`main_window.slint`) holds state, panels and the input gates; `MainToolbar` (`toolbar.slint`) is the shared toolbar. `ui.rs` compiles the markup and exposes its types to Rust; it contains no markup. | `falcon/native/ui/`; `ui.rs` |
-| File-type detection, folder scan, decoding and the export encoders (`lib.rs`); the finished-image decoder interface (`decode.rs`); bounded header reads (`scan_io.rs`); HEIF grid parsing (`heif_grid.rs`); NV12-to-RGB conversion (`yuv_kernel.rs`); rotation write-back and XMP sidecars (`apply.rs`); RAW development for export and for X-Trans (`raw_export.rs`, `xtrans.rs`) | `falcon/crates/falcon-decode/` |
+| File-type detection, folder scan, decoding and the export encoders (`lib.rs`); the finished-image decoder interface (`decode.rs`); bounded header reads for shared names and the opened photo (`scan_io.rs`); HEIF grid parsing (`heif_grid.rs`); NV12-to-RGB conversion (`yuv_kernel.rs`); rotation write-back and XMP sidecars (`apply.rs`); RAW development for export and for X-Trans (`raw_export.rs`, `xtrans.rs`) | `falcon/crates/falcon-decode/` |
 | Colour spaces, ICC profiles and transforms | `falcon/crates/falcon-color/` |
 | GPU work: RAW development on the GPU (`lib.rs`), HEIC tile assembly (`heic.rs`) and banded read-back planning (`band.rs`) | `falcon/crates/falcon-gpu/` |
 | Optional NVIDIA JPEG decoding | `falcon/crates/falcon-nvjpeg/` |
@@ -573,7 +566,7 @@ flowchart TB
   end
   CB["Slint callbacks on the UI thread<br/>keys, menus, buttons, dropped files"]
   subgraph W["Worker threads: detached, each job in catch_unwind, results stamped with the folder-open counter"]
-    SCAN["Folder scan and clicked-photo open<br/>bounded header reads"]
+    SCAN["Folder scan and clicked-photo open<br/>lists names; reads only shared names and the opened photo"]
     FAST["Fast preview pool<br/>Windows: min(18, cores - 2), at least 4<br/>Mac: one elastic pool shared with thumbnails<br/>JPEG reduced-size DCT decode · HEIC hardware lane, else OS codec at reduced scale · other formats full decode<br/>skips a job more than 110 photos from the current one"]
     DER["Derive worker x1<br/>shrinks a full-resolution master to preview size"]
     DET["Detail worker x1, one job at a time, cancellable<br/>HEIC hardware lane with GPU colour · RAW development (GPU for RGGB Bayer, else CPU)<br/>nvJPEG on Windows or Image I/O on Mac · CPU chain"]
@@ -706,6 +699,7 @@ All workers are detached threads. Each job runs inside `catch_unwind`, and every
 | Upload | 1; the **only** thread that stages GPU textures | `sync_channel::<UploadJob>(8)` | `channel::<UploadDone>` | `fast.uploading`, `detail.uploading`, `bd_inflight` |
 | GIF (thread `falcon-gif`) | 1 | `channel`; drains its backlog and keeps only the newest request | `channel` | `gif_inflight` (photo index and folder-open counter). The animated-GIF record starts at the written sentinel `u64::MAX`, never a real counter value |
 | Durable writer (thread `falcon-writer`) | 1 | `mpsc::channel::<WriteMsg>`, the app's one unbounded queue (see [The save queue has no length limit](#the-save-queue-has-no-length-limit)) | none (a barrier answers) | `writer_barrier` |
+| Date read (threads `falcon-dates`) | One per read: half the logical cores, at most 8, below normal priority | `TakenPass::start`, a claim loop over the photos still unread | a slot inside `TakenPass`, taken by the tick; see [The date read](#the-date-read) | `TakenPass` `done`, `total`, `ended`, through `taken_pass` |
 | Fonts, watermark strips, benchmark, file operations | One-off or per run | — | a `channel` or an `Arc<Mutex<Option<…>>>` slot | `wm_strips_started`, `bench_running`, `sel_busy` |
 | Colour watcher (Windows), power watcher (Windows and Mac) | 1 each, lowest priority, every 2 s | — | `mpsc` of changes only | none (drained with `try_iter`) |
 | Low-priority pools (Windows; threads `falcon-prep-W-N`) | One pool per worker, below normal priority: one thread for each preview and thumbnail worker, one per core for the full-resolution worker | Only its own worker hands it work: a preview or thumbnail job nobody asked for (`prep_priority::Worker::run`), or a speculative full-resolution job's CPU decode, RAW read and develop, and colour conversion (`Guard::on_low_pool`). The worker waits for it. See [Lower priority for work done ahead](#lower-priority-for-work-done-ahead-windows) | the handing worker's own channel | the handing worker's |
@@ -764,7 +758,7 @@ Three kinds of state exist, and the kind decides which threads may touch it. In 
 | Kind | Rule | Examples (code names) |
 | --- | --- | --- |
 | UI thread only | `Rc`, `RefCell`, `Cell`; workers never touch it | `current`, `shown`, `shown_dims`; the UI halves of the tier structs (`FastTier.cache`/`uploading`/`hover_pin`, `DetailTier`, `RoiZoom` tiles/region/source sizes, `Film` thumbnails/`pending`/`pinned`); `l2` (`L2Store`); `meta` (`PerShotMeta`: `exif_cache`, `wb_cache`, `shot_gamut`, request sets); `rot` (`RotState`); `undo_stack`; `notif_log`; `select_set`; the `display_*` colour cells; every filmstrip scroll cell and `last_*_key` memo |
-| Shared with workers | `Arc` around an atomic or a mutex | `shots: Arc<Mutex<Arc<Vec<Shot>>>>`, `generation`, `len_atomic`, `cur_atomic`, `compare_atomic`, `detail_ahead_atomic`, `scrub_dim_atomic`, `fast_super`, `detail_dim_atomic`, `output_gamut`, `raw_mode`, `det_epoch`, `det_busy`, `det_cpu`, `det_awaited`, `roi_busy`, `meta.orient_cache`, `meta.file_gamuts`, `fast.pump`, `fast.failed`, `fast.hover_ask`, `film.frost`, `film.failed`, `roi.failed`, `vram_oom`, `gpu_lost`, `sel_busy`, `op_cancel`, `export_progress`, `upload_focus`, `scan_id`, `photo_open_id`; and the hand-off slots (`Arc<Mutex<Option<…>>>`): `reload_req`, `sort_reload_req`, `resolved_open`, `early_scan`, `scan_done`, `move_slot`, `rot.apply_slot`, `sel_status_slot`, `wm_sample_slot` |
+| Shared with workers | `Arc` around an atomic or a mutex | `shots: Arc<Mutex<Arc<Vec<Shot>>>>`, `generation`, `len_atomic`, `cur_atomic`, `compare_atomic`, `detail_ahead_atomic`, `scrub_dim_atomic`, `fast_super`, `detail_dim_atomic`, `output_gamut`, `raw_mode`, `det_epoch`, `det_busy`, `det_cpu`, `det_awaited`, `roi_busy`, `meta.orient_cache`, `meta.file_gamuts`, `fast.pump`, `fast.failed`, `fast.hover_ask`, `film.frost`, `film.failed`, `roi.failed`, `vram_oom`, `gpu_lost`, `sel_busy`, `applying_rotations`, `op_cancel`, `export_progress`, `upload_focus`, `scan_id`, `photo_open_id`; and the hand-off slots (`Arc<Mutex<Option<…>>>`): `reload_req`, `sort_reload_req`, `resolved_open`, `early_scan`, `scan_done`, `move_slot`, `rot.apply_slot`, `sel_status_slot`, `wm_sample_slot` |
 | Process-wide statics | Owned by one module | `support`: `WRITER`, `GPU_MEMO`, `WIN_GEOM` and its `LATCH_GATE`, `SETTINGS_WARN`, `TAKEN_CACHE`, `DECODE_STATS`, `FAST_COST_KNOWN`/`FAST_COST_MEASURED`/`FAST_COST_SAMPLES`, `HW_SERVICE`, `DISPLAY_TOPOLOGY_DIRTY`, `MIRROR_LOGGED`, `HEIC_PROBED`, `SHUTDOWN_ONCE`, `LOG_TO_PID`, `DIAGNOSTIC_LOG`, `SAVED_MODE` and `BATTERY_POWER_SAVER`, `MODERN_ICC_API`, `WEB_PART_CTR`, thread-local `BULK_ASK`. `hwheic` (Windows): `LANE_LIVE`, `LANE_LOST`, `ASSEMBLER`, `POOL` and `POOL_CV`, `DECLINE_MEMO`, `FOLDER_GEN`, `PLAN_CACHE`, the two storage limits (`RENDER_STORAGE_LIMIT`, `ASSEMBLY_STORAGE_LIMIT`) and five session counters. `main` (Mac): `MENU_SNAP`, `MAC_VRAM_SRC` |
 
 ### Per-folder state and its owners
@@ -814,7 +808,7 @@ Tests pin these too: `per_shot_meta_swap_clears_and_reseeds`, `on_folder_swap_re
 
 When a folder scan finishes, one closure in `main.rs`, `apply_scan`, swaps in the new shot list and resets everything that belonged to the old folder. It runs for a new folder, for a rescan of the same folder, and at the end of an open that showed the clicked photo first. Nothing else runs on the interface thread meanwhile, so the order of the resets does not affect correctness. The folder-open counter (`generation`) is bumped under the same lock that swaps the shot list, so background results from the old folder are recognised and dropped later.
 
-The diagram shows the groups of work `apply_scan` does, in order, including the two branches for a rescan of the same folder and for carrying prepared work over from a photo-first open.
+The diagram shows the groups of work `apply_scan` does, in order, including the branches for a rescan of the same folder, for a reopen of the folder on screen (see [Every folder open uses one path](#every-folder-open-uses-one-path)) and for carrying prepared work over, from a photo-first open or across a delete, move or sort change.
 
 ```mermaid
 flowchart TB
@@ -822,22 +816,31 @@ flowchart TB
   FLUSH --> SAME{"Same folder?"}
   SAME -->|"yes"| CARRY["carry_live_review_on_rescan<br/>keep live ratings and marks newer than the disk copy"]
   SAME -->|"no"| SWAP
-  CARRY --> OPENING{"Clicked photo still<br/>in its opening phase?"}
+  CARRY --> REOPEN{"You reopened this folder<br/>(read in the background)?"}
+  REOPEN -->|"yes"| SETTLE["photo_open::settle_reopen<br/>Rating order from the live ratings, land on the photo you opened"]
+  SETTLE --> SWAP
+  REOPEN -->|"no"| OPENING{"Clicked photo still<br/>in its opening phase?"}
   OPENING -->|"yes"| TAKE["Promotion::take<br/>copy prepared work for unchanged files, by file identity"]
-  OPENING -->|"no"| SWAP
+  OPENING -->|"no"| RESCAN{"A delete, move or sort change,<br/>and the last full listing is known?<br/>rescan_carries"}
+  RESCAN -->|"yes"| KEEP["RescanCarry::take<br/>copy prepared work for unchanged files, and the undo history, by file identity"]
+  RESCAN -->|"no"| SWAP
+  KEEP --> SWAP
   TAKE --> SWAP["Swap the shot list and bump the folder-open counter<br/>under one lock"]
   SWAP --> META["PerShotMeta::on_folder_swap<br/>orientation, colour facts, white balance, EXIF, cloud tags"]
   META --> SEL["Floating EXIF panels re-resolved by name<br/>SelectSet::restore_keys · reseed_xmp_journal"]
   SEL --> DEV["drop_developed_caches<br/>fast cache · detail developed set · zoom tiles · RAM cache"]
   DEV --> TIERS["FastTier · DetailTier · RoiZoom · Film<br/>on_folder_swap, then Film::arm_open"]
-  TIERS --> MEMOS["reset_fast_cost (skipped on promotion) · reset_fast_latency<br/>hwheic::note_folder_swap · tick::release_parked_done"]
+  TIERS --> MEMOS["reset_fast_cost (skipped on promotion and on a kept rescan) · reset_fast_latency<br/>hwheic::note_folder_swap · tick::release_parked_done"]
   MEMOS --> ROT["RotState::on_folder_swap<br/>reload recorded rotations, drop a stale apply batch"]
   ROT --> LOOSE["Remaining per-folder lines<br/>cloud re-check list · undo history · compare halves<br/>Review filters · selection counter · last scanned folder"]
   LOOSE --> VIEW["ViewReset::reset_for_swap<br/>compare off · shown record · filmstrip position"]
   VIEW --> UI["reset_transient_ui<br/>close confirm dialogs and photo menus, zoom to fit"]
   UI --> PROMO{"Promotion taken?"}
   PROMO -->|"yes"| RESTORE["Promotion::restore<br/>re-insert the copies at their new positions"]
-  PROMO -->|"no"| SHOWN["New folder on screen"]
+  PROMO -->|"no"| KEPT{"Rescan work kept?"}
+  KEPT -->|"yes"| PUTBACK["RescanCarry::restore<br/>re-insert the copies and the undo history at their new positions"]
+  KEPT -->|"no"| SHOWN["New folder on screen"]
+  PUTBACK --> SHOWN
   RESTORE --> SHOWN
 ```
 
@@ -848,24 +851,57 @@ The boxes are grouped. The exact line order is in `apply_scan`; for example, the
 - fast previews;
 - full-detail images and their order;
 - thumbnails and blur images;
-- zoom tiles and source sizes;
+- source sizes;
+- zoom tiles, although the same timer tick then clears them, so the sharp zoom detail loads again (`view.reset_for_swap` resets `last_seen`, and `step_bookkeeping` clears the tiles when it sees that). A sort change is the exception: it keeps your view, and its tiles come back right after that clear (`kept_tiles`, see [Keeping the view on a sort change](#keeping-the-view-on-a-sort-change));
 - colour facts and rotation bases;
 - undo history, zoom and pan.
 
 The normal resets then run, and `Promotion::restore` puts the copies back at their new positions. The per-format cost measurements are kept too (`reset_fast_cost` is skipped), because the folder has not changed. See [Opening and inspection](#opening-and-inspection) for the photo-first open itself.
 
+**A delete, move or sort change keeps prepared work too (2 November 2026, the owner's choice).** After Delete, Move rejected, Undo move, Recover or a sort change in the same folder, the photos that stayed keep what was ready. The next photo usually appears straight away if it was prepared, and the filmstrip and grid stay filled. The rescan itself stays on the interface thread, so the list stays true to the disk and a brief pause stays for now. That pause has never been measured. The design's estimate is 0.1 to 0.2 s on 6,000 photos on a local drive, plus Delete's own wait for the Recycle Bin. One folder-open swap with 8.5 GB in the RAM cache took 348 ms in total; how much of that was freeing memory is unmeasured. All of this was checked by tests on Windows and compiled for Mac; it has not yet been run in the app.
+
+How it works: `photo_open::RescanCarry::take` copies the work out before the list swap, and `RescanCarry::restore` puts it back at the end of the same `apply_scan` call. Every normal reset runs in between, and no timer tick can run there. So when the carry is refused, the result is exactly the full reset.
+
+```text
+  listing A ───────── photo decoded ───── another program saves one file ───── listing B
+  (size + date                                                                 (size + date
+   of every file)                                                               of every file)
+                                                 │
+  at listing B, for each photo:                  ▼
+    every file's size and date the same in A and B?  yes: its pictures and facts move with it
+                                                     no:  they are dropped, and it loads again alone
+    same files, whatever their size and date?        yes: its Undo steps move with it
+                                                     no:  they are dropped (it left the folder)
+```
+
+- **Who keeps it.** `rescan_carries` answers yes only for a rescan of the folder on screen after a file operation or sort pick. A reopen still reloads everything, as the manual "read it all again". The first photo and nearby stages of an open have no full listing, so nothing can be kept right after them. Recover during a long Apply rotations reloads everything too: that is the one way to reach a rescan while Apply runs (it holds `sel_busy`, so Delete, Move rejected and Undo move refuse, and sorting is greyed), and a RAW written by a side file keeps its own stamp.
+- **What moves.** Everything in `PreparedWork`, the one list shared with Promotion: fast previews, sharp frames, thumbnails, blur images, source sizes, colour facts and rotation bases. Also, new compared with Promotion, the RAM cache (`L2Store::carried`) and the note of thumbnails whose blur image was trimmed (`film.mipless`). Sharp frames are ordered again by distance from the photo landed on.
+- **File stamps.** At every landing `apply_scan` remembers each RAW and finished file's size and modified date (`ListingStamps`), from the listing the scan already reads. No file is opened, nothing is downloaded and no system call is added. The memory is replaced at every landing, so a partial stage clears it. A stamp missing on either side counts as changed. A file another program saved, such as a Photoshop save over the same file, loads again alone, and it keeps its Undo steps.
+- **Undo and Redo.** `remap_history` moves both stacks by exact file identity (`same_photo`, never a name alone), in the same call as the list swap, which is the only place positions change. The steps of a photo that left drop, and a group drops whole if any member left. They do not come back when the photo returns, although its stars, marks and turns do, by name. The stamps stay, so after a Delete, Ctrl+Z first recovers the photo and then undoes the earlier stars on the right photo. New to see: Redo stays lit across a delete, move or sort change when there is something to redo, and Ctrl+Z after Recover or Undo move can jump to another photo because it undoes an older star.
+- **Sort.** The photo you are on stays, and prepared tiles stay. New neighbours that were not prepared load. The thumbnail cache keeps the nearest 400 in Eco and about 2,900 in Balanced. Frames far from where you now are get trimmed as new ones arrive, under the same memory limits.
+- **Kept on purpose:** the learned decode costs and the HEIC service record (`reset_fast_cost` is skipped), because the folder has not changed.
+- **Still reset, as before:** zoom back to fit, Compare closing, failure marks (a failing file is tried again once per rescan), the info panel blanking and refilling, and `reset_fast_latency`. With kept frames fewer fast decodes land, so the speed limits sit on the benchmark seed or the default for longer. That moves pace, worker count and reach only; nothing kept is evicted by it. Work still decoding at the moment of the rescan is dropped as before, because the folder-open counter moves.
+- **Log line:** `scan: rescan kept fast=… detail=… thumbnails=… ram=… undo=… redo=… changed=… in … ms`, where the time is the cost of the two copies, not of the whole pause.
+
 Some pacing state resets in the timer tick instead, when the tick sees the folder-open counter change. An example is the full-detail landing rate and its clock (`DetailPace::on_folder_swap`).
 
 **What is still a checklist.** Some per-folder state is still reset by single lines in `apply_scan`:
 
-- the cloud re-check list (`cloud_retry`) and undo/redo history (`UndoRedo::default()`);
+- the cloud re-check list (`cloud_retry`) and undo/redo history (`UndoRedo::default()`, which a kept rescan has already taken out and puts back at the end);
 - the compare halves' shown records and stored wheel notches, and the navigation kind;
+- on an actual folder change only, the browse gesture in progress (`tick::end_gestures_on_folder_change`): a held arrow key (`held_dir`), the stored wheel notches (`wheel_accum`) and the wheel's pace clock. A photo-first promotion, a re-sort or a rescan of the same folder keeps them;
 - the Review panel's filters (`support::reset_folder_filters_on_scan`) and the selection rebuild counter (`sel_gen`);
 - the tile-number plan and the folder's export record;
 - floating EXIF panels, which are re-matched by file name or closed;
 - the "last scanned folder" memory (`LastScannedDir::record`).
 
 One helper, `reset_transient_ui`, closes or resets interface state that points into the old folder: open confirm dialogs, the pending delete identity, both photo context menus, the zoom region, compare, zoom and pan.
+
+#### Keeping the view on a sort change
+
+A sort change is a same-folder reread, so it passes through that reset too. Since the Date taken sort round it keeps your place. `apply_scan` reads the view before the list swap (`RescanCarry::keep_view`), lets every reset run, and puts it back at the end of the same call, so no frame is drawn in between: zoom, pan, Compare and its two photos, and the zoom tiles. It keeps them only if the photo on screen is still the photo it lands on, and both Compare photos are still there, by exact file identity. Otherwise today's reset stands. The view is measured to cost nothing a person can feel (`memory_archive/rounds/2026-11-02_keep_view_cost/RESULTS.md`). Delete, Move rejected and Undo move still reset: that is the Delete round.
+
+The landing photo is worked out when the reread runs, from the live list (`landing_file`), never when the sort was picked: the reread can run seconds later, and by then you may be on another photo.
 
 Process-wide memos are reset next to the owners:
 
@@ -874,7 +910,35 @@ Process-wide memos are reset next to the owners:
 - `hwheic::note_folder_swap`: the hardware decline memo and the HEIC tile-plan cache.
 - `tick::release_parked_done`: frames the upload drain was holding, released together with their in-flight marks.
 
-**One memo deliberately crosses folders.** The Date-taken sort memo (`TAKEN_CACHE` in `support.rs`) is keyed by file path and checked against each file's modified time, so it stays correct across folders. It is not cleared on a folder switch, so sorting, switching folders and switching back stays fast. Instead, it is emptied all at once when it reaches 50,000 entries (`TAKEN_CACHE_MAX`, about 10 MB of paths). Cloud placeholders never get an EXIF read for this sort; they use the modified time from the folder listing, so sorting never downloads them. Since the cloud-only round a re-sort also asks the metadata it reads for that modified time, so a file freed up during the session is not read either, and a pair's RAW is checked before the sort falls back to it.
+**One memo deliberately crosses folders.** The Date-taken sort memo (`TAKEN_CACHE` in `support.rs`) is keyed by file path and checked against each file's modified time, so it stays correct across folders. It is not cleared on a folder switch, so sorting, switching folders and switching back stays fast. Instead, it is emptied all at once when a batch of new rows would take it to 50,000 entries (`TAKEN_CACHE_MAX`, about 10 MB of paths), before they go in, so a read never loses its own rows. Cloud placeholders never get an EXIF read for this sort, so sorting never downloads them: they use what is known about them, else the modified time from the folder listing. A file freed up during the session is not read either, and a pair's RAW is checked before it is opened.
+
+#### The date read
+
+Owner, 2 November: "re-sorting large folder was very slow". The first Date taken sort of 16,775 photos left the order unchanged for 14 to 24 seconds with nothing on screen.
+
+**The sort itself reads no file**, at any scale. It only asks what is known (`taken_key`). The reading is one background job, `TakenPass`, on half the logical cores (at most 8) at below-normal priority.
+
+```mermaid
+flowchart TB
+  P["You pick Date taken"] --> R
+  O["A folder that remembers Date taken opens"] --> R
+  R["TakenPass, on its own threads<br/>known in the memo → known in falcon.cache → read the rest<br/>cloud-only photos are never read, a damaged file costs one photo's date"]
+  R --> H["The rows wait inside the read<br/>the memo doesn't change, so a Delete during the read rereads the same order"]
+  H --> W{"Finished inside an open's wait?"}
+  W -- "yes" --> M["Rows into the memo on the worker<br/>one landing, in the right order"]
+  W -- "no, or a pick" --> T["The tick waits until nothing the landing would close is open (LandingHolds)"]
+  T --> S{"Handed over from an open, and the final order is already on screen?"}
+  S -- "yes" --> N["Rows into the memo, no reread"]
+  S -- "no" --> L["Rows into the memo, then one reread<br/>you stay on the photo on screen, zoom and Compare stay"]
+```
+
+- **A pick changes the order once.** The menu shows Date taken at once and the list stays in the old order until the read ends. The folder's sort memory is written at the landing, so any reread during the read uses the old order, and closing Falcon during the read leaves the old order for next time. A direction flip during the read only changes the pick. Choosing another sort stops the read, and what it read stays for the session. A pick where everything is known ends at once, with no card.
+- **An open waits according to what is unread.** With 2,000 or fewer photos unread it waits up to 1.5 seconds (`TAKEN_WAIT`) and lands once, in the right order. With more it waits only until `falcon.cache` is loaded. If the read isn't finished, the list lands in file-date order, the only time Falcon shows that stand-in order, and the read goes along in `ScanDone`. A `ScanDone` that never lands drops the read's handle (`PassHandle`), which stops it.
+- **A reread never starts a read.** With no read running it reads at most 32 unknown dates first (`read_dates_inline`), so a photo saved beside the original, or a few rotated ones, sort to their real date. During a read it reads none. A photo whose modified time changed keeps its stored date until it is read again, so it doesn't jump in the order and move the next Delete's landing.
+- **A landing that arrives on its own waits** for a dialog or menu (`modal-open`, the photo, tile, sort and Open menus), a scan or a photo-first open, Move rejected, Undo move or Empty, a file operation's reread not yet run, Apply rotations, a filmstrip drag or scrub, a reopen still scanning (for 30 seconds at most), and 2 seconds after the last free scroll of the strip or grid (`LandingHolds`). Export running holds nothing, and a zoom tile on screen holds nothing. There is no time limit on the rest, because nothing is lost by waiting.
+- **A landing that changes nothing doesn't run.** When an open's read ends, it has already worked out the final order on its own thread. If that is the order on screen and nothing has reread since, the rows go in the memo and there is no reread, so no pause and no blank Info panel.
+- **The Resume offer follows the photo.** The order can now change on its own, so the offer keeps the photo's name and finds it at the click. If the photo has gone, nothing happens.
+- **The card.** "Reading capture dates · 4,210 of 16,775", in the Export card's style, once reading has passed a second and at least about 0.3 seconds of it is left. It takes no presses. It gives way to Export's card and to dialogs, and it isn't part of the quit gate: closing is never delayed by a read.
 
 ### Colour changes versus folder switches
 
@@ -991,9 +1055,9 @@ Boot log lines such as `boot: settings loaded in … ms`, `boot: wgpu backend se
 
 ### Shutdown order
 
-Every way out of Falcon runs one save sequence, built once in `main()` before the event loop (`support::SaveSequence`). Every way out of the event loop (closing the window, a device loss, ⌘Q on Mac) runs it after `app.run()` returns. On a Mac, a system log-out, restart or shut-down runs it inside the quit handler instead (below). First, unfinished export work is told to stop. Then `support::graceful_shutdown` emits a fixed list of steps that `main` carries out:
+Every way out of Falcon runs one save sequence, built once in `main()` before the event loop (`support::SaveSequence`). Every way out of the event loop (closing the window, a device loss, ⌘Q on Mac) runs it after `app.run()` returns. On a Mac, a system log-out, restart or shut-down runs it inside the quit handler instead (below). First, unfinished export work is told to stop, and so are Copy picks, Move rejected and Apply rotations (after the file or photo they are writing; `op_cancel`). Then `support::graceful_shutdown` emits a fixed list of steps that `main` carries out:
 
-`AwaitFileOpBoundary` (Mac immediate quit only: a bounded wait for a copy, move or export to reach a safe point; never emitted on Windows) → `DrainAppliedRotations` → `DrainPickerResults` → `RevertStagedEdits` → `SaveSettings` → `FlushSelection` → `WriterBarrier` → `UnregisterFolder`.
+`AwaitFileOpBoundary` (a bounded wait, at most 10 s, for a file operation to reach a safe point; on both platforms whenever one is still running at exit, and always after Mac ⌘Q; `support::shutdown_waits_for_file_op`) → `DrainAppliedRotations` → `DrainPickerResults` → `RevertStagedEdits` → `SaveSettings` → `FlushSelection` → `WriterBarrier` → `UnregisterFolder`.
 
 The order matters. Staged (unconfirmed) key and preset edits must be reverted before settings are saved. The two worker hand-offs must be drained before review data is written. The writer barrier must come after both writes, or they may never reach disk. `SaveSettings` and `FlushSelection` write only if something changed since the last load or save, or if that save is still on its way or failed; switching to another folder uses the same rule (see [Several Falcon windows at once](#several-falcon-windows-at-once)). The test `the_shutdown_tail_runs_its_steps_in_the_one_correct_order` pins this order. `SHUTDOWN_ONCE` makes a second arrival do nothing (on Mac, the quit handler and the ⌘Q key are two doors into the same exit). From the start of the tail every log line is written directly (`log_inline_from_now`), after a 2 s barrier that drains already-queued lines so the log stays in order.
 
@@ -1031,7 +1095,7 @@ nothing.
 | --- | --- | --- |
 | `colour-resolve:{path}` | the bytes gave a different answer than the name alone would have | 200 files |
 | `colour-miss:{profile}:{distance}` | a measurable profile matched no modelled gamut; says whether it renders faithfully, or which refusal applied | 8 profiles, separate counter |
-| `sniff:{path}` | a file's bytes and name disagree; says which decoder it was sent to, not that it decoded | 200 |
+| `sniff:{path}` | a file's bytes and name disagree, found when a photo is opened or a shared name is scanned; says which decoder it was sent to, not that it decoded | 200 |
 | `placeholder-kind:{path}` | a cloud placeholder was classified by its name | 200 |
 | `jpeg-truncated:{path}` | a truncated JPEG was decoded by the OS codec | 200 |
 | `cmyk-os:{path}` | a four-channel JPEG took the Windows colour-managed route | 200 |
@@ -1061,11 +1125,11 @@ flowchart TB
   IDLEQ["Finish it, then quit<br/>(a second press forces)"]
   ROT{"Unapplied rotations?"}
   REMIND["Rotation reminder"]
-  CANCEL["Stop export between photos,<br/>stop copy/move after the current file"]
+  CANCEL["Stop export between photos,<br/>stop copy/move after the current file,<br/>stop Apply after the current photo"]
   HIDE["Stop the tick, hide the window<br/>(the event loop is still running)"]
   LOOP["Event loop returns"]
   ONCE["support::graceful_shutdown (once per process)"]
-  S0["AwaitFileOpBoundary<br/>⌘Q and quit-handler routes only, at most 10 s"]
+  S0["AwaitFileOpBoundary<br/>whenever a file operation is still running at exit<br/>(both platforms; told to stop first), at most 10 s"]
   S1["DrainAppliedRotations"]
   S2["DrainPickerResults"]
   S3["RevertStagedEdits"]
@@ -1095,7 +1159,9 @@ The order matters:
 
 Once the sequence starts, log lines are written directly instead of being queued. A short 2-second barrier first keeps earlier queued lines in order.
 
-**⌘Q is an immediate, graceful quit (Mac).** There is no prompt and no deferral. It is still not a raw `terminate:`: Falcon's Quit item replaces the window library's `terminate:`, which would end the process before anything was saved. The loop returns at once and the full sequence runs. A running web export stops between photos, and a copy or move stops after the file it is writing. `AwaitFileOpBoundary` then waits at most 10 seconds (`support::await_file_op_boundary`) for that file to finish. Windows never runs that step, because every Windows exit route already waits for its workers. The ⌘Q route skips the rotation reminder; the close button keeps it.
+**⌘Q is an immediate, graceful quit (Mac).** There is no prompt and no deferral. It is still not a raw `terminate:`: Falcon's Quit item replaces the window library's `terminate:`, which would end the process before anything was saved. The loop returns at once and the full sequence runs. A running web export stops between photos, and a copy or move stops after the file it is writing. `AwaitFileOpBoundary` then waits at most 10 seconds (`support::await_file_op_boundary`) for that file to finish. The ⌘Q route skips the rotation reminder; the close button keeps it.
+
+**Every exit stops and waits for a running file operation (both platforms).** The save sequence first tells a running Copy picks, Move rejected or Apply rotations to stop after the file or photo it is writing (the quit signal `op_cancel`; Apply checks it before each photo). If a file operation is still running, `AwaitFileOpBoundary` waits for it, at most 10 seconds and after the window has already closed, before anything is saved. Then `DrainAppliedRotations` takes every photo Apply wrote, so none stays listed as pending. Until fix round 1 (November 2026) Windows skipped this wait: a second press of the close button during a long Apply could leave the photos written after the save listed as pending, and they then showed turned twice on the next launch (CS-32). An idle exit, the usual case, does not wait at all.
 
 `DrainPickerResults` applies a colour profile or watermark picked in the very last frame, so a choice made in a native file dialog is not lost. A folder picked at that moment is deliberately not opened. Folder reloads, scans and file moves are not drained.
 
@@ -1477,7 +1543,9 @@ file together) and on its full identity. Compare needs a second identified shot.
 
 The rules live in `photo_open.rs` and the folder-open worker in `main.rs`:
 
-1. The clicked shot is published alone, with its RAW or finished partner, and its decode starts.
+1. The clicked photo's first bytes are read (usually one 32-byte read), so it has its real type from
+   its first frame. The clicked shot is then published alone, with its RAW or finished partner, and
+   its decode starts.
 2. The nearby stage waits only until the interface has taken that first request: normally one
    tick, at most 250 ms (`REQUEST_HANDOFF_LIMIT`, `request_taken`). It never waits for a decode or
    a shown frame. If the hand-off does not happen in time, the nearby stage is skipped and logged.
@@ -1487,7 +1555,15 @@ The rules live in `photo_open.rs` and the folder-open worker in `main.rs`:
    CPU, new thumbnail decodes wait, for at most 750 ms after the open (`defer_thumbnails`). After
    the preview shows, GPU full-detail decoding and CPU thumbnails may overlap. A queued thumbnail
    for a visible cell can be raised in priority without starting a second decode of it.
-5. Scan results are held while the clicked photo is still becoming visible, until it shows, fails
+5. Preparing ahead waits while the visible thumbnails fill (the start-up hold, `startup_hold`, at
+   most 3 s) and while the clicked photo's full detail is on its way (folder-open priming,
+   `open_prime_holds`). There is one exception: once the current photo's own frame is on screen, the
+   two photos each side of it may still prepare a preview (`open_let_through`, `OPEN_LET_THROUGH`).
+   They run at low priority and follow the current photo if you move. A HEIC neighbour stays held,
+   and on the Mac nothing passes yet, because no Mac run has measured it. Everything further out
+   waits for the holds to end. The nearest tiles can fill first, with the preview standing in until
+   their real thumbnail arrives.
+6. Scan results are held while the clicked photo is still becoming visible, until it shows, fails
    or 10 seconds pass (`defer_promotion`). After that, promotion waits for neither full detail nor
    neighbours.
 
@@ -1496,13 +1572,14 @@ The diagram shows these steps and what releases each wait.
 ```mermaid
 flowchart TB
   OPEN["A photo is opened<br/>file association, drag-and-drop or Open"]
-  FIRST["Clicked shot published alone<br/>with its RAW or finished partner<br/>its decode starts"]
+  FIRST["Clicked photo's first bytes read, then published alone<br/>with its RAW or finished partner<br/>its decode starts"]
   HAND{"Interface took the first request<br/>within 250 ms?<br/>REQUEST_HANDOFF_LIMIT"}
   NEAR["Nearby batch: 21 to 129 neighbours<br/>Name, Date modified, Date created or Size sort only"]
   SKIPN["Nearby stage skipped and logged"]
   FULL["Complete folder scan<br/>in the background"]
   PRIME["defer_thumbnails<br/>no new thumbnail decodes until the preview shows<br/>or while CPU detail runs, at most 750 ms"]
   READY["Clicked photo visible<br/>zoom and pan work"]
+  LET["open_let_through<br/>two photos each side may prepare a preview<br/>not HEIC, not on the Mac; the rest stays held"]
   HOLD{"defer_promotion<br/>photo still becoming visible,<br/>not failed, under 10 s?"}
   WAIT["Result held<br/>checked again next tick"]
   PROMO["apply_scan with Promotion<br/>caches and history re-keyed by identity"]
@@ -1513,6 +1590,7 @@ flowchart TB
   NEAR --> FULL
   SKIPN --> FULL
   FIRST --> PRIME --> READY
+  READY --> LET
   NEAR --> HOLD
   FULL --> HOLD
   HOLD -->|"yes"| WAIT --> HOLD
@@ -1522,10 +1600,12 @@ flowchart TB
 
 ### How the clicked photo is found first
 
-For an explicit file open, the open worker first calls `falcon_decode::scan_requested_shot`. It
+For an explicit file open, the open worker first calls `FolderCatalogue::requested_shot`. It
 lists the folder but reads metadata and headers only for the clicked file's same-stem group (for
 example `IMG_0001.CR3` with `IMG_0001.JPG`). It then uses the same content classification,
-RAW-partner ranking, cloud-placeholder check and shot creation as the full scan.
+RAW-partner ranking, cloud-placeholder check and shot creation as the full scan. The catalogue
+remembers that name for this opening (`wanted`), so the nearby batch and the full scan reuse the same
+header and give the opened photo the same answer.
 
 - Names that would make review records ambiguous (a dot or a parenthesis in the stem, or an
   AppleDouble `._` sidecar) skip this step and wait for the full scan, so an early photo can never
@@ -1552,8 +1632,8 @@ pairing are certain.
 - **Size.** Enough to fill the visible filmstrip or grid: at least 21 photos, always an odd number,
   at most 129 (`photo_open::visible_batch_len`). The batch is preloaded in either mode.
 - **Order.** Photos are taken in exact Name, Date modified, Date created or Size order from a
-  metadata-only list (`single_photo_candidates`). Those sorts need nothing but the folder listing
-  (`supports_nearby_sort`). Headers are read only for that window.
+  metadata-only list (`simple_candidates`). Those sorts need nothing but the folder listing
+  (`supports_nearby_sort`). No file contents are read for them.
 - **What waits for the full scan.** Folders with RAW files or duplicate stems, ambiguous names, and
   the Date taken, Type and Rating sorts, which need other files' contents or edits.
 
@@ -1574,9 +1654,9 @@ identity before applying the offset; a proven folder end uses the usual clamping
 wait. Scan errors clear it too. An explicit folder change discards the old wait. The overlay never changes
 `photo-ready`, so it cannot hold discovery back through `defer_promotion`.
 
-To identify files, the scan reads only the first bytes of each one; see
-[Folder scan reads](#folder-scan-reads). A file's type always comes from those bytes, never from its
-name alone.
+The scan goes by each file's name, apart from the opened photo and names shared by two finished
+files; see [Folder scan reads](#folder-scan-reads). Every photo's real type is checked from its first
+bytes when something opens it; see [File type detection](#file-type-detection-bytes-over-names).
 
 ### Promotion: the clicked photo joins its folder
 
@@ -1588,7 +1668,10 @@ When the scan finishes, the photo moves into the full folder view without reload
   name, RAW path, finished path, format, decodable-picture flag and cloud-placeholder flag.
 - **What is carried across**, moved to its new position:
   - browsing previews, full-detail frames and thumbnails;
-  - source dimensions and completed zoom tiles;
+  - source dimensions;
+  - completed zoom tiles, although the same timer tick then clears them (`step_bookkeeping`, after
+    `view.reset_for_swap` resets `last_seen`), so the sharp zoom detail loads again, except on a sort
+    change, which keeps them (`kept_tiles`);
   - menu-blur images (`film.frost`);
   - frame colour records (`shot_gamut`) and file colour records (`file_gamuts`): which colour space
     each frame's pixels and each file are in;
@@ -1602,8 +1685,9 @@ When the scan finishes, the photo moves into the full folder view without reload
 
 **Undo and Redo survive promotion.** `photo_open::reindex_history` carries the history by matching
 identities in the old and new shot lists. A grouped action that loses any of its members is dropped
-whole. This is the one exception to "a folder swap clears Undo": ordinary folder swaps and rescans
-after file operations still reset history.
+whole. A delete, move or sort change in the same folder keeps history the same way
+(`RescanCarry`, see [Switching folders](#switching-folders)). A folder change and a reopen of the
+folder on screen still reset it.
 
 **Promotion waits for the clicked photo.** It never interrupts the current photo's unfinished
 decode. `photo_open::defer_promotion` holds it until the photo is ready or has failed, for at most
@@ -1639,13 +1723,77 @@ Command-line arguments, drag and drop, the picker, recent folders and Finder ope
   the interface thread. `apply_scan` then swaps the state and restores selection, rotations, panels,
   resume position and export manifest through the shared path. `register_open_folder` runs when the
   swap is accepted.
+- The scan worker, the reopen worker (below) and the rescan after a file operation all read review
+  data through `load_selection_through_ledger`: a save from this window that hasn't reached the
+  disk yet wins over the file (see [A quick return reads the newest save](#durable-writer)).
+- That read also says what it found (`ReviewLoad`: read, nothing there, or a file it couldn't use).
+  `apply_scan` records it when a folder opens; a file it couldn't use is never saved over (see
+  [A review file that can't be read is never replaced](#saved-state-and-data-safety)).
+
+**The folder on screen is recognised under any spelling (safety round, 1 November 2026).** One
+folder can be written several ways: in different letter case, through a junction or link, as a
+mapped drive or its network path, or with an extra `\` at the end.
+
+- **Before:** Falcon compared the folder's name as text. Opening the folder already on screen by
+  another spelling counted as opening a different folder. It reloaded the review file, which could
+  be older than your latest changes, and the next save could write those older ratings back.
+- **Now:** the worker that checks the target also reads the folder's identity on disk
+  (`support::folder_identity`: on Windows the drive's serial number and the folder's file number,
+  on the Mac the device and file number). It compares that with the identity recorded when the
+  folder on screen was opened (`ShownFolder`, kept beside `scanned_dir`). If they match, Falcon
+  rescans the folder in place, using the spelling already on screen (`reopen_on_screen`), so your
+  live edits carry over exactly as for any other reopen.
+- Letter case alone never makes two folders the same, so two folders on a case-sensitive disk stay
+  two folders. If the identity can't be read, Falcon compares the paths, as before.
+- A folder renamed while it is on screen opens as a new folder by its new name.
+- The interface never waits for these disk reads.
+
+```
+Folder on screen: C:\Photos\Trip (opened from the picker). Its file says IMG_1 1★; you rate it 5★.
+You then drag in C:\photos\trip, or open it from a terminal as C:\Photos\Trip\ :
+  before: treated as another folder; the older file is read and can save 1★ over 5★   ✗
+  now:    the same folder; rescanned as C:\Photos\Trip with your 5★ kept              ✓
+```
+
+**Reopening the folder on screen no longer freezes the window (safety round, 1 November 2026).**
+Dropping a photo or folder from the folder you are already in, or picking it again (either picker,
+the Mac's Open Recent, a Finder open), reopens that folder: Falcon reads it again from disk, so new
+or removed files show up, and lands on the photo you opened.
+
+- **Before:** that second read ran on the interface thread (`reload`). On a slow network share, a
+  cold external disk or a stalled cloud folder, the whole window froze until it finished.
+- **Now:** it runs in the background (`support::reopen_scan`), like opening any other folder. The
+  folder stays on screen and usable meanwhile: no "Scanning…" overlay and no
+  clicked-photo-first stage.
+- **Your changes made meanwhile win.** When the result arrives, `apply_scan` treats it as a rescan
+  of the same folder: the ratings, flags, rejects and rotations on screen are carried over the
+  ones just read (`carry_live_review_on_rescan`). In a Rating sort the order is then worked out
+  again from those ratings, and Falcon lands on the photo you opened
+  (`photo_open::settle_reopen`). From there it behaves exactly as before: no resume offer, no
+  second "already open in another window" warning, the number badges kept.
+- **A file operation's rescan wins over it.** If a delete, move, undo or sort pick rescans the
+  folder before the reopen's result arrives, that older result is dropped (`PendingReopen`), so a
+  photo you just deleted can't come back. The photo you asked to open is then not selected; the
+  operation's own landing stands.
+- **A folder that can't be read** keeps its current list, as before.
+
+```
+Folder on screen on a slow network share. You drop IMG_0042.JPG from the same folder,
+then rate IMG_0007 5★ while it is read again:
+  before: the window freezes until the folder has been read; then IMG_0042 is selected    ✗
+  now:    the window keeps working; IMG_0007 keeps 5★ (in Rating order too), and IMG_0042
+          is selected when the read finishes                                               ✓
+```
 
 An explicit reopen of the same folder also cancels older opens; internal reloads after file
-operations do not. Same-folder reloads stay synchronous. Ratings and marks for a Rating sort come
-from live memory, and `flush_old` writes finished changes before the swap refreshes review and
-rotation state. So reading a review file that has not been written yet cannot bring back cleared
-ratings or apply a rotation twice. `scan_id` guards both publishing and applying, and a superseded
-scan returns `Interrupted` instead of publishing a partial list.
+operations do not (they cancel only a reopen of their own folder, above). The rescan after a file
+operation still runs on the interface thread (see
+[The rescan after a file operation runs on the interface thread](#the-rescan-after-a-file-operation-runs-on-the-interface-thread)).
+Ratings and marks for a Rating sort come from live memory, and `flush_old` writes finished changes
+before the swap refreshes review and rotation state. So reading a review file that has not been
+written yet cannot bring back cleared ratings or apply a rotation twice. `scan_id` guards both
+publishing and applying, and a superseded scan returns `Interrupted` instead of publishing a
+partial list.
 
 ### Cold and warm opens
 
@@ -1658,10 +1806,42 @@ only within one folder opening (`FolderCatalogue`, below).
 ### File type detection ("bytes over names")
 
 Each finished image gets one format, `SrcKind`, with nine values: `Jpeg`, `Png`, `Tiff`, `Webp`,
-`Heic`, `Jxl`, `Bmp`, `Gif` and `Unsupported`. The folder scan sets it in exactly one place,
-`scan_classify` in `falcon-decode`, and every other part of the app reads that value. The file's
-own first bytes decide; the extension is only the fallback. The tests live in `falcon-decode`'s
-`bytes_over_names` module. The three rules:
+`Heic`, `Jxl`, `Bmp`, `Gif` and `Unsupported`. A file's own first bytes have the final say, and the
+extension is the fallback. That answer is worked out at two moments, by the same function
+(`scan_classify` in `falcon-decode`):
+
+- **While the folder is listed.** The format comes from the name, so the folder is ready as soon as it
+  is listed, cold or not. There are two exceptions, where the first bytes are read straight away:
+  names shared by two or more finished files, because which file a RAW pairs with depends on them,
+  and the photo being opened, so it is right from its first frame.
+- **When a photo is opened.** Anything that opens a finished file first reads its first 32 bytes and
+  goes by them (`shot_by_bytes`). That covers the decoders at every speed tier, the size probe, the
+  colour reader, orientation, the info panel, the feed to the graphics card's JPEG decoder and the
+  Mac Image I/O slot; [Everything reads the one `kind`](#everything-reads-the-one-kind) lists them. So
+  a PNG named `.JPG` opens correctly the first time anything touches it, and no tier ever records a
+  false failure.
+
+The owner chose this on 2 November 2026 ("Check when the photo is opened"): opening every file during
+the scan had cost 3.3–3.8 seconds on first access to a folder of about 6,000 files. The trade-off they
+accepted is that a misnamed photo's format label is wrong until you look at it.
+
+**The label corrects itself.** When a check disagrees with the name, the answer goes into a small table
+for the session (`BYTES_LEARNED`, by file path; about 150 bytes per misnamed file, and a later agreeing
+read overwrites the entry, so a file replaced in place is put right at its next read). On the next
+tick the photo you are looking at takes that answer (`tick::step_checked_kind`; both halves in
+Compare). Only its `kind`, `has_jpg` and `sniffed` change: nothing moves or is renamed, and the
+tiles redraw. Every new list goes through `apply_scan`, which applies one snapshot of the table to the
+live list and to the incoming list before comparing them, so promotion keeps its frames, zoom and
+undo, and a rescan never puts the name's format back. Other photos checked by a thumbnail get their
+labels at the next list, or when you view them. An undecodable misnamed photo that was not the one
+you opened can show "may be corrupt" for at most one frame.
+
+**Apply rotations needs no new check.** Before any write, its preparation opens a photo it believes
+is a JPEG read-only and looks for a real orientation tag (`jpeg_route`). A PNG, AVIF or anything else
+named `.jpg` fails that look and gets only a side file (`<name>.JPG.xmp`); the original is never
+opened for writing.
+
+The tests live in `falcon-decode`'s `bytes_over_names` module. The three rules, at both moments:
 
 1. **Never read a cloud placeholder.** Opening a OneDrive or iCloud stub would download it. The scan
    reads the placeholder flag from the directory listing it already has (`is_cloud_placeholder`
@@ -1669,9 +1849,13 @@ own first bytes decide; the extension is only the fallback. The tests live in `f
    `SF_DATALESS` on macOS). A placeholder keeps its extension's format. The header read is passed in
    as a closure, so the test `the_sniff_never_touches_a_cloud_placeholder` can prove it is never
    called. When the file later downloads, the cloud retry sweep (`step_cloud_retry`) calls
-   `reclassify_hydrated`, which reads it and corrects the format in place.
-2. **The bytes win.** If the header names a known format, that replaces the extension's answer
-   everywhere at once, because there is only one `kind`.
+   `reclassify_hydrated`, which reads it and corrects the format in place. When a photo is opened,
+   the check reads only a file the reader was about to read, inside that reader's own cloud check. It
+   never reads a file riding along beside a RAW. A lone file whose name says unsupported is not read
+   if it is online-only. If the bytes would hand the picture to a RAW that is online-only right now,
+   nothing changes and nothing is recorded, so nothing downloads.
+2. **The bytes win.** If the header names a known format, that replaces the extension's answer, for
+   every reader at once, because there is only one `kind`.
 3. **Unknown bytes fall back to the name.** A short or unreadable file, or a header `sniff_kind`
    does not recognise, keeps the extension's answer. A `.tga` (a format with no signature) still
    works, and no existing folder is reclassified by guesswork.
@@ -1714,7 +1898,9 @@ flowchart TB
   EXT -->|"other"| IGN["Not an image: ignored"]
   EXT -->|"finished-image extension"| PH{"Cloud placeholder?<br/>Windows attributes / macOS SF_DATALESS"}
   PH -->|"yes"| NAME["Keep the extension's kind<br/>log: classified by its NAME"]
-  PH -->|"no"| HEAD["read_head: first 32 bytes<br/>scan_io, up to 8 readers"]
+  PH -->|"no"| WHICH{"Two or more finished files share this name,<br/>or it is the opened photo?"}
+  WHICH -->|"no"| LISTED["Keep the extension's kind for now<br/>the file is not opened"]
+  WHICH -->|"yes"| HEAD["read_head: first 32 bytes<br/>scan_io, up to 8 readers"]
   HEAD --> SNIFF{"sniff_kind"}
   SNIFF -->|"unknown or short"| NAME2["Keep the extension's kind"]
   SNIFF -->|"HEIC"| GATE{"heic_scan_kind_here<br/>macOS: yes / Windows: codec installed?"}
@@ -1722,17 +1908,24 @@ flowchart TB
   GATE -->|"no"| UNS["Unsupported"]
   SNIFF -->|"other known format"| BYTES["The bytes' kind wins<br/>sniffed is set if the name disagreed"]
   NAME --> PAIR["Pairing and mint_finished"]
+  LISTED --> PAIR
   NAME2 --> PAIR
   HEIC --> PAIR
   UNS --> PAIR
   BYTES --> PAIR
   RAW --> PAIR
+  PAIR --> READER["Later: something opens the file<br/>shot_by_bytes reads its first 32 bytes<br/>same rules, inside that reader's cloud check"]
+  READER --> RIGHT["That reader goes by the bytes<br/>decode, size, colour, orientation, panel"]
+  READER --> TABLE["A disagreement goes in the session table<br/>BYTES_LEARNED"]
+  TABLE --> LABEL["Photo on screen: label corrects next tick<br/>Every new list: takes the answer before it is compared"]
 ```
 
 ### Folder scan reads
 
 The scan (`scan_folder_with_metadata` and its cancellable form) first lists the folder and keeps
-each entry's metadata. It then reads the 32-byte headers it needs through `scan_io`:
+each entry's metadata. For an ordinary folder that is all it does. It reads 32-byte headers only for
+names shared by two or more finished files (counted from the listing, so every opening stage gets the
+same answer) and for the opened photo's name, through `scan_io`:
 
 - At most eight files are open at once (`MAX_SCAN_READERS`). Batches below 16 header reads
   (`PARALLEL_SCAN_MIN_FILES`), such as the clicked photo, read one at a time. Workers take files one
@@ -1759,15 +1952,22 @@ before anything else reads it (`falcon_decode::is_appledouble_sidecar`, used by 
 pairing). This happens on both platforms, because memory cards travel between Macs and PCs. The scan
 log reports how many were skipped (`FolderScan::appledouble`).
 
-**What the header reads cost.** On a release build with a warm local NVMe drive, one open, one
-32-byte read and one close cost about 13–16 µs per file, whatever the file size. RAW files and
-placeholders skip the read. A 500-file folder scanned in about 0.4 ms without header reads and
-7.4 ms with them, still small next to the ~300 ms before the first photo appears. In a 6,289-PNG
-cloud-synced folder with every file local, warm repeated scans took 221–255 ms with one reader,
-130–132 ms with four and 108–116 ms with eight, with identical results. These are scan times, not
-full launch times. On a network share or a cold spinning disk each header read is a round trip or a
-seek. The rescan after a delete, move or undo runs synchronously on the interface thread and repeats
-these reads.
+**What the header reads cost, and why the scan stopped reading every file.** On a release build with
+a warm local NVMe drive, one open, one 32-byte read and one close cost about 13–16 µs per file,
+whatever the file size. A 500-file folder scanned in about 0.4 ms without header reads and 7.4 ms with
+them. In a 6,289-PNG cloud-synced folder with every file local, warm repeated scans took 221–255 ms
+with one reader, 130–132 ms with four and 108–116 ms with eight, with identical results. Those are
+warm numbers. The cost that mattered was first access: 3.3–3.8 seconds for about 6,000 files, spent
+before the folder was ready, and more on a network share or a cold spinning disk, where each read is
+a round trip or a seek. So since 2 November 2026 the scan reads only the listing: the folder is ready
+as soon as it is listed, and the scan log's header count (`header_reads`) reports about 0 for an
+ordinary folder. A folder of exported pairs (`X.jpg` beside `X.png` for every photo) still reads every
+file, because each name is shared; the owner accepted that.
+
+The reads move to the readers: each one does an extra 32-byte open of a file it was about to read,
+about four to six per viewed photo and two to three per thumbnail, all on worker threads. That is tens
+of microseconds each on a warm drive (an estimate, not measured) and one round trip each on a network
+share, far below what the scan saves.
 
 ### Shots, pairing and names
 
@@ -1775,8 +1975,9 @@ Files with the same name stem form *shots* (one photo, possibly with a RAW and a
 
 - A RAW pairs with its best finished sibling. Ranking (`finished_rank`, highest wins):
   `Jpeg 8 > Tiff 7 > Png 6 > Jxl 5 > Webp 4 > Bmp 3 > Gif 2 > Heic 1 > Unsupported 0`, then by path.
-  The rank uses the kind the bytes declared, so a misnamed file ranks as what it really is and
-  cannot push out a genuine sibling.
+  Names shared by two or more finished files are checked during the scan, so the rank uses the kind
+  the bytes declared: a misnamed file ranks as what it really is and cannot push out a genuine
+  sibling. A RAW with just one finished file pairs by name, with no read.
 - Only RAW + finished collapses into one shot. Two finished images with one stem (say a JPG and a
   TIFF) are separate shots named with their extension (`IMG_0042.jpg`, `IMG_0042.tif`). Extra RAWs
   with the same stem (a CR3 and a DNG) become their own RAW-only shots, so nothing is hidden or left
@@ -1897,8 +2098,9 @@ flowchart TB
   `sniffed` and `has_jpg`. It uses the same `mint_finished` rule as the scan, so a RAW's undecodable
   partner cannot end up in a state the scan would never produce. The change is copy-on-write on the
   shared shot list (`Arc::make_mut`); positions, names and order stay the same, so nothing keyed on
-  them is invalidated. A re-classified file gets the same one-time message a normal scan gives when
-  contents and extension disagree, and the log counts re-classified files.
+  them is invalidated. A re-classified file gets the same one-time message a normal check gives when
+  contents and extension disagree, its answer goes into the same session table, and the log counts
+  re-classified files.
 - **Known limit.** Metadata cannot show a download in progress. The retry sweep is the workaround;
   Falcon does not subscribe to download events.
 
@@ -2145,6 +2347,15 @@ Wheel input only accumulates notches (`wheel_accum`; `cmp_wheel_accum` in Compar
 `WHEEL_ACCUM_MAX`) plus a timestamp. The tick applies the banked steps at the browse rate without
 drift, and drops the remainder once the wheel has been quiet for 140 ms (`HOLD_TIMEOUT_MS`), so
 buffered wheel events never glide on after the wheel stops.
+
+**A browse never carries into another folder** (1 November safety round). Before, a wheel notch
+still stored when a new folder opened was paid out in that folder, moving it off the photo it opened
+on; a notch made over an empty folder waited there for the next folder. Now a folder change empties
+the stored notches and releases a held arrow key, and an empty folder spends any notch at once (it
+has no photo to move to). A key still held down after the change starts again like a new press: its
+next repeat moves one photo, and the scrub resumes after that. Opening the clicked photo first is
+not a folder change, so a browse started on that photo carries on when the rest of the folder
+arrives.
 
 **Navigation input never decodes, with one deliberate exception.** A key press, wheel notch or click
 only moves `current`; the tick requests the decodes. The exception is `prime_jump`, the shared body
@@ -2851,19 +3062,39 @@ lossy-JPEG compressed. Falcon never calls rawler's preview functions.
 
 #### Everything reads the one `kind`
 
-Every subsystem reads the scan's `kind`, so correcting the classification corrects them all together:
+Every subsystem reads the shot's one `kind`. The scan sets it (from the name, or from the bytes for
+shared names and the opened photo), and it is corrected where a photo is looked at.
 
-- the decode dispatch at every tier (`decode_source_rgb`, `decode_source_rgb_lane`);
-- `source_dimensions`;
-- the colour-profile reader (`file_color_tag`);
-- RAW partner ranking (`finished_rank`);
-- the format tag in log lines (`kind_tag`);
+These readers open the finished file, so each checks the bytes first (`shot_by_bytes`) and goes by the
+answer, whatever the shot says:
+
+- the decode dispatch at every tier (`decode_source_keep`, `decode_source_rgb_lane`), which covers
+  fast previews, thumbnails, full detail, the zoom region, export, the watermark preview and the clipboard;
+- `source_dimensions`, which also checks a file whose name says unsupported, because every settled
+  photo gets this probe. So a JPEG named `.avif` is found when you view it;
+- the colour-profile reader (`shot_source_gamut`, which calls `file_color_tag`);
+- orientation (`read_orientation`, `decoder_consumed_turns`);
+- the info panel (`exif_rows`);
+- the feed to the graphics card's JPEG decoder (`jpeg_bytes`, which refuses bytes that are not a JPEG,
+  so the CPU decoder takes over) and the Mac Image I/O slot (`ImageIODecoder`);
+- the web export's loop over its picks, unless a file has gone online-only since you agreed to download.
+
+These read the shot's current answer, so they follow the name until the photo has been looked at:
+
+- RAW partner ranking (`finished_rank`), which matters only for shared names, and those are read during
+  the scan;
+- the format tag in log lines (`kind_tag`), so a first decode of a PNG named `.JPG` logs `JPG / CPU`,
+  and the `sniff:` line beside it explains;
 - `Shot::is_jpeg_source`, which admits a shot to nvJPEG, to the GPU YUV zoom path and to in-file
-  rotation (`finished_is_jpeg`, which also requires `has_jpg`).
+  rotation (`finished_is_jpeg`, which also requires `has_jpg`). Each of those checks again before it
+  uses the file;
+- the badge, the menus, the toast and the GIF controls. The rare cases this leaves are in
+  [known issues](docs/planning/known-issues.md).
 
 The format name shown to the user comes from `Shot::finished_format`, built from `kind_tag`. A PNG
-named `53d879f01a3f481c.JPG` badges **PNG** while the header still shows its real filename. The info
-panel adds `(named .JPG)` (`named_ext_when_bytes_disagree`).
+named `53d879f01a3f481c.JPG` badges **JPG** until it has been viewed, and then **PNG**, while the header
+still shows its real filename. The info panel adds `(named .JPG)` from its first build
+(`named_ext_when_bytes_disagree`).
 
 `Unsupported` has no format name of its own, so `finished_file_format` answers in this order:
 
@@ -3074,7 +3305,7 @@ thumbnail before its frame header is still followed to the end. A missing size w
 zoom-region tiles, focus readout and zoom decision, so the probe must not give up early on real files.
 
 The budget matters because `source_dimensions` runs on the interface thread, and any file starting
-`FF D8 FF` counts as a JPEG by its bytes. A crafted file of `FF D8` followed by gigabytes of filler is
+`FF D8 FF` counts as a JPEG by its bytes once it is checked. A crafted file of `FF D8` followed by gigabytes of filler is
 abandoned after 16 MiB instead of stalling the interface (byte-by-byte reading measured 36.9 ms per
 32 MB). The same walk supplies the component count for the CMYK setting (`JpegFrame`).
 
@@ -3170,7 +3401,9 @@ Runway        costly_prefetch_window(full) = (min(8, ahead), min(3, behind)); it
 Duck          costly_prefetch_budget(cap, in_flight, interactive_busy) = 0 while the user waits on a decode
               (Balanced ducks only where Turbo would cap)
 Priming       open_prime_holds: after a folder opens, speculation waits until the user moves or the
-              first full-detail frame lands; past OPEN_PRIME_MAX_MS = 500 ms only while that decode runs
+              first full-detail frame lands; past OPEN_PRIME_MAX_MS = 500 ms only while that decode runs.
+              It shuts the window only for HEIC, a RAW develop and the Mac (priming_shuts_window).
+              On other formats the two photos each side may still ask (open_let_through), not a HEIC
 Admission     admit_costly_prefetch: the displayed photo and both Compare halves are never rationed;
               the displayed photo is left out instead when its preview will be derived (derive_c)
 ```
@@ -3203,7 +3436,8 @@ Measurement (`support::note_fast_cost`, fed by every browsing-preview decode thr
 - Each format may relax once per folder (`relax_spent`), and a relaxed class is re-judged after only
   4 decodes (`FAST_COST_PROBATION_WINDOW`), so a wrong relax is undone quickly.
 - `support::reset_fast_cost` clears all of this when a new folder opens (not when the opened photo is
-  promoted into its full folder), and a change in HEIC hardware service clears HEIC's own measurement
+  promoted into its full folder, and not on a delete, move or sort change that keeps prepared work),
+  and a change in HEIC hardware service clears HEIC's own measurement
   (`reset_fast_cost_heic`).
 - The tick takes one snapshot per `step_prefetch_fast` (`fast_cost_view()`, two relaxed atomic
   loads), so one queue build cannot see two answers.
@@ -3217,7 +3451,7 @@ Each lever is a pure function in `support.rs`; the tick only carries out its ans
 | Runway | `costly_prefetch_window(full)` = `(8.min(full.0), 3.min(full.1))` | A costly photo is decoded only if it is at most 8 ahead or 3 behind (`COSTLY_PREFETCH_AHEAD`, `COSTLY_PREFETCH_BEHIND`). The rule can only shorten the window, never widen it. The window of photos *kept* in memory (retention) is not narrowed, so nothing already prepared is evicted. | `costly()` per photo |
 | Cap | `costly_prefetch_cap(workers)` = `(workers / 4).clamp(2, 6)` | At most this many speculative costly decodes at once (4 on an 18-worker pool). The steady ceiling is `costly_prefetch_ceiling(cap)` = cap + 1, because the displayed photo is admitted on top. | `costly_by_prior()` |
 | Duck | `costly_prefetch_budget(cap, inflight, interactive_busy)` | The budget is the cap minus what is already decoding, and **zero** while the user is waiting on a decode. | `interactive_busy` |
-| Folder-open priming | `open_prime_holds(armed, navigated, detail_landed, detail_busy, elapsed_ms)` | When a folder opens, preparation ahead waits until the opened photo's full-detail frame has landed or been refused. It releases at once if the user moves to another photo, and after `OPEN_PRIME_MAX_MS` (500 ms) if no full-detail decode has started. | — |
+| Folder-open priming | `open_prime_holds(armed, navigated, detail_landed, detail_busy, elapsed_ms)` | When a folder opens, preparation ahead waits until the opened photo's full-detail frame has landed or been refused. It releases at once if the user moves to another photo, and after `OPEN_PRIME_MAX_MS` (500 ms) if no full-detail decode has started. Only the current photo being HEIC or a RAW develop, or the Mac, shuts the preview window while it waits (`priming_shuts_window`). On other formats the window stays, and once the photo's own frame is on screen the two photos each side may still ask (`open_let_through`), except a HEIC. | Format of the current photo, RAW mode |
 
 `interactive_busy` is true while any of these holds:
 
@@ -3316,8 +3550,15 @@ tick; only decodes already in flight finish under the marks they were admitted w
 
 Neither of these costs comes from a browse step itself:
 
-- **The folder-open batch.** When the priming hold releases, the neighbour prefetch dispatches its
-  first batch, and the first ~3.5 s of a browse overlap it.
+- **The folder-open batch.** When the opening holds end, the neighbour prefetch dispatches its first
+  batch, and the first ~3.5 s of a browse overlap it. Outside HEIC, a RAW develop and the Mac, the two
+  photos each side have usually gone ahead of it, beside the thumbnails. Those previews give the speed
+  estimate a real sample, so on Balanced with no benchmark the first batch can be smaller: far previews
+  on PNG and camera JPEG can finish about 0.3-0.5 s later (an estimate, not measured).
+- **The two photos each side.** They can overlap the current photo's own decode on normal routes, such
+  as a plain open, a Delete or a sort change on JPEG, or a clicked PNG whose list lands later. This is
+  accepted because they are few and run at low priority, not because they cannot overlap. No machine
+  has measured the cost yet; the first laptop log will show it in `decode-stats full-res`.
 - **The stop.** The batch in flight when a browse ends cannot be recalled, so the first full-detail
   frame after the browse settles still pays for it: 1,439–1,738 ms, against 795–967 ms for the same
   photos with the queue drained (100-file test folder, 18-worker pool).
@@ -3336,7 +3577,9 @@ Neither of these costs comes from a browse step itself:
   - `costly=N/CAP` appears whenever capped work is in flight. `CAP` is the cap in force (`cap_eff`),
     after the lane-cap and throttle rules, not the boot constant;
   - `dref=` appears when the derive worker refused a derive.
-- **Change lines.** Folder-open priming prints one `armed` and one `released` line with the reason.
+- **Change lines.** Folder-open priming prints one `armed` and one `released` line with the reason. The
+  `armed` line ends `(fast window collapsed)` where priming shuts the window and `(nearest photos may
+  pass)` where it does not.
   Each change of a format's measured class prints `pool posture: <format> fast decodes measure Nms —
   runway NARROW (costly)` or `FULL (cheap)` `(cap unchanged)`. Each HEIC service transition, each
   Settings-throttle edge and each publish-gate row change prints its own `pool posture:` line.
@@ -3742,6 +3985,18 @@ navigation: it stamps the motion clock and frees the tier on the next tick.
 - Two more reasons hold speculative preview asks behind the same exemption: the folder-open thumbnail
   start-up hold (`startup_hold`, until visible thumbnails are presented or 3 s pass), and, in
   Eco, stale-size upgrades after a preview-size change.
+- The opening holds are softer than a gesture. While the start-up hold or priming (where it does not
+  shut the window) is on, the two photos each side may still ask once the current photo's own frame is
+  on screen (`open_let_through`); a HEIC never does, nor does anything on the Mac. A gesture, memory or
+  background hold stops them too. They are not treated as on screen: the Eco pause, the mode's cap, low
+  priority and "never download a cloud-only file" still apply, so on battery they start when the sharp
+  frame lands. Priming now also counts as a hold for the backpressure test above, which is harmless at
+  this size.
+- With the window no longer shut during priming on those formats, two things read the real window
+  sooner. The cache meter shows the new folder straight after a landing, instead of the old folder's
+  reading. The frost feeder (the background feed of small blur images) can run on the wide window for a
+  moment, if the start-up hold has already ended and thumbnails are not being deferred; its requests
+  are speculative and bounded by its own share.
 
 **What the hold costs, and how it looks in the log.** Frames held in `drain_buf` are decoded RGBA in
 main memory, not GPU memory. They sit outside the browsing-preview GPU budget: `fast_budget` sizes the
@@ -4679,8 +4934,11 @@ These are the pieces Falcon relies on when input is bad or a resource runs out.
   [Saved state and data safety](#saved-state-and-data-safety).
 - **Saved files.** Settings and review files load with `#[serde(default)]` and clamped values. A review
   (selection) file that fails to parse is renamed aside to a `.corrupt` or `.corrupt[N]` name that does
-  not collide (`preserve_corrupt_file`) before anything can overwrite it. An over-cap file is read as
-  absent and left untouched, and a zero-byte file counts as debris and is read as absent.
+  not collide (`preserve_corrupt_file`) before anything can overwrite it, and so is one that isn't
+  UTF-8 text. A zero-byte file counts as debris and is read as absent. A review file that is over the
+  cap, can't be read, or is damaged and can't be renamed aside is left untouched, and nothing is saved
+  over it while the folder is open (see
+  [A review file that can't be read is never replaced](#saved-state-and-data-safety)).
 - **Refuse rather than overwrite.** Rotation apply (`falcon-decode/src/apply.rs`) patches a JPEG's
   orientation in place only after re-parsing the file and checking the current value (compare-and-swap),
   then reads the value back. Other files get an XMP sidecar, written by atomic replace. An existing
@@ -4705,7 +4963,7 @@ flowchart LR
     G1["guard_source_dims before any pixel buffer<br/>limit = RAM/48 pixels, clamped to 200-2,000 MP"]
     G2["Byte limits before reading<br/>JPEG, RAW, JXL 600 MB, HEIC container and GIF frames 256 MiB<br/>EXIF and XMP 4 MiB, picked ICC 64 MiB, saved files 16 MiB"]
     G3["Every worker job in catch_unwind<br/>every lock recovers from poisoning"]
-    G4["serde defaults and clamping<br/>unreadable: kept as .corrupt[N]<br/>over cap or 0 bytes: read as absent, untouched"]
+    G4["serde defaults and clamping<br/>unreadable: kept as .corrupt[N]<br/>0 bytes: read as absent, untouched<br/>review file over cap or can't be read: untouched, never saved over"]
     G5["Scan: no link following, name-uniqueness pass<br/>placeholders tagged, never opened"]
   end
   subgraph FB["Fallback chains"]
@@ -4773,11 +5031,12 @@ allocating.
 | GIF pre-composition | 256 MiB and 100,000 frames |
 | Watermark text | 64 characters |
 | Settings, review data, open-folders registry, export manifest | 16 MiB each (`CONFIG_MAX_BYTES`, `SELECTION_MAX_BYTES`, `EXPORT_MANIFEST_MAX_BYTES`) |
+| Capture date cache (`falcon.cache`) | 16 MiB, about 700,000 photos (`DATE_CACHE_MAX_BYTES`); larger is left alone and never read |
 | Picked output ICC profile | 64 MiB |
 
 **Config files are checked before they are read.** `read_to_string` sizes its buffer from the file's
-length, so reading an unbounded file risks a huge allocation. Every config-folder file (`settings.json`,
-`ratings.json`, `open_folders.json`) therefore gets one metadata check before it is read
+length, so reading an unbounded file risks a huge allocation. Every config-folder file Falcon reads
+(`settings.json`, `open_folders.json`) therefore gets one metadata check before it is read
 (`config_file_over_cap`). The limit is 16 MiB (`CONFIG_MAX_BYTES`), the same number as the review data
 and the export record. A file over the cap is treated as absent and left exactly as it is on disk; it is
 never moved aside or overwritten, because those bytes may be the user's only copy. The message is logged
@@ -5537,7 +5796,7 @@ The source colour space describes the pixels Falcon actually kept, not just the 
 
 Falcon converts every photo from the colour space it was saved in (its **source gamut**) to the display's colour space. The source is read from the profile's measured primaries (its colorants), not from its name. The name is a fallback; sRGB is the floor.
 
-**One reader per format.** `file_color_tag(path, kind)` returns a `ColorTag { icc, desc, desc_from_profile }`. Because `kind` comes from the file's bytes, a Display P3 PNG named `.jpg` is read by the PNG reader. The readers:
+**One reader per format.** `file_color_tag(path, kind)` returns a `ColorTag { icc, desc, desc_from_profile }`. Because `shot_source_gamut` checks the file's bytes first, a Display P3 PNG named `.jpg` is read by the PNG reader. The readers:
 
 - JPEG: APP2 `ICC_PROFILE` segments, joined in sequence-number order.
 - PNG: `iCCP`. A bare `sRGB` chunk supplies a name only.
@@ -5804,6 +6063,20 @@ Apply rotations writes to the user's originals, so it follows a strict safety co
 
 Updating an existing attribute (`tiff:Orientation="N"`) or element (`<tiff:Orientation>N</tiff:Orientation>`) is a plain value replacement and does not need this check.
 
+**Apply waits while the folder's review file can't be read (safety round review, 1 November 2026).** While the folder on screen is marked as having a review file Falcon couldn't read (see [A review file that can't be read is never replaced](#saved-state-and-data-safety)), **Apply rotations** is faded, the same look it has when nothing is turned. Turning photos on screen and **Discard rotations** still work, and the amber warning the folder opened with already says changes made there won't be saved. Apply comes back when a reopen reads the file, or on any later fresh open of the folder.
+
+- **Why.** Apply writes the turn into the photo, then saves the review file without that pending turn. While the file can't be read, that save is refused, so the file would keep any older pending turn it holds for the photo. That older turn isn't shown during such a visit, because the file wasn't read. When the file reads again, the older turn would be added on top of the turn already written, and the photo would show (and a second Apply would write) a quarter-turn too many.
+- **One answer for every way in.** The Apply button's fade (`apply-rotations-waits`), the step that counts cloud-only files before the confirm (`on_apply_rotations_ask`) and the run itself (`on_apply_rotations`) all ask the same question (`support::apply_rotations_waits`) about the folder Apply writes and saves to (`cur_dir`). The run asks before it builds its list or writes anything, so a confirm left open closes without writing. The button's property is set each time a folder lands (`apply_scan`), after the mark is recorded, so it clears exactly when the mark does.
+
+```
+IMG_1 has a pending turn ↻ in the review file (Close anyway, last session).
+Today the file is locked, so IMG_1 shows without it. You turn IMG_1 ↻ again and press Apply:
+  before: IMG_1 is written ↻; the save is refused; the file still says ↻ pending
+          → reopen: ↻ + ↻ = upside down                                         ✗
+  now:    Apply is faded; nothing is written to IMG_1
+          → reopen reads the file: IMG_1 shows its one pending ↻; Apply works    ✓
+```
+
 Apply works out the turns the decoder consumed from the cached remaining turn and the fresh absolute tag, with no second decoder probe, because such a probe could fail on a locked file. When a HEIC has no EXIF, Apply starts from orientation 1.
 
 **Reading back, repeat Applies and crashes.** `read_orientation` checks Falcon's sidecar first (`sidecar_orientation`). An applied rotation therefore wins over the file's unchanged embedded tag (the Adobe convention) and survives a reload. A RAW reads only `name.xmp` and a finished file reads only `name.ext.xmp`; the two never cross. A second Apply builds on the value the first one wrote (`current_for_sidecar`).
@@ -5814,18 +6087,19 @@ There is no separate journal file. The pending manual turns saved in the review 
 - The patcher is idempotent. Re-running the same expected → target finds the file already at the target and writes nothing.
 - After the batch, XMP ratings are queued and the review data is flushed through a writer barrier before the result is shown.
 - Shutdown drains the hand-off before it saves anything (`ShutdownStep::DrainAppliedRotations`, through `support::rebase_only`). When the folder changes, the outgoing folder's finished entries are rebased and saved before the switch.
-- So if Falcon quits, crashes or changes folder mid-batch, at most one photo's state is uncertain, and the next Apply cannot rotate the whole batch a second time.
+- Quitting mid-batch stops Apply after the photo it is writing, waits for it, then saves (see [Quitting and shutdown](#quitting-and-shutdown)). This holds on both platforms since fix round 1 (November 2026).
+- So if Falcon quits, crashes or changes folder mid-batch, at most the one photo being written is uncertain (on a quit, only if the 10-second wait runs out or the process is killed outright), and the next Apply cannot rotate the batch a second time.
 
 Accepted limits:
 
 1. The process may die in the short gap between a file's sync and the review-data save. That one shot can then show a double rotation on the next launch. Nothing is corrupted, and the user can rotate it back.
-2. The folder may change while a batch is still arriving. Shots written after the old folder's last save are logged by count and first file name (`RotState::on_folder_swap` returns them). They are not dropped silently. Their rotation is on disk and their pending turn stays recorded.
+2. The folder may change while a batch is still arriving. Shots written after the old folder's last save are logged by count and first file name (`RotState::on_folder_swap` returns them). They are not dropped silently. Their rotation is on disk and their pending turn stays recorded. Sorting is greyed out while Apply rotations runs (since fix round 1), so a re-sort can't cause this; deleting a photo or reopening the folder mid-Apply still can (a known issue).
 
 ### Unapplied rotations
 
 **Unapplied rotations are always visible and never lost silently.**
 
-- Copy and Move transfer the original bytes, so a manual turn that has not been applied does not travel with the file. The Copy confirmation counts the picks that have pending turns and says so (`copy-rot-notice`). A one-time notice follows a copy or move that included such shots: "Apply rotations first if you want them upright elsewhere".
+- Copy and Move transfer the original bytes, so a manual turn that has not been applied does not travel with the file. An **applied** turn does travel: a JPEG's is in the file itself, and a RAW's, HEIC's, PNG's, TIFF's or WebP's is in its XMP sidecar, which Copy and Move carry with the file (since fix round 1; see [Side files](#side-files)). The Copy confirmation counts the picks that have pending turns and says so (`copy-rot-notice`). A one-time notice follows a copy or move that included such shots: "Apply rotations first if you want them upright elsewhere".
 - Closing Falcon with rotations that are new since the last Apply or acknowledgement opens a reminder. Its buttons are **Open Review** (the default, on Enter) and **Close anyway** (`rot-reminder-open`). The acknowledgement lives in `RotState.rot_acked` and is cleared on a folder change.
 - **Discard rotations** removes every manual turn for the folder after a confirmation.
 
@@ -6352,7 +6626,7 @@ Falcon's reversible history has three records:
 - the `DeleteRecord`: files sent to the Recycle Bin or Trash;
 - `last_move`: files moved to the Rejected folder.
 
-The last two live outside the stack because delete and move both end in a re-scan, and `apply_scan` always replaces the stack.
+The last two live outside the stack because delete and move both end in a re-scan, and they are single records with their own folder gates. A re-scan of the same folder keeps the stack for the photos that stayed, by file (`remap_history`), with its numbers unchanged. A folder change or a reopen replaces it.
 
 To put the three in order, every reversible act takes a number from one counter, `main.rs::next_act_seq`. The counter is pre-incremented, so 0 means "never stamped", and it is called only from the ten places that arm something reversible. Ctrl+Z reverses whichever live record has the highest number. So after delete → move → Ctrl+Z, the move is undone, not the delete. The counter lives in `main`, not in `UndoRedo`: a counter reset by a re-scan would let a new edit take a lower number than a delete record that survived the scan.
 
@@ -6373,7 +6647,7 @@ flowchart LR
   ARM --> D6["Pinned last-action row<br/>when no row matches"]
 ```
 
-`support::live_undo_arm(...)` counts each record only while it is live: the stack's `top_seq`, the delete record through `recover_offer_live`, and the move record through `move_undo_live`. It returns the newest live one, or `None` when nothing is reversible. Everything that shows or performs Undo reads this one answer:
+`support::live_undo_arm(...)` counts each record only while it is live: the stack's `top_seq`, the delete record through `recover_offer_live`, and the move record through `move_undo_live`. A delete or move record is live only while the folder it happened in is the folder on screen (`scanned_dir`). The last folder that had photos (`cur_dir`) does not count: opening a folder with no photos, or starting Falcon with no folder open, leaves `cur_dir` on the earlier folder, so it cannot answer "is this folder on screen?". A move that finishes after you have left its folder is never offered for undo. `live_undo_arm` returns the newest live one, or `None` when nothing is reversible. Everything that shows or performs Undo reads this one answer:
 - the Ctrl+Z dispatch;
 - enablement (`undo_control_enabled`): only the Move arm runs through `start_op`, which refuses while another file operation holds `sel_busy`, so only Move is greyed out then;
 - the pill label (`undo_pill_label`): "Undo move" when a move is newest, otherwise "Undo". The move is the one reversal that moves files on disk, and "Undo delete" would wrongly suggest a matching redo;
@@ -6391,7 +6665,7 @@ Two rims link rows to the history:
 - an accent rim marks the row Undo would reverse;
 - a light rim marks the row Redo would re-apply.
 
-Both come from `support::seq_row_index`, where −1 means no row. When no row describes the newest act, a **pinned last-action row** appears instead. It covers acts that raise no notification (for example "Flagged IMG_1234"), and it is the visible sign that a re-scan cleared the cull history. A matching row and the pinned row cannot both appear, because both are decided from the same number.
+Both come from `support::seq_row_index`, where −1 means no row. When no row describes the newest act, a **pinned last-action row** appears instead. It covers acts that raise no notification (for example "Flagged IMG_1234"), and it is the visible sign of what Ctrl+Z reaches next. After Recover or Undo move it can show an older star again, because that star is the newest act left. A matching row and the pinned row cannot both appear, because both are decided from the same number.
 
 Undo and redo results appear where they can be seen. The events panel covers the toast card, so `main.rs::say_edit_result` asks `support::edit_say_route`:
 - with the panel open, the sentence becomes a persistent `NotifEntry` tagged with its act number;
@@ -6440,7 +6714,21 @@ The tile menu shows no shortcut chips on rows that act on the tile. Select all, 
 
 ## File operations, delete and recovery
 
-Falcon copies picks to `./Picks`, moves rejects to `./Rejected`, exports to `./export` (see [Export](#export)) and sends deleted shots to the Recycle Bin or Trash. It never deletes a file permanently. Copies, moves and restores never overwrite an existing file; only an export with **Overwrite** chosen replaces files, and Apply rotations edits files in place as described in [Apply rotations](#apply-rotations). Copy and Move transfer the original bytes, so unapplied manual turns do not travel with them (see [Unapplied rotations](#unapplied-rotations)).
+Falcon copies picks to `./Picks`, moves rejects to `./Rejected`, exports to `./export` (see [Export](#export)) and sends deleted shots to the Recycle Bin or Trash. It never deletes a file permanently. Copies, moves and restores never overwrite an existing file; only an export with **Overwrite** chosen replaces files, and Apply rotations edits files in place as described in [Apply rotations](#apply-rotations). Copy and Move transfer the original bytes, so unapplied manual turns do not travel with them (see [Unapplied rotations](#unapplied-rotations)); each file's XMP sidecar, which holds an applied turn and synced stars, travels with it (see [Side files](#side-files)).
+
+### Side files
+
+Since fix round 1 (1 November 2026), Copy picks and Move rejected take each file's own XMP sidecar along, the small side file where Falcon keeps an applied turn for a RAW, HEIC, PNG, TIFF or WebP, and the synced stars (`side_file_of`, `carry_side_file`). Before, ./Picks showed those photos unturned and Move left `IMG.xmp` behind in the shoot folder.
+
+- **Which sidecar.** The RAW takes `IMG.xmp`; the finished image takes `IMG.JPG.xmp` (or `IMG.HEIC.xmp`). These are the names Apply, reading, XMP sync and Delete use (`sidecar_path_for`). A sidecar travels only when its own file does, so **RAW only** carries `IMG.xmp` and **Image only** carries `IMG.JPG.xmp`. `IMG.CR3.xmp` belongs to other programs and never travels; neither does an `IMG.xmp` beside a JPEG-only photo. Two RAWs that share one name (`IMG_1.CR3` and `IMG_1.DNG`) share `IMG_1.xmp`; it is carried once.
+- **Same steps as the photo.** The sidecar is copied right after its file, inside that file's step (a quit waits for both), through the same claim, `.part` and rename, with the same interrupted-copy recovery.
+- **Never overwritten.** If a different sidecar is already at the destination, it is left untouched and the result line says so, for example " · 1 XMP sidecar not copied (see log)" ("not moved" for Move rejected). An identical one is fine and silent. A sidecar that can't be moved stays beside the photo's old place.
+- **Only with files copied or moved now.** A re-copy that finds the photo already in ./Picks carries nothing, so a pair in ./Picks never ends up half refreshed. (A re-copy after Apply rotations does not refresh ./Picks: a known issue.)
+- **Counts and colour.** "Copied 12 file(s)" still counts photo files; sidecars that travelled are not mentioned. A result whose only problem is a sidecar keeps the normal colour, like "need attention".
+- **Undo move** restores the photos first, then their sidecars, so a sidecar never comes back before its photo. One whose old name is taken again stays in ./Rejected: " · 1 XMP sidecar not restored (see log)".
+- **Stars first.** Both operations queue the pending star writes and wait for them (`writer_barrier`, 10 s) before carrying anything, so a carried sidecar holds the latest star and none lands on a sidecar that has just moved.
+- **Not in the export record**, and outside the cloud rule (owner, 28 October): an online-only sidecar of a few KB downloads with its photo and is not added to the confirm's cloud count.
+- **Empty to Recycle Bin** sends the sidecars in ./Rejected with the photos, and its count includes them.
 
 ### The in-progress marker (`.part`)
 
@@ -6476,6 +6764,7 @@ flowchart TB
   UN -- ok --> CL{"claim_new(destination): exclusive create"}
   CL -- "created: a 0-byte placeholder" --> CP["copy_via_part: create destination.part exclusively, write, fsync, rename onto the placeholder (4 tries)<br/>move: same-volume rename first, across volumes copy through .part, then remove the source"]
   CP -- "error" --> CLEAN["remove only a marker this call created"]
+  CP -- "copied or moved (Copy picks, Move rejected)" --> SC["then the file's own XMP sidecar, through the same steps;<br/>never overwritten, a different one is counted (Side files)"]
   CL -- "already exists (copy and export)" --> DV{"dest_verdict"}
   DV -- "sizes match, no marker" --> SK["Skip: already there"]
   DV -- "marker present, zero bytes, or a size difference with no manifest record" --> ATT
@@ -6577,54 +6866,109 @@ flowchart TB
 
 ## Saved state and data safety
 
-Falcon changes and removes user files, so saving is where a mistake costs the most. Saved review data and settings are never treated as a cache: they are replaced in one step, a damaged file is kept for recovery, and a failed save is reported.
+Falcon changes and removes user files, so saving is where a mistake costs the most. Saved review data and settings are never treated as a cache: they are replaced in one step, a damaged file is kept for recovery, and a failed save is reported. `falcon.cache` is the one file that is only a cache: losing it costs a re-read and nothing else.
 
 ### Saved files
 
-Falcon writes four kinds of lasting file:
+Falcon writes five kinds of lasting file:
 
 | File | Where | Written by | Read by | Size cap | If it is damaged |
 | --- | --- | --- | --- | --- | --- |
-| `falcon_review_data.json` (older name `falcon_selection.json`): ratings, flags, rejects, manual rotations, sort and resume memory | the photo folder | `save_selection` → `enqueue_review_data` → writer thread | `load_selection`, once per folder open after `review_data_state` | 16 MiB (`SELECTION_MAX_BYTES`) | unreadable: renamed to `.corrupt[N]` plus a red events entry. 0 bytes: debris, read as absent and left alone. Over the cap: read as absent and left untouched. |
+| `falcon_review_data.json` (older name `falcon_selection.json`): ratings, flags, rejects, manual rotations, sort and resume memory | the photo folder | `save_selection` → `enqueue_review_data` → writer thread | `load_selection_through_ledger` (this window's save still on its way, else `load_selection`), once per folder open after `review_data_state` | 16 MiB (`SELECTION_MAX_BYTES`) | damaged (including not UTF-8): renamed to `.corrupt[N]` plus a red events entry. 0 bytes: debris, read as absent and left alone. Over the cap, a read error, or damaged and the rename failed: left untouched, an amber warning, and nothing saved over it until a later open reads it. |
 | `settings.json` | the config folder | `save_settings` → `enqueue_write` → writer thread | `load_settings` | 16 MiB (`CONFIG_MAX_BYTES`) | unreadable: `settings.json.corrupt[N]` plus a warning the tick shows. Over the cap: defaults, file untouched. |
 | `<photo>.xmp` (`tiff:Orientation`, `xmp:Rating`) | beside the photo | Apply rotations (`apply.rs`, on the apply worker); ratings via `enqueue_xmp_rating`, with the read-modify-write on the writer thread | `sidecar_orientation`, `sidecar_rating` | 4 MiB read | never rewritten wholesale; surgical edits only; refused if unrecognised or not UTF-8 |
 | `falcon_export.json` (the export record) | `./Picks` and `./export`; earlier `./Web` folders keep theirs; **never `./Rejected`** | `write_export_manifest` → `write_atomic` **directly**, on the copy or export worker | `read_export_manifest` | 16 MiB (`EXPORT_MANIFEST_MAX_BYTES`) | read as absent and left on disk |
+| `falcon.cache` (capture dates, numbers only) | the photo folder, only at 2,000 photos or more on Date taken with sort memory on | `send_date_cache_write` → writer thread → `write_atomic` | `load_date_cache`, on a date read's thread | 16 MiB (`DATE_CACHE_MAX_BYTES`) | counts as no rows: those photos are read again and the file is rewritten. Never a notice. |
 
 The config folder (`config_dir`) is `%LOCALAPPDATA%\Falcon` on Windows and `~/Library/Application Support/Falcon` on macOS. It also holds:
 
-- `ratings.json`, an older rating store read only as a seed for folders with no review data;
 - `open_folders.json`, the registry of open folders (see [Several Falcon windows at once](#several-falcon-windows-at-once));
 - on Windows, the `versions-run` folder: one empty file for each Falcon version that has run (see [The update prompt (Windows)](#the-update-prompt-windows));
 - on Mac, `falcon.lock`;
 - per-process `falcon-<pid>.log` files, written only when diagnostic logging is on.
 
-**A damaged settings file is kept, not overwritten.** `load_settings` tells an absent `settings.json` (first run: defaults, no message) apart from an unreadable one. An unreadable file is renamed to `settings.json.corrupt`, or `.corrupt1`, `.corrupt2` and so on if that name is taken (`preserve_corrupt_file`). The tick then shows a warning: "Settings file was unreadable — kept as … and reset to defaults". A silent reset would lose shortcuts, per-folder resume memory and every preset. The review-data file follows the same rule, with a red events entry. A zero-byte file is never preserved: it is debris from an interrupted create, so it reads as absent. A file over its size cap is read as absent and left exactly as it is.
+**A damaged settings file is kept, not overwritten.** `load_settings` tells an absent `settings.json` (first run: defaults, no message) apart from an unreadable one. An unreadable file is renamed to `settings.json.corrupt`, or `.corrupt1`, `.corrupt2` and so on if that name is taken (`preserve_corrupt_file`). The tick then shows a warning: "Settings file was unreadable — kept as … and reset to defaults". A silent reset would lose shortcuts, per-folder resume memory and every preset. The review-data file follows the same rule, with a red events entry ("Review data was unreadable — kept as … and starting fresh"). A zero-byte file is never preserved: it is debris from an interrupted create, so it reads as absent. A settings file over its size cap is read as absent and left exactly as it is; a review file over the cap is covered next.
+
+**A review file that can't be read is never replaced (safety round, 1 November 2026).** Sometimes a folder's `falcon_review_data.json` is there but Falcon can't use it: another program has it open, it is only in the cloud while you're offline, the folder's permissions block it, it is over the 16 MB cap, or it is damaged and can't be renamed aside.
+
+- **Before:** Falcon opened the folder as if it had no review file. The first save, even one that only recorded which photo you were on, replaced the file with that empty state, and the stars in it were lost.
+- **Now:** the read says what it found (`ReviewLoad`): read, nothing there (no file, a zero-byte file, or a damaged file now kept as `.corrupt`), or a file it couldn't use (`Unresolved`, with the cause). When the folder opens, `apply_scan` records that (`note_review_load`). For a file it couldn't use, Falcon:
+  - leaves the file exactly as it is;
+  - saves nothing to the folder: every save passes one place (`save_selection_via`), which refuses with its own result (`ReviewSaveError::Unreadable`), logs it once and never retries in a loop, so quitting is not held up;
+  - keeps the changes you make there in memory only;
+  - fades **Apply rotations** until a reopen reads the file, because Apply would change the photo while the review file can't record it (review fix R2; see [Apply rotations](#apply-rotations)). Turning photos on screen and **Discard rotations** still work;
+  - shows one amber warning when the folder opens with photos, worded for the cause:
+    - can't be read: "Couldn't read this folder's review data — it may be only in the cloud while you're offline, open in another program, or blocked by folder permissions. It's left untouched, and changes made here won't be saved. Reopen the folder to try again."
+    - damaged and can't be set aside: "This folder's review data looks damaged, and Falcon couldn't set it aside — another program may have it open. It's left untouched, and changes made here won't be saved. Reopen the folder to try again."
+    - over the cap: "This folder's review data is too large to read (over 16 MB), which usually means it's damaged. It's left untouched, and changes made here won't be saved. To start fresh, move falcon_review_data.json out of the folder."
+- **Trying again.** Opening the folder again (from another folder, or reopening the one on screen) reads the file again. If it reads now, the visit starts afresh from the file: the stars it holds come back, and the changes made while it couldn't be read are dropped, as the warning said. If it still can't be read, the warning shows again and the changes stay in memory.
+- A damaged file that *can* be renamed aside still gets the red "kept as … and starting fresh" message, and the folder starts clean.
+- A file that isn't UTF-8 text (disk or sync damage, a hand edit saved as UTF-16) now counts as damaged. Before, it was read as missing, with no copy kept.
+- A save of this window's that hasn't reached the disk yet still wins over the file (see [A quick return reads the newest save](#durable-writer)): the open reads it without touching the file, so the folder isn't marked. A folder whose file couldn't be read never has such a save, because nothing is saved to it.
+- Photos moved out of the folder (to `./Rejected`) keep their stars only when the file was actually read, not just because it exists.
+- The folder's sort, resume and panel memory stays in Falcon's settings (`settings.json`) for such a visit instead of moving into a file that can't be saved.
+
+```
+Folder A's review file: IMG_1 3★, but OneDrive has it only online and you're offline.
+You open A, rate IMG_2 4★, browse, then switch folders or quit:
+  before: A's file is replaced by {IMG_2 4★}; IMG_1's 3★ is gone          ✗
+  now:    amber warning; nothing is saved; A's file still says IMG_1 3★     ✓
+Back online, you reopen A:  IMG_1 shows 3★, and saving works again         ✓
+```
 
 **Older names are still understood, and nothing asks the user to migrate.** A folder's `falcon_selection.json` converts silently to `falcon_review_data.json` with its contents byte-identical. The copy destination is `./Picks` (`PICKS_SUBFOLDER`); an older `./Selected` folder on disk is left alone. New encoded exports go to `./export` (`EXPORT_SUBFOLDER`); earlier `./Web` folders are not moved, and their records stay valid. The panel is called the **Review** panel, although some code names still say "selection" (`sel-open`, `select_set`, `save_selection`).
 
+### The capture date cache
+
+Owner, 2 November: "once someone settles on one order it usually stays for that folder for very long time", and "saving dates in falcon's own folder is not a good idea". So what Falcon has read stays where you can see it: a visible file, `falcon.cache`, beside the photos. It holds numbers only: a hash of each file's name, its modified time and its capture date. 16,775 photos are 402,632 bytes.
+
+```text
+ falcon.cache, little-endian
+ ┌───────────────────────────────────────────────────────────────┐
+ │ header, 32 bytes:  "FalconDateCache\n" · u32 version · u32 rows │
+ │                    · u64 fnv1a64 of the body                   │
+ ├───────────────────────────────────────────────────────────────┤
+ │ one row, 24 bytes, sorted by the hash:                         │
+ │   u64 fnv1a64 of the file's name                               │
+ │   i64 modified time, nanoseconds since 1970                    │
+ │   i64 capture date in seconds, i64::MIN for "read, no date"    │
+ └───────────────────────────────────────────────────────────────┘
+```
+
+- **When it is created.** Only when a read finishes in a folder of 2,000 photos or more (owner: "2,000 is fine") on Date taken, with sort memory on, and never empty. Below that the read costs about a second or less, so no file. Once it exists it stays in use however small the folder gets, and it is rewritten only when the read read something new, so an unchanged folder writes nothing. A cancelled read writes nothing.
+- **What a row can do.** It applies only when the name's hash matches and the modified time equals this listing's exactly. It supplies a sort key and nothing else: it never touches names, ratings, pairing or the landing. So a wrong, stale, damaged or foreign file costs a re-read, and nothing else. A hash collision would also need the identical modified time, and could only misplace one photo in the order.
+- **A failed write** is a log line with no folder name, never a notice: it never goes near `on_fail` or a save record. A folder Falcon can't write to opens at once in file-date order, reads in the background, and re-sorts while you stay on your photo, each session.
+- **One classifier guards every read, write and removal** (`classify_date_cache_with`), in this order: the folder is a real folder, not a link (`is_safe_dir`); nothing there is Absent; it is a plain file, not a link or folder; it isn't cloud-only, so it is never opened, which would download it; its size is sane; it starts with Falcon's own header. Anything else, or any doubt, is left alone, and someone else's file with this name is never overwritten.
+
+**Removal.** The only thing ever deleted is Falcon's own `falcon.cache`, never a photo or any other file (owner: "it is the cache not any real photos"). There is one delete door, `remove_own_date_cache_with`: it takes a folder, never a file, joins the constant name, and asks the classifier. It lists nothing and takes no name from a caller. Only the writer thread opens it (or the same call where no writer can take the message).
+
+Picking **Name ascending**, the default order, removes the file 20 seconds later (`DATE_CACHE_REMOVAL_DELAY`) or when Falcon closes, whichever comes first, even if you have moved to another folder. Picking Date taken again within the 20 seconds keeps it. Other sorts, and Name descending, leave it, so moving to Rating and back to Date taken stays instant. A cache write is refused while its folder's removal is pending or Falcon is closing, under one lock (`DATE_CACHE_PENDING`), so a write can't undo a removal. At close, `ShutdownStep::RemoveDateCaches` sends what's still waiting, before the writer barrier.
+
 ### Durable writer
 
-Saving runs on one worker thread (`writer_loop`, thread `falcon-writer`) that handles requests in the order they arrive (first in, first out), so the interface never waits for the disk. Settings, review data, XMP rating sidecars and opted-in diagnostic lines all go through it. The review file's name is chosen when the write happens (`review_write_target`): `falcon_review_data.json` if it exists, otherwise the older `falcon_selection.json` if only that exists, otherwise the new name. A save queued just before a name conversion, or by a second Falcon window, therefore still reaches the folder's real file.
+Saving runs on one worker thread (`writer_loop`, thread `falcon-writer`) that handles requests in the order they arrive (first in, first out), so the interface never waits for the disk. Settings, review data, XMP rating sidecars, `falcon.cache` and opted-in diagnostic lines all go through it. The review file's name is chosen when the write happens (`review_write_target`): `falcon_review_data.json` if it exists, otherwise the older `falcon_selection.json` if only that exists, otherwise the new name. A save queued just before a name conversion, or by a second Falcon window, therefore still reaches the folder's real file.
 
 The diagram shows every caller, the one queue, what each message does, and the writes that bypass the queue.
 
 ```mermaid
 flowchart TB
   subgraph CALL["Callers"]
-    A1["save_selection -> enqueue_review_data(folder, bytes)"]
+    A1["save_selection -> enqueue_review_data(folder, bytes)<br/>the bytes stay in REVIEW_LATEST until this save is written"]
     A2["save_settings -> enqueue_settings(settings.json, bytes): its attempt in SETTINGS_SAVES"]
     A3["sync_xmp_ratings -> enqueue_xmp_rating(sidecar, stars)"]
     A4["Open-folders registry: 25 s heartbeat and folder open -> enqueue_write"]
     A5["log_event with diagnostic logging On -> a Log line carrying a permission ticket (any thread)"]
+    A6["A finished date read, the tick's 20-second check, the shutdown step -> falcon.cache messages"]
   end
   Q["One unbounded mpsc channel of WriteMsg<br/>single consumer thread falcon-writer, FIFO: the last write to a file wins"]
-  A1 & A2 & A3 & A4 & A5 --> Q
+  A1 & A2 & A3 & A4 & A5 & A6 --> Q
   Q --> W["Write: write_atomic, inside catch_unwind"]
   Q --> S["Settings: the same write, then completes its attempt (only the newest attempt's answer counts)"]
   S --> W
   Q --> R["ReviewData: review_write_target(folder) chosen now, on the writer thread<br/>the new name if it exists, else the legacy name if only it exists, else the new name"]
   Q --> X["XmpRating: read the sidecar, change xmp:Rating, write it back (other content kept)"]
   Q --> L["Log: append only if the ticket is still valid, turning logging Off discards queued lines<br/>never retried, never reported"]
+  Q --> C["DateCacheWrite, DateCacheRemove: falcon.cache, by its folder<br/>the classifier first, then the one write or the one delete door<br/>a failure is a log line, never retried, never reported"]
   Q --> B["Barrier: acknowledge after every earlier message"]
   R --> W
   W --> RT{"failed?"}
@@ -6654,7 +6998,65 @@ The queue is an unbounded `mpsc` channel (`WriteMsg` and `writer_loop` in `suppo
 
 `reap_stale_temps` removes `.falcontmp` files older than 60 seconds when a folder loads, and in the config folder at startup. The age rule protects a temporary file that another running Falcon is still writing. There is **no fsync of the parent folder** after the rename, so the rename itself is not forced to disk; this is a known, accepted gap. Review JSON and XMP sidecars share `falcon_decode::file_io::write_atomic`; JPEG orientation patches use the same synchronization helper.
 
-Review autosave distinguishes a queued snapshot from a disk acknowledgement. Only the latest ticket for the current folder visit controls retry/recovery state. Each photo-list swap (including opening a folder without photos) clears that state after the outgoing flush. An empty displayed photo list never retries or announces a saved journal, because `cur_dir` deliberately remembers the last folder with photos. Failed saves of the loaded folder retry on the existing persistence backstop; a fresh visit starts without the old visit's failure. Every terminal background failure is still reported, including failures after leaving a folder or after Apply rebases its journal. Synchronous review fallback errors propagate to callers; recovery feedback requires a real successful acknowledgement and an unchanged current snapshot.
+Review autosave distinguishes a queued snapshot from a disk acknowledgement. Only the latest ticket for the current folder visit controls retry/recovery state. Each photo-list swap (including opening a folder without photos) clears that state after the outgoing flush. An empty displayed photo list never retries or announces a saved journal, because `cur_dir` deliberately remembers the last folder with photos. Failed saves of the loaded folder retry on the existing persistence backstop. A fresh visit starts without the old visit's record, but the retry also asks about the folder's newest save in any visit (`REVIEW_LATEST`, see the next paragraphs), so a save that failed is retried until it is written (`review_save_needs_retry`). Every terminal background failure is still reported, including failures after leaving a folder or after Apply rebases its journal. Synchronous review fallback errors propagate to callers; recovery feedback requires a real successful acknowledgement and an unchanged current snapshot.
+
+**A quick return reads the newest save, even before it reaches the disk (safety round, 1 November 2026).** Leaving a folder queues its last changes for the save worker. On a slow disk, or when that save fails, the file in the folder stays the older one for a while.
+
+- **Before:** returning to the folder in that moment read the older file. The next save there (a rating, or just moving to another photo, which records the resume position) wrote the older ratings back over the newer ones. A save that failed was gone once you left the folder, after one "not saved" notice.
+- **Now:** for each folder, Falcon keeps the exact bytes of its newest save in memory until that very save is written (`REVIEW_LATEST`, `LatestReview`). An older save landing doesn't release them, and a failure keeps them. Opening the folder reads them before the file (`load_selection_through_ledger`), exactly as it would read the file. The visit then counts as changed (`ScanDone::from_ledger`, `adopted_baseline_stays_dirty`), so the next regular save, a moment after the folder opens, writes them again. The XMP rating journal is reseeded from the same ratings, so sidecars stay in step.
+
+```
+Folder A's file: IMG_1 1★. You rate IMG_1 5★ and open folder B; A's save waits in the queue.
+You reopen A before that save is written:
+  before: A shows 1★, and browsing A saves 1★ over the 5★        ✗
+  now:    A shows 5★ (read from the waiting save) and saves it   ✓
+That save fails instead:
+  before: the 5★ is lost once you leave A                        ✗
+  now:    reopening A shows 5★ and saves it again                ✓
+```
+
+- Nothing waits for the save worker, and the interface never pauses for it.
+- This is within one Falcon window. Two windows that both change a folder stay last-writer-wins (see [Several Falcon windows at once](#several-falcon-windows-at-once)).
+- If the folder opens with no photos, its bytes stay in memory for a later open that has photos.
+- The bytes are kept under the folder's path as Falcon wrote it. Returning from another folder by a
+  different spelling of the same folder (see [the folder on screen under any spelling](#every-folder-open-uses-one-path))
+  reads the file instead. Reopening the folder that is still on screen, by any spelling, is covered.
+
+**A failed save keeps being retried after a re-sort, delete, move or undo (safety round, 1 November 2026).** When a
+save of the folder on screen fails (for example, another program has the review file locked), Falcon tries again about
+every 15 seconds until it is written.
+
+- **Before:** a re-sort, delete, move or undo in the same folder rescans it, and the rescan wiped the record of the
+  failed save, so the retries stopped. The changes were written only at the next edit, folder change or quit, and
+  were lost if Falcon crashed or the power failed before then.
+- **Now:** the retry also asks about the folder's newest save in any visit (`review_save_needs_retry` reads
+  `REVIEW_LATEST` too), which a rescan doesn't wipe. While that save has failed, the retries go on; once one is
+  written, they stop. The retry writes what is on screen, which already holds that save's changes (the rescan read
+  them, as above).
+- As before, a view with no photos never retries, because the remembered folder may be a different one.
+
+**Clearing the last mark after a failed save stays cleared (safety round review, 1 November 2026).** This is about a
+folder that has no review file yet, on a card or share where saving fails (for example a write-protected SD card).
+
+- **Before (with the quick-return change above):** your first star, flag, reject or turn there couldn't be saved, so
+  Falcon kept it in memory to save again. When you then removed it, the folder looked clean again, and Falcon saves
+  nothing for a clean folder (see rule 3, "Folders stay clean", under [Review-data file name conversion](#review-data-file-name-conversion)). So the kept save still held
+  the removed mark, and leaving the folder and coming back showed it again. On a slow disk the same could happen
+  without a failure: removing the mark before the first save reached the disk let that save land afterwards.
+- **Now:** a folder counts as clean only if Falcon also holds no unsaved save for it (`review_save_unsettled`). While
+  one is still waiting or has failed, removing the last mark is saved like any other change: it replaces the kept
+  save, and it is written after any older save still waiting, so the older one can't have the last word.
+
+```
+A folder with no review file, on a locked card. You give IMG_1 a star; saving it fails.
+You remove the star, open another folder, then come back:
+  before: IMG_1 has its star again                     ✗
+  now:    IMG_1 has no star                            ✓
+```
+
+- A folder you never marked or turned still never gets a review file.
+- A folder where you added a mark and removed it again can end up with a review file that holds no marks, once
+  saving works there. That is the same as a folder whose file existed before you cleared it.
 
 What the writer guarantees:
 
@@ -6737,7 +7139,7 @@ Rung 4 checks the old name first because two conversions in one process can over
 
 1. `review_data_state(dir)` is the one resolver, and it runs the conversion. It is entered **once per folder open**. Its answer (`ReviewDataState`) is passed to every reader in that open: `load_selection`, `review_data_present` and the check for entries that moved out. They do not each ask again, because each entry can cost an exclusive claim, a rename and, on the refusal path, up to 350 ms of retry pauses.
 2. The **save side does not use that answer.** The writer thread chooses the file name when it writes (`review_write_target` → `review_write_name`): the new name if it exists, otherwise the old name if that exists, otherwise the new name. Whatever the conversion did in between, the bytes land on the file the folder actually has. The save path never converts.
-3. **Folders stay clean.** `save_selection` never creates a review file for a folder with no ratings, marks, moved-out entries or rotations. Sort and panel memories alone never create one. Once a file exists it is kept up to date, even when it becomes empty.
+3. **Folders stay clean.** `save_selection` never creates a review file for a folder with no ratings, marks, moved-out entries or rotations. Sort and panel memories alone never create one. The one thing that does appear in a folder for a sort is `falcon.cache`, at 2,000 photos or more on Date taken (see [The capture date cache](#the-capture-date-cache)). Once a review file exists it is kept up to date, even when it becomes empty. The same holds while a save of this window's for the folder is still waiting or has failed: clearing the last mark is then saved over it (see [Clearing the last mark after a failed save stays cleared](#durable-writer)).
 4. If the conversion was refused, for example because another program locks the file, the folder is read under the old name for the session. Falcon shows a warning, not a success message: "This folder's review data is locked by another program — Falcon is reading it in place and will rename it when the folder is free."
 
 ### XMP rating sync
@@ -6774,7 +7176,7 @@ Window A, untouched, closes   before: rewrote the file without IMG_2 ✗
 ```
 
 - **What still counts as a change:** ratings, flags, rejects, rotations, the sort, the panels' layout and the resume position. In a folder with a review file, moving to another photo records the resume position. So a window you browsed but didn't rate still writes its whole view at its next save (about every 15 s, or when it closes). Two windows that both edit stay last-writer-wins. Fixing that would need a merge with the file on disk, which is not part of this change.
-- **A save still on its way or failed is never skipped.** For each folder, the window remembers its newest save attempt, even across a re-sort or a delete (`review_final_status`). It does the same for the settings file (`SETTINGS_SAVES`), so a final save retries it. A folder opened afresh starts clean (`forget_review_attempts`), because its state was just read from disk.
+- **A save still on its way or failed is never skipped.** For each folder, the window remembers its newest save attempt, even across a re-sort or a delete (`review_final_status`). It does the same for the settings file (`SETTINGS_SAVES`), so a final save retries it. A folder opened afresh starts clean (`forget_review_attempts`), because its state was just read from disk. The exception is a save of this window's that is still on its way or failed: the open read that save instead, so its attempt is kept (see [A quick return reads the newest save](#durable-writer)).
 - **Saved memory still gets saved.** When a folder with a review file takes over its remembered sort, panels or resume position from the settings file, that counts as a change (the load compares against the file's own values, `disk_attrs`), so it is written to the review file soon after.
 - The warning about a folder already open in another window is unchanged.
 
@@ -7378,7 +7780,7 @@ File → Reveal stays single, because the File menu is about the current file. T
 **Honest enablement.**
 - Photo items are disabled when no folder is loaded or a dialog is open.
 - Settings and Show Welcome Guide are disabled under a blocking dialog.
-- Undo reads "Undo Delete" only when ⌘Z would restore a deleted photo.
+- Undo reads "Undo Delete" only when ⌘Z would restore a deleted photo. It asks the same question `on_undo` asks (`menubar_model::undo_kind_for`), and it lights after Move rejected too (compiled for Mac, not run on one).
 - Sort and Open Recent mirror the live state.
 - Quit and the Help items are always available.
 - View → Enter/Exit Full Screen reads "Exit" whenever Falcon is immersive or the window is in Mac full screen.
@@ -7824,7 +8226,7 @@ Each rule below names a mistake that is easy to make in this code and the check 
 
 **One shader source.** Duplicated WGSL drifts apart. The rotation and colour-transfer code shared by `CM_SHADER`, `YUV_WGSL` and the HEIC `FINISH_WGSL` comes from one macro (`rot_uv_cm_core!` in `falcon-gpu`), and the `wgsl_single_source` tests check every copy against it.
 
-**Folder identity is data.** The current folder (`cur_dir`), the shot list and the review file must agree on every path. The shot name is the rating key, so shots split from one stem get unique names (for example `IMG.jpg` and `IMG.tif`). `cur_dir` is the last folder that had photos. To ask "is the user still on this folder?", use the scan memory (`last_scanned_dir`) instead.
+**Folder identity is data.** The current folder (`cur_dir`), the shot list and the review file must agree on every path. The shot name is the rating key, so shots split from one stem get unique names (for example `IMG.jpg` and `IMG.tif`). `cur_dir` is the last folder that had photos. To ask "is the user still on this folder?", use the scan memory (`last_scanned_dir`) instead. Actions on the open folder (Empty to Recycle Bin / Trash, Undo move, Recover) act on the folder on screen (`scanned_dir`), never on `cur_dir`.
 
 **Failures and sends.**
 

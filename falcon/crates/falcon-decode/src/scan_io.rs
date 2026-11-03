@@ -4,8 +4,9 @@
 use std::path::PathBuf;
 
 pub(crate) const MAX_SCAN_READERS: usize = 8;
-// Nearby batches start at 21 files; overlap their cold opens too. The clicked
-// photo and genuinely tiny scans remain serial, with the same eight-reader cap.
+// Open-time check (2 November): a scan reads only names shared by two or more finished
+// files and the clicked photo. A folder of exported pairs (X.jpg + X.png) can still be
+// large, so overlap those; the clicked photo and tiny scans stay serial, same cap.
 const PARALLEL_SCAN_MIN_FILES: usize = 16;
 
 pub(crate) fn reader_count(files: usize) -> usize {
@@ -320,11 +321,11 @@ mod tests {
         assert_eq!(catalogue.heads.len(), 1, "unrelated cold files have not been opened");
         let paths: Vec<_> = (30..51).map(|i| scratch.0.join(format!("P{i:04}.JPG"))).collect();
         let batch = catalogue.scan_batch(&paths, || false).unwrap().unwrap();
-        assert_eq!((batch.shots.len(), batch.header_reads), (21, 20));
+        assert_eq!((batch.shots.len(), batch.header_reads), (21, 0));
         assert!(batch.shots.iter().all(|s| s.has_raw && s.has_jpg));
-        assert_eq!(catalogue.heads.len(), 21, "visible groups do not await the other 59 headers");
+        assert_eq!(catalogue.heads.len(), 1, "the folder is ready once listed: only the opened photo was read");
         let full = catalogue.finish(|| false).unwrap();
-        assert_eq!((full.shots.len(), full.header_reads), (80, 59));
+        assert_eq!((full.shots.len(), full.header_reads), (80, 0));
         let fresh = crate::scan_folder(&scratch.0).unwrap();
         for (a,b) in full.shots.iter().zip(fresh.iter()) {
             assert_eq!((&a.name,&a.jpg,&a.raw,a.kind),(&b.name,&b.jpg,&b.raw,b.kind));
@@ -351,7 +352,9 @@ mod tests {
         for (a,b) in early.shots.iter().zip(fresh.iter()) {
             assert_eq!((&a.name,&a.jpg,&a.raw,a.kind,a.has_jpg),(&b.name,&b.jpg,&b.raw,b.kind,b.has_jpg));
         }
-        assert_eq!(early.shots[0].kind, crate::SrcKind::Png, "bytes still override the misleading JPG name");
+        // Open-time check (2 November): the scan goes by the name, and the bytes decide at the reader.
+        assert_eq!(early.shots[0].kind, crate::SrcKind::Jpeg, "the scan takes the JPG name");
+        assert_eq!(crate::shot_by_bytes(&early.shots[0]).kind, crate::SrcKind::Png, "bytes still override it");
         std::fs::write(scratch.0.join("a.jpg"),jpeg).unwrap();
         std::fs::remove_file(scratch.0.join("b.png")).unwrap();
         let full = catalogue.finish(|| false).unwrap();
@@ -359,7 +362,7 @@ mod tests {
         assert!(full.changed_sources.contains(&scratch.0.join("b.png")));
         assert_eq!(full.shots.len(),4);
         assert_eq!(full.shots[0].kind,crate::SrcKind::Jpeg);
-        assert_eq!(full.header_reads,1);
+        assert_eq!(full.header_reads,0);
         assert_eq!(catalogue.finish(|| true).err().unwrap().kind(),std::io::ErrorKind::Interrupted);
     }
 
@@ -418,7 +421,7 @@ mod tests {
         assert_eq!(catalogue.len(), 80);
         let paths: Vec<_> = catalogue.iter().skip(30).take(21).map(|c| c.path.clone()).collect();
         let batch = crate::scan_requested_batch(&paths, || false).unwrap().unwrap();
-        assert_eq!((batch.shots.len(), batch.header_reads, batch.metadata.len()), (21, 21, 21));
+        assert_eq!((batch.shots.len(), batch.header_reads, batch.metadata.len()), (21, 0, 21));
         let full = crate::scan_folder(&scratch.0).unwrap();
         assert_eq!(batch.shots.iter().map(|s| &s.jpg).collect::<Vec<_>>(),
             full[30..51].iter().map(|s| &s.jpg).collect::<Vec<_>>());
@@ -450,7 +453,7 @@ mod tests {
             "passenger.CR3",
             b"raw with an unsupported finished passenger",
         );
-        write("passenger.jpg", b"\0\0\0\x18ftypavif\0\0\0\0avifmif1");
+        write("passenger.avif", b"\0\0\0\x18ftypavif\0\0\0\0avifmif1");
         write("unknown.jpg", b"unknown magic keeps extension routing");
         write("misnamed.png", jpeg);
         write("twin.jpg", jpeg);
@@ -552,6 +555,72 @@ mod tests {
                 "placeholder bytes cannot reclassify it"
             );
         }
+    }
+
+    /// Open-time check (2 November): **a scan reads only names shared by two finished files.** That
+    /// is the owner's speed change, and its one exception keeps pairing right.
+    ///
+    /// L28 — REDDENED BY: removing the stem-count term from the scan's read filter (the lone files
+    /// are not read: `header_reads` 0 and the RAW pairs with the impostor by path order), or making
+    /// every candidate read again (`header_reads` 42 and the lone files become `Png`).
+    #[test]
+    fn only_names_shared_by_two_finished_files_are_read_at_scan() {
+        let scratch = Scratch::new();
+        let png = include_bytes!("../tests/fixtures/mismatch/png_named_jpg.jpg");
+        let jpeg = include_bytes!("../tests/fixtures/mismatch/jpeg_named_png.png");
+        for i in 0..40 {
+            std::fs::write(scratch.0.join(format!("lone_{i:02}.JPG")), png).unwrap();
+        }
+        std::fs::write(scratch.0.join("IMG_1.CR3"), b"never sniffed").unwrap();
+        std::fs::write(scratch.0.join("IMG_1.JPG"), png).unwrap();
+        std::fs::write(scratch.0.join("IMG_1.jpeg"), jpeg).unwrap();
+
+        let scan = crate::scan_folder_with_metadata(&scratch.0).unwrap();
+        assert_eq!(scan.header_reads, 2, "the two files that share a name, nothing else");
+        for s in scan.shots.iter().filter(|s| s.name.starts_with("lone_")) {
+            assert_eq!((s.kind, s.sniffed), (crate::SrcKind::Jpeg, None), "{} takes its name", s.name);
+        }
+        let paired = scan.shots.iter().find(|s| s.has_raw).unwrap();
+        assert_eq!(paired.jpg.as_deref(), Some(scratch.0.join("IMG_1.jpeg").as_path()), "the real JPEG pairs");
+        let impostor = scan.shots.iter().find(|s| s.jpg.as_deref() == Some(scratch.0.join("IMG_1.JPG").as_path())).unwrap();
+        assert_eq!((impostor.kind, impostor.sniffed), (crate::SrcKind::Png, Some(crate::SrcKind::Png)));
+    }
+
+    /// Open-time check (2 November): **the opened photo is read when it is opened, and stays the same
+    /// at every opening stage**, so promotion's identity check holds. An AVIF named `.jpg` must stay
+    /// out of the early publish (`main.rs`, which filters on `is_unsupported`), or it would hold the
+    /// folder for ten seconds.
+    ///
+    /// L28 — REDDENED BY: dropping `wanted` from the scan's read filter (the early shot is `Jpeg`),
+    /// or `finish` no longer reusing the opening's cached head (`header_reads` 1).
+    #[test]
+    fn the_opened_misnamed_photo_is_checked_at_open_and_keeps_that_answer() {
+        let scratch = Scratch::new();
+        let png = include_bytes!("../tests/fixtures/mismatch/png_named_jpg.jpg");
+        std::fs::write(scratch.0.join("lone.JPG"), png).unwrap();
+        for i in 0..20 {
+            std::fs::write(scratch.0.join(format!("single_{i:02}.png")), png).unwrap();
+        }
+        let path = scratch.0.join("lone.JPG");
+        let mut catalogue = crate::FolderCatalogue::read(&scratch.0, || false).unwrap();
+        let early = catalogue.requested_shot(&path, || false).unwrap().unwrap();
+        assert_eq!((early.kind, early.sniffed), (crate::SrcKind::Png, Some(crate::SrcKind::Png)));
+        let same = |s: &crate::Shot| (s.name.clone(), s.raw.clone(), s.jpg.clone(), s.kind, s.has_jpg, s.cloud_placeholder);
+        let paths: Vec<_> = catalogue.simple_candidates().unwrap().into_iter().map(|c| c.path).collect();
+        let batch = catalogue.scan_batch(&paths, || false).unwrap().unwrap();
+        let in_batch = batch.shots.iter().find(|s| s.jpg.as_deref() == Some(path.as_path())).unwrap();
+        assert_eq!(same(in_batch), same(&early));
+        let full = catalogue.finish(|| false).unwrap();
+        assert_eq!(full.header_reads, 0, "the opened photo's head is reused");
+        let in_full = full.shots.iter().find(|s| s.jpg.as_deref() == Some(path.as_path())).unwrap();
+        assert_eq!(same(in_full), same(&early));
+
+        // An AVIF named `.jpg`, opened: unsupported from the first stage, as the early publish needs.
+        let other = Scratch::new();
+        std::fs::write(other.0.join("holiday.jpg"), b"\0\0\0\x18ftypavif\0\0\0\0mif1miaf").unwrap();
+        let mut catalogue = crate::FolderCatalogue::read(&other.0, || false).unwrap();
+        let early = catalogue.requested_shot(&other.0.join("holiday.jpg"), || false).unwrap().unwrap();
+        assert!(early.is_unsupported());
     }
 
     #[test]

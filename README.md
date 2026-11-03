@@ -81,7 +81,10 @@ a small visible button instead of disappearing, so there is always a way back.
 
 **5. Folders, not a catalogue.**
 There is no import step and no library database to maintain. Falcon opens the folder in front of
-you, and remembers your sort order and your place when you come back.
+you, and remembers your sort order and your place when you come back. If you sort a folder of 2,000
+photos or more by Date taken, Falcon keeps a small `falcon.cache` file beside the photos so it opens
+in that order at once next time. It holds only numbers, and Falcon removes it when you go back to
+Name order.
 
 **6. Quiet and consistent.**
 The interface is a dark, flat viewing space built from one set of colours, spacing and motion rules.
@@ -122,9 +125,10 @@ finished reading the folder. You can zoom and pan straight away while the filmst
 the folder fill in behind it. In a test reopening an 11,831-file RAW + JPEG folder, the 45-megapixel
 photo was on screen about 0.7 seconds after launch.
 
-To make that possible, Falcon identifies each file from its first 32 bytes and pairs RAW and JPEG
-files by name without opening the RAWs. The photo you are looking at always comes first, and all
-other preparation gives way to it.
+Falcon lists a folder without opening the photos in it. It goes by each file's name, and checks a
+photo's real format from its first bytes when you open it. RAW and JPEG files are paired by name,
+without opening the RAWs. The photo you are looking at always comes first, and all other preparation
+gives way to it.
 
 ### iPhone photos at full speed
 

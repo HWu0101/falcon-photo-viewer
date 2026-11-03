@@ -324,7 +324,8 @@ fn passenger_does_not_rotate_the_owners_portrait_raw() {
     let with = scan_folder(&dir).expect("scan");
     let with = with.iter().find(|s| s.has_raw).expect("the RAW's shot").clone();
     assert!(with.jpg.is_some(), "the passenger is still on the shot (visible, deletable)");
-    assert!(!with.has_jpg, "…and it is not the picture");
+    // Open-time check (2 November): the scan goes by the name; the check below is what the readers run.
+    assert!(!falcon_decode::shot_by_bytes(&with).has_jpg, "…and it is not the picture");
     assert_eq!(
         read_orientation(&with, false),
         want,

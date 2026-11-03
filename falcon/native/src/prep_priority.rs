@@ -409,7 +409,7 @@ fn os_set(t: ThreadRef, level: Level) {
 }
 
 /// A worker's pool threads start below normal, so that is their usual level.
-fn lower_current_thread() {
+pub(crate) fn lower_current_thread() {
     #[cfg(windows)]
     // SAFETY: the pseudo-handle names the calling thread.
     unsafe {

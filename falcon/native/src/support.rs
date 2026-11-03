@@ -1342,6 +1342,17 @@ impl Drop for OpGuard {
     }
 }
 
+/// Fix round 1 (1 November): lowers its flag when dropped, so a flag raised for one worker's run
+/// comes down however the worker ends: finished, failed, stopped for quit, or panicked. Apply
+/// rotations holds one for `applying_rotations` (the sort picks' Apply-only switch), bound AFTER
+/// its `OpGuard` so it drops first: the flag is down before `sel_busy` lets another Apply raise it.
+pub(crate) struct FlagGuard(pub(crate) Arc<AtomicBool>);
+impl Drop for FlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Adaptive hi-res region request: decode shot `id` once (cached), then crop these
 /// NORMALISED rects `(u0,v0,u1,v1, out_long)` — the visible tile + its neighbours — in
 /// PARALLEL, so dragging to a nearby area is instant (the tiles are already cached).
@@ -4457,32 +4468,38 @@ mod apply_drain_tests {
     }
 
     /// v0.9.61 (J10 / A1.2): THE SHUTDOWN ORDER. Four things it has to get right, each of which was
-    /// a comment before and is an assert now: the boundary wait is ⌘Q-only; both worker hand-offs are
+    /// a comment before and is an assert now: the boundary wait is conditional (fix round 1: on a
+    /// file operation in flight or ⌘Q, `shutdown_waits_for_file_op`); both worker hand-offs are
     /// drained BEFORE the flush that persists them; the staged-edit revert precedes the settings
     /// snapshot that reads the keymap it reverts; and the writer barrier is after every write.
     ///
     /// FALSIFIERS (assert granularity): move `RevertStagedEdits` after `SaveSettings` in
     /// `graceful_shutdown_steps` → the `"revert precedes the snapshot it protects"` assert reddens;
     /// move `WriterBarrier` before `FlushSelection` → the `"the barrier is last of the writes"`
-    /// assert reddens; make the boundary wait unconditional → the `"only ⌘Q waits"` assert reddens;
-    /// move either drain after `FlushSelection` → the drain-before-flush assert reddens.
+    /// assert reddens; make the boundary wait unconditional → the `"an idle exit doesn't wait"` assert
+    /// reddens; move either drain after `FlushSelection` → the drain-before-flush assert reddens; move
+    /// `RemoveDateCaches` after `WriterBarrier` → the removals assert reddens.
     #[test]
     fn the_shutdown_tail_runs_its_steps_in_the_one_correct_order() {
         use ShutdownStep::*;
-        let record = |immediate: bool| {
+        let record = |wait_for_file_op: bool| {
             let mut seen = Vec::new();
-            graceful_shutdown_steps(immediate, &mut |s| seen.push(s));
+            graceful_shutdown_steps(wait_for_file_op, &mut |s| seen.push(s));
             seen
         };
         let at = |v: &[ShutdownStep], s: ShutdownStep| v.iter().position(|x| *x == s).unwrap();
 
         let normal = record(false);
-        assert!(!normal.contains(&AwaitFileOpBoundary), "only ⌘Q waits for a file-op boundary");
+        assert!(!normal.contains(&AwaitFileOpBoundary), "an idle exit doesn't wait for a file-op boundary");
         let quit = record(true);
         assert_eq!(quit[0], AwaitFileOpBoundary, "…and when it does, it waits FIRST of all");
         assert_eq!(quit.len(), normal.len() + 1, "the wait is the ONLY difference between the routes");
 
         for v in [&normal, &quit] {
+            assert!(
+                at(v, FlushSelection) < at(v, RemoveDateCaches) && at(v, RemoveDateCaches) < at(v, WriterBarrier),
+                "the waiting falcon.cache removals go out before the barrier that makes them happen"
+            );
             assert!(
                 at(v, DrainAppliedRotations) < at(v, FlushSelection),
                 "applied rotations are drained before the flush that would otherwise persist them as pending"
@@ -4501,6 +4518,51 @@ mod apply_drain_tests {
             );
             assert_eq!(*v.last().unwrap(), UnregisterFolder, "the registry entry goes last");
         }
+    }
+
+    /// Fix round 1 (1 November, CS-32): a file operation still running at exit makes EVERY exit wait
+    /// for it first, not only ⌘Q. On Windows `immediate` is always false, so before this a second
+    /// press of × mid-Apply skipped the wait, drained the hand-off once and left every photo the
+    /// worker wrote afterwards listed as pending (turned twice on the next launch).
+    ///
+    /// FALSIFIER (L28): make `shutdown_waits_for_file_op` return `immediate` alone → the
+    /// `(false, true)` assert reddens.
+    #[test]
+    fn a_file_operation_in_flight_makes_every_exit_wait_first() {
+        use ShutdownStep::*;
+        assert!(shutdown_waits_for_file_op(false, true), "Windows second × mid-Apply waits");
+        assert!(shutdown_waits_for_file_op(true, false), "⌘Q keeps its step");
+        assert!(!shutdown_waits_for_file_op(false, false), "an idle exit costs nothing");
+        let mut seen = Vec::new();
+        graceful_shutdown_steps(shutdown_waits_for_file_op(false, true), &mut |s| seen.push(s));
+        let at = |s: ShutdownStep| seen.iter().position(|x| *x == s).unwrap();
+        assert_eq!(seen[0], AwaitFileOpBoundary, "the wait comes first");
+        assert!(at(AwaitFileOpBoundary) < at(DrainAppliedRotations) && at(DrainAppliedRotations) < at(FlushSelection),
+            "the wait precedes the drain, which precedes the flush");
+    }
+
+    /// Fix round 1 (1 November, F13-apply-4, owner: "Apply rotations only"): the sort picks' switch
+    /// comes down however the Apply worker ends. A finished run and a panicking one both leave it
+    /// lowered; a guard still held keeps it raised.
+    ///
+    /// FALSIFIER (L28): delete the `store(false, …)` in `FlagGuard::drop` → the finished-run assert
+    /// reddens (and the panic one).
+    #[test]
+    fn the_apply_only_switch_comes_down_however_the_worker_ends() {
+        let flag = Arc::new(AtomicBool::new(true));
+        {
+            let _held = FlagGuard(flag.clone());
+            assert!(flag.load(Ordering::SeqCst), "raised while the worker runs");
+        }
+        assert!(!flag.load(Ordering::SeqCst), "a finished run lowers it");
+        flag.store(true, Ordering::SeqCst);
+        let guard = FlagGuard(flag.clone());
+        let worker = std::thread::spawn(move || {
+            let _held = guard;
+            panic!("a worker that crashes mid-run");
+        });
+        assert!(worker.join().is_err(), "the worker panicked");
+        assert!(!flag.load(Ordering::SeqCst), "a panicked run lowers it too");
     }
 
     /// v0.9.61 (A1.5 / J10): the tail is a `Once`. The ⌘Q key equivalent and the
@@ -8650,9 +8712,10 @@ pub(crate) fn exif_datetime_epoch(s: &str) -> Option<i64> {
 }
 
 /// Session-global Date-taken cache: primary path → (mtime at read, parsed epoch). The folder-wide
-/// EXIF pass is paid ONCE per file per session (validated by mtime); later re-sorts / move-op
-/// rescans under an active Date-taken sort hit the cache. Mutex — the pass runs on the UI thread
-/// (sync re-sort), the async scan worker, and the pre-warm thread (see main.rs `sort-pick`).
+/// EXIF read is paid ONCE per file per session (validated by mtime); later re-sorts / move-op
+/// rescans under an active Date-taken sort hit the cache. Mutex — a date read's threads, the scan
+/// workers' sorts and the interface thread's sort all reach it. Rows enter through
+/// [`merge_taken_rows`] only, so the order a reread gives doesn't change during a read.
 static TAKEN_CACHE: Mutex<BTreeMap<PathBuf, (Option<std::time::SystemTime>, Option<i64>)>> =
     Mutex::new(BTreeMap::new());
 
@@ -8663,9 +8726,8 @@ static TAKEN_CACHE: Mutex<BTreeMap<PathBuf, (Option<std::time::SystemTime>, Opti
 /// Date-taken key for": ~1 MB per `bigtest`-sized folder, held for the session, forever.
 ///
 /// 50,000 entries ≈ 10 MB of `PathBuf`s, which is ~8 of the largest folder the app is documented
-/// against and far past any single sort. It is deliberately NOT a per-folder clear: the pre-warm
-/// thread fills this for a folder the user is about to re-sort, and clearing at the swap would make
-/// a sort→swap→sort-back sequence re-read every file's EXIF.
+/// against and far past any single sort. It is deliberately NOT a per-folder clear: clearing at the
+/// swap would make a sort→swap→sort-back sequence re-read every file's EXIF.
 const TAKEN_CACHE_MAX: usize = 50_000;
 
 /// PURE: has the Date-taken memo outgrown its bound? Split out so the RULE is testable without a
@@ -8676,69 +8738,606 @@ fn taken_cache_full(len: usize) -> bool {
     len >= TAKEN_CACHE_MAX
 }
 
-/// One shot's Date-taken sort key. CLOUD PLACEHOLDERS never get an EXIF read — opening the file
-/// would HYDRATE it (OneDrive Files-On-Demand: a folder-wide pass = a mass download) — they use the
-/// mtime fallback, which the dir listing carries for free. Absent/unparseable EXIF → mtime too.
-fn taken_epoch_of(shot: &Shot) -> i64 {
-    taken_epoch_with_metadata(shot, None)
+/// One shot's Date-taken sort key, from what is known, with no read and no stat, so a sort can't stall
+/// the interface thread at any scale. In this order:
+/// - a row for this exact modified time: its date (read and no date: the modified time);
+/// - a row for another modified time: the stored date, so a rotated or re-saved photo keeps its place
+///   until it is read again. Otherwise it would jump in the order and the next Delete's position
+///   landing would miss;
+/// - no row: the modified time, which the listing carries for free, also for a cloud-only photo.
+fn taken_key(row: impl Fn(&PathBuf) -> Option<(Option<std::time::SystemTime>, Option<i64>)>, shot: &Shot, modified: Option<std::time::SystemTime>) -> i64 {
+    let Some(p) = primary_file(shot) else { return 0 };
+    let file_date = modified.map(systemtime_epoch).unwrap_or(0);
+    match row(p) {
+        Some((at, date)) if at == modified => date.unwrap_or(file_date),
+        Some((at, date)) => date.or(at.map(systemtime_epoch)).unwrap_or(file_date),
+        None => file_date,
+    }
 }
 
-fn taken_epoch_with_metadata(shot: &Shot, metadata: Option<&std::fs::Metadata>) -> i64 {
-    taken_epoch_with_metadata_with(
-        shot, metadata, falcon_decode::metadata_is_cloud_placeholder, falcon_decode::file_is_cloud_placeholder,
-    )
+/// How many dates a reread may read on the interface thread, when no read is running for the folder.
+/// This keeps the normal flow right: a photo saved beside the original, or a few rotated ones, sort to
+/// their real date at the next reread. Anything larger waits for the next open's date read.
+pub(crate) const INLINE_DATE_READS: usize = 32;
+
+/// R3: read at most `budget` photos that have no row for their listed modified time, and store them.
+/// Never a cloud-only photo, by the scan's tag or by the listing's metadata. Runs before the sort, on
+/// `reload` only: the sort itself reads nothing.
+pub(crate) fn read_dates_inline(shots: &[Shot], metadata: &BTreeMap<PathBuf, std::fs::Metadata>, budget: usize) -> usize {
+    read_dates_inline_with(shots, metadata, budget, falcon_decode::metadata_is_cloud_placeholder, |shot, stamp| {
+        read_taken_row_with(shot, stamp, falcon_decode::metadata_is_cloud_placeholder, falcon_decode::file_is_cloud_placeholder)
+    })
 }
 
-/// [`taken_epoch_with_metadata`] with the two cloud probes passed in (no test can make a real
-/// placeholder). 2026-10-28 (the cloud-only round, owner answer 12): the scan's tag is fresh only at
-/// the scan, so a re-sort (`warm_taken_dates`) also asks the metadata it already reads for the
-/// modified time (no extra call), and `falcon_decode::read_date_taken_with` asks before it falls back
-/// to the RAW: a file freed up during the session is never read, so never downloaded.
-///
-/// FALSIFIER (L28): drop the metadata term and `a_resort_never_reads_a_file_freed_up_since_the_scan`
-/// reddens with the date read.
-fn taken_epoch_with_metadata_with(
+fn read_dates_inline_with(
+    shots: &[Shot],
+    metadata: &BTreeMap<PathBuf, std::fs::Metadata>,
+    budget: usize,
+    meta_is_cloud: impl Fn(&std::fs::Metadata) -> bool,
+    read: impl Fn(&Shot, Option<std::time::SystemTime>) -> Option<TakenRow>,
+) -> usize {
+    if budget == 0 {
+        return 0;
+    }
+    let unread: Vec<(&Shot, Option<std::time::SystemTime>)> = {
+        let memo = TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        shots.iter().filter_map(|s| {
+            let p = primary_file(s)?;
+            let meta = metadata.get(p);
+            let stamp = meta.and_then(|m| m.modified().ok());
+            if s.cloud_placeholder || meta.is_some_and(&meta_is_cloud) || matches!(memo.get(p), Some((at, _)) if *at == stamp) {
+                return None;
+            }
+            Some((s, stamp))
+        }).take(budget).collect()
+    };
+    let rows: Vec<TakenRow> = unread.into_iter().filter_map(|(s, stamp)| read(s, stamp)).collect();
+    let reads = rows.len();
+    merge_rows_into(&mut TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()), rows);
+    reads
+}
+
+// ─── Date taken sort (2 November): ONE BACKGROUND READ OF THE CAPTURE DATES ─────────────────────
+// Owner: "re-sorting large folder was very slow". The first Date taken sort of 16,775 photos left
+// the order unchanged for 14 to 24 s with nothing on screen, because the dates were read one file at
+// a time. `TakenPass` reads them on several threads at below-normal priority and holds what it read,
+// so the memo only changes where the landing is about to read it: a Delete during the read rereads
+// the same order, and its position-number landing stays right.
+
+/// One photo's answer from a date read: its primary file, the modified time the answer is good for,
+/// and the capture date in the sort's seconds, `None` when the photo was read and has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TakenRow {
+    pub(crate) path: PathBuf,
+    pub(crate) modified: Option<std::time::SystemTime>,
+    pub(crate) date: Option<i64>,
+}
+
+/// The file a photo's Date-taken key belongs to: the finished image, else the RAW.
+fn primary_file(shot: &Shot) -> Option<&PathBuf> {
+    shot.jpg.as_ref().or(shot.raw.as_ref())
+}
+
+/// Read one photo's capture date without touching the memo. `None` (no row) for a file that can't be
+/// asked about or lives only in the cloud: the scan's tag is fresh only at the scan, so a fresh stat
+/// asks again, and `read_date_taken_with` asks before it falls back to the RAW. A file freed up during
+/// the session is never read, so never downloaded. The row's time is `stamp`, the listing's own
+/// (`listing_stamps`), because that is what the sort compares it with; the stat's time is only the
+/// fallback for a file the listing didn't have.
+fn read_taken_row_with(
     shot: &Shot,
-    metadata: Option<&std::fs::Metadata>,
+    stamp: Option<std::time::SystemTime>,
     meta_is_cloud: impl Fn(&std::fs::Metadata) -> bool,
     path_is_cloud: impl Fn(&std::path::Path) -> bool,
-) -> i64 {
-    let Some(p) = shot.jpg.as_ref().or(shot.raw.as_ref()) else { return 0 };
-    let meta = metadata.cloned().or_else(|| std::fs::metadata(p).ok());
-    let mtime = meta.as_ref().and_then(|m| m.modified().ok());
-    let mtime_epoch = mtime.map(systemtime_epoch).unwrap_or(0);
-    if shot.cloud_placeholder || meta.as_ref().is_some_and(&meta_is_cloud) {
-        return mtime_epoch;
+) -> Option<TakenRow> {
+    let p = primary_file(shot)?;
+    let meta = std::fs::metadata(p).ok()?;
+    if shot.cloud_placeholder || meta_is_cloud(&meta) {
+        return None;
     }
-    if let Some((mt, cached)) = TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(p) {
-        if *mt == mtime {
-            return cached.unwrap_or(mtime_epoch);
-        }
-    }
-    // Read OUTSIDE the lock (two threads may duplicate a read — harmless; neither blocks the other).
     // `p` was just found local; only another file (a pair's RAW) needs asking.
-    let taken = falcon_decode::read_date_taken_with(shot, |q: &std::path::Path| q != p.as_path() && path_is_cloud(q))
+    let date = falcon_decode::read_date_taken_with(shot, |q: &std::path::Path| q != p.as_path() && path_is_cloud(q))
         .and_then(|s| exif_datetime_epoch(&s));
-    {
-        let mut g = TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        // v0.8.151: the bound. Say so once per clear — an unbounded collection that starts
-        // bounding itself silently is the same invisibility the ledger keeps closing.
-        if taken_cache_full(g.len()) {
-            g.clear();
-            log_event(&format!(
-                "date-taken cache: cleared at {TAKEN_CACHE_MAX} entries (session bound) — the next \
-                 sort re-reads its EXIF once"
-            ));
-        }
-        g.insert(p.clone(), (mtime, taken));
-    }
-    taken.unwrap_or(mtime_epoch)
+    Some(TakenRow { path: p.clone(), modified: stamp.or_else(|| meta.modified().ok()), date })
 }
-/// Pre-warm the Date-taken cache for a shot list (the `sort-pick` worker thread runs this BEFORE
-/// requesting the re-scan, so the UI-thread sort itself is a pure cache walk — no I/O stall).
-pub(crate) fn warm_taken_dates(shots: &[Shot]) {
-    for s in shots {
-        let _ = taken_epoch_of(s);
+
+/// PURE: rows enter a memo. The bound is asked once, before any row goes in, so a pass never clears
+/// its own results halfway and a folder larger than the bound keeps all of them. Only rows new to the
+/// memo count: a folder's own rows coming back must not cost the other folders theirs.
+fn merge_rows_into(memo: &mut BTreeMap<PathBuf, (Option<std::time::SystemTime>, Option<i64>)>, rows: Vec<TakenRow>) -> bool {
+    let arriving = rows.iter().filter(|r| !memo.contains_key(&r.path)).count();
+    let cleared = arriving > 0 && taken_cache_full(memo.len() + arriving);
+    if cleared {
+        memo.clear();
+    }
+    for r in rows {
+        memo.insert(r.path, (r.modified, r.date));
+    }
+    cleared
+}
+
+/// The memo's one way in for a date read. Called just before a landing, on the worker of an open that
+/// finished inside its wait, and for a cancelled read, whose rows stay good for the session.
+pub(crate) fn merge_taken_rows(rows: Vec<TakenRow>) {
+    if rows.is_empty() {
+        return;
+    }
+    let (at, count) = (Instant::now(), rows.len());
+    let cleared = merge_rows_into(&mut TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()), rows);
+    if cleared {
+        log_event(&format!(
+            "date-taken cache: cleared at {TAKEN_CACHE_MAX} entries (session bound) — the next \
+             sort re-reads its EXIF once"
+        ));
+    }
+    log_event(&format!("date read: merged {count} rows in {} ms", at.elapsed().as_millis()));
+}
+
+/// PURE: how many threads read dates. Half the logical cores, so the photo on screen keeps the other
+/// half, and never more than 8: on a laptop the owner was told about 5 to 9 s for 16,775 photos.
+pub(crate) fn date_read_threads_for(cores: usize) -> usize {
+    (cores / 2).clamp(1, 8)
+}
+
+/// What a date read needs, taken when it starts. `stamps` is the listing the photos came from.
+pub(crate) struct PassInput {
+    pub(crate) dir: PathBuf,
+    pub(crate) shots: Arc<Vec<Shot>>,
+    pub(crate) stamps: ListingStamps,
+    /// An open's read, handed over behind a list in file-date order: `shots` is the scan's own order,
+    /// and this is the direction. The read works out the final order for the comparison in
+    /// [`PassHandle::same_order_as`].
+    pub(crate) order_desc: Option<bool>,
+    /// Sort memory is on, so a `falcon.cache` here would be used again.
+    pub(crate) write_allowed: bool,
+}
+
+/// What a finished read holds until its landing.
+struct FinishedPass {
+    rows: Vec<TakenRow>,
+    order: Option<Vec<PathBuf>>,
+}
+
+/// A date read's file reader. Injected so a test can hold it, count it or make it panic.
+type PassReader = Arc<dyn Fn(&Shot, Option<std::time::SystemTime>) -> Option<TakenRow> + Send + Sync>;
+
+/// One running date read. Everything here is read and written across threads; the rows stay inside
+/// until [`PassHandle::merge_finished`] or the cancel path hands them to the memo.
+pub(crate) struct TakenPass {
+    pub(crate) dir: PathBuf,
+    done: AtomicUsize,
+    total: AtomicUsize,
+    /// `total` is known: the photos still unread have been worked out.
+    counted: AtomicBool,
+    cancel: AtomicBool,
+    started: Instant,
+    finished: Mutex<Option<FinishedPass>>,
+    ended: AtomicBool,
+}
+
+/// `ended` is set from here, so a panic anywhere in a pass still ends it and no card can stick.
+struct PassEnded(Arc<TakenPass>);
+impl Drop for PassEnded {
+    fn drop(&mut self) {
+        self.0.ended.store(true, Ordering::SeqCst);
+    }
+}
+
+impl TakenPass {
+    pub(crate) fn start(input: PassInput) -> PassHandle {
+        let reader: PassReader = Arc::new(|shot, stamp| {
+            read_taken_row_with(shot, stamp, falcon_decode::metadata_is_cloud_placeholder, falcon_decode::file_is_cloud_placeholder)
+        });
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Self::start_with(input, reader, date_read_threads_for(cores))
+    }
+
+    fn start_with(input: PassInput, read: PassReader, threads: usize) -> PassHandle {
+        let pass = Arc::new(TakenPass {
+            dir: input.dir.clone(),
+            done: AtomicUsize::new(0),
+            total: AtomicUsize::new(0),
+            counted: AtomicBool::new(false),
+            cancel: AtomicBool::new(false),
+            started: Instant::now(),
+            finished: Mutex::new(None),
+            ended: AtomicBool::new(false),
+        });
+        let worker = pass.clone();
+        let spawned = std::thread::Builder::new().name("falcon-dates".into()).spawn(move || {
+            let _ended = PassEnded(worker.clone());
+            crate::prep_priority::lower_current_thread();
+            run_taken_pass(&worker, input, read, threads);
+        });
+        if let Err(e) = spawned {
+            log_event(&format!("date read: couldn't start its thread ({e})"));
+            pass.ended.store(true, Ordering::SeqCst);
+        }
+        PassHandle(pass)
+    }
+}
+
+/// The pass itself, on its own thread: known dates first, then what is still unread on `threads`
+/// readers. The claim loop is falcon-decode's `scan_io`, including its fallback when a thread won't
+/// start. A panic inside a reader (a damaged RAW in the RAW library) costs that photo its date, stored
+/// as read with none, so it isn't tried again on every open.
+fn run_taken_pass(pass: &TakenPass, input: PassInput, read: PassReader, threads: usize) {
+    let PassInput { dir, shots, stamps, order_desc, write_allowed } = input;
+    let stamp_of = |p: &PathBuf| stamps.get(p).map(|s| s.1);
+    let mut rows = Vec::new();
+    let mut unread = Vec::new();
+    let mut cloud_only = Vec::new();
+    {
+        let memo = TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, shot) in shots.iter().enumerate() {
+            let Some(p) = primary_file(shot) else { continue };
+            let stamp = stamp_of(p);
+            match memo.get(p) {
+                Some(&(modified, date)) if modified == stamp => rows.push(TakenRow { path: p.clone(), modified, date }),
+                _ if shot.cloud_placeholder => cloud_only.push(i),
+                _ => unread.push(i),
+            }
+        }
+    }
+    // What `falcon.cache` already knows, opened only if some photo is unknown to the memo. A row needs
+    // this listing's exact modified time, so a stale one is simply read again. Cloud-only photos take
+    // their rows too: they can't be read, and a later write must not lose what is known about them.
+    let mut from_file = 0;
+    if !unread.is_empty() || !cloud_only.is_empty() {
+        if let Some(known) = load_date_cache(&dir) {
+            let mut apply = |i: &usize| -> bool {
+                let Some(p) = primary_file(&shots[*i]) else { return false };
+                let stamp = stamp_of(p);
+                match stamp.and_then(|t| known.date_of(p, t)) {
+                    Some(date) => {
+                        rows.push(TakenRow { path: p.clone(), modified: stamp, date });
+                        from_file += 1;
+                        true
+                    }
+                    None => false,
+                }
+            };
+            unread.retain(|i| !apply(i));
+            cloud_only.iter().for_each(|i| { apply(i); });
+        }
+    }
+    pass.total.store(unread.len(), Ordering::SeqCst);
+    pass.counted.store(true, Ordering::SeqCst);
+    let width = threads.clamp(1, 8).min(unread.len().max(1));
+    let next = AtomicUsize::new(0);
+    let read_next = || {
+        let mut out = Vec::new();
+        while !pass.cancel.load(Ordering::SeqCst) {
+            let Some(&i) = unread.get(next.fetch_add(1, Ordering::SeqCst)) else { break };
+            let shot = &shots[i];
+            let stamp = primary_file(shot).and_then(&stamp_of);
+            let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(shot, stamp))).unwrap_or_else(|_| {
+                log_event("date read: a photo's date read panicked; it sorts by its modified time");
+                primary_file(shot).map(|p| TakenRow { path: p.clone(), modified: stamp, date: None })
+            });
+            match row {
+                Some(row) => {
+                    out.push(row);
+                    pass.done.fetch_add(1, Ordering::SeqCst);
+                }
+                // Freed up since the scan, or gone: not a photo this read can finish.
+                None => {
+                    pass.total.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+        }
+        out
+    };
+    let read_rows: Vec<TakenRow> = if width <= 1 {
+        read_next()
+    } else {
+        std::thread::scope(|scope| {
+            let mut out = Vec::new();
+            let mut workers = Vec::new();
+            for _ in 0..width {
+                let spawned = std::thread::Builder::new().name("falcon-dates".into()).spawn_scoped(scope, || {
+                    crate::prep_priority::lower_current_thread();
+                    read_next()
+                });
+                match spawned {
+                    Ok(worker) => workers.push(worker),
+                    Err(_) => out.extend(read_next()),
+                }
+            }
+            for worker in workers {
+                out.extend(worker.join().unwrap_or_default());
+            }
+            out
+        })
+    };
+    let reads = read_rows.len();
+    rows.extend(read_rows);
+    let cancelled = pass.cancel.load(Ordering::SeqCst);
+    let ms = pass.started.elapsed().as_millis();
+    log_event(&format!("date read: reads={reads} from-file={from_file} threads={width} ms={ms} outcome={}", if cancelled { "cancelled" } else { "finished" }));
+    if cancelled {
+        // Valid for the session, so choosing another sort and coming back resumes from here. A
+        // cancelled read writes nothing: the file would say the read was complete.
+        merge_taken_rows(rows);
+        return;
+    }
+    if date_cache_should_write(classify_date_cache(&dir), shots.len(), reads, rows.len(), write_allowed) {
+        send_date_cache_write(&dir, encode_date_cache(&rows));
+    }
+    let order = order_desc.map(|desc| taken_order_with(&shots, &stamps, &rows, desc));
+    *pass.finished.lock().unwrap_or_else(|e| e.into_inner()) = Some(FinishedPass { rows, order });
+    // The handle may have gone between the check above and this publish: its Drop found nothing.
+    if pass.cancel.load(Ordering::SeqCst) {
+        if let Some(finished) = pass.finished.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            merge_taken_rows(finished.rows);
+        }
+    }
+}
+
+/// The order `sort_scanned_shots` will give once `rows` are in the memo, as primary files, worked out
+/// on the read's own thread. `shots` is the scan's order, the same input the sort has, so ties match.
+fn taken_order_with(shots: &[Shot], stamps: &ListingStamps, rows: &[TakenRow], desc: bool) -> Vec<PathBuf> {
+    let read: HashMap<&PathBuf, (Option<std::time::SystemTime>, Option<i64>)> =
+        rows.iter().map(|r| (&r.path, (r.modified, r.date))).collect();
+    let keys: Vec<i64> = {
+        let memo = TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        shots.iter().map(|s| {
+            let stamp = primary_file(s).and_then(|p| stamps.get(p)).map(|st| st.1);
+            taken_key(|p| read.get(p).copied().or_else(|| memo.get(p).copied()), s, stamp)
+        }).collect()
+    };
+    let mut idx: Vec<usize> = (0..shots.len()).collect();
+    idx.sort_by(|&a, &b| if desc { keys[b].cmp(&keys[a]) } else { keys[a].cmp(&keys[b]) });
+    idx.into_iter().filter_map(|i| primary_file(&shots[i]).cloned()).collect()
+}
+
+/// R2: how long an open waits for its date read when 2,000 or fewer photos are unread. Long enough for
+/// a shoot-sized folder to land once, in the right order. Above that the wait ends once the read has
+/// loaded what it knows.
+pub(crate) const TAKEN_WAIT: Duration = Duration::from_millis(1500);
+/// R2: the most unread photos an open waits for.
+const TAKEN_WAIT_MAX_UNREAD: usize = 2_000;
+
+/// PURE: the second half of the wait. See [`TAKEN_WAIT_MAX_UNREAD`].
+fn taken_wait_worthwhile(unread: usize) -> bool {
+    unread <= TAKEN_WAIT_MAX_UNREAD
+}
+
+/// Runs on an open's worker, just before its sort, for Date taken only. Starts the date read and waits,
+/// bounded. Finished in time: the rows go in the memo here and the sort that follows gives the right
+/// order, one landing, and `None`. Otherwise the list lands in file-date order (the only stand-in
+/// order there is) and this handle goes along in `ScanDone`. A retired `ScanDone` drops the handle,
+/// which stops the read.
+pub(crate) fn taken_before_sort(input: PassInput, cancelled: &dyn Fn() -> bool) -> Option<PassHandle> {
+    wait_for_taken_pass(TakenPass::start(input), cancelled, TAKEN_WAIT)
+}
+
+fn wait_for_taken_pass(handle: PassHandle, cancelled: &dyn Fn() -> bool, limit: Duration) -> Option<PassHandle> {
+    let at = Instant::now();
+    let pass = &handle.0;
+    let counted = crate::photo_open::request_taken(|| pass.counted.load(Ordering::SeqCst) || pass.ended.load(Ordering::SeqCst), cancelled, limit);
+    if counted && taken_wait_worthwhile(pass.total.load(Ordering::SeqCst)) {
+        crate::photo_open::request_taken(|| pass.ended.load(Ordering::SeqCst), cancelled, limit.saturating_sub(at.elapsed()));
+    }
+    if handle.ended() {
+        handle.merge_finished();
+        return None;
+    }
+    Some(handle)
+}
+
+/// The owner of a running date read. Dropping it stops the read (per file, so within one read per
+/// thread) and keeps what was read, so a landing elsewhere or a retired `ScanDone` needs no other code.
+pub(crate) struct PassHandle(Arc<TakenPass>);
+
+impl PassHandle {
+    pub(crate) fn dir(&self) -> &Path {
+        &self.0.dir
+    }
+
+    pub(crate) fn ended(&self) -> bool {
+        self.0.ended.load(Ordering::SeqCst)
+    }
+
+    /// Put the finished rows in the memo, for the landing that is about to read them.
+    pub(crate) fn merge_finished(&self) {
+        let finished = self.0.finished.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(finished) = finished {
+            merge_taken_rows(finished.rows);
+        }
+    }
+
+    /// What the progress card shows: photos read, photos to read, time since the read started, and
+    /// whether it is still reading.
+    pub(crate) fn progress(&self) -> (usize, usize, Duration, bool) {
+        let pass = &self.0;
+        (pass.done.load(Ordering::SeqCst), pass.total.load(Ordering::SeqCst), pass.started.elapsed(), !pass.ended.load(Ordering::SeqCst))
+    }
+
+    /// R5: would the final order be the one `on_screen` already has? `false` if this read worked out
+    /// no order.
+    pub(crate) fn same_order_as(&self, on_screen: &[Shot]) -> bool {
+        let finished = self.0.finished.lock().unwrap_or_else(|e| e.into_inner());
+        finished.as_ref().and_then(|f| f.order.as_ref()).is_some_and(|order| on_screen.iter().filter_map(primary_file).eq(order.iter()))
+    }
+}
+
+impl Drop for PassHandle {
+    fn drop(&mut self) {
+        self.0.cancel.store(true, Ordering::SeqCst);
+        self.merge_finished();
+    }
+}
+
+/// The date read of the folder on screen, as the interface thread holds it.
+pub(crate) struct ActivePass {
+    pub(crate) handle: PassHandle,
+    /// A Date taken pick waiting for this read, with its direction. The order on screen and the
+    /// folder's sort memory stay the old ones until it lands, so a Delete during the read rereads the
+    /// same order and closing Falcon leaves the old order for next time.
+    pub(crate) pick: Option<bool>,
+    /// A read handed over from an open: the folder generation it landed with, and whether the final
+    /// order has been compared with that landing's list yet.
+    pub(crate) handed_over_at: Option<u64>,
+    pub(crate) order_checked: bool,
+}
+
+impl ActivePass {
+    pub(crate) fn picked(handle: PassHandle, desc: bool) -> Self {
+        Self { handle, pick: Some(desc), handed_over_at: None, order_checked: false }
+    }
+
+    pub(crate) fn handed_over(handle: PassHandle, generation: u64) -> Self {
+        Self { handle, pick: None, handed_over_at: Some(generation), order_checked: false }
+    }
+
+    /// R5, asked once when the read ends: a read handed over from an open whose final order is what is
+    /// on screen needs no landing, so its reread, its pause and the Info panel's blank don't happen.
+    /// Only if nothing has reread the folder since that landing, and no pick is waiting behind it.
+    pub(crate) fn order_is_settled(&mut self, generation: u64, on_screen: &[Shot]) -> bool {
+        if self.order_checked || !self.handle.ended() || self.pick.is_some() {
+            return false;
+        }
+        self.order_checked = true;
+        self.handed_over_at == Some(generation) && self.handle.same_order_as(on_screen)
+    }
+}
+
+/// PURE: does a running date read outlive this landing? Another folder never keeps it. In this folder
+/// a pick's read outlives the old-order rereads it is waiting behind; any other read stops when the
+/// list leaves Date taken. A generation change alone means nothing (known issue O1).
+pub(crate) fn pass_survives_landing(same_folder: bool, sort_is_taken: bool, picked: bool) -> bool {
+    same_folder && (sort_is_taken || picked)
+}
+
+/// PURE: what the sort menu shows after a landing. `apply_scan` writes the applied sort back onto the
+/// menu, so a reread during a pick's read has to put the pick back: the person chose it and sees it
+/// in the menu while the list waits.
+pub(crate) fn menu_sort(applied: (SortMethod, bool), pending_pick: Option<bool>) -> (SortMethod, bool) {
+    pending_pick.map_or(applied, |desc| (SortMethod::Taken, desc))
+}
+
+/// A sort choice goes in the folder's memory: its review file's attrs where it has one (no slot in
+/// the list), else the capped list of recent folders. `cap` 0 means sort memory is off.
+pub(crate) fn remember_sort(cap: usize, json_folder: bool, attrs: &mut FolderAttrs, lru: &mut Vec<(String, String)>, dir: &str, spec: String) {
+    if cap == 0 {
+        return;
+    }
+    if json_folder {
+        attrs.sort = Some(spec); // the attr IS the memory (flushed with the selection; rule 3)
+    } else {
+        lru_upsert(lru, dir, &spec, cap);
+    }
+}
+
+/// PURE: 16775 → `16,775`. Slint ints have no grouping, so the card's text is composed in Rust.
+pub(crate) fn group_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// PURE: is the progress card up? A wait a person can feel shows that it's working: only past a second
+/// (a quick read shows nothing), and not for the last moment of a read (no flash just before it goes).
+pub(crate) fn date_card_shows(running: bool, elapsed: Duration, done: usize, total: usize) -> bool {
+    if !running || elapsed < Duration::from_secs(1) || done >= total {
+        return false;
+    }
+    // Nothing read yet says nothing about the rate, and that is when showing it matters most.
+    done == 0 || elapsed.as_secs_f64() / done as f64 * (total - done) as f64 >= 0.3
+}
+
+/// The card's one sentence.
+pub(crate) fn date_card_text(done: usize, total: usize) -> String {
+    tr_format!("Reading capture dates · {done} of {total}", done = group_thousands(done), total = group_thousands(total))
+}
+
+/// How long after the last wheel or drag on the filmstrip or the grid a landing waits, so it doesn't
+/// snap back a list someone is scrolling through. Tuned on clicking.
+pub(crate) const LANDING_SCROLL_SETTLE: Duration = Duration::from_secs(2);
+
+/// What a landing that arrives on its own has to wait for, because every landing closes or ends it
+/// (`reset_transient_ui`, `view.reset_for_swap`) or lands on a position in the order before it. Export
+/// and Copy picks are not here: they end in no position landing and can run for minutes. Nor is the
+/// zoom tile overlay: a kept view brings it back.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LandingHolds {
+    pub(crate) modal_open: bool,
+    pub(crate) ctx_open: bool,
+    pub(crate) sel_ctx_open: bool,
+    pub(crate) sort_open: bool,
+    pub(crate) open_menu_open: bool,
+    pub(crate) scanning: bool,
+    pub(crate) opening_photo: bool,
+    /// Move rejected, Undo move or Empty is running.
+    pub(crate) position_op: bool,
+    /// A file operation's reread is posted and not yet drained (its landing is a position).
+    pub(crate) reload_pending: bool,
+    pub(crate) applying_rotations: bool,
+    pub(crate) film_dragging: bool,
+    pub(crate) scrubbing: bool,
+    pub(crate) scrolled_lately: bool,
+    pub(crate) reopen_pending: bool,
+}
+
+impl LandingHolds {
+    pub(crate) fn any(self) -> bool {
+        let Self { modal_open, ctx_open, sel_ctx_open, sort_open, open_menu_open, scanning, opening_photo,
+            position_op, reload_pending, applying_rotations, film_dragging, scrubbing, scrolled_lately, reopen_pending } = self;
+        modal_open || ctx_open || sel_ctx_open || sort_open || open_menu_open || scanning || opening_photo
+            || position_op || reload_pending || applying_rotations || film_dragging || scrubbing || scrolled_lately || reopen_pending
+    }
+
+    /// The interface's half of the terms, read from the window. The rest are the app's own state.
+    pub(crate) fn from_window(app: &MainWindow) -> Self {
+        Self {
+            modal_open: app.get_modal_open(),
+            ctx_open: app.get_ctx_open(),
+            sel_ctx_open: app.get_sel_ctx_open(),
+            sort_open: app.get_sort_open(),
+            open_menu_open: app.get_open_menu_open(),
+            scanning: app.get_scanning(),
+            opening_photo: app.get_opening_photo(),
+            ..Self::default()
+        }
+    }
+}
+
+/// PURE: a free scroll holds a landing only for a moment after the last input. A strip left scrolled
+/// stays that way until the next navigation, so `!film_follow` alone could hold it forever.
+pub(crate) fn scrolled_lately(film_follow: bool, grid_open: bool, since_input: Option<Duration>) -> bool {
+    (!film_follow || grid_open) && since_input.is_some_and(|d| d < LANDING_SCROLL_SETTLE)
+}
+
+/// What the tick does with a date read this time round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassDue {
+    /// Still reading.
+    Reading,
+    /// Read, and the order on screen is already the final one: nothing lands.
+    Settled,
+    /// Read, and something the landing would close is open.
+    Hold,
+    /// Land now.
+    Land,
+}
+
+/// PURE: see [`PassDue`]. There is no timeout on a hold, because nothing is lost by waiting.
+pub(crate) fn pass_landing_due(ended: bool, settled: bool, held: bool) -> PassDue {
+    if !ended {
+        PassDue::Reading
+    } else if settled {
+        PassDue::Settled
+    } else if held {
+        PassDue::Hold
+    } else {
+        PassDue::Land
     }
 }
 
@@ -8889,12 +9488,16 @@ pub(crate) fn sort_scanned_shots(
     }
     let primary_meta = |s: &Shot| s.jpg.as_ref().or(s.raw.as_ref())
         .and_then(|p| metadata.get(p).cloned().or_else(|| std::fs::metadata(p).ok()));
+    // One lock for the walk, and only for this sort's own method.
+    let memo = (method == SortMethod::Taken).then(|| TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()));
     let keys: Vec<SortKeyVal> = shots
         .iter()
         .map(|s| match method {
             SortMethod::Name => unreachable!("handled above"),
-            SortMethod::Taken => SortKeyVal::Int(taken_epoch_with_metadata(
-                s, s.jpg.as_ref().or(s.raw.as_ref()).and_then(|p| metadata.get(p)),
+            SortMethod::Taken => SortKeyVal::Int(taken_key(
+                |p| memo.as_ref().and_then(|m| m.get(p).copied()),
+                s,
+                primary_file(s).and_then(|p| metadata.get(p)).and_then(|m| m.modified().ok()),
             )),
             SortMethod::Modified => SortKeyVal::Int(
                 primary_meta(s).and_then(|m| m.modified().ok()).map(systemtime_epoch).unwrap_or(0),
@@ -9144,9 +9747,8 @@ mod sort_tests {
     /// straight out of a photograph's EXIF. A 19-digit hour parses fine and `h * 3600` overflows:
     /// a release build WRAPPED to a nonsense sort key (Cargo's default `overflow-checks = false`)
     /// and a debug build or `cargo test` PANICKED — so a crafted file could abort a debug boot or a
-    /// fixture-driven test run, and silently mis-sort a shipping one. Reached from `taken_epoch_of`
-    /// on the UI thread (inside `apply_scan`), on the async scan worker, and on the sort pre-warm
-    /// thread.
+    /// fixture-driven test run, and silently mis-sort a shipping one. Reached from a date read's
+    /// threads, and from the few dates a reread reads on the interface thread.
     ///
     /// FALSIFIER (L28): delete the `h`/`mi`/`se` clauses from the guard and the first row panics
     /// with an arithmetic overflow under `cargo test` — which is the finding, executed.
@@ -9178,8 +9780,8 @@ mod sort_tests {
     /// in for a placeholder). The key is the modified time and nothing is read: the date memo, which
     /// every read fills, has no entry for it. On this device the file is read as before.
     ///
-    /// FALSIFIER (L28): drop the metadata term in `taken_epoch_with_metadata_with` and the cloud row
-    /// fills the memo.
+    /// FALSIFIER (L28): drop the metadata term in `read_dates_inline_with` and the cloud row fills the
+    /// memo.
     #[test]
     fn a_resort_never_reads_a_file_freed_up_since_the_scan() {
         let dir = std::env::temp_dir().join(format!("falcon_cloud_resort_{}", std::process::id()));
@@ -9188,13 +9790,18 @@ mod sort_tests {
         let p = dir.join("freed.jpg");
         std::fs::write(&p, b"not a real jpeg").unwrap();
         let s = shot(0, "freed", Some(p.clone()), None);
-        let mtime = systemtime_epoch(std::fs::metadata(&p).unwrap().modified().unwrap());
+        let meta = std::fs::metadata(&p).unwrap();
+        let modified = meta.modified().ok();
+        let mtime = systemtime_epoch(modified.unwrap());
+        let metadata = BTreeMap::from([(p.clone(), meta)]);
         let memo = || TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&p);
-        let key = taken_epoch_with_metadata_with(&s, None, |_| true, |_| false);
-        assert_eq!(key, mtime, "only in the cloud now: the modified time");
+        let real = |s: &Shot, stamp| read_taken_row_with(s, stamp, |_| false, |_| false);
+        let key = || taken_key(|q| TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(q).copied(), &s, modified);
+        assert_eq!(read_dates_inline_with(std::slice::from_ref(&s), &metadata, INLINE_DATE_READS, |_| true, real), 0);
+        assert_eq!(key(), mtime, "only in the cloud now: the modified time");
         assert!(!memo(), "…and the file was not read");
-        let key = taken_epoch_with_metadata_with(&s, None, |_| false, |_| false);
-        assert_eq!(key, mtime, "no EXIF: the modified time");
+        assert_eq!(read_dates_inline_with(std::slice::from_ref(&s), &metadata, INLINE_DATE_READS, |_| false, real), 1);
+        assert_eq!(key(), mtime, "no EXIF: the modified time");
         assert!(memo(), "on this device it is read as before");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9210,7 +9817,1102 @@ mod sort_tests {
         assert!(TAKEN_CACHE_MAX >= 8 * 5_934, "a single large folder must never trip the bound");
     }
 
-    /// v0.8.151 — the three CONFIG-dir reads get the byte cap their two shoot-folder peers have
+    // ── Date taken sort: the date read ─────────────────────────────────────────────────────
+
+    fn pass_shot(name: &str, cloud: bool) -> Shot {
+        let mut s = shot(0, name, Some(PathBuf::from(format!("C:/falcon-date-read/{}/{name}.jpg", std::process::id()))), None);
+        s.cloud_placeholder = cloud;
+        s
+    }
+
+    fn pass_input(shots: Vec<Shot>) -> PassInput {
+        PassInput { dir: PathBuf::from("C:/falcon-date-read"), shots: Arc::new(shots), stamps: ListingStamps::new(), order_desc: None, write_allowed: false }
+    }
+
+    fn wait_ended(handle: &PassHandle) {
+        let until = Instant::now() + Duration::from_secs(30);
+        while !handle.ended() {
+            assert!(Instant::now() < until, "the pass never ended");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn row_reader(date: i64) -> PassReader {
+        Arc::new(move |s, stamp| Some(TakenRow { path: primary_file(s).unwrap().clone(), modified: stamp, date: Some(date) }))
+    }
+
+    /// The hard rule for batch work: a date read never opens a cloud-only photo, by the scan's tag, by
+    /// the fresh stat (a file freed up since the scan) or through a pair's RAW. Replaces the coverage of
+    /// the old `taken_epoch` row of the same shape.
+    ///
+    /// FALSIFIER (L28): drop the tag or metadata term in `read_taken_row_with`, drop the path probe
+    /// passed to `read_date_taken_with`, or count a tagged photo as unread in `run_taken_pass`.
+    #[test]
+    fn the_pass_never_reads_a_cloud_only_photo() {
+        // By the scan's tag: no reader call at all, and not part of the count.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let reader: PassReader = Arc::new(move |s, stamp| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Some(TakenRow { path: primary_file(s).unwrap().clone(), modified: stamp, date: None })
+        });
+        let handle = TakenPass::start_with(pass_input(vec![pass_shot("tagged-cloud", true), pass_shot("tagged-local", false)]), reader, 2);
+        wait_ended(&handle);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "only the local photo is read");
+        assert_eq!(handle.0.total.load(Ordering::SeqCst), 1);
+        // Freed up since the scan: the reader finds out, gives no row, and it leaves the count.
+        let freed: PassReader = Arc::new(|_, _| None);
+        let handle = TakenPass::start_with(pass_input(vec![pass_shot("freed", false)]), freed, 2);
+        wait_ended(&handle);
+        assert_eq!((handle.0.total.load(Ordering::SeqCst), handle.0.done.load(Ordering::SeqCst)), (0, 0));
+
+        // The real reader, on a real file, with the probes standing in for a placeholder.
+        let dir = std::env::temp_dir().join(format!("falcon_date_read_cloud_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpg = dir.join("freed.jpg");
+        std::fs::write(&jpg, b"not a real jpeg").unwrap();
+        let s = shot(0, "freed", Some(jpg.clone()), None);
+        assert_eq!(read_taken_row_with(&s, None, |_| true, |_| false), None, "only in the cloud now: nothing is read");
+        let mut tagged = s.clone();
+        tagged.cloud_placeholder = true;
+        assert_eq!(read_taken_row_with(&tagged, None, |_| false, |_| false), None, "the scan's tag counts too");
+        assert!(read_taken_row_with(&s, None, |_| false, |_| false).is_some(), "on this device it is read");
+        // A pair's RAW is asked about before it is opened, and the finished file itself isn't.
+        let raw = dir.join("freed.CR3");
+        std::fs::write(&raw, b"not a real raw").unwrap();
+        let mut pair = s.clone();
+        pair.raw = Some(raw.clone());
+        let asked = Mutex::new(Vec::new());
+        let row = read_taken_row_with(&pair, None, |_| false, |q| { asked.lock().unwrap().push(q.to_path_buf()); true });
+        assert_eq!(row.unwrap().date, None, "the JPEG has no date and the RAW isn't opened");
+        assert_eq!(*asked.lock().unwrap(), [raw]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Choosing another sort stops the read at once, and what it read stays for the session.
+    ///
+    /// FALSIFIER (L28): remove the per-file `cancel` check in `read_next`, or skip the merge on cancel
+    /// (`merge_taken_rows(rows)` in the cancelled arm of `run_taken_pass`).
+    #[test]
+    fn cancel_stops_the_claim_loop_and_keeps_its_rows() {
+        let shots: Vec<Shot> = (0..200).map(|i| pass_shot(&format!("cancel-{i}"), false)).collect();
+        let paths: Vec<PathBuf> = shots.iter().map(|s| primary_file(s).unwrap().clone()).collect();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let slot: Arc<Mutex<Option<Arc<TakenPass>>>> = Arc::new(Mutex::new(None));
+        let (counted, pass_slot) = (calls.clone(), slot.clone());
+        let threads = 2;
+        let reader: PassReader = Arc::new(move |s, stamp| {
+            // No read starts until the test holds the pass, so the count below means what it says.
+            let pass = loop {
+                if let Some(pass) = pass_slot.lock().unwrap().as_ref() {
+                    break pass.clone();
+                }
+                std::thread::yield_now();
+            };
+            // Stands in for the person's next pick: the read is told to stop after five files.
+            if counted.fetch_add(1, Ordering::SeqCst) + 1 == 5 {
+                pass.cancel.store(true, Ordering::SeqCst);
+            }
+            Some(TakenRow { path: primary_file(s).unwrap().clone(), modified: stamp, date: Some(1) })
+        });
+        let handle = TakenPass::start_with(pass_input(shots), reader, threads);
+        *slot.lock().unwrap() = Some(handle.0.clone());
+        wait_ended(&handle);
+        let read = calls.load(Ordering::SeqCst);
+        assert!((5..=5 + threads).contains(&read), "stops within one read per thread: {read}");
+        let memo = TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(paths.iter().filter(|p| memo.contains_key(*p)).count(), read, "every row read is kept");
+    }
+
+    /// The card counts only what this read has to read.
+    ///
+    /// FALSIFIER (L28): set `total` to `shots.len()`, or add memo hits to `done`.
+    #[test]
+    fn the_done_count_reaches_the_misses_only() {
+        let shots: Vec<Shot> = (0..10).map(|i| pass_shot(&format!("count-{i}"), false)).collect();
+        // Three are known already, at the listing's modified time.
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        let stamps: ListingStamps = shots.iter().map(|s| (primary_file(s).unwrap().clone(), (1, t))).collect();
+        merge_taken_rows(shots[..3].iter().map(|s| TakenRow { path: primary_file(s).unwrap().clone(), modified: Some(t), date: Some(5) }).collect());
+        let input = PassInput { dir: PathBuf::from("C:/falcon-date-read"), shots: Arc::new(shots), stamps, order_desc: None, write_allowed: false };
+        let handle = TakenPass::start_with(input, row_reader(9), 3);
+        wait_ended(&handle);
+        assert_eq!(handle.0.total.load(Ordering::SeqCst), 7);
+        assert_eq!(handle.0.done.load(Ordering::SeqCst), 7);
+        assert_eq!(handle.0.finished.lock().unwrap().as_ref().unwrap().rows.len(), 10, "the rows hold the memo hits too");
+        // The share of the machine it takes.
+        assert_eq!([1, 2, 3, 4, 8, 16, 64].map(date_read_threads_for), [1, 1, 1, 2, 4, 8, 8]);
+    }
+
+    /// The memo's bound is asked once, before any row goes in.
+    ///
+    /// FALSIFIER (L28): check `taken_cache_full` per insert, as the old read did.
+    #[test]
+    fn merge_clears_first_and_keeps_the_whole_pass() {
+        let row = |i: usize| TakenRow { path: PathBuf::from(format!("p{i}")), modified: None, date: Some(i as i64) };
+        let mut memo = BTreeMap::new();
+        assert!(!merge_rows_into(&mut memo, (0..TAKEN_CACHE_MAX - 10).map(row).collect()));
+        // Near the bound, a read of 20,000 photos ends with all of them present.
+        assert!(merge_rows_into(&mut memo, (100_000..120_000).map(row).collect()));
+        assert_eq!(memo.len(), 20_000);
+        assert!((100_000..120_000).all(|i| memo.contains_key(&row(i).path)));
+        // A folder over the bound keeps all of its rows.
+        let mut memo = BTreeMap::new();
+        merge_rows_into(&mut memo, (0..60_000).map(row).collect());
+        assert_eq!(memo.len(), 60_000);
+        // A folder's own rows coming back don't cost the other folders theirs.
+        let mut memo = BTreeMap::new();
+        merge_rows_into(&mut memo, (0..30_000).map(row).collect());
+        assert!(!merge_rows_into(&mut memo, (0..30_000).map(row).collect()));
+        assert_eq!(memo.len(), 30_000);
+    }
+
+    /// A damaged RAW costs that one photo its date. The read goes on, the card clears, and the photo
+    /// is stored as read so it isn't tried on every open.
+    ///
+    /// FALSIFIER (L28): remove the `catch_unwind` around the reader, or set `ended` at the end of the
+    /// thread's body instead of from the `PassEnded` guard.
+    #[test]
+    fn a_reader_panic_still_ends_the_pass() {
+        let shots: Vec<Shot> = (0..6).map(|i| pass_shot(&format!("panic-{i}"), false)).collect();
+        let bad = primary_file(&shots[2]).unwrap().clone();
+        let bad_r = bad.clone();
+        let reader: PassReader = Arc::new(move |s, stamp| {
+            let p = primary_file(s).unwrap();
+            assert!(*p != bad_r, "a damaged file (this panic is the test)");
+            Some(TakenRow { path: p.clone(), modified: stamp, date: Some(7) })
+        });
+        let handle = TakenPass::start_with(pass_input(shots), reader, 2);
+        wait_ended(&handle);
+        let finished = handle.0.finished.lock().unwrap();
+        let rows = &finished.as_ref().expect("the pass finished, not only ended").rows;
+        assert_eq!(rows.len(), 6, "the other five were read too");
+        assert_eq!(rows.iter().find(|r| r.path == bad).unwrap().date, None, "read, no date");
+        assert_eq!(handle.0.done.load(Ordering::SeqCst), 6, "the card reaches its end");
+        // A panic anywhere else on the thread still ends the read, so no card can stick.
+        let guard_source = include_str!("support.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let body = guard_source.split_once(concat!(".name(\"falcon-dates\".into())", ".spawn(move || {")).expect("the read's thread").1;
+        assert!(body.trim_start().starts_with("let _ended = PassEnded(worker.clone());"), "the guard is the thread's first line");
+        let pass = handle.0.clone();
+        let ended_by_guard = std::thread::spawn(move || {
+            let _ended = PassEnded(pass);
+            panic!("a panic outside the reader (the test)");
+        }).join();
+        assert!(ended_by_guard.is_err());
+    }
+
+    /// The apply rule. Named by what the person did: a read keeps going through a Delete during it,
+    /// stops on leaving the folder, and stops when the list leaves Date taken, except that a pick's own
+    /// read is waiting behind rereads in the old order.
+    ///
+    /// FALSIFIER (L28): bring back a generation comparison, or drop any one term.
+    #[test]
+    fn a_same_folder_landing_keeps_the_pass_and_others_drop_it() {
+        assert!(pass_survives_landing(true, true, false), "a Delete during a handed-over read");
+        assert!(pass_survives_landing(true, false, true), "a Delete during a pick's read, in the old order");
+        assert!(pass_survives_landing(true, true, true), "a direction flip's read in a Date taken list");
+        assert!(!pass_survives_landing(false, true, false), "another folder");
+        assert!(!pass_survives_landing(false, true, true), "another folder, even with a pick");
+        assert!(!pass_survives_landing(false, false, true));
+        assert!(!pass_survives_landing(true, false, false), "the same folder has left Date taken");
+    }
+
+    /// The menu shows what the person chose while the list waits, through any reread.
+    ///
+    /// FALSIFIER (L28): `apply_scan` writes the applied sort straight to the menu, or `menu_sort`
+    /// ignores the direction.
+    #[test]
+    fn a_mid_read_reread_keeps_the_pending_sort_on_the_menu() {
+        assert_eq!(menu_sort((SortMethod::Name, false), Some(true)), (SortMethod::Taken, true), "a Delete's reread, in Name order");
+        assert_eq!(menu_sort((SortMethod::Name, false), None), (SortMethod::Name, false), "no pick waiting");
+        assert_eq!(menu_sort((SortMethod::Taken, false), Some(true)), (SortMethod::Taken, true), "a flip waiting");
+        let source = include_str!("main.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let apply = source.split_once("    let apply_scan: Rc<dyn Fn(ScanDone)> = {").unwrap().1.split_once("\n    };").unwrap().0;
+        assert!(apply.contains("support::menu_sort(sort, taken_pass.borrow().as_ref().and_then(|p| p.pick));"), "the landing asks");
+        assert!(!apply.contains("a.set_sort_method(sort.0.as_i32());"), "and never writes the applied sort directly");
+    }
+
+    /// R1: what the person chose changes once. The sort memory is written at the landing, so any reread
+    /// during the read uses the old order, and closing Falcon during it leaves the old order for next
+    /// time. A flip only updates the pending pick. Pinned by source, because the glue runs only in the
+    /// app, with the routing itself run for real.
+    ///
+    /// FALSIFIER (L28): call `remember_sort` for a Date taken pick in a folder with photos (in
+    /// `apply_pick`), drop the one at the landing, or post a reread for the flip.
+    #[test]
+    fn a_pick_changes_the_order_once() {
+        let source = include_str!("main.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let section = |from: &str, to: &str| source.split_once(from).unwrap().1.split_once(to).unwrap().0.to_owned();
+        let pick = section("let apply_pick = Rc::new(move |method: SortMethod, desc: bool| {", "\n        });");
+        let remember = pick.find("support::remember_sort(").expect("the pick's memory");
+        assert!(pick[..remember].contains("if method != SortMethod::Taken || snap.is_empty() {"), "a Date taken pick with photos waits for its landing");
+        assert!(pick.contains("if let Some(active) = slot.as_mut() {\n                    active.pick = Some(desc);\n                    return;\n                }"), "a flip updates the pending pick, with no landing");
+        let taken = pick.split_once("if method == SortMethod::Taken {").unwrap().1.split_once("} else {").unwrap().0;
+        assert!(!taken.contains("*sort_rl.lock()"), "nothing is posted until the read ends");
+        let land = section("PassDue::Land => {", "mk!(\"reload_req\");");
+        // Its own statement: a `borrow_mut()` held into `reload` would panic when it reads the slot.
+        let order = ["let landing_pass = taken_pass_t.borrow_mut().take();", "active.handle.merge_finished();", "support::remember_sort(", "keep_view_req_t.set(true);", "reload_t(path, None);", "keep_view_req_t.set(false);"];
+        let spots: Vec<usize> = order.iter().map(|s| land.find(s).unwrap_or_else(|| panic!("the landing: {s}"))).collect();
+        assert!(spots.windows(2).all(|w| w[0] < w[1]), "rows, then memory, then one reread: {spots:?}");
+        // The memory's routing, and that the old order is what the next reread reads until then.
+        let (mut attrs, mut lru) = (FolderAttrs::default(), Vec::new());
+        let spec = encode_sort_spec(SortMethod::Taken, true);
+        assert_eq!(resolve_sort_spec(attrs.sort.as_deref(), &lru, "C:/f", 10), (SortMethod::Name, false), "during the read, and after a close");
+        remember_sort(0, false, &mut attrs, &mut lru, "C:/f", spec.clone());
+        assert_eq!(resolve_sort_spec(attrs.sort.as_deref(), &lru, "C:/f", 10), (SortMethod::Name, false), "sort memory off keeps nothing");
+        remember_sort(10, false, &mut attrs, &mut lru, "C:/f", spec.clone());
+        assert_eq!(resolve_sort_spec(attrs.sort.as_deref(), &lru, "C:/f", 10), (SortMethod::Taken, true), "the list");
+        lru.clear();
+        remember_sort(10, true, &mut attrs, &mut lru, "C:/f", spec);
+        assert!(lru.is_empty(), "a review file's folder takes no slot");
+        assert_eq!(resolve_sort_spec(attrs.sort.as_deref(), &lru, "C:/f", 10), (SortMethod::Taken, true), "the attr");
+    }
+
+    /// A generated folder for the date rows: 0-byte PNGs named as given, each with its modified time
+    /// in seconds, removed on drop. Named for what the rows care about: which photo, never where.
+    struct DatedFolder(PathBuf);
+    impl Drop for DatedFolder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn dated_folder(tag: &str, photos: &[(&str, u64)]) -> DatedFolder {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("falcon-dates-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, secs) in photos {
+            set_file_time(&dir.join(format!("{name}.png")), *secs);
+        }
+        DatedFolder(dir)
+    }
+    fn set_file_time(path: &Path, secs: u64) {
+        let file = std::fs::File::options().create(true).truncate(false).write(true).open(path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+    }
+    fn listed(dir: &Path, method: SortMethod, desc: bool) -> Vec<Shot> {
+        let scan = falcon_decode::scan_folder_with_metadata(dir).unwrap();
+        let mut shots = scan.shots;
+        sort_scanned_shots(&mut shots, method, desc, &BTreeMap::new(), &scan.metadata);
+        shots
+    }
+    fn names(shots: &[Shot]) -> Vec<&str> {
+        shots.iter().map(|s| s.name.as_str()).collect()
+    }
+    /// A reader that knows capture dates by photo name, and can be held on one photo.
+    fn dates_by_name(dates: &[(&str, i64)], hold_on: Option<(&str, std::sync::mpsc::Receiver<()>)>) -> PassReader {
+        let dates: HashMap<String, i64> = dates.iter().map(|(n, d)| (n.to_string(), *d)).collect();
+        let hold_name = hold_on.as_ref().map(|h| h.0.to_string());
+        let hold = Mutex::new(hold_on.map(|h| h.1));
+        Arc::new(move |s, stamp| {
+            if hold_name.as_deref() == Some(s.name.as_str()) {
+                if let Some(rx) = hold.lock().unwrap().take() {
+                    let _ = rx.recv();
+                }
+            }
+            Some(TakenRow { path: primary_file(s).unwrap().clone(), modified: stamp, date: dates.get(&s.name).copied() })
+        })
+    }
+
+    /// R3: the sort reads no file, whatever the memo holds. With nothing known it orders by modified
+    /// time and the memo stays empty; once a row is merged the same call orders by capture date.
+    /// Together with `the_inline_budget_caps_reads`, this is what keeps a date read off the interface
+    /// thread at any scale.
+    ///
+    /// FALSIFIER (L28): call the reader from the Taken arm of `sort_scanned_shots`.
+    #[test]
+    fn a_date_sort_reads_no_file() {
+        let folder = dated_folder("noread", &[("A", 3_000), ("B", 1_000), ("C", 2_000)]);
+        let in_memo = |shots: &[Shot]| {
+            let memo = TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            shots.iter().filter(|s| memo.contains_key(primary_file(s).unwrap())).count()
+        };
+        let shots = listed(&folder.0, SortMethod::Taken, false);
+        assert_eq!(names(&shots), ["B", "C", "A"], "nothing known: the modified time");
+        assert_eq!(in_memo(&shots), 0, "and nothing was read");
+        let rows: Vec<TakenRow> = shots.iter().map(|s| {
+            let date = match s.name.as_str() { "A" => 10, "B" => 30, _ => 20 };
+            let modified = std::fs::metadata(primary_file(s).unwrap()).unwrap().modified().ok();
+            TakenRow { path: primary_file(s).unwrap().clone(), modified, date: Some(date) }
+        }).collect();
+        merge_taken_rows(rows);
+        assert_eq!(names(&listed(&folder.0, SortMethod::Taken, false)), ["A", "C", "B"], "the same call, by capture date");
+        assert_eq!(names(&listed(&folder.0, SortMethod::Taken, true)), ["B", "C", "A"], "and the other way round");
+    }
+
+    /// R3: a reread reads at most its budget, never a cloud-only photo, and nothing known. A budget of 0
+    /// (a read is running for the folder) reads nothing.
+    ///
+    /// FALSIFIER (L28): drop `.take(budget)`, the tag or the metadata term, or the memo term in
+    /// `read_dates_inline_with`.
+    #[test]
+    fn the_inline_budget_caps_reads() {
+        let photos: Vec<(String, u64)> = (0..40).map(|i| (format!("P{i:02}"), 1_000 + i as u64)).collect();
+        let refs: Vec<(&str, u64)> = photos.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let folder = dated_folder("budget", &refs);
+        let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+        let calls = AtomicUsize::new(0);
+        let read = |s: &Shot, stamp| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(TakenRow { path: primary_file(s).unwrap().clone(), modified: stamp, date: Some(1) })
+        };
+        let mut shots = scan.shots.clone();
+        assert_eq!(read_dates_inline_with(&shots, &scan.metadata, 0, |_| false, read), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "budget 0 reads nothing");
+        assert_eq!(read_dates_inline_with(&shots, &scan.metadata, 5, |_| true, read), 0, "every photo is only in the cloud now");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        for s in shots.iter_mut() { s.cloud_placeholder = true; }
+        assert_eq!(read_dates_inline_with(&shots, &scan.metadata, 5, |_| false, read), 0, "the scan's tag counts too");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let shots = scan.shots;
+        assert_eq!(read_dates_inline_with(&shots, &scan.metadata, INLINE_DATE_READS, |_| false, read), INLINE_DATE_READS);
+        assert_eq!(calls.load(Ordering::SeqCst), INLINE_DATE_READS, "at most the budget");
+        assert_eq!(read_dates_inline_with(&shots, &scan.metadata, INLINE_DATE_READS, |_| false, read), 8, "the known ones aren't read again");
+        assert_eq!(read_dates_inline_with(&shots, &scan.metadata, INLINE_DATE_READS, |_| false, read), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 40);
+    }
+
+    /// R2: an open waits on what's unread. A shoot-sized folder that finishes in time lands once, in the
+    /// right order. One that doesn't lands in file-date order and hands the read over. A large unread
+    /// count doesn't wait beyond working out that count.
+    ///
+    /// FALSIFIER (L28): wait for the read to end whatever it takes, or drop the `taken_wait_worthwhile`
+    /// term.
+    #[test]
+    fn opening_waits_at_most_the_limit_then_hands_over() {
+        let limit = Duration::from_millis(300);
+        let never = || false;
+        // A fast reader: no handle, and the list is in capture-date order.
+        let folder = dated_folder("wait-fast", &[("A", 3_000), ("B", 1_000), ("C", 2_000)]);
+        let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+        let input = PassInput { dir: folder.0.clone(), shots: Arc::new(scan.shots.clone()), stamps: listing_stamps_of(&scan.metadata), order_desc: Some(false), write_allowed: false };
+        let handle = TakenPass::start_with(input, dates_by_name(&[("A", 30), ("B", 10), ("C", 20)], None), 2);
+        assert!(wait_for_taken_pass(handle, &never, Duration::from_secs(30)).is_none(), "finished in time: nothing to hand over");
+        assert_eq!(names(&listed(&folder.0, SortMethod::Taken, false)), ["B", "C", "A"]);
+        let folder = dated_folder("wait-fast2", &[("A", 1_000), ("B", 2_000), ("C", 3_000)]);
+        let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+        let input = PassInput { dir: folder.0.clone(), shots: Arc::new(scan.shots.clone()), stamps: listing_stamps_of(&scan.metadata), order_desc: Some(false), write_allowed: false };
+        let handle = TakenPass::start_with(input, dates_by_name(&[("A", 30), ("B", 20), ("C", 10)], None), 2);
+        assert!(wait_for_taken_pass(handle, &never, Duration::from_secs(30)).is_none());
+        assert_eq!(names(&listed(&folder.0, SortMethod::Taken, false)), ["C", "B", "A"], "capture dates, not file dates");
+        // A reader held on a small folder: the wait ends at the limit, in file-date order.
+        let folder = dated_folder("wait-held", &[("A", 3_000), ("B", 1_000), ("C", 2_000)]);
+        let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+        let (release, held) = std::sync::mpsc::channel();
+        let input = PassInput { dir: folder.0.clone(), shots: Arc::new(scan.shots.clone()), stamps: listing_stamps_of(&scan.metadata), order_desc: Some(false), write_allowed: false };
+        let handle = TakenPass::start_with(input, dates_by_name(&[("A", 10), ("B", 20), ("C", 30)], Some(("B", held))), 2);
+        let at = Instant::now();
+        let handed = wait_for_taken_pass(handle, &never, limit).expect("a read still running is handed over");
+        assert!(at.elapsed() >= limit && at.elapsed() < limit + Duration::from_secs(5), "waited the limit: {:?}", at.elapsed());
+        assert_eq!(names(&listed(&folder.0, SortMethod::Taken, false)), ["B", "C", "A"], "file-date order until it lands");
+        release.send(()).unwrap();
+        wait_ended(&handed);
+        // More unread than the limit: no wait beyond the count, however long the limit.
+        let many: Vec<Shot> = (0..TAKEN_WAIT_MAX_UNREAD + 1).map(|i| pass_shot(&format!("many-{i}"), false)).collect();
+        let (release, held) = std::sync::mpsc::channel();
+        let input = pass_input(many);
+        let first = input.shots[0].name.clone();
+        let handle = TakenPass::start_with(input, dates_by_name(&[], Some((first.as_str(), held))), 1);
+        let at = Instant::now();
+        let handed = wait_for_taken_pass(handle, &never, Duration::from_secs(60)).expect("handed over");
+        assert!(at.elapsed() < Duration::from_secs(10), "no wait on the read itself: {:?}", at.elapsed());
+        assert_eq!(handed.0.total.load(Ordering::SeqCst), TAKEN_WAIT_MAX_UNREAD + 1);
+        drop(release);
+        // A superseded open stops waiting at once.
+        let (_release, held) = std::sync::mpsc::channel();
+        let input = pass_input(vec![pass_shot("superseded", false)]);
+        let handle = TakenPass::start_with(input, dates_by_name(&[], Some(("superseded", held))), 1);
+        let at = Instant::now();
+        assert!(wait_for_taken_pass(handle, &|| true, Duration::from_secs(60)).is_some());
+        assert!(at.elapsed() < Duration::from_secs(10));
+        assert!(taken_wait_worthwhile(TAKEN_WAIT_MAX_UNREAD) && !taken_wait_worthwhile(TAKEN_WAIT_MAX_UNREAD + 1), "2,000 or fewer");
+    }
+
+    /// A `ScanDone` that never lands (a newer open replaced it) stops its read, and keeps the rows of a
+    /// read that had finished. `Drop` is the only thing that can do this: the worker has already gone.
+    ///
+    /// FALSIFIER (L28): remove `PassHandle`'s `Drop`, or its merge.
+    #[test]
+    fn a_retired_scan_stops_its_pass() {
+        // A read still running is told to stop.
+        let (_release, held) = std::sync::mpsc::channel();
+        let handle = TakenPass::start_with(pass_input(vec![pass_shot("retired-0", false)]), dates_by_name(&[], Some(("retired-0", held))), 1);
+        let pass = handle.0.clone();
+        let mut done = stale_scan_for_pass();
+        done.taken_pass = Some(handle);
+        assert!(!pass.cancel.load(Ordering::SeqCst));
+        drop(done);
+        assert!(pass.cancel.load(Ordering::SeqCst), "the read stops");
+        // A read that had finished leaves its rows for the session.
+        let shot = pass_shot("retired-1", false);
+        let path = primary_file(&shot).unwrap().clone();
+        let handle = TakenPass::start_with(pass_input(vec![shot]), row_reader(5), 1);
+        wait_ended(&handle);
+        let mut done = stale_scan_for_pass();
+        done.taken_pass = Some(handle);
+        assert!(!TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&path), "not before the landing");
+        drop(done);
+        assert_eq!(TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&path).map(|r| r.1), Some(Some(5)));
+    }
+
+    fn stale_scan_for_pass() -> ScanDone {
+        ScanDone { changed_sources: HashSet::new(), stamps: None, partial: false, pending_edges: (false, false), source_order: Vec::new(), id: 9, dir: PathBuf::from("retired"), shots: Vec::new(), ratings: Vec::new(),
+            marks: Vec::new(), start: 0, land: None, extra: BTreeMap::new(), rotations: BTreeMap::new(),
+            attrs: FolderAttrs::default(), had_file: false, from_ledger: false, identity: None, manifest: None,
+            sort: (SortMethod::Taken, false), scan_err: false, scan_denied: false, unlisted_target: None, review_load: ReviewLoad::Loaded, taken_pass: None }
+    }
+
+    /// One Delete of the photo on screen, as the reread after it runs: the file leaves, the folder is
+    /// listed and sorted by the sort the folder has now, and the landing is the deleted position.
+    fn delete_on_screen(dir: &Path, on_screen: &[Shot], at: usize, method: SortMethod) -> (Vec<Shot>, usize) {
+        std::fs::remove_file(primary_file(&on_screen[at]).unwrap()).unwrap();
+        let after = listed(dir, method, false);
+        let land = post_op_land(at, after.len());
+        (after, land)
+    }
+
+    /// The memo doesn't change until the landing, so a Delete during the read lands by position on the
+    /// next photo, in the order on screen, each time it is pressed. Two cases: a pick (the reread is
+    /// still in the old order) and an open handed over (the list is in file-date order, unmerged). A
+    /// Delete can also arrive after the read ended, with the landing held behind its dialog. Then the
+    /// landing keeps the person on the same photo. Named by photo, never by position (L52, L53).
+    ///
+    /// FALSIFIER (L28): merge rows into the memo as they are read, or at the end of the read instead of
+    /// at the landing (`run_taken_pass`).
+    #[test]
+    fn a_delete_during_the_read_lands_on_the_next_photo() {
+        // File dates run P1 upward; capture dates run the other way, so any early merge shows.
+        let photos: Vec<(String, u64)> = (1..=9).map(|i| (format!("P{i}"), 1_000 + i as u64)).collect();
+        let refs: Vec<(&str, u64)> = photos.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let dates: Vec<(&str, i64)> = refs.iter().enumerate().map(|(i, (n, _))| (*n, 100 - i as i64)).collect();
+        for (case, old_sort, order_desc) in [("a pick", SortMethod::Name, None), ("a handed-over open", SortMethod::Taken, Some(false))] {
+            let folder = dated_folder("delete", &refs);
+            let mut on_screen = listed(&folder.0, old_sort, false);
+            assert_eq!(names(&on_screen), ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9"], "{case}: the old order");
+            let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+            let (release, held) = std::sync::mpsc::channel();
+            let input = PassInput { dir: folder.0.clone(), shots: Arc::new(scan.shots), stamps: listing_stamps_of(&scan.metadata), order_desc, write_allowed: false };
+            // One thread, so the rows before the held photo really have been read when the Deletes run.
+            let handle = TakenPass::start_with(input, dates_by_name(&dates, Some(("P8", held))), 1);
+            let until = Instant::now() + Duration::from_secs(30);
+            while handle.0.done.load(Ordering::SeqCst) < 6 {
+                assert!(Instant::now() < until, "{case}: the reader didn't reach the held photo");
+                std::thread::yield_now();
+            }
+            // On P2, press Delete three times during the read.
+            let mut at = 1;
+            for next in ["P3", "P4", "P5"] {
+                let (after, land) = delete_on_screen(&folder.0, &on_screen, at, old_sort);
+                assert_eq!(after[land].name, next, "{case}: a Delete moves to the next photo");
+                (on_screen, at) = (after, land);
+            }
+            // The read ends with its landing held behind a confirm dialog, and that Delete goes ahead.
+            release.send(()).unwrap();
+            wait_ended(&handle);
+            let (after, land) = delete_on_screen(&folder.0, &on_screen, at, old_sort);
+            assert_eq!(after[land].name, "P6", "{case}: still the old order, with the read finished");
+            (on_screen, at) = (after, land);
+            // The landing: rows in the memo, the new order, and the person on the same photo.
+            handle.merge_finished();
+            let file = landing_file(&on_screen, at);
+            let landed = listed(&folder.0, SortMethod::Taken, false);
+            assert_eq!(names(&landed), ["P9", "P8", "P7", "P6", "P1"], "{case}: capture dates");
+            assert_eq!(landed[select_match(&landed, &file).unwrap()].name, "P6", "{case}: the same photo");
+        }
+    }
+
+    /// R3: a photo whose modified time changed (Apply rotations, or saved in another program) keeps its
+    /// place until it is read again, so nothing shifts and the next Delete still lands on the next photo.
+    ///
+    /// FALSIFIER (L28): in `taken_key`, make a row for another modified time fall to the file date.
+    #[test]
+    fn a_changed_file_keeps_its_place() {
+        let folder = dated_folder("changed", &[("A", 1_000), ("B", 2_000), ("C", 3_000), ("D", 4_000), ("E", 5_000)]);
+        let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+        // Capture dates in the opposite order to the file dates.
+        let dates = |n: &str| match n { "A" => 50, "B" => 40, "C" => 30, "D" => 20, _ => 10 };
+        merge_taken_rows(scan.shots.iter().map(|s| {
+            let p = primary_file(s).unwrap();
+            TakenRow { path: p.clone(), modified: scan.metadata[p].modified().ok(), date: Some(dates(&s.name)) }
+        }).collect());
+        let on_screen = listed(&folder.0, SortMethod::Taken, false);
+        assert_eq!(names(&on_screen), ["E", "D", "C", "B", "A"]);
+        // D is rotated and written: its file date moves past every other photo.
+        set_file_time(primary_file(&on_screen[1]).unwrap(), 9_000);
+        let kept = listed(&folder.0, SortMethod::Taken, false);
+        assert_eq!(names(&kept), ["E", "D", "C", "B", "A"], "D keeps its place");
+        // On C, delete: the next photo is B.
+        let (after, land) = delete_on_screen(&folder.0, &kept, 2, SortMethod::Taken);
+        assert_eq!(after[land].name, "B");
+        // A photo read and found to have no date keeps its old place the same way.
+        let p = primary_file(&after[3]).unwrap().clone();
+        assert_eq!(after[3].name, "A");
+        let was = std::fs::metadata(&p).unwrap().modified().ok();
+        TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(p.clone(), (was, None));
+        set_file_time(&p, 9_500);
+        let row = |q: &PathBuf| TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(q).copied();
+        let now = std::fs::metadata(&p).unwrap().modified().ok();
+        assert_eq!(taken_key(row, &after[3], now), systemtime_epoch(was.unwrap()), "its old file date");
+        // A photo with no row at all still sorts by its file date.
+        assert_eq!(taken_key(|_| None, &after[3], now), 9_500);
+    }
+
+    // ── Date taken sort: `falcon.cache` ────────────────────────────────────────────────────
+
+    fn real_probe(m: &std::fs::Metadata) -> bool {
+        falcon_decode::metadata_is_cloud_placeholder(m)
+    }
+
+    /// Run a read of `dir`, as an open or a pick does, with a counting reader. Returns how many photos
+    /// it read, and the rows it would hand the memo.
+    fn read_with_counter(dir: &Path, write_allowed: bool) -> (usize, Vec<TakenRow>) {
+        let scan = falcon_decode::scan_folder_with_metadata(dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let reader: PassReader = Arc::new(move |s, stamp| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Some(TakenRow { path: primary_file(s).unwrap().clone(), modified: stamp, date: Some(77) })
+        });
+        let input = PassInput { dir: dir.to_path_buf(), shots: Arc::new(scan.shots), stamps: listing_stamps_of(&scan.metadata), order_desc: None, write_allowed };
+        let handle = TakenPass::start_with(input, reader, 2);
+        wait_ended(&handle);
+        writer_barrier(Duration::from_secs(5)); // the write, if the writer is up in this test process
+        let rows = handle.0.finished.lock().unwrap().take().map_or(Vec::new(), |f| f.rows);
+        (calls.load(Ordering::SeqCst), rows)
+    }
+
+    /// The format keeps what the memo needs: the listing's modified time to the digit, a date before
+    /// 1970, and "read, no date", so a photo without one isn't read on every open. Against a real
+    /// listing, because that is what a row is compared with.
+    ///
+    /// FALSIFIER (L28): store seconds, leave out rows with no date, or give up on negative dates.
+    #[test]
+    fn a_cache_round_trips_exactly() {
+        let folder = dated_folder("roundtrip", &[("A", 0), ("B", 0), ("C", 0)]);
+        let sub_second = std::time::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_700);
+        for name in ["A", "B", "C"] {
+            std::fs::File::options().write(true).open(folder.0.join(format!("{name}.png"))).unwrap().set_modified(sub_second).unwrap();
+        }
+        let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+        let stamps = listing_stamps_of(&scan.metadata);
+        let row = |name: &str, date| {
+            let p = folder.0.join(format!("{name}.png"));
+            TakenRow { modified: Some(stamps[&p].1), path: p, date }
+        };
+        let rows = [row("A", Some(1_600_000_000)), row("B", None), row("C", Some(-86_400))];
+        let bytes = encode_date_cache(&rows);
+        assert_eq!(bytes.len(), DATE_CACHE_HEADER + 3 * DATE_CACHE_ROW);
+        assert_eq!(DATE_CACHE_HEADER + 16_775 * DATE_CACHE_ROW, 402_632, "the size the owner was told");
+        std::fs::write(folder.0.join(DATE_CACHE_NAME), &bytes).unwrap();
+        assert_eq!(classify_date_cache(&folder.0), DateCacheState::Ours);
+        let known = load_date_cache(&folder.0).expect("valid");
+        for r in &rows {
+            assert_eq!(known.date_of(&r.path, r.modified.unwrap()), Some(r.date), "{}", r.path.display());
+        }
+        // A fresh stat of the file agrees to the digit, so it stays a hit; and a time one tick away is
+        // a different time, however near.
+        let p = &rows[0].path;
+        let exact = std::fs::metadata(p).unwrap().modified().unwrap();
+        assert_eq!(known.date_of(p, exact), Some(rows[0].date));
+        assert_eq!(known.date_of(p, exact + Duration::from_nanos(100)), None, "not the same modified time");
+        // Through a real read: none of the three is read, and the no-date photo isn't a miss.
+        let (reads, kept) = read_with_counter(&folder.0, true);
+        assert_eq!(reads, 0, "nothing is read");
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept.iter().find(|r| r.path == rows[1].path).unwrap().date, None);
+        assert_eq!(kept.iter().find(|r| r.path == rows[2].path).unwrap().date, Some(-86_400));
+    }
+
+    /// The hard rule for the file: a wrong or damaged one can only cost a re-read. It can't change
+    /// which photo is which, lose a star or block opening. It also never shows up as a photo.
+    ///
+    /// FALSIFIER (L28): remove the checksum check, the version check, the length check, or the
+    /// modified-time comparison in `date_of`.
+    #[test]
+    fn a_wrong_cache_costs_only_a_read() {
+        let photos = [("A", 1_000), ("B", 2_000), ("C", 3_000)];
+        let good = |folder: &DatedFolder| {
+            let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+            let stamps = listing_stamps_of(&scan.metadata);
+            let rows: Vec<TakenRow> = scan.shots.iter().map(|s| {
+                let p = primary_file(s).unwrap();
+                TakenRow { path: p.clone(), modified: Some(stamps[p].1), date: Some(5) }
+            }).collect();
+            encode_date_cache(&rows)
+        };
+        type Spoil = fn(&DatedFolder, Vec<u8>) -> Vec<u8>;
+        let cases: [(&str, Spoil, usize); 7] = [
+            ("truncated", |_, b| b[..b.len() - 3].to_vec(), 3),
+            ("cut at the header", |_, b| b[..DATE_CACHE_HEADER].to_vec(), 3),
+            ("one flipped byte", |_, mut b| { let at = b.len() - 1; b[at] ^= 1; b }, 3),
+            ("a wrong version", |_, mut b| { b[16] = 9; b }, 3),
+            ("a count that disagrees", |_, mut b| { b[20] = 2; b }, 3),
+            ("a changed modified time", |f, b| { set_file_time(&f.0.join("B.png"), 9_000); b }, 1),
+            ("an unknown name", |f, b| { std::fs::rename(f.0.join("B.png"), f.0.join("Z.png")).unwrap(); b }, 1),
+        ];
+        for (i, (what, spoil, unread)) in cases.into_iter().enumerate() {
+            let folder = dated_folder(&format!("wrong-{i}"), &photos);
+            let bytes = spoil(&folder, good(&folder));
+            std::fs::write(folder.0.join(DATE_CACHE_NAME), bytes).unwrap();
+            let (reads, rows) = read_with_counter(&folder.0, false);
+            assert_eq!(reads, unread, "{what}: those photos are read again");
+            assert_eq!(rows.len(), 3, "{what}: every photo has its date");
+            // The photos and their stars are untouched, in any sort, and the file is no photo.
+            let sel = BTreeMap::from([("A".to_string(), Sel { rating: 5, ..Sel::default() })]);
+            let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+            assert_eq!(scan.shots.len(), 3, "{what}: falcon.cache is never a photo");
+            let mut shots = scan.shots;
+            sort_scanned_shots(&mut shots, SortMethod::Taken, false, &sel, &scan.metadata);
+            let (ratings, _) = apply_selection(&sel, &shots);
+            let starred = shots.iter().position(|s| s.name == "A").unwrap();
+            assert_eq!(ratings[starred], 5, "{what}: A keeps its star");
+        }
+        // Over the cap: left alone and never read, so every photo is read.
+        let folder = dated_folder("wrong-over", &photos);
+        let big = std::fs::File::create(folder.0.join(DATE_CACHE_NAME)).unwrap();
+        { use std::io::Write; (&big).write_all(DATE_CACHE_MAGIC).unwrap(); }
+        big.set_len(DATE_CACHE_MAX_BYTES + 1).unwrap();
+        drop(big);
+        assert_eq!(classify_date_cache(&folder.0), DateCacheState::LeaveAlone);
+        assert_eq!(read_with_counter(&folder.0, false).0, 3);
+    }
+
+    /// A cloud-only `falcon.cache` is never opened, replaced or removed: reading it would download it.
+    /// The probe stands in for a placeholder, and a file that would fail to parse shows any read.
+    ///
+    /// FALSIFIER (L28): drop the `is_cloud` term from the classifier.
+    #[test]
+    fn a_cloud_only_cache_is_never_opened() {
+        let folder = dated_folder("cloud", &[("A", 1_000)]);
+        let file = folder.0.join(DATE_CACHE_NAME);
+        let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+        let stamps = listing_stamps_of(&scan.metadata);
+        let rows: Vec<TakenRow> = scan.shots.iter().map(|s| {
+            let p = primary_file(s).unwrap();
+            TakenRow { path: p.clone(), modified: Some(stamps[p].1), date: Some(5) }
+        }).collect();
+        let bytes = encode_date_cache(&rows);
+        std::fs::write(&file, &bytes).unwrap();
+        assert_eq!(classify_date_cache_with(&folder.0, |_| true), DateCacheState::LeaveAlone);
+        assert!(load_date_cache_with(&folder.0, |_| true).is_none(), "no bytes are read");
+        assert!(load_date_cache_with(&folder.0, |_| false).is_some(), "the same file, local");
+        let wrote = write_date_cache_with(&folder.0, b"replacement", |_| true, |_, _| panic!("never written"));
+        assert!(!wrote);
+        assert_eq!(std::fs::read(&file).unwrap(), bytes, "byte-identical");
+    }
+
+    /// `write_atomic` renames over its target, so the classifier guards the write: someone else's file
+    /// with this name is never overwritten, and Falcon's own with a damaged body is replaced.
+    ///
+    /// FALSIFIER (L28): call `write_atomic` without the classifier in `write_date_cache_with`.
+    #[test]
+    fn a_foreign_cache_is_never_overwritten() {
+        let folder = dated_folder("foreign", &[("A", 1_000)]);
+        let file = folder.0.join(DATE_CACHE_NAME);
+        let new = encode_date_cache(&[]);
+        for foreign in [&b"my own notes, nothing to do with Falcon, and long enough"[..], b"", b"short"] {
+            std::fs::write(&file, foreign).unwrap();
+            assert!(!write_date_cache(&folder.0, &new));
+            assert_eq!(std::fs::read(&file).unwrap(), foreign, "left exactly as it was");
+        }
+        std::fs::remove_file(&file).unwrap();
+        // A folder with this name.
+        std::fs::create_dir(&file).unwrap();
+        assert!(!write_date_cache(&folder.0, &new));
+        assert!(file.is_dir());
+        std::fs::remove_dir(&file).unwrap();
+        // Nothing there: it is written.
+        assert!(write_date_cache(&folder.0, &new));
+        assert_eq!(std::fs::read(&file).unwrap(), new);
+        // Falcon's header with a damaged body: replaced.
+        let mut damaged = new.clone();
+        damaged.extend_from_slice(b"junk");
+        std::fs::write(&file, &damaged).unwrap();
+        assert_eq!(classify_date_cache(&folder.0), DateCacheState::Ours);
+        assert!(load_date_cache(&folder.0).is_none());
+        assert!(write_date_cache(&folder.0, &new));
+        assert_eq!(std::fs::read(&file).unwrap(), new);
+    }
+
+    /// The owner's limit decides only creation. It is created at 2,000 photos and above, where the
+    /// person chose Date taken and sort memory is on, and never empty. An existing file goes on being
+    /// used and updated below the limit, and an unchanged folder writes nothing. Run for real at the
+    /// edge, because the file is what a person sees.
+    ///
+    /// FALSIFIER (L28): change `>=` to `>`, change the constant, or drop the `Ours` no-new-rows term or
+    /// the no-rows term.
+    #[test]
+    fn the_limit_decides_only_creation() {
+        use DateCacheState::*;
+        assert_eq!(DATE_CACHE_MIN_PHOTOS, 2_000, "owner: 2,000 is fine");
+        assert!(!date_cache_should_write(Absent, 1_999, 1_999, 1_999, true), "below the limit");
+        assert!(date_cache_should_write(Absent, 2_000, 2_000, 2_000, true), "at the limit");
+        assert!(date_cache_should_write(Absent, 2_000, 0, 2_000, true), "back to Date taken after a removal, nothing new read");
+        assert!(!date_cache_should_write(Absent, 2_000, 2_000, 2_000, false), "sort memory off: nothing would use it");
+        assert!(!date_cache_should_write(Absent, 5_000, 0, 0, true), "never an empty file: a folder all in the cloud");
+        assert!(!date_cache_should_write(Ours, 16_775, 0, 16_775, true), "an unchanged folder writes nothing");
+        assert!(date_cache_should_write(Ours, 16_775, 1, 16_775, true), "one new photo");
+        assert!(date_cache_should_write(Ours, 1_500, 3, 1_500, true), "still in use below the limit");
+        assert!(!date_cache_should_write(Ours, 16_775, 5, 16_775, false));
+        assert!(!date_cache_should_write(LeaveAlone, 16_775, 5, 16_775, true), "someone else's");
+        // The real thing, in a real folder, with listed photos that needn't exist.
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        let run = |tag: &str, photos: usize, cloud: bool, write_allowed: bool| {
+            let folder = dated_folder(tag, &[]);
+            let shots: Vec<Shot> = (0..photos).map(|i| {
+                let mut s = shot(0, &format!("L{i}"), Some(folder.0.join(format!("L{i}.jpg"))), None);
+                s.cloud_placeholder = cloud;
+                s
+            }).collect();
+            let stamps: ListingStamps = shots.iter().map(|s| (primary_file(s).unwrap().clone(), (1, t))).collect();
+            let input = PassInput { dir: folder.0.clone(), shots: Arc::new(shots), stamps, order_desc: None, write_allowed };
+            let handle = TakenPass::start_with(input, row_reader(1), 4);
+            wait_ended(&handle);
+            writer_barrier(Duration::from_secs(5));
+            std::fs::metadata(folder.0.join(DATE_CACHE_NAME)).ok().map(|m| m.len())
+        };
+        assert_eq!(run("limit-under", 1_999, false, true), None);
+        assert_eq!(run("limit-at", 2_000, false, true), Some((DATE_CACHE_HEADER + 2_000 * DATE_CACHE_ROW) as u64));
+        assert_eq!(run("limit-off", 2_000, false, false), None, "sort memory off");
+        assert_eq!(run("limit-cloud", 2_000, true, true), None, "no rows, no file");
+    }
+
+    /// A cache is not a save. Through the real `writer_loop`, a cache write that can't happen raises no
+    /// notice, never reaches the save sink, and touches no review save record. A folder Falcon can't
+    /// write to just reads again next session.
+    ///
+    /// FALSIFIER (L28): route the cache through `WriteMsg::Write` (`enqueue_write`), or call `on_fail`
+    /// from the arm.
+    #[test]
+    fn a_failed_cache_write_raises_no_notice() {
+        let folder = dated_folder("no-notice", &[]);
+        let missing = folder.0.join("gone");
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(WriteMsg::DateCacheWrite { dir: missing.clone(), data: encode_date_cache(&[]) }).unwrap();
+        drop(tx);
+        let mut sink_calls = 0;
+        let mut fails = 0;
+        writer_loop(rx, |_, _| { sink_calls += 1; Ok(()) }, |_, _| Ok(()), |_, _, _| fails += 1, |d| d.to_path_buf(), |_, _, _| {});
+        assert_eq!((sink_calls, fails), (0, 0), "no save, no notice");
+        assert!(!missing.exists());
+        assert_eq!(review_save_status(&missing), None);
+        assert_eq!(review_final_status(&missing), None);
+        // A write that really fails is only an answer, and a panic inside it is too.
+        assert!(!write_date_cache_with(&folder.0, b"x", |_| false, |_, _| Err(std::io::Error::other("read-only"))));
+        assert!(!write_date_cache_with(&folder.0, b"x", |_| false, |_, _| panic!("a write that panics (the test)")));
+        assert_eq!(classify_date_cache_with(&folder.0, real_probe), DateCacheState::Absent, "and leaves nothing behind");
+    }
+
+    /// A second spelling of a path that is no real file or folder of its own: a junction on Windows (no
+    /// admin rights needed), a symbolic link on Unix.
+    fn junction(link: &Path, target: &Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd").arg("/C").arg("mklink").arg("/J").arg(link).arg(target)
+                .stdout(std::process::Stdio::null()).status().unwrap();
+            assert!(made.success(), "mklink /J {}", link.display());
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    /// THE HARD RULE (owner, twice): the only thing ever deleted is Falcon's own `falcon.cache`, never a
+    /// photo or any other file. Everything beside it stays byte for byte in every case, and a file with
+    /// the right name but anything else about it stays too.
+    ///
+    /// FALSIFIER (L28): drop the header check, use `metadata` instead of `symlink_metadata` in the
+    /// classifier, drop the file-type term, or the safe-folder term.
+    #[test]
+    fn only_falcons_own_cache_is_ever_removed() {
+        let valid = encode_date_cache(&[]);
+        let photo = b"a photograph, not a cache".to_vec();
+        let review = br#"{"photos":{}}"#.to_vec();
+        let bystanders = |dir: &Path| {
+            std::fs::write(dir.join("IMG_0001.jpg"), &photo).unwrap();
+            std::fs::write(dir.join("falcon.jpg"), &photo).unwrap();
+            std::fs::write(dir.join(SELECTION_FILE), &review).unwrap();
+            std::fs::write(dir.join("falcon.cache.bak"), &valid).unwrap();
+        };
+        let bystanders_intact = |dir: &Path, what: &str| {
+            assert_eq!(std::fs::read(dir.join("IMG_0001.jpg")).unwrap(), photo, "{what}: the photo");
+            assert_eq!(std::fs::read(dir.join("falcon.jpg")).unwrap(), photo, "{what}: a photo called falcon");
+            assert_eq!(std::fs::read(dir.join(SELECTION_FILE)).unwrap(), review, "{what}: the review file");
+            assert_eq!(std::fs::read(dir.join("falcon.cache.bak")).unwrap(), valid, "{what}: another name");
+        };
+        // Files with the right name and the wrong everything else.
+        let mut wrong_magic = valid.clone();
+        wrong_magic[0] ^= 1;
+        let mut longer = b"this is someone else's notes file, long enough to pass the size check".to_vec();
+        longer.extend_from_slice(&[0; 64]);
+        for (what, bytes) in [("a wrong header", wrong_magic.as_slice()), ("no header", longer.as_slice()), ("0 bytes", b"".as_slice()), ("31 bytes", &valid[..31])] {
+            let folder = dated_folder("own-wrong", &[]);
+            bystanders(&folder.0);
+            let file = folder.0.join(DATE_CACHE_NAME);
+            std::fs::write(&file, bytes).unwrap();
+            assert!(!remove_own_date_cache(&folder.0), "{what}");
+            assert_eq!(std::fs::read(&file).unwrap(), bytes, "{what}: left exactly as it was");
+            bystanders_intact(&folder.0, what);
+        }
+        // A folder with this name, holding something.
+        let folder = dated_folder("own-folder", &[]);
+        bystanders(&folder.0);
+        let file = folder.0.join(DATE_CACHE_NAME);
+        std::fs::create_dir(&file).unwrap();
+        std::fs::write(file.join("inside.txt"), b"kept").unwrap();
+        assert!(!remove_own_date_cache(&folder.0));
+        assert_eq!(std::fs::read(file.join("inside.txt")).unwrap(), b"kept");
+        bystanders_intact(&folder.0, "a folder");
+        // A link with this name to somewhere else, whose contents look like Falcon's own file.
+        let folder = dated_folder("own-link", &[]);
+        bystanders(&folder.0);
+        let elsewhere = dated_folder("own-link-target", &[]);
+        std::fs::write(elsewhere.0.join("keep.jpg"), &photo).unwrap();
+        let link = folder.0.join(DATE_CACHE_NAME);
+        junction(&link, &elsewhere.0);
+        assert!(!remove_own_date_cache(&folder.0));
+        assert!(std::fs::symlink_metadata(&link).is_ok(), "the link stays");
+        assert_eq!(std::fs::read(elsewhere.0.join("keep.jpg")).unwrap(), photo);
+        bystanders_intact(&folder.0, "a link");
+        let _ = std::fs::remove_dir(&link).or_else(|_| std::fs::remove_file(&link));
+        // A link to a file that looks like Falcon's own. Windows only lets some accounts make one, so
+        // this row runs where it can; the link stays, and so does what it points at.
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(elsewhere.0.join("target.cache"), &link);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(elsewhere.0.join("target.cache"), &link);
+        std::fs::write(elsewhere.0.join("target.cache"), &valid).unwrap();
+        if linked.is_ok() {
+            assert_eq!(classify_date_cache(&folder.0), DateCacheState::LeaveAlone, "a link is never Falcon's own");
+            assert!(!remove_own_date_cache(&folder.0));
+            assert_eq!(std::fs::read(elsewhere.0.join("target.cache")).unwrap(), valid);
+            assert!(std::fs::symlink_metadata(&link).is_ok());
+            std::fs::remove_file(&link).unwrap();
+        }
+        // A valid file inside a folder reached through a link: not a safe folder, so it stays.
+        let real = dated_folder("own-through-link", &[]);
+        std::fs::write(real.0.join(DATE_CACHE_NAME), &valid).unwrap();
+        let spelled = folder.0.join("spelled");
+        junction(&spelled, &real.0);
+        assert!(!remove_own_date_cache(&spelled));
+        assert_eq!(std::fs::read(real.0.join(DATE_CACHE_NAME)).unwrap(), valid);
+        let _ = std::fs::remove_dir(&spelled).or_else(|_| std::fs::remove_file(&spelled));
+        // Cloud-only: never opened or removed.
+        let folder = dated_folder("own-cloud", &[]);
+        bystanders(&folder.0);
+        std::fs::write(folder.0.join(DATE_CACHE_NAME), &valid).unwrap();
+        assert!(!remove_own_date_cache_with(&folder.0, |_| true));
+        assert_eq!(std::fs::read(folder.0.join(DATE_CACHE_NAME)).unwrap(), valid);
+        // Nothing there, and no folder there.
+        let folder = dated_folder("own-absent", &[]);
+        bystanders(&folder.0);
+        assert!(!remove_own_date_cache(&folder.0));
+        assert!(!remove_own_date_cache(&folder.0.join("gone")));
+        bystanders_intact(&folder.0, "nothing there");
+        // Falcon's own file: removed, and nothing else.
+        std::fs::write(folder.0.join(DATE_CACHE_NAME), &valid).unwrap();
+        assert!(remove_own_date_cache(&folder.0));
+        assert!(!folder.0.join(DATE_CACHE_NAME).exists());
+        bystanders_intact(&folder.0, "the valid case");
+        // Falcon's header with a damaged body is still Falcon's own.
+        let mut damaged = valid.clone();
+        damaged.extend_from_slice(b"junk");
+        std::fs::write(folder.0.join(DATE_CACHE_NAME), &damaged).unwrap();
+        assert!(remove_own_date_cache(&folder.0));
+        bystanders_intact(&folder.0, "a damaged body");
+        // There is one door, and only the writer's arm and its fallback open it.
+        let source = include_str!("support.rs");
+        let lines: Vec<&str> = source.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        // The classifier never follows a link, including where this account can't make a file link
+        // for the row above.
+        assert!(lines.iter().any(|l| l.contains(concat!("let meta = match std::fs::symlink_", "metadata(&file) {"))), "it reads the link, not its target");
+        // Spelled in two pieces, so these lines don't count themselves.
+        let removals = concat!("std::fs::remove_file(dir.join(", "DATE_CACHE_NAME))");
+        assert_eq!(lines.iter().filter(|l| l.contains(removals)).count(), 1, "one removal of the file");
+        let door = concat!("remove_own_date_cache(", "&dir)");
+        assert_eq!(lines.iter().filter(|l| l.contains(door)).count(), 3, "the writer's arm, and the two fallbacks when no writer can take it");
+    }
+
+    /// The timing. Twenty seconds, or when Falcon closes, whichever comes first. Date taken within the
+    /// twenty seconds keeps the file, and moving to another folder doesn't affect it. A cache write for a
+    /// folder about to lose its file, or while closing, is refused, so it can't come back.
+    ///
+    /// FALSIFIER (L28): change the delay, clear the map at a folder swap, drop the refusal in
+    /// `send_date_cache_write`, or send removals only at the tick (so closing leaves the file).
+    #[test]
+    fn removal_waits_twenty_seconds_and_a_repick_cancels_it() {
+        let (a, b) = (PathBuf::from("C:/shoot-a"), PathBuf::from("C:/shoot-b"));
+        let t0 = Instant::now();
+        let mut pending = DateCachePending::default();
+        pending.schedule(&a, t0);
+        assert!(pending.take_due(t0 + Duration::from_millis(19_900)).is_empty(), "not at 19.9 s");
+        assert!(pending.refuses_write(&a), "a write can't undo the removal to come");
+        assert!(!pending.refuses_write(&b), "another folder writes as usual");
+        assert_eq!(pending.take_due(t0 + Duration::from_secs(20)), vec![a.clone()], "at 20 s");
+        assert!(pending.take_due(t0 + Duration::from_secs(40)).is_empty(), "once");
+        assert!(!pending.refuses_write(&a), "and the folder can write again");
+        // Date taken again within the twenty seconds keeps the file.
+        pending.schedule(&a, t0);
+        pending.cancel(&a);
+        assert!(pending.take_due(t0 + Duration::from_secs(60)).is_empty());
+        assert!(!pending.refuses_write(&a));
+        // Closing sends everything still waiting, and raises the latch.
+        pending.schedule(&a, t0);
+        pending.schedule(&b, t0);
+        let mut closing = pending.close();
+        closing.sort();
+        assert_eq!(closing, [a.clone(), b.clone()]);
+        assert!(pending.take_due(t0 + Duration::from_secs(60)).is_empty(), "nothing twice");
+        assert!(pending.refuses_write(&PathBuf::from("C:/shoot-c")), "no cache writes after the latch");
+        // For real, on the process's own map: the write is refused, and goes through once cancelled.
+        let folder = dated_folder("removal", &[]);
+        let bytes = encode_date_cache(&[]);
+        schedule_date_cache_removal(&folder.0);
+        assert!(!send_date_cache_write(&folder.0, bytes.clone()), "refused while pending");
+        writer_barrier(Duration::from_secs(5));
+        assert!(!folder.0.join(DATE_CACHE_NAME).exists());
+        cancel_date_cache_removal(&folder.0);
+        assert!(send_date_cache_write(&folder.0, bytes));
+        writer_barrier(Duration::from_secs(5));
+        assert!(folder.0.join(DATE_CACHE_NAME).exists());
+        // A due removal goes through the door when its time comes, and leaves the photo.
+        std::fs::write(folder.0.join("IMG.jpg"), b"photo").unwrap();
+        schedule_date_cache_removal(&folder.0);
+        DATE_CACHE_PENDING.lock().unwrap_or_else(|e| e.into_inner()).due.insert(folder.0.clone(), Instant::now());
+        send_due_date_cache_removals(Instant::now() + Duration::from_millis(1));
+        writer_barrier(Duration::from_secs(5));
+        assert!(!folder.0.join(DATE_CACHE_NAME).exists(), "removed");
+        assert_eq!(std::fs::read(folder.0.join("IMG.jpg")).unwrap(), b"photo");
+        // The map isn't touched by a folder change: nothing in the landing mentions it.
+        let main = include_str!("main.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let apply = main.split_once("    let apply_scan: Rc<dyn Fn(ScanDone)> = {").unwrap().1.split_once("\n    };").unwrap().0;
+        assert!(!apply.contains("date_cache"), "a landing never touches a pending removal");
+        assert!(main.contains("support::send_due_date_cache_removals(now);"), "the tick's check");
+        let closing = main.split_once("support::ShutdownStep::RemoveDateCaches => {").expect("the shutdown step").1;
+        assert!(closing[..closing.find('}').unwrap()].contains("support::close_date_cache_removals();"));
+    }
+
+    /// Owner: going back to the default order removes the file; the other sorts leave it, so moving to
+    /// Rating and back to Date taken stays instant. The pick schedules it, after the check that the
+    /// folder really has photos on screen (`cur_dir` can be stale on a photo-less view).
+    ///
+    /// FALSIFIER (L28): drop the `!desc` term, widen it to other sorts, schedule it before the
+    /// `snap.is_empty()` return, or don't cancel on a Date taken pick.
+    #[test]
+    fn only_name_ascending_schedules_a_removal() {
+        for method in [SortMethod::Taken, SortMethod::Modified, SortMethod::Created, SortMethod::Size, SortMethod::Kind, SortMethod::Rating] {
+            for desc in [false, true] {
+                assert!(!date_cache_removal_wanted(method, desc), "{method:?} {desc}");
+            }
+        }
+        assert!(date_cache_removal_wanted(SortMethod::Name, false), "the default order");
+        assert!(!date_cache_removal_wanted(SortMethod::Name, true), "Name descending isn't the default");
+        let main = include_str!("main.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let pick = main.split_once("let apply_pick = Rc::new(move |method: SortMethod, desc: bool| {").unwrap().1.split_once("\n        });").unwrap().0;
+        let guard = pick.find("if snap.is_empty() {").expect("the photo-less view returns");
+        let scheduled = pick.find("support::date_cache_removal_wanted(method, desc)").expect("the pick asks");
+        assert!(guard < scheduled, "only with photos on screen");
+        assert!(pick[scheduled..].contains("support::schedule_date_cache_removal("));
+        let taken = pick.split_once("if method == SortMethod::Taken {").unwrap().1.split_once("} else {").unwrap().0;
+        assert!(taken.contains("support::cancel_date_cache_removal("), "Date taken keeps the file");
+    }
+
+    /// R8: the card shows the count with grouped digits, and appears only when a person would otherwise
+    /// wonder: past a second, with reading still to do, and not for the last moment of a read.
+    ///
+    /// FALSIFIER (L28): print the raw integer, drop the elapsed term, or drop the time-left term in
+    /// `date_card_shows`.
+    #[test]
+    fn the_card_groups_digits_and_shows_after_a_second() {
+        assert_eq!([0, 7, 999, 1_000, 4_210, 16_775, 999_999, 1_000_000].map(group_thousands),
+            ["0", "7", "999", "1,000", "4,210", "16,775", "999,999", "1,000,000"]);
+        assert_eq!(date_card_text(4_210, 16_775), "Reading capture dates · 4,210 of 16,775");
+        let s = |secs: f64| Duration::from_secs_f64(secs);
+        assert!(!date_card_shows(true, s(0.9), 100, 16_775), "not before a second");
+        assert!(date_card_shows(true, s(1.0), 100, 16_775), "from a second on");
+        assert!(date_card_shows(true, s(1.0), 0, 16_775), "a slow start is exactly when it matters");
+        assert!(!date_card_shows(true, s(5.0), 0, 0), "nothing to read");
+        assert!(!date_card_shows(true, s(5.0), 300, 300), "all read");
+        assert!(!date_card_shows(false, s(5.0), 100, 300), "ended");
+        // 2,000 photos read in 1.2 s: at a second, 1,667 are done and 0.2 s are left, so no flash.
+        assert!(!date_card_shows(true, s(1.0), 1_667, 2_000));
+        assert!(date_card_shows(true, s(1.0), 1_000, 2_000), "a second left");
+    }
+
+    /// R5: an open's read whose final order is the order on screen runs no reread, so no pause, no blank
+    /// Info panel and no restarted decode at a moment the person didn't choose. It is asked once, and
+    /// not if the folder was reread since that landing, or a pick is waiting.
+    ///
+    /// FALSIFIER (L28): drop the generation term or the pick term in `order_is_settled`, or compare
+    /// without the read's rows (`taken_order_with`).
+    #[test]
+    fn same_order_skips_the_landing() {
+        let photos = [("A", 1_000), ("B", 2_000), ("C", 3_000)];
+        let run = |tag: &str, dates: &[(&str, i64)]| {
+            let folder = dated_folder(tag, &photos);
+            let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+            let input = PassInput { dir: folder.0.clone(), shots: Arc::new(scan.shots), stamps: listing_stamps_of(&scan.metadata), order_desc: Some(false), write_allowed: false };
+            let handle = TakenPass::start_with(input, dates_by_name(dates, None), 2);
+            wait_ended(&handle);
+            let on_screen = listed(&folder.0, SortMethod::Taken, false);
+            assert_eq!(names(&on_screen), ["A", "B", "C"], "file-date order on screen");
+            (folder, handle, on_screen)
+        };
+        // Capture dates in the same order as the file dates.
+        let same = [("A", 1), ("B", 2), ("C", 3)];
+        let (_folder, handle, on_screen) = run("same", &same);
+        let mut active = ActivePass::handed_over(handle, 7);
+        assert!(active.order_is_settled(7, &on_screen), "nothing moves: no landing");
+        assert!(!active.order_is_settled(7, &on_screen), "asked once");
+        // No date at all also keeps the order: those photos sort by the same file dates.
+        let (_folder, handle, on_screen) = run("no-dates", &[]);
+        assert!(ActivePass::handed_over(handle, 7).order_is_settled(7, &on_screen));
+        // Capture dates in another order land.
+        let (_folder, handle, on_screen) = run("other", &[("A", 3), ("B", 2), ("C", 1)]);
+        assert!(!ActivePass::handed_over(handle, 7).order_is_settled(7, &on_screen), "the order moves");
+        // A Delete since that landing: its reread changed the list, so land.
+        let (_folder, handle, on_screen) = run("reread", &same);
+        assert!(!ActivePass::handed_over(handle, 7).order_is_settled(8, &on_screen));
+        // A direction flip is waiting behind the read: land.
+        let (_folder, handle, on_screen) = run("flip", &same);
+        let mut flipped = ActivePass::handed_over(handle, 7);
+        flipped.pick = Some(true);
+        assert!(!flipped.order_is_settled(7, &on_screen));
+        // A pick's read works out no order, so it always lands.
+        let (_folder, handle, on_screen) = run("picked", &same);
+        assert!(!ActivePass::picked(handle, false).order_is_settled(7, &on_screen));
+        // The decision, and that it isn't held behind anything: nothing would close.
+        assert_eq!(pass_landing_due(true, true, true), PassDue::Settled);
+        assert_eq!(pass_landing_due(false, true, false), PassDue::Reading);
+        let source = include_str!("main.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let arm = source.split_once("support::PassDue::Settled => {").expect("the arm").1.split_once("support::PassDue::Land => {").unwrap().0;
+        assert!(arm.contains("active.handle.merge_finished();") && !arm.contains("reload_t"), "merge the rows and run no reread");
+    }
+
+    /// R6: the Resume offer follows the photo. After the order settles, the button goes to that photo
+    /// wherever it now sits, on both surfaces, and to nowhere if it has gone (L52).
+    ///
+    /// FALSIFIER (L28): pass the index to `sel-jump` from either button, or make `resume_index` give a
+    /// position when the name is gone.
+    #[test]
+    fn resume_follows_the_photo_name() {
+        let shot_named = |n: &str| shot(0, n, Some(PathBuf::from(format!("{n}.jpg"))), None);
+        let stand_in: Vec<Shot> = ["A", "B", "C", "D"].iter().map(|n| shot_named(n)).collect();
+        let settled: Vec<Shot> = ["D", "C", "B", "A"].iter().map(|n| shot_named(n)).collect();
+        let at_offer = resume_index(&stand_in, "B").unwrap();
+        assert_eq!(stand_in[at_offer].name, "B");
+        assert_eq!(settled[resume_index(&settled, "B").unwrap()].name, "B", "the same photo after the order settled");
+        assert_ne!(resume_index(&settled, "B"), Some(at_offer), "where the old index would have gone wrong");
+        assert_eq!(resume_index(&settled, "GONE"), None, "no jump");
+        let ui = include_str!("../ui/main_window.slint");
+        assert!(ui.contains("root.resume-jump(root.toast-jump-name);"), "the toast's button");
+        assert!(ui.contains("root.resume-jump(row.jump-name);"), "the events row's button");
+        assert!(!ui.contains("root.sel-jump(root.toast-jump)") && !ui.contains("root.sel-jump(row.jump-to)"), "neither jumps by number");
+        let source = include_str!("main.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let wired = source.split_once("app.on_resume_jump(move |name| {").expect("the callback").1.split_once("\n    });").unwrap().0;
+        assert!(wired.contains("support::resume_index(&live, name.as_str())"), "worked out at the click");
+    }
+
+    /// v0.8.151 — the CONFIG-dir reads get the byte cap their two shoot-folder peers have
     /// carried since v0.8.x, for the reason those peers state: `read_to_string` sizes its buffer
     /// from the file length, so an unbounded file is an unbounded allocation — and
     /// `preserve_corrupt_file` cannot help, because it only runs after the read is attempted.
@@ -9632,8 +11334,8 @@ mod sort_tests {
         let remains = (moved.exists(), marker.exists());
         assert!(dir.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(result, (1, 0, 0), "restore must recover the stale empty claim");
-        assert_eq!(next, (0, 1, 0));
+        assert_eq!(result, (1, 0, 0, 0), "restore must recover the stale empty claim");
+        assert_eq!(next, (0, 1, 0, 0));
         assert_eq!(bytes, vec![0xa5; 4096]); assert_eq!(remains, (false, false));
     }
 
@@ -9678,7 +11380,7 @@ mod sort_tests {
         std::fs::remove_dir_all(&dir).unwrap();
         for (case, export, undo, unchanged, marker, record) in results {
             assert_eq!(export, (0, 0, 0, 1), "{case}");
-            assert_eq!(undo, if case == "missing-source" { (0, 1, 0) } else { (0, 0, 1) }, "{case}");
+            assert_eq!(undo, if case == "missing-source" { (0, 1, 0, 0) } else { (0, 0, 1, 0) }, "{case}");
             assert!(unchanged, "{case}: final changed");
             assert_eq!(marker.as_deref(), Some(b"unfinished".as_slice()), "{case}");
             assert_eq!(record, if case == "missing-final" { None } else { Some(900) },
@@ -9717,7 +11419,7 @@ mod sort_tests {
         assert!(dir.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!((result.0, result.1, result.2, result.4), (0, 0, 0, 1));
-        assert_eq!(undo, (0, 0, 1)); assert!(bytes.is_empty());
+        assert_eq!(undo, (0, 0, 1, 0)); assert!(bytes.is_empty());
         assert_eq!(part, b"unfinished"); assert_eq!(record, 99);
     }
 
@@ -9924,7 +11626,7 @@ mod sort_tests {
         let never = AtomicBool::new(false);
 
         // 1) A CLEAN RUN leaves the deliverables and no markers.
-        let (ok, sk, fail, _nc, att, _dv, _un, _ops) = export_marked(
+        let (ok, sk, fail, _nc, att, _dv, _un, _side, _ops) = export_marked(
             &dir, &shots, &marks, MARK_FLAG, "Sel", false, CopyContent::JpgOnly, &never, false,
         );
         assert_eq!((ok, sk, fail, att), (2, 0, 0, 0));
@@ -9942,7 +11644,7 @@ mod sort_tests {
         // 2) A TRUNCATED destination (what a pre-protocol quit left behind) is COUNTED and LEFT
         //    ALONE. The old code reported this "skip (exists)" and the corruption was invisible.
         std::fs::write(out.join("A.jpg"), vec![0u8; 7]).unwrap();
-        let (ok, sk, fail, _nc, att, _dv, _un, _ops) = export_marked(
+        let (ok, sk, fail, _nc, att, _dv, _un, _side, _ops) = export_marked(
             &dir, &shots, &marks, MARK_FLAG, "Sel", false, CopyContent::JpgOnly, &never, false,
         );
         assert_eq!(att, 1, "a truncated destination is counted, not skipped");
@@ -9958,7 +11660,7 @@ mod sort_tests {
         //    marker or partial deliverable is left in the destination.
         let out2 = dir.join("Sel2");
         let cancelled = AtomicBool::new(true);
-        let (ok, sk, fail, _nc, att, _dv, _un, ops) = export_marked(
+        let (ok, sk, fail, _nc, att, _dv, _un, _side, ops) = export_marked(
             &dir, &shots, &marks, MARK_FLAG, "Sel2", false, CopyContent::JpgOnly, &cancelled, false,
         );
         assert_eq!((ok, sk, fail, att), (0, 0, 0, 0), "a cancelled batch does no work and blames nobody");
@@ -10000,7 +11702,7 @@ mod sort_tests {
         let never = AtomicBool::new(false);
 
         // (1) the first copy writes the deliverable AND the manifest record the verdict reads.
-        let (ok, _sk, _fail, _nc, _att, dv0, _un, _ops) = export_marked(
+        let (ok, _sk, _fail, _nc, _att, dv0, _un, _side, _ops) = export_marked(
             &dir, &shots, &marks, MARK_FLAG, "Picks", false, CopyContent::JpgOnly, &never, true,
         );
         assert_eq!((ok, dv0), (1, (0, 0)), "premise: a first copy diverges from nothing");
@@ -10009,7 +11711,7 @@ mod sort_tests {
 
         // (2) EDIT the deliverable in ./Picks — the workflow, not a fault.
         std::fs::write(out.join("A.jpg"), vec![0x11u8; 5000]).unwrap();
-        let (ok, sk, fail, _nc, att, (dv_dest, dv_src), _un, _ops) = export_marked(
+        let (ok, sk, fail, _nc, att, (dv_dest, dv_src), _un, _side, _ops) = export_marked(
             &dir, &shots, &marks, MARK_FLAG, "Picks", false, CopyContent::JpgOnly, &never, true,
         );
         // COUNTED — in the returned tuple, which is the only place a caller can see it.
@@ -10078,7 +11780,7 @@ mod sort_tests {
         std::fs::write(&to_b, vec![0x11u8; 64]).unwrap();
         std::fs::write(&from_b, vec![0x22u8; 99]).unwrap(); // reappeared at the original name
 
-        let (ok, skipped, failed) =
+        let (ok, skipped, failed, _side) =
             undo_moves(&[(from_a.clone(), to_a.clone()), (from_b.clone(), to_b.clone())]);
         assert_eq!(
             (ok, skipped, failed),
@@ -10099,9 +11801,212 @@ mod sort_tests {
         assert!(!part_marker(&from_a).exists(), "a completed restore leaves no marker behind");
         assert!(!part_marker(&from_b).exists(), "a failed restore leaves no marker behind");
         // A source that is simply gone is a skip, never a failure.
-        let (ok, skipped, failed) = undo_moves(&[(dir.join("C.jpg"), rej.join("C.jpg"))]);
+        let (ok, skipped, failed, _side) = undo_moves(&[(dir.join("C.jpg"), rej.join("C.jpg"))]);
         assert_eq!((ok, skipped, failed), (0, 1, 0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Fix round 1 (1 November, CS-26): the XMP sidecars travel with Copy picks and Move rejected ──
+    fn side_tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("falcon_side_{tag}_{}_{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    fn side_done(dir: &Path) {
+        assert!(dir.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).map(|rd| rd.flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// Copy picks takes a RAW's XMP sidecar (its applied turn, its synced stars) into ./Picks beside
+    /// it; the counts stay photo files and the export record stays photos-only. A re-copy that skips
+    /// the photo carries nothing (fix round 1 plan: side files travel only with files copied now).
+    /// FALSIFIERS: R1F2-F1 (no carry), R1F2-F6 (counted as a photo), R1F2-F7 (in the record),
+    /// R1F2-F8 (carried on a skip).
+    #[test]
+    fn copy_picks_carries_the_raw_side_file() {
+        let dir = side_tmp("copy");
+        let raw = dir.join("A.CR3");
+        std::fs::write(&raw, vec![0x5a; 4096]).unwrap();
+        let xmp = b"<x:xmpmeta tiff:Orientation=\"6\"/>".to_vec();
+        std::fs::write(dir.join("A.xmp"), &xmp).unwrap();
+        let shots = [shot(0, "A", None, Some(raw))];
+        let never = AtomicBool::new(false);
+        let picks = dir.join(PICKS_SUBFOLDER);
+        let first = export_marked(&dir, &shots, &[MARK_FLAG], MARK_FLAG, PICKS_SUBFOLDER, false, CopyContent::Both, &never, true);
+        let carried = std::fs::read(picks.join("A.xmp")).ok();
+        let source_kept = dir.join("A.xmp").exists();
+        let marker = part_marker(&picks.join("A.xmp")).exists();
+        let keys: Vec<String> = read_export_manifest(&picks).map(|m| m.files.keys().cloned().collect()).unwrap_or_default();
+        std::fs::remove_file(picks.join("A.xmp")).unwrap();
+        let again = export_marked(&dir, &shots, &[MARK_FLAG], MARK_FLAG, PICKS_SUBFOLDER, false, CopyContent::Both, &never, true);
+        let brought_back = picks.join("A.xmp").exists();
+        side_done(&dir);
+        assert_eq!((first.0, first.1, first.2, first.4), (1, 0, 0, 0), "one photo file copied; the sidecar is not counted as one");
+        assert_eq!(first.7, (1, 0), "one sidecar carried");
+        assert_eq!(carried, Some(xmp), "./Picks holds the source's sidecar bytes");
+        assert!(source_kept && !marker, "a copy keeps the source and leaves no marker");
+        assert_eq!(keys, vec!["A.CR3".to_string()], "sidecars stay out of the export record");
+        assert_eq!((again.0, again.1, again.7), (0, 1, (0, 0)), "the re-copy is a skip");
+        assert!(!brought_back, "a skipped photo carries no sidecar");
+    }
+
+    /// Each file takes only its OWN sidecar, chosen by its slot: the RAW `A.xmp`, the image
+    /// `A.JPG.xmp`; another program's `A.CR3.xmp` and an `B.xmp` beside a JPEG-only photo never go.
+    /// FALSIFIERS: R1F2-F2 (every file takes the basename form), R1F2-F3 (every file the full-name form).
+    #[test]
+    fn each_file_takes_only_its_own_side_file() {
+        let dir = side_tmp("own");
+        for (name, bytes) in [("A.CR3", &b"raw"[..]), ("A.JPG", b"jpg"), ("A.xmp", b"raw side"), ("A.JPG.xmp", b"jpg side"),
+            ("A.CR3.xmp", b"foreign"), ("B.JPG", b"jpg b"), ("B.xmp", b"foreign b")] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        let shots = [shot(0, "A", Some(dir.join("A.JPG")), Some(dir.join("A.CR3"))), shot(1, "B", Some(dir.join("B.JPG")), None)];
+        let never = AtomicBool::new(false);
+        let mut got = Vec::new();
+        for (sub, content) in [("S1", CopyContent::Both), ("S2", CopyContent::RawOnly), ("S3", CopyContent::JpgOnly)] {
+            let r = export_marked(&dir, &shots, &[MARK_FLAG, MARK_FLAG], MARK_FLAG, sub, false, content, &never, false);
+            got.push((sub, names_in(&dir.join(sub)), r.7));
+        }
+        side_done(&dir);
+        let want = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(got[0], ("S1", want(&["A.CR3", "A.JPG", "A.JPG.xmp", "A.xmp", "B.JPG"]), (2, 0)), "both files, both own sidecars");
+        assert_eq!(got[1], ("S2", want(&["A.CR3", "A.xmp"]), (1, 0)), "RAW only: the RAW's sidecar only");
+        assert_eq!(got[2], ("S3", want(&["A.JPG", "A.JPG.xmp", "B.JPG"]), (1, 0)), "image only: the image's sidecar only");
+    }
+
+    /// Move rejected moves the sidecar with its photo (no orphan left in the shoot folder), records
+    /// it right after its photo, and Undo move brings both back.
+    /// FALSIFIERS: R1F2-F4 (pair not recorded), R1F2-F11 (Undo counts sidecars as photos).
+    #[test]
+    fn move_rejected_moves_the_side_file_and_undo_brings_it_back() {
+        let dir = side_tmp("move");
+        let (raw, side) = (dir.join("A.CR3"), dir.join("A.xmp"));
+        std::fs::write(&raw, vec![0x5a; 4096]).unwrap();
+        std::fs::write(&side, b"turned").unwrap();
+        let rej = dir.join("Rejected");
+        let shots = [shot(0, "A", None, Some(raw.clone()))];
+        let r = export_marked(&dir, &shots, &[MARK_REJECT], MARK_REJECT, "Rejected", true, CopyContent::Both, &AtomicBool::new(false), false);
+        let after_move = (side.exists(), std::fs::read(rej.join("A.xmp")).ok());
+        let undo = undo_moves(&r.8);
+        let back = (std::fs::read(&raw).ok().map(|b| b.len()), std::fs::read(&side).ok(), names_in(&rej));
+        side_done(&dir);
+        assert_eq!((r.0, r.7), (1, (1, 0)), "one photo moved, its sidecar with it");
+        assert_eq!(after_move, (false, Some(b"turned".to_vec())), "no sidecar left behind in the folder");
+        assert_eq!(r.8, vec![(raw, rej.join("A.CR3")), (side, rej.join("A.xmp"))], "the sidecar's pair follows its photo's");
+        assert_eq!(undo, (1, 0, 0, 0), "Undo counts the photo file; the sidecar comes back without a word");
+        assert_eq!(back, (Some(4096), Some(b"turned".to_vec()), Vec::<String>::new()), "both are home; ./Rejected is empty");
+    }
+
+    /// Never overwrite: a DIFFERENT sidecar already at the destination is left untouched and counted;
+    /// an identical one (two same-stem RAWs share one) is fine and silent; a move whose sidecar
+    /// cannot go leaves it beside the photo's old place and records only the photo.
+    /// FALSIFIERS: R1F2-F5 (overwrites), R1F2-F16 (identical counted as a problem).
+    #[test]
+    fn side_file_collisions_never_overwrite() {
+        let never = AtomicBool::new(false);
+        let mut got = Vec::new();
+        for case in ["copy-different", "copy-identical", "move-different"] {
+            let dir = side_tmp("clash");
+            let raw = dir.join("A.CR3");
+            std::fs::write(&raw, vec![0x5a; 4096]).unwrap();
+            std::fs::write(dir.join("A.xmp"), b"source side").unwrap();
+            let moving = case.starts_with("move");
+            let sub = if moving { "Rejected" } else { "Picks" };
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+            let there: &[u8] = if case == "copy-identical" { b"source side" } else { b"already here" };
+            std::fs::write(dir.join(sub).join("A.xmp"), there).unwrap();
+            let r = export_marked(&dir, &[shot(0, "A", None, Some(raw))], &[MARK_FLAG], MARK_FLAG, sub, moving,
+                CopyContent::Both, &never, false);
+            got.push((case, r.0, r.7, r.8.len(), std::fs::read(dir.join(sub).join("A.xmp")).unwrap() == there,
+                dir.join("A.xmp").exists()));
+            side_done(&dir);
+        }
+        assert_eq!(got[0], ("copy-different", 1, (0, 1), 1, true, true), "the photo copies; the other sidecar is untouched and counted");
+        assert_eq!(got[1], ("copy-identical", 1, (0, 0), 1, true, true), "an identical one is not a problem");
+        // `ops` (r.8) holds the photo's pair in every case: a sidecar that did not travel adds none.
+        assert_eq!(got[2], ("move-different", 1, (0, 1), 1, true, true), "the photo moves; its sidecar stays, counted; only the photo is recorded");
+    }
+
+    /// A sidecar goes through the photos' interrupted-copy recovery: an old empty claim with its
+    /// marker is recovered and the sidecar carried; a fresh marker (a copy maybe in flight) blocks it,
+    /// counted, both left as they were.
+    /// FALSIFIER: R1F2-F10 (no recovery step).
+    #[test]
+    fn a_side_file_uses_the_interrupted_copy_recovery() {
+        let never = AtomicBool::new(false);
+        let mut got = Vec::new();
+        for stale in [true, false] {
+            let dir = side_tmp("part");
+            let raw = dir.join("A.CR3");
+            std::fs::write(&raw, vec![0x5a; 4096]).unwrap();
+            std::fs::write(dir.join("A.xmp"), b"source side").unwrap();
+            let picks = dir.join("Picks");
+            std::fs::create_dir_all(&picks).unwrap();
+            let claim = picks.join("A.xmp");
+            std::fs::write(&claim, []).unwrap();
+            let marker = part_marker(&claim);
+            std::fs::write(&marker, b"unfinished").unwrap();
+            if stale {
+                std::fs::File::options().write(true).open(&marker).unwrap().set_times(std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))).unwrap();
+            }
+            let r = export_marked(&dir, &[shot(0, "A", None, Some(raw))], &[MARK_FLAG], MARK_FLAG, "Picks", false,
+                CopyContent::Both, &never, false);
+            got.push((stale, r.0, r.7, std::fs::read(&claim).unwrap(), std::fs::read(&marker).ok()));
+            side_done(&dir);
+        }
+        assert_eq!(got[0], (true, 1, (1, 0), b"source side".to_vec(), None), "an abandoned sidecar copy is finished");
+        assert_eq!(got[1], (false, 1, (0, 1), Vec::new(), Some(b"unfinished".to_vec())), "a fresh marker blocks it, untouched");
+    }
+
+    /// Undo move counts sidecars apart: a sidecar whose old name is taken again is never clobbered
+    /// and is reported as not restored; the photo's count is unchanged.
+    /// FALSIFIERS: R1F2-F11, R1F2-F17 (a sidecar left in ./Rejected is not reported).
+    #[test]
+    fn undo_counts_side_files_apart() {
+        let dir = side_tmp("undo");
+        let rej = dir.join("Rejected");
+        std::fs::create_dir_all(&rej).unwrap();
+        std::fs::write(rej.join("A.CR3"), vec![0x5a; 4096]).unwrap();
+        std::fs::write(rej.join("A.xmp"), b"moved side").unwrap();
+        std::fs::write(dir.join("A.xmp"), b"written since").unwrap();
+        let r = undo_moves(&[(dir.join("A.CR3"), rej.join("A.CR3")), (dir.join("A.xmp"), rej.join("A.xmp"))]);
+        let state = (dir.join("A.CR3").exists(), std::fs::read(dir.join("A.xmp")).unwrap(), rej.join("A.xmp").exists());
+        side_done(&dir);
+        assert_eq!(r, (1, 0, 0, 1), "the photo is restored; the sidecar is counted apart");
+        assert_eq!(state, (true, b"written since".to_vec(), true), "nothing clobbered; the moved sidecar stays in ./Rejected");
+    }
+
+    /// Undo move's classifier: no photo extension is `.xmp`, so a sidecar pair can never be a photo's.
+    /// FALSIFIER: R1F2-F12.
+    #[test]
+    fn no_photo_extension_is_a_side_file() {
+        let finished = ["jpg", "jpeg", "png", "tif", "tiff", "heic", "heif", "webp", "jxl", "bmp", "gif", "apng", "avif", "tga"];
+        for ext in falcon_decode::RAW_EXTS.iter().chain(finished.iter()) {
+            for e in [ext.to_string(), ext.to_ascii_uppercase()] {
+                assert!(!is_side_file(Path::new(&format!("A.{e}"))), "{e} is a photo, not a sidecar");
+            }
+        }
+        assert!(is_side_file(Path::new("A.xmp")) && is_side_file(Path::new("A.JPG.XMP")));
+    }
+
+    /// The owner's wording (1 November, "XMP sidecar").
+    #[test]
+    fn clause_side_files_text() {
+        assert_eq!(clause_side_files(0, SideVerb::Copied), "");
+        assert_eq!(clause_side_files(1, SideVerb::Copied), " · 1 XMP sidecar not copied (see log)");
+        assert_eq!(clause_side_files(2, SideVerb::Copied), " · 2 XMP sidecars not copied (see log)");
+        assert_eq!(clause_side_files(1, SideVerb::Moved), " · 1 XMP sidecar not moved (see log)");
+        assert_eq!(clause_side_files(3, SideVerb::Moved), " · 3 XMP sidecars not moved (see log)");
+        assert_eq!(clause_side_files(1, SideVerb::Restored), " · 1 XMP sidecar not restored (see log)");
+        assert_eq!(clause_side_files(2, SideVerb::Restored), " · 2 XMP sidecars not restored (see log)");
     }
 
     /// v0.8.100 (A1 / design-sweep O13), the NON-WEB half of the colour ruling: `export_marked` —
@@ -10134,7 +12039,7 @@ mod sort_tests {
 
         let shots = [shot(0, "MASTER", Some(jpg.clone()), Some(raw.clone()))];
         let never = AtomicBool::new(false); // v0.8.128 (A1.3): no quit — the batch runs to the end
-        let (ok, skipped, failed, no_content, attention, _dv, _un, _ops) = export_marked(
+        let (ok, skipped, failed, no_content, attention, _dv, _un, _side, _ops) = export_marked(
             &dir, &shots, &[MARK_FLAG], MARK_FLAG, PICKS_SUBFOLDER, false, CopyContent::Both, &never, true,
         );
         assert_eq!((ok, skipped, failed, no_content, attention), (2, 0, 0, 0, 0), "both files copied");
@@ -10174,9 +12079,16 @@ mod sort_tests {
         let p = dir.join("noexif.jpg");
         std::fs::write(&p, b"not a real jpeg").unwrap();
         let s = shot(0, "noexif", Some(p.clone()), None);
-        let expect = systemtime_epoch(std::fs::metadata(&p).unwrap().modified().unwrap());
-        assert_eq!(taken_epoch_of(&s), expect, "no EXIF → the file's mtime");
-        assert_eq!(taken_epoch_of(&s), expect, "cache hit returns the same key");
+        let meta = std::fs::metadata(&p).unwrap();
+        let modified = meta.modified().ok();
+        let expect = systemtime_epoch(modified.unwrap());
+        let metadata = BTreeMap::from([(p.clone(), meta)]);
+        let key = || taken_key(|q| TAKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(q).copied(), &s, modified);
+        let shots = std::slice::from_ref(&s);
+        assert_eq!(read_dates_inline(shots, &metadata, 1), 1, "read once");
+        assert_eq!(key(), expect, "no EXIF → the file's mtime");
+        assert_eq!(read_dates_inline(shots, &metadata, 1), 0, "known now, so not read again");
+        assert_eq!(key(), expect, "cache hit returns the same key");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13471,7 +15383,7 @@ impl Default for Settings {
     }
 }
 
-/// Per-OS config directory for settings + ratings. Windows: `%LOCALAPPDATA%\Falcon`;
+/// Per-OS config directory for settings and the open-folders registry. Windows: `%LOCALAPPDATA%\Falcon`;
 /// macOS: `~/Library/Application Support/Falcon`; Linux: `$XDG_CONFIG_HOME/Falcon`
 /// (else `~/.config/Falcon`). Returns None only if the platform env vars are unset.
 pub(crate) fn config_dir() -> Option<PathBuf> {
@@ -13522,6 +15434,328 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     falcon_decode::file_io::write_atomic(path, data)
 }
 
+// ─── Date taken sort: `falcon.cache`, the capture dates of a folder that has settled on that order ──
+// Owner: "once someone settles on one order it usually stays for that folder for very long time",
+// and "saving dates in falcon's own folder is not a good idea". So it sits beside the photos, visible,
+// numbers only. It is created only where the person chose Date taken and the first read costs more
+// than about a second, and it is only ever a cache: a wrong, stale, damaged or foreign file costs a
+// re-read. Rows supply a sort key and nothing else; they never touch names, ratings, pairing or
+// landing.
+//
+// Little-endian. Header, 32 bytes: magic, u32 version, u32 row count, u64 fnv1a64 of the body. Body:
+// rows of 24 bytes, sorted by hash: u64 fnv1a64 of the primary file's name, i64 modified time in
+// nanoseconds since 1970 (the memo compares `SystemTime` exactly), i64 capture date in the sort's
+// seconds, `i64::MIN` for "read, no date". 16,775 photos are 402,632 bytes.
+
+pub(crate) const DATE_CACHE_NAME: &str = "falcon.cache";
+/// Owner: "2,000 is fine". Decides only whether a file is CREATED: at several threads a read of this
+/// many takes about a second, so below it the read costs less than the file. An existing file stays
+/// in use however small the folder gets.
+pub(crate) const DATE_CACHE_MIN_PHOTOS: usize = 2_000;
+/// About 700,000 photos. The file is never read past this, like every other 16 MiB reader here.
+const DATE_CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const DATE_CACHE_MAGIC: &[u8; 16] = b"FalconDateCache\n";
+const DATE_CACHE_VERSION: u32 = 1;
+const DATE_CACHE_HEADER: usize = 32;
+const DATE_CACHE_ROW: usize = 24;
+const DATE_CACHE_NO_DATE: i64 = i64::MIN;
+
+/// What is at `folder/falcon.cache`, by the one classifier every read, write and removal asks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DateCacheState {
+    /// Nothing there.
+    Absent,
+    /// A local file of a sane size that starts with Falcon's own header. Its body may still be damaged.
+    Ours,
+    /// Anything else, or any doubt: not a safe folder, a link, a folder, a cloud-only file, the wrong
+    /// size or header, an error. It is never opened further, replaced or removed.
+    LeaveAlone,
+}
+
+/// The classifier. In this order, and a cloud-only file is settled before anything opens it, because
+/// opening would download it. The probe is injected for tests: no test can make a real placeholder.
+fn classify_date_cache_with(dir: &Path, is_cloud: impl Fn(&std::fs::Metadata) -> bool) -> DateCacheState {
+    use std::io::Read;
+    if !is_safe_dir(dir) {
+        return DateCacheState::LeaveAlone;
+    }
+    let file = dir.join(DATE_CACHE_NAME);
+    let meta = match std::fs::symlink_metadata(&file) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DateCacheState::Absent,
+        Err(_) => return DateCacheState::LeaveAlone,
+    };
+    if !meta.file_type().is_file() || is_cloud(&meta) {
+        return DateCacheState::LeaveAlone;
+    }
+    if meta.len() < DATE_CACHE_HEADER as u64 || meta.len() > DATE_CACHE_MAX_BYTES {
+        return DateCacheState::LeaveAlone;
+    }
+    let mut magic = [0u8; DATE_CACHE_MAGIC.len()];
+    match std::fs::File::open(&file).and_then(|mut f| f.read_exact(&mut magic)) {
+        Ok(()) if &magic == DATE_CACHE_MAGIC => DateCacheState::Ours,
+        _ => DateCacheState::LeaveAlone,
+    }
+}
+
+pub(crate) fn classify_date_cache(dir: &Path) -> DateCacheState {
+    classify_date_cache_with(dir, falcon_decode::metadata_is_cloud_placeholder)
+}
+
+/// PURE: a read's write decision. An absent file is created at the limit, also when nothing new was
+/// read, so going back to Date taken after a removal recreates it, but never empty. Falcon's own file
+/// is rewritten only for rows actually read: an unchanged folder writes nothing, so a synced folder
+/// doesn't upload it again. Anything else is left alone.
+fn date_cache_should_write(state: DateCacheState, photos: usize, read_new: usize, rows: usize, write_allowed: bool) -> bool {
+    if !write_allowed || rows == 0 {
+        return false;
+    }
+    match state {
+        DateCacheState::Absent => photos >= DATE_CACHE_MIN_PHOTOS,
+        DateCacheState::Ours => read_new > 0,
+        DateCacheState::LeaveAlone => false,
+    }
+}
+
+fn date_cache_name_hash(path: &Path) -> Option<u64> {
+    Some(fnv1a64(path.file_name()?.to_string_lossy().as_bytes()))
+}
+
+/// Full precision, because the memo compares `SystemTime` exactly. A time before 1970 or too far ahead
+/// has no row, and that photo is read each session.
+fn date_cache_nanos(t: std::time::SystemTime) -> Option<i64> {
+    i64::try_from(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos()).ok()
+}
+
+fn encode_date_cache(rows: &[TakenRow]) -> Vec<u8> {
+    let mut body: Vec<(u64, i64, i64)> = rows.iter().filter_map(|r| {
+        Some((date_cache_name_hash(&r.path)?, date_cache_nanos(r.modified?)?, r.date.unwrap_or(DATE_CACHE_NO_DATE)))
+    }).collect();
+    body.sort_unstable();
+    let mut bytes = Vec::with_capacity(DATE_CACHE_HEADER + body.len() * DATE_CACHE_ROW);
+    for (hash, modified, date) in &body {
+        bytes.extend_from_slice(&hash.to_le_bytes());
+        bytes.extend_from_slice(&modified.to_le_bytes());
+        bytes.extend_from_slice(&date.to_le_bytes());
+    }
+    let checksum = fnv1a64(&bytes);
+    let mut out = Vec::with_capacity(DATE_CACHE_HEADER + bytes.len());
+    out.extend_from_slice(DATE_CACHE_MAGIC);
+    out.extend_from_slice(&DATE_CACHE_VERSION.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out.extend_from_slice(&bytes);
+    out
+}
+
+/// The rows of a valid file, sorted by hash.
+struct DateCacheRows(Vec<(u64, i64, i64)>);
+
+impl DateCacheRows {
+    /// The row for this file name at exactly this modified time. `Some(None)` is "read, no date". A
+    /// hash collision would also need an identical modified time, and could only misplace one photo.
+    fn date_of(&self, path: &Path, modified: std::time::SystemTime) -> Option<Option<i64>> {
+        let (hash, nanos) = (date_cache_name_hash(path)?, date_cache_nanos(modified)?);
+        let first = self.0.partition_point(|r| r.0 < hash);
+        self.0[first..].iter().take_while(|r| r.0 == hash).find(|r| r.1 == nanos)
+            .map(|r| (r.2 != DATE_CACHE_NO_DATE).then_some(r.2))
+    }
+}
+
+/// All of length, magic, version and checksum must hold. Otherwise the file counts as no rows, and it
+/// is rewritten after the read.
+fn decode_date_cache(bytes: &[u8]) -> Option<DateCacheRows> {
+    let header = bytes.get(..DATE_CACHE_HEADER)?;
+    let u32_at = |at: usize| Some(u32::from_le_bytes(header.get(at..at + 4)?.try_into().ok()?));
+    if &header[..DATE_CACHE_MAGIC.len()] != DATE_CACHE_MAGIC || u32_at(16)? != DATE_CACHE_VERSION {
+        return None;
+    }
+    let count = u32_at(20)? as usize;
+    let body = &bytes[DATE_CACHE_HEADER..];
+    if body.len() != count.checked_mul(DATE_CACHE_ROW)? || u64::from_le_bytes(header[24..32].try_into().ok()?) != fnv1a64(body) {
+        return None;
+    }
+    let field = |row: &[u8], at: usize| -> [u8; 8] { row[at..at + 8].try_into().expect("eight bytes") };
+    Some(DateCacheRows(body.chunks_exact(DATE_CACHE_ROW).map(|row| {
+        (u64::from_le_bytes(field(row, 0)), i64::from_le_bytes(field(row, 8)), i64::from_le_bytes(field(row, 16)))
+    }).collect()))
+}
+
+/// Worker only. Classified first, so a cloud-only file is never opened.
+fn load_date_cache_with(dir: &Path, is_cloud: impl Fn(&std::fs::Metadata) -> bool) -> Option<DateCacheRows> {
+    use std::io::Read;
+    if classify_date_cache_with(dir, is_cloud) != DateCacheState::Ours {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(dir.join(DATE_CACHE_NAME)).ok()?.take(DATE_CACHE_MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    decode_date_cache(&bytes)
+}
+
+fn load_date_cache(dir: &Path) -> Option<DateCacheRows> {
+    load_date_cache_with(dir, falcon_decode::metadata_is_cloud_placeholder)
+}
+
+/// The writer's arm for a cache write. The same classifier guards it, because `write_atomic` renames
+/// over its target, so someone else's `falcon.cache` is never overwritten. A failure is a log line
+/// with no folder name, never a notice: a folder Falcon can't write to just reads again next session.
+fn write_date_cache_with(dir: &Path, data: &[u8], is_cloud: impl Fn(&std::fs::Metadata) -> bool, write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>) -> bool {
+    if classify_date_cache_with(dir, is_cloud) == DateCacheState::LeaveAlone {
+        log_event("date read: left a falcon.cache that isn't Falcon's own, or is only in the cloud, alone");
+        return false;
+    }
+    let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write(&dir.join(DATE_CACHE_NAME), data)))
+        .unwrap_or_else(|_| Err(std::io::Error::other("cache write panicked")));
+    if let Err(e) = &written {
+        log_event(&format!("date read: couldn't write falcon.cache ({})", e.kind()));
+    }
+    written.is_ok()
+}
+
+fn write_date_cache(dir: &Path, data: &[u8]) -> bool {
+    write_date_cache_with(dir, data, falcon_decode::metadata_is_cloud_placeholder, write_atomic)
+}
+
+/// Queue a cache write. Built on the date read's own thread; the writer thread decides and does it.
+/// Refused while the folder's removal is pending or Falcon is closing, under the lock the removals are
+/// sent under, so a write can't land after the removal it would undo. Returns whether it was sent.
+fn send_date_cache_write(dir: &Path, data: Vec<u8>) -> bool {
+    let pending = DATE_CACHE_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.refuses_write(dir) {
+        log_event("date read: falcon.cache not written, its removal is pending or Falcon is closing");
+        return false;
+    }
+    let msg = WriteMsg::DateCacheWrite { dir: dir.to_path_buf(), data };
+    match WRITER.get() {
+        Some(h) => {
+            if let Err(std::sync::mpsc::SendError(WriteMsg::DateCacheWrite { dir, data })) = h.tx.send(msg) {
+                write_date_cache(&dir, &data);
+            }
+        }
+        None => {
+            let WriteMsg::DateCacheWrite { dir, data } = msg else { unreachable!() };
+            write_date_cache(&dir, &data);
+        }
+    }
+    true
+}
+
+// ─── Date taken sort: removing `falcon.cache` ──────────────────────────────────────────────────
+// Owner: "yes delete it after 20 seconds or when the user closes Falcon", and "it is the cache not any
+// real photos". THE HARD RULE: the only thing ever deleted here is Falcon's own `falcon.cache`, never a
+// photo or any other file. There is one delete door, and it can't be pointed at anything else.
+
+/// THE ONE DELETE DOOR. It takes a folder, never a file, and joins the constant name. No listing, no
+/// pattern, no name from a caller. Only Falcon's own file gets past the classifier: anything else, or
+/// any doubt, stays. A failure is one log line, with no notice and no retry.
+fn remove_own_date_cache_with(dir: &Path, is_cloud: impl Fn(&std::fs::Metadata) -> bool) -> bool {
+    if classify_date_cache_with(dir, is_cloud) != DateCacheState::Ours {
+        return false;
+    }
+    match std::fs::remove_file(dir.join(DATE_CACHE_NAME)) {
+        Ok(()) => true,
+        Err(e) => {
+            log_event(&format!("date read: couldn't remove falcon.cache ({})", e.kind()));
+            false
+        }
+    }
+}
+
+fn remove_own_date_cache(dir: &Path) -> bool {
+    remove_own_date_cache_with(dir, falcon_decode::metadata_is_cloud_placeholder)
+}
+
+/// Owner: going back to the default order removes the file 20 seconds later, so a slip of the menu
+/// costs nothing.
+const DATE_CACHE_REMOVAL_DELAY: Duration = Duration::from_secs(20);
+
+/// PURE: only the default order removes the file: a person moving to Rating and back to Date taken
+/// should stay instant. Keyed on the pick, never on "opened in Name order", because Name can appear
+/// without the person asking (list eviction, the setting at 0, an unreadable review file).
+pub(crate) fn date_cache_removal_wanted(method: SortMethod, desc: bool) -> bool {
+    method == SortMethod::Name && !desc
+}
+
+/// Folders waiting for their removal. Memory only, and never cleared by a folder change, so it fires
+/// even after the person has moved on. A crash loses it and leaves the file, numbers only and reusable.
+#[derive(Default)]
+struct DateCachePending {
+    due: HashMap<PathBuf, Instant>,
+    closing: bool,
+}
+
+impl DateCachePending {
+    fn schedule(&mut self, dir: &Path, now: Instant) {
+        self.due.insert(dir.to_path_buf(), now + DATE_CACHE_REMOVAL_DELAY);
+    }
+
+    fn cancel(&mut self, dir: &Path) {
+        self.due.remove(dir);
+    }
+
+    /// Each folder comes out once.
+    fn take_due(&mut self, now: Instant) -> Vec<PathBuf> {
+        let ready: Vec<PathBuf> = self.due.iter().filter(|(_, at)| **at <= now).map(|(d, _)| d.clone()).collect();
+        for d in &ready {
+            self.due.remove(d);
+        }
+        ready
+    }
+
+    fn refuses_write(&self, dir: &Path) -> bool {
+        self.closing || self.due.contains_key(dir)
+    }
+
+    /// Falcon is closing: everything still waiting goes now, and no more cache writes.
+    fn close(&mut self) -> Vec<PathBuf> {
+        self.closing = true;
+        self.due.drain().map(|(d, _)| d).collect()
+    }
+}
+
+static DATE_CACHE_PENDING: std::sync::LazyLock<Mutex<DateCachePending>> = std::sync::LazyLock::new(|| Mutex::new(DateCachePending::default()));
+
+pub(crate) fn schedule_date_cache_removal(dir: &Path) {
+    DATE_CACHE_PENDING.lock().unwrap_or_else(|e| e.into_inner()).schedule(dir, Instant::now());
+}
+
+pub(crate) fn cancel_date_cache_removal(dir: &Path) {
+    DATE_CACHE_PENDING.lock().unwrap_or_else(|e| e.into_inner()).cancel(dir);
+}
+
+fn send_date_cache_removals(dirs: Vec<PathBuf>) {
+    for dir in dirs {
+        let msg = WriteMsg::DateCacheRemove { dir };
+        match WRITER.get() {
+            Some(h) => {
+                if let Err(std::sync::mpsc::SendError(WriteMsg::DateCacheRemove { dir })) = h.tx.send(msg) {
+                    remove_own_date_cache(&dir);
+                }
+            }
+            None => {
+                let WriteMsg::DateCacheRemove { dir } = msg else { unreachable!() };
+                remove_own_date_cache(&dir);
+            }
+        }
+    }
+}
+
+/// The tick's check, each tick. The writer thread does the removal, after any write queued before it.
+pub(crate) fn send_due_date_cache_removals(now: Instant) {
+    let mut pending = DATE_CACHE_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if !pending.due.is_empty() {
+        send_date_cache_removals(pending.take_due(now));
+    }
+}
+
+/// `ShutdownStep::RemoveDateCaches`: no tick runs here (on the Mac's system quit the tick is already
+/// stopped), and the writer barrier that follows makes the removals happen before the process exits.
+pub(crate) fn close_date_cache_removals() {
+    let mut pending = DATE_CACHE_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let remaining = pending.close();
+    send_date_cache_removals(remaining);
+}
+
 // ─── v0.8.128 (J10 / A1.2): THE SHUTDOWN ORDER, AS A DECIDABLE OBJECT ──────────────────────────
 // Five routes reach `quit_event_loop` and one more exits the loop with an error, and every one of
 // them lands on the same tail in `main()`. The tail's ORDER is load-bearing — the staged-edit revert
@@ -13537,11 +15771,11 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// One step of the shutdown tail, in the order [`graceful_shutdown`] emits them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownStep {
-    /// The immediate-quit route only (⌘Q / `applicationShouldTerminate:`): wait (bounded) for an
-    /// in-flight file operation to reach its safe boundary. WINDOWS: never emitted — neither door
-    /// exists there, so `immediate` is a compile-time `false` at the only call site and every
-    /// Windows exit route already guarantees the workers are idle. The variant exists so both
-    /// trunks share ONE step order (and one test of it).
+    /// Wait (bounded) for an in-flight file operation to reach its safe boundary. Fix round 1
+    /// (1 November, CS-32): emitted whenever a file operation is still running at exit, on both
+    /// platforms (`shutdown_waits_for_file_op`), not only on the immediate-quit route (⌘Q /
+    /// `applicationShouldTerminate:`). Windows used to skip it, so a second × mid-Apply left the
+    /// photos written after the drain listed as pending. The window has already closed by then.
     AwaitFileOpBoundary,
     /// Drain the apply-rotations worker hand-off so shots already written to disk stop being
     /// listed as pending in the folder's journal.
@@ -13554,6 +15788,9 @@ pub(crate) enum ShutdownStep {
     SaveSettings,
     /// Write the current folder's selection JSON (ratings, marks, rotations, attrs).
     FlushSelection,
+    /// Date taken sort: send every `falcon.cache` removal still waiting its 20 seconds, and refuse
+    /// further cache writes. Before the barrier, which makes them happen.
+    RemoveDateCaches,
     /// Drain the background writer so both files above are actually on disk.
     WriterBarrier,
     /// Drop our entry from the multi-instance open-folders registry.
@@ -13583,13 +15820,13 @@ pub(crate) fn tick_prof_threshold_ms(raw: Option<&str>) -> u32 {
 /// arrival must not re-run it.
 static SHUTDOWN_ONCE: std::sync::Once = std::sync::Once::new();
 
-/// THE ORDER. Emits every step the tail must run, in the one sequence that is correct. `immediate`
-/// = the ⌘Q latch; the boundary wait is the only conditional step, because every other route to the
-/// tail already guarantees the workers are idle. Deliberately free of the `Once` so a test can run
-/// it as often as it likes — the latch belongs to the wrapper, and a step order nobody can call
-/// twice is a step order nobody can test.
-pub(crate) fn graceful_shutdown_steps(immediate: bool, step: &mut dyn FnMut(ShutdownStep)) {
-    if immediate {
+/// THE ORDER. Emits every step the tail must run, in the one sequence that is correct.
+/// `wait_for_file_op` = [`shutdown_waits_for_file_op`]'s answer (fix round 1: a file operation in
+/// flight, or the ⌘Q latch); the boundary wait is the only conditional step, so an idle exit costs
+/// nothing. Deliberately free of the `Once` so a test can run it as often as it likes — the latch
+/// belongs to the wrapper, and a step order nobody can call twice is a step order nobody can test.
+pub(crate) fn graceful_shutdown_steps(wait_for_file_op: bool, step: &mut dyn FnMut(ShutdownStep)) {
+    if wait_for_file_op {
         step(ShutdownStep::AwaitFileOpBoundary);
     }
     step(ShutdownStep::DrainAppliedRotations);
@@ -13597,14 +15834,23 @@ pub(crate) fn graceful_shutdown_steps(immediate: bool, step: &mut dyn FnMut(Shut
     step(ShutdownStep::RevertStagedEdits);
     step(ShutdownStep::SaveSettings);
     step(ShutdownStep::FlushSelection);
+    step(ShutdownStep::RemoveDateCaches);
     step(ShutdownStep::WriterBarrier);
     step(ShutdownStep::UnregisterFolder);
+}
+
+/// Fix round 1 (1 November, CS-32): does this exit wait for a file operation first? Yes on the
+/// immediate-quit route (⌘Q / the Mac terminate hook, as before) and, on both platforms, whenever
+/// one is still running (`sel_busy`): a second × mid-Apply, a device-lost exit. The save sequence
+/// raises `op_cancel` before the wait, so it ends after the photo or file in flight.
+pub(crate) fn shutdown_waits_for_file_op(immediate: bool, file_op_busy: bool) -> bool {
+    immediate || file_op_busy
 }
 
 /// [`graceful_shutdown_steps`] behind the process `Once`. Returns `false` when a previous arrival
 /// already ran the tail — in which case NOTHING is emitted, which is the point: a second pass would
 /// write a settings snapshot over one already flushed and take a second 10 s writer barrier.
-pub(crate) fn graceful_shutdown(immediate: bool, step: &mut dyn FnMut(ShutdownStep)) -> bool {
+pub(crate) fn graceful_shutdown(wait_for_file_op: bool, step: &mut dyn FnMut(ShutdownStep)) -> bool {
     let mut ran = false;
     SHUTDOWN_ONCE.call_once(|| {
         ran = true;
@@ -13616,7 +15862,7 @@ pub(crate) fn graceful_shutdown(immediate: bool, step: &mut dyn FnMut(ShutdownSt
         // the durability barrier still runs at its proper place in the sequence.
         log_inline_from_now();
         writer_barrier(std::time::Duration::from_secs(2));
-        graceful_shutdown_steps(immediate, step);
+        graceful_shutdown_steps(wait_for_file_op, step);
     });
     ran
 }
@@ -14058,7 +16304,9 @@ pub(crate) enum WriteMsg {
     /// it, or the reverse), and the multi-instance divergence where two Falcons disagree about
     /// which name a folder has. Whatever happened to the folder in between, the bytes land on the
     /// file the folder actually has.
-    ReviewData { dir: PathBuf, data: Vec<u8>, ticket: u64 },
+    /// R1 (1 November safety round): `data` is the same `Arc` the folder's [`REVIEW_LATEST`] entry
+    /// keeps until this ticket is on disk, so keeping it costs no copy.
+    ReviewData { dir: PathBuf, data: Arc<[u8]>, ticket: u64 },
     /// v0.8.69 (E/H2): a surgical `xmp:Rating` sidecar write — the read-modify-write runs ON the writer
     /// thread (never the UI thread), preserving all foreign sidecar content. Rides the SAME FIFO as the
     /// JSON writes, so the existing durability barriers (Apply / delete / exit) flush pending rating
@@ -14082,6 +16330,12 @@ pub(crate) enum WriteMsg {
     /// panic hook and the whole shutdown tail keep writing inline; the remaining window is the
     /// sub-millisecond one between a worker's `send` and the writer's `write_all`.
     Log { target: PathBuf, line: String, ticket: u64 },
+    /// Date taken sort: a folder's `falcon.cache`, addressed by its FOLDER. It is only a cache, so its
+    /// failure is a log line: it never reaches `on_fail`, and never touches a save record.
+    DateCacheWrite { dir: PathBuf, data: Vec<u8> },
+    /// Date taken sort: remove a folder's own `falcon.cache`. The folder, never a file: see
+    /// [`remove_own_date_cache`], the only thing this reaches.
+    DateCacheRemove { dir: PathBuf },
     /// Barrier marker: the writer acks (sends `()`) only AFTER every earlier write in the FIFO is done.
     Barrier(std::sync::mpsc::Sender<()>),
 }
@@ -14117,12 +16371,22 @@ fn writer_loop(
     mut log_sink: impl FnMut(&Path, &str, u64),
 ) {
     while let Ok(msg) = rx.recv() {
-        let (target, data, review, settings) = match msg {
-            WriteMsg::Write { target, data } => (target, data, None, None),
-            WriteMsg::Settings { target, data, ticket, saves } => (target, data, None, Some((saves, ticket))),
+        // R1: one payload type for the three durable writes. Review data arrives shared with its
+        // save record; the small settings and registry files are copied once here.
+        let (target, data, review, settings): (PathBuf, Arc<[u8]>, _, _) = match msg {
+            WriteMsg::Write { target, data } => (target, data.into(), None, None),
+            WriteMsg::Settings { target, data, ticket, saves } => (target, data.into(), None, Some((saves, ticket))),
             WriteMsg::ReviewData { dir, data, ticket } => (resolve_review(&dir), data, Some((dir, ticket)), None),
             WriteMsg::Log { target, line, ticket } => {
                 log_sink(&target, &line, ticket);
+                continue;
+            }
+            WriteMsg::DateCacheWrite { dir, data } => {
+                write_date_cache(&dir, &data);
+                continue;
+            }
+            WriteMsg::DateCacheRemove { dir } => {
+                remove_own_date_cache(&dir);
                 continue;
             }
             WriteMsg::XmpRating { sidecar, rating } => {
@@ -14245,6 +16509,8 @@ static REVIEW_TICKET: AtomicU64 = AtomicU64::new(1);
 static REVIEW_VISIT: AtomicU64 = AtomicU64::new(0);
 /// End the outgoing visit after its final flush, before swapping photos. Old
 /// completions still report failures, but cannot drive retries/recovery in the new visit.
+/// CS-53: a folder whose newest attempt failed is still retried, through [`REVIEW_LATEST`]
+/// ([`review_save_needs_retry`]).
 pub(crate) fn begin_review_visit() {
     let mut saves = REVIEW_SAVES.lock().unwrap_or_else(|e| e.into_inner());
     saves.clear();
@@ -14256,34 +16522,138 @@ fn review_save_complete(dir: &Path, ticket: u64, ok: bool) {
     if let Some(record) = REVIEW_SAVES.lock().unwrap_or_else(|e| e.into_inner()).get_mut(dir) {
         record.complete(ticket, ok);
     }
-    if let Some(record) = REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).get_mut(dir) {
-        record.complete(ticket, ok);
+    if let Some(latest) = REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).get_mut(dir) {
+        latest.attempt.complete(ticket, ok);
+        // R1: only this entry's own ticket, written, releases its bytes. An older ticket's success
+        // says nothing about them, and a failure keeps them for the next open of the folder.
+        if ok && latest.attempt.ticket == ticket {
+            latest.unsaved = None;
+        }
     }
 }
+/// R1 (1 November safety round): a [`REVIEW_LATEST`] entry. `unsaved` holds the exact bytes of
+/// `attempt` until that attempt is on disk, so a quick return to the folder (or a return after the
+/// write failed) reads them instead of the older file ([`load_selection_through_ledger`]).
+struct LatestReview { attempt: ReviewSaveRecord, unsaved: Option<Arc<[u8]>> }
 /// Issue #11 batch B1: each folder's newest save attempt in this process, OUTLIVING visits: the
 /// memory the final flushes ask ([`final_review_flush`]). [`REVIEW_SAVES`] is cleared at every swap,
 /// same-folder rescans (a sort pick, a delete) included, so a save that failed after one would read as
 /// clean and a gated exit flush would skip it, where the unconditional one used to retry it. Same
 /// tickets, same completion; forgotten only when the folder is freshly opened from disk
 /// ([`forget_review_attempts`]).
-static REVIEW_LATEST: std::sync::LazyLock<Mutex<HashMap<PathBuf, ReviewSaveRecord>>> =
+/// R1 (1 November safety round): it also keeps the newest attempt's bytes until they are written,
+/// and never drops them before ([`LatestReview`]).
+static REVIEW_LATEST: std::sync::LazyLock<Mutex<HashMap<PathBuf, LatestReview>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 /// B1: the newest save attempt for `dir` in this process, whichever visit made it.
 pub(crate) fn review_final_status(dir: &Path) -> Option<ReviewSaveStatus> {
-    REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).get(dir).map(|r| r.status)
+    REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).get(dir).map(|r| r.attempt.status)
 }
 /// B1: `dir` was freshly opened (not a same-folder rescan), so its live review state is what is on
 /// disk now and earlier attempts no longer say anything about it.
+/// R1: …unless the newest attempt is still unsaved. Then the open read its bytes, not the disk
+/// ([`load_selection_through_ledger`]), and the entry stays until they are written or replaced.
 pub(crate) fn forget_review_attempts(dir: &Path) {
-    REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).remove(dir);
+    let mut latest = REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner());
+    if latest.get(dir).is_some_and(|r| r.unsaved.is_none()) {
+        latest.remove(dir);
+    }
+}
+/// R1: the bytes of `dir`'s newest save attempt while they are not on disk. The `Arc` is cloned
+/// under the lock and parsed by the caller outside it.
+fn unsaved_review_bytes(dir: &Path) -> Option<Arc<[u8]>> {
+    REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).get(dir).and_then(|r| r.unsaved.clone())
+}
+/// Safety round review R1 (1 November): does `dir` still have unsaved bytes (its newest save is
+/// queued or failed)? Then an empty state is a change to save, not a clean folder to skip
+/// ([`save_selection_via`]).
+fn review_save_unsettled(dir: &Path) -> bool {
+    REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).get(dir).is_some_and(|r| r.unsaved.is_some())
 }
 pub(crate) fn review_save_status(dir: &Path) -> Option<ReviewSaveStatus> {
     REVIEW_SAVES.lock().unwrap_or_else(|e| e.into_inner()).get(dir).map(|r| r.status)
 }
 /// cur_dir may name the previous photo folder while the displayed folder is empty.
 /// Such a view can neither retry a save nor announce its recovery.
+/// CS-53 (1 November safety round): the folder's newest attempt in any visit counts too. A same-folder
+/// rescan (a sort pick, a delete, a move, an undo) starts a new visit, which clears this visit's
+/// record, and its baseline matches the map it carried, so without it a failed save would no longer be
+/// retried. A failed attempt keeps its bytes until they are written, and every open of the folder reads
+/// them ([`load_selection_through_ledger`]), so the retry writes the newest state, never an older one.
 pub(crate) fn review_save_needs_retry(dir: &Path, has_photos: bool) -> bool {
-    has_photos && review_save_status(dir) == Some(ReviewSaveStatus::Failed)
+    has_photos
+        && (review_save_status(dir) == Some(ReviewSaveStatus::Failed)
+            || review_final_status(dir) == Some(ReviewSaveStatus::Failed))
+}
+
+/// R6 (1 November safety round): why a folder's review file was there but couldn't be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewUnreadable {
+    /// Reading it failed: a lock, a permission, a cloud-only file while offline, another I/O error.
+    ReadError,
+    /// It doesn't parse (or isn't UTF-8), and setting it aside as `.corrupt` failed.
+    Damaged,
+    /// It is over [`SELECTION_MAX_BYTES`], so it is never read.
+    TooLarge,
+}
+/// R6: what a folder open's review read found ([`load_selection`], [`load_selection_through_ledger`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewLoad {
+    /// The file, or this process's unsaved save bytes for the folder, was read.
+    Loaded,
+    /// Nothing to read: no file, 0-byte debris, or a damaged file now set aside as `.corrupt`. The
+    /// folder starts clean and empty, and its first save writes a new file.
+    Absent,
+    /// A file is there but couldn't be used. Nothing is ever saved over it ([`save_selection_via`]).
+    Unresolved(ReviewUnreadable),
+}
+/// R6: the folders whose review file couldn't be read when they were last opened (the value:
+/// whether a refused save has been logged yet). Set and cleared only by [`note_review_load`].
+static REVIEW_UNRESOLVED: std::sync::LazyLock<Mutex<HashMap<PathBuf, bool>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// R6: a fresh visit records its review read (`apply_scan`, at the landing). An unresolved read
+/// marks the folder, so every save to it is refused until a later open reads it, and returns the
+/// warning to show; any other read clears the mark.
+pub(crate) fn note_review_load(dir: &Path, load: ReviewLoad) -> Option<String> {
+    let mut unresolved = REVIEW_UNRESOLVED.lock().unwrap_or_else(|e| e.into_inner());
+    match load {
+        ReviewLoad::Unresolved(why) => {
+            unresolved.insert(dir.to_path_buf(), false);
+            Some(review_unreadable_warning(why))
+        }
+        ReviewLoad::Loaded | ReviewLoad::Absent => {
+            unresolved.remove(dir);
+            None
+        }
+    }
+}
+/// R6: was `dir`'s review file unreadable when it was last opened?
+pub(crate) fn review_data_unresolved(dir: &Path) -> bool {
+    REVIEW_UNRESOLVED.lock().unwrap_or_else(|e| e.into_inner()).contains_key(dir)
+}
+/// Safety round review R2 (1 November, owner: grey it out): Apply rotations waits while the folder
+/// it acts on (`cur_dir`, the folder its plan and its review save use) is marked unreadable. Apply
+/// would write the turn into the photo, but the review save after it is refused, so the file would
+/// keep an older pending turn for that photo and add it on top once the file reads again. One answer
+/// for the button (`apply-rotations-waits`, set at every landing in `apply_scan`), the ask and the
+/// run. No folder (`""`) never waits. It ends with the mark: a reopen that reads, or a fresh visit.
+pub(crate) fn apply_rotations_waits(dir: &str) -> bool {
+    !dir.is_empty() && review_data_unresolved(Path::new(dir))
+}
+/// R6: `Some(first)` when a save to `dir` must be refused; `first` is true only for the first
+/// refusal since the mark was set, so the log says it once.
+fn review_save_refused(dir: &Path) -> Option<bool> {
+    let mut unresolved = REVIEW_UNRESOLVED.lock().unwrap_or_else(|e| e.into_inner());
+    unresolved.get_mut(dir).map(|logged| !std::mem::replace(logged, true))
+}
+/// R6: the amber warning for an unresolved read, one sentence per cause (owner-approved wording).
+pub(crate) fn review_unreadable_warning(why: ReviewUnreadable) -> String {
+    match why {
+        ReviewUnreadable::ReadError => i18n::tr("Couldn't read this folder's review data — it may be only in the cloud while you're offline, open in another program, or blocked by folder permissions. It's left untouched, and changes made here won't be saved. Reopen the folder to try again."),
+        ReviewUnreadable::Damaged => i18n::tr("This folder's review data looks damaged, and Falcon couldn't set it aside — another program may have it open. It's left untouched, and changes made here won't be saved. Reopen the folder to try again."),
+        ReviewUnreadable::TooLarge => i18n::tr("This folder's review data is too large to read (over 16 MB), which usually means it's damaged. It's left untouched, and changes made here won't be saved. To start fresh, move falcon_review_data.json out of the folder."),
+    }
+    .to_string()
 }
 
 pub(crate) fn enqueue_review_data(dir: &Path, data: Vec<u8>) -> std::io::Result<()> {
@@ -14296,6 +16666,7 @@ fn enqueue_review_data_via(
     dir: &Path,
     data: Vec<u8>,
 ) -> std::io::Result<()> {
+    let data: Arc<[u8]> = data.into();
     let msg = {
         // Publish the ticket and send under the same lock: concurrent callers
         // must agree on which snapshot is last in the writer FIFO.
@@ -14303,7 +16674,9 @@ fn enqueue_review_data_via(
         let ticket = REVIEW_TICKET.fetch_add(1, Ordering::Relaxed);
         let record = ReviewSaveRecord { ticket, status: ReviewSaveStatus::Pending };
         saves.insert(dir.to_owned(), record);
-        REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).insert(dir.to_owned(), record); // B1
+        // B1; R1: with the bytes themselves, the same Arc the writer gets.
+        let latest = LatestReview { attempt: record, unsaved: Some(data.clone()) };
+        REVIEW_LATEST.lock().unwrap_or_else(|e| e.into_inner()).insert(dir.to_owned(), latest);
         let msg = WriteMsg::ReviewData { dir: dir.to_path_buf(), data, ticket };
         match tx {
             Some(tx) => match tx.send(msg) { Ok(()) => return Ok(()), Err(e) => e.0 },
@@ -14485,22 +16858,26 @@ pub(crate) fn writer_barrier(timeout: std::time::Duration) {
 /// copy/move/export half-written — so the WINDOW goes at once (the event loop exits on the keypress)
 /// and this bounded wait runs afterwards, in the shutdown tail, where there is no UI left to defer.
 ///
-/// HONEST LIMIT (reported, not papered over): only the web export carries a per-item `cancel` flag
-/// its worker polls between shots. The copy/move/delete workers have no such flag, and adding one
-/// means editing shared, Windows-reachable worker loops — out of scope for this wave. So for those
-/// the nearest REACHABLE boundary is the end of the in-flight batch, which is what this waits for,
-/// bounded, with one line each way. Same 10 s shape as `writer_barrier`: a hung network drive must
-/// never wedge exit forever. Returns true if the operation finished inside the budget.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // caller is the Mac-gated ⌘Q shutdown tail
+/// Fix round 1 (1 November, CS-32): it runs on every platform now, whenever a file operation is
+/// still running at exit (`shutdown_waits_for_file_op`). The web export polls its own `cancel`;
+/// Copy picks, Move rejected (v0.9.61) and Apply rotations (fix round 1) poll `op_cancel`, which the
+/// save sequence raises first, so the wait usually ends after one file or photo. Undo move and
+/// Empty have no cancel; for them the boundary is the end of the batch. Same 10 s shape as
+/// `writer_barrier`: a hung network drive must never wedge exit forever. Returns true if the
+/// operation finished inside the budget.
+///
+/// `Acquire` loads: OpGuard stores `false` (SeqCst) after the worker's last `publish_applied`, so a
+/// load that sees `false` also sees every shot published before it; the `DrainAppliedRotations`
+/// step that follows then takes them all.
 pub(crate) fn await_file_op_boundary(busy: &AtomicBool, budget: std::time::Duration) -> bool {
-    if !busy.load(Ordering::Relaxed) {
+    if !busy.load(Ordering::Acquire) {
         return true; // the overwhelmingly common case — zero cost, zero noise
     }
     log_event(&format!(
         "quit: a file operation was in flight — waiting up to {budget:?} for its safe boundary (queued remainder cancelled where the worker supports it)"
     ));
     let deadline = std::time::Instant::now() + budget;
-    while busy.load(Ordering::Relaxed) {
+    while busy.load(Ordering::Acquire) {
         if std::time::Instant::now() >= deadline {
             log_event(
                 "quit: file operation STILL running at the boundary deadline — exiting anyway (it may be incomplete)",
@@ -14664,7 +17041,7 @@ fn open_folders_path() -> Option<PathBuf> {
 /// v0.8.151: the byte cap the CONFIG-dir reads never had, with the same stated reason its two
 /// shoot-folder peers carry ([`SELECTION_MAX_BYTES`], `EXPORT_MANIFEST_MAX_BYTES`):
 /// `read_to_string` sizes its buffer from the file length, so reading an unbounded file is an
-/// unbounded allocation. `settings.json`, `ratings.json` and `open_folders.json` live in a
+/// unbounded allocation. `settings.json` and `open_folders.json` live in a
 /// user-editable directory and had no stat in front of them at all — and `preserve_corrupt_file`
 /// cannot help, because it only runs AFTER the read has been attempted.
 ///
@@ -14684,8 +17061,8 @@ fn over_config_cap(len: Option<u64>) -> bool {
 /// recovery path — which is the selection reader's policy and for the same reason: the user's bytes
 /// are the only copy. Logs one honest line **per (file, session)**.
 ///
-/// v0.8.153 (skeptic A / Y10) — WHY THE LINE IS THROTTLED. Two of the three readers are once-per-
-/// event (`settings`, `ratings`) but the third is not: `read_open_folders` runs from the heartbeat,
+/// v0.8.153 (skeptic A / Y10) — WHY THE LINE IS THROTTLED. One of the two readers is once-per-
+/// event (`settings`) but the other is not: `read_open_folders` runs from the heartbeat,
 /// so an over-cap `open_folders.json` — a file the policy DELIBERATELY refuses to touch, meaning it
 /// can never be fixed by the app — would emit this line every 25 s for the whole session. That is a
 /// falcon.log the shape of one repeated sentence, and it is the log a crash report would arrive
@@ -14693,7 +17070,7 @@ fn over_config_cap(len: Option<u64>) -> bool {
 fn config_file_over_cap(p: &Path, what: &'static str) -> bool {
     let len = std::fs::metadata(p).map(|m| m.len()).ok();
     if over_config_cap(len) {
-        // Keyed by the ARTEFACT, not the path: the three config files are named at their call sites
+        // Keyed by the ARTEFACT, not the path: the two config files are named at their call sites
         // and there is exactly one of each per session.
         static SAID: std::sync::OnceLock<Mutex<HashSet<&'static str>>> = std::sync::OnceLock::new();
         let first = SAID
@@ -15957,7 +18334,9 @@ pub(crate) fn collapse_fast_window(roi_busy: bool, detail_cpu_busy: bool, moving
 //      pool, so interactive work always finds a free worker. The displayed shot is exempt.
 //   3. OPEN PRIMING         — at folder open the window stays collapsed until the displayed shot's
 //      detail decode is underway ([`open_prime_holds`]), so THAT decode starts first and H4's
-//      collapse then holds it uncontended.
+//      collapse then holds it uncontended. Nearby photos (2 November): the window stays collapsed
+//      only for HEIC, a RAW develop and the Mac ([`priming_shuts_window`]). Other formats keep it and
+//      ration the asks to [`OPEN_LET_THROUGH`] each side instead.
 //
 // The whole posture reverts with `FALCON_CLASSIC_POSTURE=1` ([`classic_posture`]).
 //
@@ -16779,6 +19158,11 @@ pub(crate) fn meter_attempted<F: Fn(usize) -> bool>(
 /// stale-but-plausible rather than blank. That is the ruled behaviour and not an oversight: the
 /// alternative is the 0/0 unmount this function exists to stop, and it self-corrects on the first
 /// tick the new folder's window opens.
+///
+/// Nearby photos (2 November): that consequence now applies only where priming still shuts the window
+/// ([`priming_shuts_window`]: HEIC, a RAW develop, the Mac). On other formats the window stays real
+/// through the hold, so the meter reads the new folder (0 of N) straight after a landing. That reading
+/// is honest, and it cannot be the 0/0 unmount, because the window is not `(0, 0)`.
 pub(crate) fn meter_available(
     eff: (usize, usize),
     attempted: (usize, usize),
@@ -22959,6 +25343,45 @@ pub(crate) fn open_prime_holds(
     armed && !navigated && !detail_landed && (detail_busy || elapsed_ms < OPEN_PRIME_MAX_MS)
 }
 
+/// Nearby photos (2 November): how many photos each side of the current one may still ask for a
+/// preview while an opening hold is on. The owner's choice: "opening holds limited to slow formats,
+/// next 1-2 photos let through". Each side, because pressing left first is normal. It is one number:
+/// if a laptop log shows the on-screen photo's decode paying for it, 1 narrows it and 0 is the old rule.
+pub(crate) const OPEN_LET_THROUGH: usize = 2;
+
+/// Nearby photos (2 November): how far from the current photo an ask may pass the opening holds this
+/// tick; 0 means no let-through. Derived per tick, so there is no latch or timer to stand down.
+///
+/// `harder_hold` is a gesture, memory or background hold: those stay absolute. The stage test needs
+/// both terms: `photo_ready` alone is last tick's answer on a landing tick (`apply_scan` clears it only
+/// on partial stages, and `step_display` recomputes it later in the tick), while `shown` alone also
+/// counts a thumbnail stand-in. `mac` is an argument so its rows run on both platforms; the Mac gets no
+/// let-through until a native run has measured it, because its pool has no below-normal priority.
+pub(crate) fn open_let_through(
+    mac: bool,
+    opening_hold: bool,
+    harder_hold: bool,
+    photo_ready: bool,
+    shown: Option<usize>,
+    c: usize,
+) -> usize {
+    if !mac && opening_hold && !harder_hold && photo_ready && shown == Some(c) {
+        OPEN_LET_THROUGH
+    } else {
+        0
+    }
+}
+
+/// Nearby photos (2 November): does the open-priming hold still shut the preview window for this photo,
+/// rather than rationing it to [`OPEN_LET_THROUGH`] each side? Only for the owner's "slow formats": HEIC
+/// (the measured flood, 9966 ms against about 1 s) and a RAW develop (it reads as not CPU-bound, so the
+/// processor guard does not cover it), and on the Mac. PNG is deliberately not slow: the PNG folder is
+/// where the wait was measured. `kind` is the format, not the live cost class, which a measurement can
+/// flip and which reads false for hardware-served HEIC (v0.8.111's mistake).
+pub(crate) fn priming_shuts_window(mac: bool, kind: SrcKind, raw_develop: bool) -> bool {
+    mac || raw_develop || kind == SrcKind::Heic
+}
+
 /// v0.8.111: the ONE-SWITCH revert for the whole posture. `FALCON_CLASSIC_POSTURE=1` restores the
 /// v0.8.110 window, pool share and open ordering exactly: no format-aware narrowing, no costly cap,
 /// no priming hold. Read once per process (`OnceLock`) for the same reason
@@ -27830,6 +30253,44 @@ mod decode_instrumentation_tests {
         assert!(!open_prime_holds(true, true, false, true, 10 * OPEN_PRIME_MAX_MS));
     }
 
+    /// Nearby photos (2 November): the let-through reads the owner's 2 only with an opening hold on,
+    /// nothing harder holding, and the current photo's own frame on stage. `mac` runs both ways here on
+    /// both platforms.
+    ///
+    /// FALSIFIERS (L28, run as NP-1 to NP-5): drop `shown == Some(c)` and the landing and just-stepped
+    /// rows read 2; drop `photo_ready` and the stand-in row reads 2; drop `!harder_hold` and the gesture
+    /// row reads 2; drop `!mac` and the Mac row reads 2; drop `opening_hold` and the no-hold row reads 2.
+    #[test]
+    fn the_open_let_through_needs_the_photo_on_stage_and_only_loosens_the_opening_holds() {
+        let c = 40;
+        assert_eq!(OPEN_LET_THROUGH, 2, "the owner's choice, each side");
+        assert_eq!(open_let_through(false, true, false, true, Some(c), c), 2, "held, nothing harder, on stage");
+        assert_eq!(open_let_through(true, true, false, true, Some(c), c), 0, "the Mac has no let-through");
+        assert_eq!(open_let_through(false, false, false, true, Some(c), c), 0, "no opening hold: nothing to loosen");
+        assert_eq!(open_let_through(false, true, true, true, Some(c), c), 0, "a gesture, memory or background hold stays absolute");
+        assert_eq!(open_let_through(false, true, false, false, Some(c), c), 0, "a thumbnail stand-in is not the photo's own frame");
+        assert_eq!(open_let_through(false, true, false, true, None, c), 0, "a landing tick: `photo_ready` is still last tick's");
+        assert_eq!(open_let_through(false, true, false, true, Some(c - 1), c), 0, "just stepped: the old photo is on stage");
+    }
+
+    /// Nearby photos (2 November): "slow formats" is HEIC and a RAW develop, on Windows; the Mac keeps
+    /// the window shut for every format.
+    ///
+    /// FALSIFIERS (L28, run as NP-6 to NP-8): replace `kind == SrcKind::Heic` with `false` and the HEIC
+    /// row reddens; drop `raw_develop` and the develop row reddens; drop `mac` and the Mac rows redden.
+    #[test]
+    fn only_heic_a_raw_develop_or_the_mac_keeps_priming_shut() {
+        let others = [SrcKind::Jpeg, SrcKind::Png, SrcKind::Tiff, SrcKind::Webp, SrcKind::Jxl, SrcKind::Bmp, SrcKind::Gif];
+        for kind in others {
+            assert!(!priming_shuts_window(false, kind, false), "{kind:?} is not a slow format");
+        }
+        assert!(priming_shuts_window(false, SrcKind::Heic, false), "HEIC keeps the window shut");
+        assert!(priming_shuts_window(false, SrcKind::Jpeg, true), "the same JPEG shot with its RAW being developed");
+        for kind in others.into_iter().chain([SrcKind::Heic]) {
+            assert!(priming_shuts_window(true, kind, false), "the Mac is unchanged for {kind:?}");
+        }
+    }
+
     /// THE REVERT SWITCH: exactly `"1"` arms the classic posture, and the classic view is inert for
     /// every format — including the one the posture exists for.
     ///
@@ -28136,6 +30597,182 @@ pub(crate) struct ResolvedOpen {
     pub(crate) path: PathBuf,
     pub(crate) requested_at: Instant,
     pub(crate) target: std::io::Result<(PathBuf, Option<String>)>,
+    /// R1 alias (1 November safety round): the target folder's physical identity, read on the same
+    /// worker (`folder_identity`). The scan carries it to acceptance (`ScanDone::identity`).
+    pub(crate) identity: Option<FolderId>,
+    /// R1 alias: the on-screen folder's spelling when the target is that folder under another
+    /// spelling (`ShownFolder::alias_of`); `begin_resolved` then rescans it with this spelling.
+    pub(crate) shown_alias: Option<String>,
+}
+
+/// R1 alias (1 November safety round): a folder's physical identity, so two spellings of one
+/// folder (a case variant, a junction or link, a mapped drive versus its share) compare equal.
+/// Windows: volume serial number plus the 128-bit file ID. Unix (the Mac): `st_dev` plus `st_ino`.
+/// Nothing is lower-cased, so two folders on a case-sensitive volume stay two folders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FolderId {
+    volume: u64,
+    file: u128,
+}
+
+/// The identity of `dir`, or `None` when it can't be read (then callers fall back to `Path`
+/// equality). Filesystem work: call it on a worker only, never on the interface thread.
+#[cfg(windows)]
+pub(crate) fn folder_identity(dir: &Path) -> Option<FolderId> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    // FILE_ID_INFO, read by class FileIdInfo (18). kernel32's GetFileInformationByHandleEx is
+    // already a std import, so the executable's import table is unchanged.
+    #[repr(C)]
+    struct FileIdInfo { volume_serial_number: u64, file_id: [u8; 16] }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandleEx(file: *mut core::ffi::c_void, class: i32, info: *mut core::ffi::c_void, size: u32) -> i32;
+    }
+    // FILE_READ_ATTRIBUTES only; FILE_FLAG_BACKUP_SEMANTICS opens a folder. A junction is followed.
+    let handle = std::fs::OpenOptions::new().access_mode(0x0080).custom_flags(0x0200_0000).open(dir).ok()?;
+    let mut info = FileIdInfo { volume_serial_number: 0, file_id: [0; 16] };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(handle.as_raw_handle(), 18, (&mut info as *mut FileIdInfo).cast(), std::mem::size_of::<FileIdInfo>() as u32)
+    };
+    // A zero file ID (some network file systems) identifies nothing.
+    (ok != 0 && info.file_id != [0; 16])
+        .then(|| FolderId { volume: info.volume_serial_number, file: u128::from_le_bytes(info.file_id) })
+}
+#[cfg(unix)]
+pub(crate) fn folder_identity(dir: &Path) -> Option<FolderId> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(dir).ok()?;
+    (metadata.ino() != 0).then(|| FolderId { volume: metadata.dev(), file: metadata.ino() as u128 })
+}
+#[cfg(not(any(windows, unix)))]
+pub(crate) fn folder_identity(_dir: &Path) -> Option<FolderId> {
+    None
+}
+
+/// R1 alias (1 November safety round): the folder on screen as the last scan landed it: its
+/// spelling (the same string as `scanned_dir`) and its identity. Recorded at acceptance
+/// (`apply_scan`'s tail); an explicit open snapshots it for its worker (`begin_reload`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ShownFolder(Option<(String, FolderId)>);
+
+impl ShownFolder {
+    /// A landing with an identity records it. A landing without one (the synchronous rescan reads
+    /// none) keeps the record only while the spelling is the same.
+    pub(crate) fn record(&mut self, dir: &str, identity: Option<FolderId>) {
+        match identity {
+            Some(id) => self.0 = Some((dir.to_owned(), id)),
+            None if self.0.as_ref().is_some_and(|(shown, _)| shown != dir) => self.0 = None,
+            None => {}
+        }
+    }
+
+    /// Worker side: the on-screen spelling when `identity` (the target's) is the folder on screen.
+    /// A rename keeps a folder's identity, so the on-screen spelling is probed again and must still
+    /// name that folder; otherwise a rescan with it would read some other path.
+    pub(crate) fn alias_of(&self, identity: Option<FolderId>, probe: impl Fn(&Path) -> Option<FolderId>) -> Option<String> {
+        let (shown, id) = self.0.as_ref()?;
+        (identity == Some(*id) && probe(Path::new(shown)) == Some(*id)).then(|| shown.clone())
+    }
+}
+
+/// R1 alias (1 November safety round): `begin_resolved`'s same-folder test. An explicit open of
+/// the folder on screen (`shown` = `cur_dir`), as the same `Path` (a trailing separator, a drive
+/// letter's case) or as the same physical folder under another spelling (`shown_alias`), rescans
+/// it WITH THE ON-SCREEN SPELLING. Every same-folder test that compares strings then agrees
+/// (`apply_scan`'s live carry, the review-save record). Returns that folder and the requested file
+/// for [`reopen_scan`] (R3); `None` opens a different folder. Without photos (a plain launch seeds
+/// `cur_dir` without loading it) it is always a fresh open, so the first open still offers to resume.
+pub(crate) fn reopen_on_screen(has_photos: bool, shown: &str, dir: &Path, shown_alias: Option<&str>, sel: Option<&str>) -> Option<(PathBuf, Option<String>)> {
+    if !has_photos || !(dir == Path::new(shown) || shown_alias == Some(shown)) { return None; }
+    Some((PathBuf::from(shown), sel.map(str::to_owned)))
+}
+
+/// R3 (1 November safety round): the explicit reopen of the folder on screen that is scanning
+/// off the interface thread ([`reopen_scan`]): its request id and the photo it asked for. Kept on
+/// the interface thread; `begin_resolved` starts it, `apply_scan` takes it at acceptance, and the
+/// rescan after a file operation or a sort pick (`reload`) retires it.
+#[derive(Debug, Default)]
+pub(crate) struct PendingReopen(Option<(u64, Option<String>)>, Option<Instant>);
+
+impl PendingReopen {
+    pub(crate) fn start(&mut self, id: u64, sel: Option<String>) {
+        self.0 = Some((id, sel));
+        self.1 = Some(Instant::now());
+    }
+
+    /// At acceptance: `Some(requested photo)` when the landing `id` is this reopen's own result.
+    pub(crate) fn take_landing(&mut self, id: u64) -> Option<Option<String>> {
+        if self.0.as_ref().is_some_and(|(pending, _)| *pending == id) { self.0.take().map(|(_, sel)| sel) } else { None }
+    }
+
+    /// A rescan of the folder on screen after a file operation or a sort pick reads it AFTER that
+    /// change, so a reopen still scanning (an older listing) must never land after it. True when
+    /// the reopen is still the latest request (`latest` = `scan_id`): the caller retires it. Any
+    /// other pending open (a different folder) is left alone. Forgets the reopen either way.
+    pub(crate) fn superseded_by_rescan(&mut self, latest: u64) -> bool {
+        self.0.take().is_some_and(|(id, _)| id == latest)
+    }
+
+    /// Date taken sort: does a reopen still scanning hold a landing that arrives on its own? Only for
+    /// a while: a reopen whose folder can't be read lands nothing and stays recorded, and a hold that
+    /// only its own landing could end would leave a pick waiting forever (L34).
+    pub(crate) fn holds_landing(&self, now: Instant) -> bool {
+        self.0.is_some() && self.1.is_some_and(|at| now.saturating_duration_since(at) < REOPEN_HOLD_LIMIT)
+    }
+}
+
+/// See [`PendingReopen::holds_landing`]. A reopen's own scan is about 0.6 s on the laptop's big folder.
+const REOPEN_HOLD_LIMIT: Duration = Duration::from_secs(30);
+
+/// R3 (1 November safety round): an explicit reopen of the folder on screen (a drop, either picker,
+/// the Mac's Open Recent or a Finder open) used to rescan it on the interface thread (`reload`), so
+/// a slow or stalled folder froze the window. It now runs on a worker, as the same-folder rescan it
+/// always was: the whole folder in one result (no first-photo stage, so the list on screen stays
+/// live meanwhile), sorted by the folder's LIVE sort choice (`live_sort`, as `reload` sorts), and
+/// landing on the requested photo (`sel`). `read` lists the folder (the cancellable
+/// `scan_folder_with_metadata` in the app; tests inject a reader they can hold). A folder that
+/// can't be read returns the error and the list on screen stays (as `reload` keeps it).
+/// Ratings, marks and rotations changed while this runs are newer than anything it read, so
+/// `apply_scan` carries them at acceptance and sorts again (`carry_live_review_on_rescan`,
+/// `photo_open::settle_reopen`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reopen_scan(
+    id: u64,
+    dir: PathBuf,
+    sel: Option<String>,
+    live_sort: Option<String>,
+    sort_lru: &[(String, String)],
+    sort_cap: usize,
+    date_read: Option<&dyn Fn() -> bool>,
+    warn: &Mutex<Option<OpResult>>,
+    read: impl FnOnce(&Path) -> std::io::Result<falcon_decode::FolderScan>,
+) -> std::io::Result<ScanDone> {
+    let review_st = review_data_state(&dir); // one conversion-ladder run per open, as both open paths
+    let had_file = review_data_present(review_st, &dir);
+    let manifest = read_export_manifest(&dir).map(|m| m.files);
+    let (sel_map, rotations, attrs, from_ledger, review_load) = load_selection_through_ledger(review_st, &dir, warn);
+    let json_sort = sort_attr_at_rescan(true, live_sort.as_deref(), attrs.sort.as_deref());
+    let (method, desc) = resolve_sort_spec(json_sort.as_deref(), sort_lru, &dir.display().to_string(), sort_cap);
+    let scan = read(&dir)?;
+    log_appledouble_skips(scan.appledouble, &dir);
+    log_scan_timing(&dir, &scan);
+    let mut shots = scan.shots;
+    // The scan's own order, for `settle_reopen`'s stable Rating re-sort (as the photo-first final scan).
+    let source_order = if method == SortMethod::Rating { shots.iter().map(|s| s.name.clone()).collect() } else { Vec::new() };
+    // `date_read` is the cancel check of a reopen that may start a date read: `None` when one is
+    // already running for this folder, which the interface thread knows.
+    let taken_pass = date_read.filter(|_| method == SortMethod::Taken).and_then(|cancelled| {
+        taken_before_sort(PassInput { dir: dir.clone(), shots: Arc::new(shots.clone()), stamps: listing_stamps_of(&scan.metadata), order_desc: Some(desc), write_allowed: sort_cap > 0 }, cancelled)
+    });
+    sort_scanned_shots(&mut shots, method, desc, &sel_map, &scan.metadata);
+    let matched = select_match(&shots, &sel);
+    let unlisted_target = unlisted_target(false, &sel, matched);
+    let (ratings, marks) = apply_selection(&sel_map, &shots);
+    // R6: moved-out leftovers come only from a review file (or unsaved save) that was read.
+    let extra = if review_load == ReviewLoad::Loaded { selection_leftover(sel_map, &shots) } else { BTreeMap::new() };
+    Ok(ScanDone { changed_sources: HashSet::new(), stamps: Some(listing_stamps(scan.metadata)), partial: false, pending_edges: (false, false), source_order, id, dir, shots,
+        ratings, marks, start: matched.unwrap_or(0), land: None, extra, rotations, attrs, had_file, from_ledger,
+        identity: None, manifest, sort: (method, desc), scan_err: false, scan_denied: false, unlisted_target, review_load, taken_pass })
 }
 
 /// Explicit opens validate on a worker. In particular, a missing argv file must
@@ -28150,6 +30787,21 @@ pub(crate) fn resolve_existing_target(path: &Path) -> std::io::Result<(PathBuf, 
     if metadata.is_dir() { return Ok((path.to_path_buf(), None)); }
     if !metadata.is_file() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "target is not a file or folder")); }
     Ok((path.parent().unwrap_or(path).to_path_buf(), path.file_name().and_then(|n| n.to_str()).map(str::to_owned)))
+}
+
+/// The file name a sort reread lands on: the photo at `current` in the live list, read when the
+/// reread runs, so browsing during a long date read isn't thrown back to the photo at the pick. Its
+/// primary file name re-selects it in the new order (`select_match`); a pathless shot gives its name.
+pub(crate) fn landing_file(shots: &[Shot], current: usize) -> Option<String> {
+    shots.get(current).map(|s| {
+        s.jpg
+            .as_ref()
+            .or(s.raw.as_ref())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| s.name.clone())
+    })
 }
 
 /// Resolve a file to its parent plus exact filename, or a folder to itself.
@@ -28230,12 +30882,35 @@ pub(crate) fn post_op_land(desired: usize, new_len: usize) -> usize {
     }
 }
 
+/// Keeping prepared work (2 November): each listed file's size and modified time, by the same paths
+/// as the shots' files. They come from the directory listing, so no file is opened and nothing is
+/// downloaded. A file with no modified time has no stamp, and a missing stamp counts as changed.
+pub(crate) type ListingStamps = HashMap<PathBuf, (u64, std::time::SystemTime)>;
+
+pub(crate) fn listing_stamps(metadata: BTreeMap<PathBuf, std::fs::Metadata>) -> ListingStamps {
+    metadata.into_iter().filter_map(|(p, m)| m.modified().ok().map(|t| (p, (m.len(), t)))).collect()
+}
+
+/// [`listing_stamps`] for a worker that still needs the metadata for its sort.
+pub(crate) fn listing_stamps_of(metadata: &BTreeMap<PathBuf, std::fs::Metadata>) -> ListingStamps {
+    metadata.iter().filter_map(|(p, m)| m.modified().ok().map(|t| (p.clone(), (m.len(), t)))).collect()
+}
+
+/// R6: where the Resume offer's photo is now, worked out at the click, because the order can change on
+/// its own after the offer was made. `None`, so no jump, if the photo has gone.
+pub(crate) fn resume_index(shots: &[Shot], name: &str) -> Option<usize> {
+    shots.iter().position(|s| s.name == name)
+}
+
 /// A completed off-thread folder scan, handed from the scan worker to the tick for the (UI-thread) swap.
 /// `scan_folder` (dir walk + RAW/JPG pairing) can take multiple seconds on a large CR3+JPG shoot; running
 /// it on the UI thread froze the window (U1, RED). The OPEN path now spawns a worker that produces this,
 /// and the tick applies the swap via `apply_scan`. `id` supersedes stale scans (a second open mid-scan).
 pub(crate) struct ScanDone {
     pub(crate) changed_sources: HashSet<PathBuf>,
+    /// Keeping prepared work (2 November): the whole listing's stamps, `None` for a partial stage or
+    /// an unreadable folder. `apply_scan` remembers them, so the next rescan can tell which files changed.
+    pub(crate) stamps: Option<ListingStamps>,
     pub(crate) partial: bool,
     pub(crate) pending_edges: (bool, bool), // unknown/unread photos before and after this batch
     pub(crate) source_order: Vec<String>,
@@ -28264,6 +30939,12 @@ pub(crate) struct ScanDone {
     // syncs the position-chip menu state + seeds the live folder_attrs from these).
     pub(crate) attrs: FolderAttrs,
     pub(crate) had_file: bool,
+    /// R1 (1 November safety round): the review map came from this process's unsaved save bytes,
+    /// not the file ([`load_selection_through_ledger`]); `apply_scan` starts the baseline dirty.
+    pub(crate) from_ledger: bool,
+    /// R1 alias (1 November safety round): the folder's identity from the open's worker (`None`
+    /// for the synchronous rescan); `apply_scan` records it beside `scanned_dir` (`ShownFolder`).
+    pub(crate) identity: Option<FolderId>,
     /// v0.8.130 (W2-4): the destination folder's `falcon_export.json`, read by the scan worker
     /// beside `had_file` and applied at the swap. `None` = this is not a folder Falcon exported
     /// into (or its manifest is unreadable), which is what greys "Select new / edited". Folders
@@ -28279,9 +30960,16 @@ pub(crate) struct ScanDone {
     /// 1.1.0-rc.1 (issue #11 batch, M5): that IO error was "permission denied", so on the Mac the
     /// empty state also gets the permission hint (`folder_denied_notice`). Only with `scan_err`.
     pub(crate) scan_denied: bool,
+    /// Date taken sort (R2): an open's date read that outlived its wait, for the list to adopt. Last,
+    /// so builders read as before; dropping a retired `ScanDone` stops the read.
+    pub(crate) taken_pass: Option<PassHandle>,
     /// 1.1.0-rc.1 (issue #11 batch, O2): the explicitly opened file name when the final scan lists no
     /// shot for it (`unlisted_target`); apply_scan then says it opened the folder instead.
     pub(crate) unlisted_target: Option<String>,
+    /// R6 (1 November safety round): what the review read found ([`load_selection`]). A fresh
+    /// visit records it at the landing ([`note_review_load`]); moved-out leftovers (`extra`) are
+    /// taken only from a `Loaded` read, never just because a file exists.
+    pub(crate) review_load: ReviewLoad,
 }
 // ───────────────────────────── selection (rating/flag/reject) ─────────────────────────────
 // Per-photo cull state lives PER-FOLDER in `<folder>/falcon_review_data.json` (keyed by file
@@ -31475,12 +34163,12 @@ mod rescan_review_tests {
 
     fn stale_scan(shots: Vec<Shot>) -> ScanDone {
         let len = shots.len();
-        ScanDone { changed_sources: HashSet::new(), partial: false, pending_edges: (false, false), source_order: Vec::new(), id: 0, dir: PathBuf::from("same-folder"), shots, ratings: vec![1; len],
+        ScanDone { changed_sources: HashSet::new(), stamps: None, partial: false, pending_edges: (false, false), source_order: Vec::new(), id: 0, dir: PathBuf::from("same-folder"), shots, ratings: vec![1; len],
             marks: vec![MARK_FLAG; len], start: 1, land: Some(1),
             extra: BTreeMap::from([("STALE_DISK_ONLY".into(), Sel { rating: 5, ..Sel::default() })]),
             rotations: BTreeMap::from([("CLEARED".into(), 2), ("A".into(), 2)]),
-            attrs: FolderAttrs::default(), had_file: true, manifest: None,
-            sort: (SortMethod::Rating, true), scan_err: false, scan_denied: false, unlisted_target: None }
+            attrs: FolderAttrs::default(), had_file: true, from_ledger: false, identity: None, manifest: None,
+            sort: (SortMethod::Rating, true), scan_err: false, scan_denied: false, unlisted_target: None, review_load: ReviewLoad::Loaded, taken_pass: None }
     }
 
     #[test]
@@ -31508,6 +34196,51 @@ mod rescan_review_tests {
         assert_eq!(rot.delta_of(1), 1, "remaining turn follows A to its new index");
         assert_eq!(rot.delta_of(2), 0, "cleared rotation is not resurrected from disk");
         assert_eq!(rot.rotations_snapshot().get("REMOVED"), Some(&3));
+    }
+
+    /// Keeping prepared work (2 November): the owner's Photoshop round trip, on real files through
+    /// the real listing, after the writer's handle has closed (L32: what the listing itself reports).
+    /// Each photo's files are stamped under the same paths the shots hold.
+    ///
+    /// FALSIFIER (L28): `listing_stamps` keeps only the size or only the date; or the listing lags
+    /// a closed file on this file system, which would disprove the rule the carry rests on.
+    #[test]
+    fn listing_stamps_notice_a_save_over_in_place() {
+        let dir = std::env::temp_dir().join(format!("falcon-stamps-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&dir).unwrap();
+        struct Remove(PathBuf);
+        impl Drop for Remove { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _remove = Remove(dir.clone());
+        let old_date = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let set_date = |p: &Path, date| std::fs::File::options().write(true).open(p).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(date)).unwrap();
+        let (saved, resized, untouched) = (dir.join("SAVED.png"), dir.join("RESIZED.png"), dir.join("UNTOUCHED.png"));
+        let (pair_jpg, pair_raw) = (dir.join("PAIR.jpg"), dir.join("PAIR.CR3"));
+        for p in [&saved, &resized, &untouched, &pair_jpg, &pair_raw] {
+            std::fs::write(p, [1u8; 16]).unwrap();
+            set_date(p, old_date);
+        }
+        let list = || {
+            let scan = falcon_decode::scan_folder_with_metadata(&dir).unwrap();
+            for s in &scan.shots {
+                for p in s.jpg.iter().chain(s.raw.iter()) {
+                    assert!(scan.metadata.contains_key(p), "{}: the listing holds the shot's own path", p.display());
+                }
+            }
+            assert_eq!(scan.shots.len(), 4, "a RAW+JPEG pair is one photo");
+            listing_stamps(scan.metadata)
+        };
+        let before = list();
+        std::fs::write(&saved, [2u8; 16]).unwrap(); // same size, a new date
+        std::fs::write(&resized, [2u8; 32]).unwrap(); // a new size...
+        set_date(&resized, old_date); // ...and the date put back
+        let after = list();
+        assert_ne!(before[&saved], after[&saved], "a save over in place, same size, new date");
+        assert_ne!(before[&resized], after[&resized], "a new size under the old date");
+        assert_eq!(before[&untouched], after[&untouched], "an untouched file reads the same");
+        assert_eq!(before[&pair_jpg], after[&pair_jpg]);
+        assert_eq!(before[&pair_raw], after[&pair_raw]);
     }
 
     #[test]
@@ -31540,9 +34273,6 @@ mod rescan_review_tests {
     }
 }
 
-/// Load `<dir>/falcon_review_data.json`. On a missing/unreadable/corrupt file, seed ratings
-/// from the legacy global store (`%LOCALAPPDATA%\Falcon\ratings.json`) so existing testers
-/// keep their stars on first run. Always returns a map; logs what path was taken.
 /// Rename a corrupt selection file aside to a NON-colliding `.corrupt[N]` sibling BEFORE anything can
 /// overwrite it, so a hand-mistyped / truncated JSON is preserved for recovery instead of being
 /// silently clobbered on the next edit (N14). Returns the preserved path on success.
@@ -31575,8 +34305,10 @@ pub(crate) fn preserve_corrupt_file(path: &Path) -> Option<PathBuf> {
 /// Byte cap for a folder's `falcon_review_data.json`. A real selection file is a few KB even for a folder
 /// of thousands of photos; anything past this is corrupt or hostile, and `read_to_string` sizes its
 /// buffer from the file length, so reading it would risk a huge allocation. Over the cap the file is
-/// treated as ABSENT — it is NEVER renamed, preserved-aside, or overwritten, so the on-disk bytes stay
+/// not read — it is NEVER renamed, preserved-aside, or overwritten, so the on-disk bytes stay
 /// exactly as the user left them for manual recovery. 16 MB.
+/// R6 (1 November safety round): "never overwritten" is now enforced: the read is
+/// [`ReviewLoad::Unresolved`] and [`save_selection_via`] refuses every save to the folder.
 pub(crate) const SELECTION_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// Pure predicate: is a selection file of `len` bytes over the cap? `None` (stat failed / missing) reads
 /// as under-cap so the normal read path runs and reports the real IO error. Unit-tested.
@@ -32060,21 +34792,100 @@ pub(crate) fn review_data_present(st: ReviewDataState, dir: &Path) -> bool {
 /// warning is queued to `warn_slot` (the events-centre bridge) — never a silent reset (N14). `warn_slot`
 /// is the same `Mutex` the op-results use; a corruption sets `err=true` (a red entry) but the message
 /// makes clear the file was PRESERVED.
-/// Returns `(cull map, rotation deltas, folder attrs)` — the rotations + v0.8.49 sort/resume attrs
-/// ride the SAME file; the legacy / corrupt / missing fallbacks carry no rotations (an empty map)
-/// and default attrs, so old installs load clean.
+/// Returns `(cull map, rotation deltas, folder attrs, what the read found)` — the rotations + v0.8.49
+/// sort/resume attrs ride the SAME file; every fallback opens empty (no ratings, no rotations) with
+/// default attrs.
+///
+/// R6 (1 November safety round): the fourth value says which fallback it was ([`ReviewLoad`]). No
+/// file, 0-byte debris and a damaged file that was set aside are `Absent`: the folder starts clean.
+/// A file that is there but can't be used (a read error, over the cap, or damaged and NOT set aside)
+/// is `Unresolved`: `apply_scan` marks the folder ([`note_review_load`]) and nothing is saved over
+/// the file. Text that isn't UTF-8 is a damaged file, not a missing one.
 ///
 /// v0.8.131 (F-P3 rule 7/8): the conversion's outcome decides WHICH file this reads, and a refusal
 /// raises ONE events-centre line for the folder open — load_selection is the single per-open door,
 /// so the warning cannot repeat with the peek/present probes around it.
 /// v0.8.134 (F-4): `st` is that outcome, resolved ONCE by the caller and shared with the `had_file`
 /// probe beside it — see [`review_data_present`].
+/// R1 (1 November safety round): the folder opens call [`load_selection_through_ledger`], which
+/// calls this when the process holds no unsaved bytes for the folder.
 pub(crate) fn load_selection(
     st: ReviewDataState,
     dir: &Path,
     warn_slot: &Mutex<Option<OpResult>>,
-) -> (BTreeMap<String, Sel>, BTreeMap<String, u8>, FolderAttrs) {
+) -> (BTreeMap<String, Sel>, BTreeMap<String, u8>, FolderAttrs, ReviewLoad) {
     let path = review_read_path_of(st, dir);
+    warn_if_conversion_refused(st, warn_slot);
+    let empty = |load| (BTreeMap::new(), BTreeMap::new(), FolderAttrs::default(), load);
+    // 4b byte cap: a selection JSON past SELECTION_MAX_BYTES is corrupt/hostile — it is not read, and
+    // (unlike the parse-failure arm, which renames it) never preserved-aside or overwritten. Log one
+    // honest line; the user's bytes are left untouched.
+    if selection_file_over_cap(&path) {
+        log_event(&format!(
+            "review-data: {} exceeds the {SELECTION_MAX_BYTES}-byte cap — not read, and nothing is saved over it (file left untouched)",
+            path.display()
+        ));
+        return empty(ReviewLoad::Unresolved(ReviewUnreadable::TooLarge));
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return empty(ReviewLoad::Absent),
+        Err(e) => {
+            log_event(&format!(
+                "review-data: couldn't read {} ({e}) — nothing is saved over it until it reads (file left untouched)",
+                path.display()
+            ));
+            return empty(ReviewLoad::Unresolved(ReviewUnreadable::ReadError));
+        }
+    };
+    let parsed = std::str::from_utf8(&bytes)
+        .map_err(|e| e.to_string())
+        .and_then(|txt| serde_json::from_str::<SelectionFile>(txt).map_err(|e| e.to_string()));
+    match parsed {
+        Ok(f) => {
+            log_event(&format!(
+                "review-data: loaded {} entries ({} rotations) from {}",
+                f.photos.len(),
+                f.rotations.len(),
+                path.display()
+            ));
+            (f.photos, f.rotations, FolderAttrs { sort: f.sort, resume_shot: f.resume_shot, panel_min: pack_panel_min(f.info_min, f.raw_min, f.info_view) }, ReviewLoad::Loaded)
+        }
+        Err(e) => {
+            // v0.8.131 (F-P3 rule 5): a ZERO-LENGTH file is debris, not a corruption — an
+            // abandoned conversion claim or a create that died before its first write. It gets
+            // no `.corrupt` sibling and no red events-centre entry: there is nothing to
+            // recover and nothing was lost. It reads exactly as an absent file.
+            if bytes.is_empty() {
+                log_event(&format!("review-data: {} is 0 bytes (debris) — read as absent, left alone", path.display()));
+                return empty(ReviewLoad::Absent);
+            }
+            // R6: a damaged file that can't be set aside stays where it is, and nothing is saved over
+            // it; `apply_scan` gives the amber warning (`review_unreadable_warning`).
+            let Some(bak) = preserve_corrupt_file(&path) else {
+                log_event(&format!(
+                    "review-data: PARSE FAILED for {} ({e}) and it couldn't be set aside — nothing is saved over it until it reads (file left untouched)",
+                    path.display()
+                ));
+                return empty(ReviewLoad::Unresolved(ReviewUnreadable::Damaged));
+            };
+            let name = bak.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            // Language packs (round 2): the events centre gets the marked sentence, the log the English.
+            let msg = tr_format!("Review data was unreadable — kept as {name} and starting fresh", name = name);
+            log_event(&format!(
+                "review-data: PARSE FAILED for {} ({e}) — Review data was unreadable — kept as {name} and starting fresh",
+                path.display()
+            ));
+            // The parse-failure arm stays RED (v0.8.134 / F-2): a file was moved aside.
+            *warn_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((msg, OpSeverity::Error, -1, None));
+            empty(ReviewLoad::Absent)
+        }
+    }
+}
+
+/// The refused-conversion warning, raised once per folder open by whichever read serves it
+/// ([`load_selection`] or [`load_selection_through_ledger`]).
+fn warn_if_conversion_refused(st: ReviewDataState, warn_slot: &Mutex<Option<OpResult>>) {
     if st.outcome == ReviewDataRename::Failed {
         // v0.8.134 (F-2): WARN, not success. This slot's second field used to be `err: bool` and
         // the drain mapped it `err ? error : SUCCESS`, so this line — "nothing was lost, and
@@ -32087,65 +34898,60 @@ pub(crate) fn load_selection(
             None,
         ));
     }
-    // 4b byte cap: a selection JSON past SELECTION_MAX_BYTES is corrupt/hostile — treat it as ABSENT
-    // (fall through to the legacy seed) WITHOUT preserving-aside or overwriting the on-disk file (unlike
-    // the parse-failure arm, which renames it). Log one honest line; the user's bytes are left untouched.
-    if selection_file_over_cap(&path) {
-        log_event(&format!(
-            "review-data: {} exceeds the {SELECTION_MAX_BYTES}-byte cap — treated as absent (file left untouched)",
-            path.display()
-        ));
-        return (legacy_seed(), BTreeMap::new(), FolderAttrs::default());
-    }
-    match std::fs::read_to_string(&path) {
-        Ok(txt) => match serde_json::from_str::<SelectionFile>(&txt) {
+}
+
+/// R1 (1 November safety round): THE folder-open read of review data. Both loaders (the sync
+/// `reload` and the async scan worker) call this, never [`load_selection`] directly.
+///
+/// A folder left while its last save was still queued, or after that save failed, has newer state
+/// in this process than on disk: the save record's unsaved bytes ([`LatestReview`]). They win over
+/// the file and are parsed exactly as the file would be. Without this, a quick A → B → A return read
+/// the older file, and the next save (a rating, or just the resume position) wrote it back over the
+/// newer one; a failed save's bytes were gone once the folder was left.
+///
+/// The fourth value is `true` when the bytes were used (`ScanDone::from_ledger`). `apply_scan` then
+/// starts the visit with a dirty baseline ([`adopted_baseline_stays_dirty`]), so the backstop and
+/// the final flush write them again whatever happens to the attempt they belong to. Nothing waits
+/// for the writer, and the record's lock is never held while parsing.
+///
+/// R6 (1 November safety round): the fifth value is what the read found ([`ReviewLoad`]). Unsaved
+/// bytes are `Loaded` and still win without touching the file; only the file's own read can be
+/// `Unresolved`, so a folder whose file couldn't be read never gets the dirty baseline above.
+pub(crate) fn load_selection_through_ledger(
+    st: ReviewDataState,
+    dir: &Path,
+    warn_slot: &Mutex<Option<OpResult>>,
+) -> (BTreeMap<String, Sel>, BTreeMap<String, u8>, FolderAttrs, bool, ReviewLoad) {
+    if let Some(bytes) = unsaved_review_bytes(dir) {
+        match serde_json::from_slice::<SelectionFile>(&bytes) {
             Ok(f) => {
+                warn_if_conversion_refused(st, warn_slot);
                 log_event(&format!(
-                    "review-data: loaded {} entries ({} rotations) from {}",
+                    "review-data: read {} entries ({} rotations) from this session's unsaved save for {}",
                     f.photos.len(),
                     f.rotations.len(),
-                    path.display()
+                    dir.display()
                 ));
-                (f.photos, f.rotations, FolderAttrs { sort: f.sort, resume_shot: f.resume_shot, panel_min: pack_panel_min(f.info_min, f.raw_min, f.info_view) })
+                let attrs = FolderAttrs { sort: f.sort, resume_shot: f.resume_shot, panel_min: pack_panel_min(f.info_min, f.raw_min, f.info_view) };
+                return (f.photos, f.rotations, attrs, true, ReviewLoad::Loaded);
             }
-            Err(e) => {
-                // v0.8.131 (F-P3 rule 5): a ZERO-LENGTH file is debris, not a corruption — an
-                // abandoned conversion claim or a create that died before its first write. It gets
-                // no `.corrupt` sibling and no red events-centre entry: there is nothing to
-                // recover and nothing was lost. It reads exactly as an absent file.
-                if std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(false) {
-                    log_event(&format!("review-data: {} is 0 bytes (debris) — read as absent, left alone", path.display()));
-                    return (legacy_seed(), BTreeMap::new(), FolderAttrs::default());
-                }
-                let preserved = preserve_corrupt_file(&path);
-                let kept = preserved
-                    .as_ref()
-                    .map(|bak| bak.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-                // Language packs (round 2): the events centre gets the marked sentence, the log the English.
-                let (msg, msg_en) = match &kept {
-                    Some(name) => (
-                        tr_format!("Review data was unreadable — kept as {name} and starting fresh", name = name),
-                        format!("Review data was unreadable — kept as {name} and starting fresh"),
-                    ),
-                    None => (
-                        i18n::tr("Review data was unreadable — couldn't preserve it; starting fresh").to_string(),
-                        "Review data was unreadable — couldn't preserve it; starting fresh".to_string(),
-                    ),
-                };
-                log_event(&format!("review-data: PARSE FAILED for {} ({e}) — {msg_en}", path.display()));
-                // The parse-failure arm stays RED (v0.8.134 / F-2): a file was moved aside.
-                *warn_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((msg, OpSeverity::Error, -1, None));
-                (legacy_seed(), BTreeMap::new(), FolderAttrs::default())
-            }
-        },
-        Err(_) => {
-            let seed = legacy_seed();
-            if !seed.is_empty() {
-                log_event(&format!("review-data: no {SELECTION_FILE} in folder — seeded {} legacy ratings", seed.len()));
-            }
-            (seed, BTreeMap::new(), FolderAttrs::default())
+            // Never expected (Falcon serialized them); the file is the only other answer.
+            Err(e) => log_event(&format!("review-data: unsaved save for {} did not parse ({e}) — reading the file", dir.display())),
         }
     }
+    let (map, rotations, attrs, load) = load_selection(st, dir, warn_slot);
+    (map, rotations, attrs, false, load)
+}
+
+/// R1 (1 November safety round): does this landing's review baseline start DIRTY? Only when its map
+/// came from unsaved bytes ([`load_selection_through_ledger`]) and photos landed (an empty landing
+/// leaves `cur_dir` on the previous folder, whose file must not receive this one's entries). A fresh
+/// visit forces it. A same-folder landing never forces one, because its live state is carried and was
+/// just flushed, but keeps one it inherited: a photo-first open's later batches land as same-folder
+/// rescans of the visit the first batch started (`baseline` is still empty until a save advances it).
+#[must_use]
+pub(crate) fn adopted_baseline_stays_dirty(from_ledger: bool, has_photos: bool, same_folder: bool, baseline: &str) -> bool {
+    from_ledger && has_photos && (!same_folder || baseline.is_empty())
 }
 
 /// v0.8.49: read-only PEEK at a folder's selection JSON for the boot-path sort (the photos map feeds
@@ -33334,6 +36140,148 @@ pub(crate) fn moved_to_rejected_text(n: usize) -> String {
     tr_plural!(n, "Moved {n} file(s) → ./Rejected", "Moved {n} file(s) → ./Rejected")
 }
 
+// ─── Fix round 1 (1 November, CS-26, owner: "Carry the side files"): THE SIDE FILES TRAVEL ─────
+// Apply rotations keeps a RAW's (or a HEIC's, PNG's, TIFF's, WebP's) turn in its XMP sidecar, and
+// XMP sync keeps the stars there. Copy picks and Move rejected used to take only the photo files,
+// so ./Picks showed those photos unturned and Move left `IMG.xmp` behind in the shoot folder. Each
+// copied or moved file now takes its own sidecar along, through the photos' own steps.
+
+/// THE XMP SIDECAR THAT BELONGS TO ONE TRANSFERRED FILE of `s`: the RAW slot takes the basename
+/// form (`IMG_1.CR3` → `IMG_1.xmp`), the finished slot the full-name form (`IMG_1.JPG` →
+/// `IMG_1.JPG.xmp`) — exactly the names read, Apply, XMP sync and Delete use (`sidecar_path_for`).
+/// Decided by the SLOT, never by the extension (L42). Another program's `IMG_1.CR3.xmp`, or an
+/// `IMG_1.xmp` beside a JPEG-only photo, is never Falcon's and never travels.
+pub(crate) fn side_file_of(s: &Shot, src: &Path) -> PathBuf {
+    falcon_decode::sidecar_path_for(src, s.raw.as_deref() == Some(src))
+}
+
+/// What happened to one transferred file's sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SideCarry {
+    /// The file has none (most photos).
+    NoneThere,
+    Carried,
+    /// A byte-identical copy was already at the destination (two same-stem RAWs share one) — log only.
+    AlreadyThere,
+    /// It could not be carried, or a different one already sits at the destination (left untouched).
+    /// Counted into the result line's sidecar clause.
+    NotCarried,
+}
+
+/// True when both files can be read (each within the 4 MB sidecar read cap, `XMP_READ_CAP`) and
+/// hold the same bytes. Over the cap or unreadable counts as different.
+fn side_files_identical(a: &Path, b: &Path) -> bool {
+    const CAP: u64 = 4 * 1024 * 1024;
+    let read = |p: &Path| -> Option<Vec<u8>> {
+        let mut v = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(std::fs::File::open(p).ok()?, CAP + 1), &mut v).ok()?;
+        (v.len() as u64 <= CAP).then_some(v)
+    };
+    matches!((read(a), read(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// Carry the sidecar `src_sc` into `dest`, through the photos' own steps: the interrupted-copy
+/// recovery (`part_blocks_claim`), an exclusive claim (`claim_new`, never overwriting), then `.part`
+/// and rename (or the move's rename). Called only right after its own file was copied or moved in
+/// this run — never for a re-copy that skips a photo already there (fix round 1 plan) — and with no
+/// cancel poll in between: the sidecar belongs to its file's step. A carried MOVE returns its pair
+/// for the Undo record.
+fn carry_side_file(src_sc: &Path, dest: &Path, move_files: bool) -> (SideCarry, Option<(PathBuf, PathBuf)>) {
+    let verb = if move_files { "move" } else { "copy" };
+    match std::fs::symlink_metadata(src_sc) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (SideCarry::NoneThere, None),
+        Err(e) => {
+            log_event(&format!("export: side file NOT carried {} ({e})", src_sc.display()));
+            return (SideCarry::NotCarried, None);
+        }
+        Ok(m) if !m.file_type().is_file() => {
+            log_event(&format!("export: side file NOT carried {} — not a regular file", src_sc.display()));
+            return (SideCarry::NotCarried, None);
+        }
+        Ok(_) => {}
+    }
+    let Some(name) = src_sc.file_name() else { return (SideCarry::NoneThere, None) };
+    let to_sc = dest.join(name);
+    if part_blocks_claim(src_sc, &to_sc) {
+        log_event(&format!(
+            "export: side file NOT carried {} — temporary destination needs attention; output not replaced",
+            to_sc.display()
+        ));
+        return (SideCarry::NotCarried, None);
+    }
+    match claim_new(&to_sc) {
+        Ok(claimed) => {
+            let res = if move_files {
+                move_via_part(src_sc, &to_sc, claimed)
+            } else {
+                drop(claimed); // the reservation stays on disk; the marker's rename replaces it
+                copy_via_part(src_sc, &to_sc)
+            };
+            match res {
+                Ok(()) => {
+                    log_event(&format!("export: {verb} side file {} → {}", src_sc.display(), to_sc.display()));
+                    let pair = move_files.then(|| (src_sc.to_path_buf(), to_sc));
+                    (SideCarry::Carried, pair)
+                }
+                Err(e) => {
+                    // Only our own reservation is ours to remove (as for the photos).
+                    let _ = std::fs::remove_file(&to_sc);
+                    log_event(&format!("export: side file NOT carried {} → {} ({e})", src_sc.display(), to_sc.display()));
+                    (SideCarry::NotCarried, None)
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !move_files && side_files_identical(src_sc, &to_sc) {
+                log_event(&format!("export: side file already there (identical) {}", to_sc.display()));
+                (SideCarry::AlreadyThere, None)
+            } else {
+                log_event(&format!(
+                    "export: side file NOT carried {} — a different file is already at {}; left untouched, nothing was overwritten",
+                    src_sc.display(),
+                    to_sc.display()
+                ));
+                (SideCarry::NotCarried, None)
+            }
+        }
+        Err(e) => {
+            log_event(&format!("export: side file NOT carried — cannot claim {} ({e})", to_sc.display()));
+            (SideCarry::NotCarried, None)
+        }
+    }
+}
+
+/// Undo move tells a sidecar pair from a photo pair by its name: a sidecar's identity IS its name in
+/// Falcon (`sidecar_path_for` is pure name arithmetic), and no photo file is `.xmp` (neither the RAW
+/// list nor the finished-image formats contain it; `no_photo_extension_is_a_side_file` pins that).
+pub(crate) fn is_side_file(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("xmp"))
+}
+
+/// Which result line a sidecar clause joins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SideVerb {
+    Copied,
+    Moved,
+    Restored,
+}
+
+/// The owner's clause (1 November, "XMP sidecar"): sidecars that did not travel, one counted message
+/// per result line, separator included; empty for zero. Not an error colour on its own: the photos
+/// themselves arrived, like "need attention".
+pub(crate) fn clause_side_files(n: usize, verb: SideVerb) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    match verb {
+        SideVerb::Copied => tr_plural!(n, " · {n} XMP sidecar not copied (see log)", " · {n} XMP sidecars not copied (see log)"),
+        SideVerb::Moved => tr_plural!(n, " · {n} XMP sidecar not moved (see log)", " · {n} XMP sidecars not moved (see log)"),
+        SideVerb::Restored => {
+            tr_plural!(n, " · {n} XMP sidecar not restored (see log)", " · {n} XMP sidecars not restored (see log)")
+        }
+    }
+}
+
 /// v1.0.0-rc (queue item 27, sheet 2.2b, OWNER RULING) — **the copy sentence's clause for a delivered
 /// file this PC cannot open.**
 ///
@@ -33382,6 +36330,10 @@ pub(crate) fn unopenable_clause(n: usize, fmts: &std::collections::BTreeSet<Stri
 ///
 /// The unopenable pair sits WITH the other counted pair rather than after `ops`, because `ops` is the
 /// one element that is not a tally.
+///
+/// Fix round 1 (1 November, CS-26): `(side_carried, side_not)` joins before `ops` — XMP sidecars
+/// carried and not carried. The other counts stay counts of photo files; a carried MOVE sidecar's
+/// pair follows its photo's pair in `ops`.
 pub(crate) type ExportTally = (
     usize,
     usize,
@@ -33390,6 +36342,7 @@ pub(crate) type ExportTally = (
     usize,
     (usize, usize),
     (usize, std::collections::BTreeSet<String>),
+    (usize, usize),
     Vec<(PathBuf, PathBuf)>,
 );
 
@@ -33413,11 +36366,11 @@ pub(crate) fn export_marked(
     let dest = dir.join(subfolder);
     if let Err(e) = std::fs::create_dir_all(&dest) {
         log_event(&format!("export: cannot create {} ({e})", dest.display()));
-        return (0, 0, 1, 0, 0, (0, 0), (0, std::collections::BTreeSet::new()), Vec::new());
+        return (0, 0, 1, 0, 0, (0, 0), (0, std::collections::BTreeSet::new()), (0, 0), Vec::new());
     }
     if !is_safe_dir(&dest) {
         log_event(&format!("export: refusing — {} is not a real directory (symlink/junction?)", dest.display()));
-        return (0, 0, 1, 0, 0, (0, 0), (0, std::collections::BTreeSet::new()), Vec::new());
+        return (0, 0, 1, 0, 0, (0, 0), (0, std::collections::BTreeSet::new()), (0, 0), Vec::new());
     }
     log_event(&format!("export: {verb} marked photos → {}", dest.display()));
     // v0.8.131 (F-P9): the DESTINATION's own record, read ONCE, before the loop. It is
@@ -33440,6 +36393,8 @@ pub(crate) fn export_marked(
     // an already-present file was told the first time, and a copy that FAILED delivered nothing to be
     // unable to open.
     let (mut unopenable, mut unopenable_fmts) = (0usize, std::collections::BTreeSet::<String>::new());
+    // Fix round 1 (1 November, CS-26): XMP sidecars carried with their files, and not carried.
+    let (mut side_carried, mut side_not) = (0usize, 0usize);
     // Successful (src → dest) pairs — the MOVE caller keeps these so a mis-reject can be UNDONE (#11).
     let mut ops: Vec<(PathBuf, PathBuf)> = Vec::new();
     // v0.8.128 (A1.3): what the batch did NOT get to, for the one honest cancellation line. A user
@@ -33474,8 +36429,9 @@ pub(crate) fn export_marked(
                 continue;
             }
             // v0.8.128 (A1.3): the safe boundary is BETWEEN files. Polled here rather than per shot
-            // so a RAW+JPG pair's second file is not started after the quit either. Windows never
-            // sets this flag (nothing there raises it), so the arm is inert on that trunk.
+            // so a RAW+JPG pair's second file is not started after the quit either. Fix round 1
+            // (1 November): every exit raises it now, on both platforms; a file's own XMP sidecar
+            // is carried inside that file's step below, never across this poll.
             if cancel.load(Ordering::Relaxed) {
                 cancelled = true;
                 unfinished += 1;
@@ -33603,6 +36559,18 @@ pub(crate) fn export_marked(
                     // later compares against the wrong file (H9).
                     mrecs.push((fname_s, ManifestOutcome::Ok, stat_rec(&to)));
                     log_event(&format!("export: {verb} {} → {}", src.display(), to.display()));
+                    // Fix round 1 (1 November, CS-26): this file's own XMP sidecar goes with it, here,
+                    // with no cancel poll in between. Never counted into `ok`, never in the manifest;
+                    // a moved one's pair follows its photo's pair, for Undo.
+                    let (carry, pair) = carry_side_file(&side_file_of(s, src), &dest, move_files);
+                    match carry {
+                        SideCarry::Carried => side_carried += 1,
+                        SideCarry::NotCarried => side_not += 1,
+                        SideCarry::NoneThere | SideCarry::AlreadyThere => {}
+                    }
+                    if let Some(pair) = pair {
+                        ops.push(pair);
+                    }
                 }
                 Err(e) => {
                     // Only our final reservation is ours to remove. copy_via_part
@@ -33621,7 +36589,8 @@ pub(crate) fn export_marked(
         }
     }
     log_event(&format!(
-        "export: done — {ok} {verb}d, {skipped} skipped, {failed} failed, {no_content} no-content, {attention} need attention"
+        "export: done — {ok} {verb}d, {skipped} skipped, {failed} failed, {no_content} no-content, {attention} need attention, \
+         {side_carried} side file(s) carried, {side_not} not carried"
     ));
     if cancelled {
         // The next-launch-no-explanation hole: ONE line naming what stopped and where it stopped.
@@ -33636,7 +36605,7 @@ pub(crate) fn export_marked(
     if manifest && !mrecs.is_empty() {
         write_export_manifest(&dest, &mrecs);
     }
-    (ok, skipped, failed, no_content, attention, (diverged_dest, diverged_src), (unopenable, unopenable_fmts), ops)
+    (ok, skipped, failed, no_content, attention, (diverged_dest, diverged_src), (unopenable, unopenable_fmts), (side_carried, side_not), ops)
 }
 
 
@@ -33651,50 +36620,79 @@ pub(crate) fn export_marked(
 /// quit, a crash or a power cut mid-copy left a SHORT file wearing the original photograph's name,
 /// back in the user's folder, indistinguishable from the real thing. Through the marker the bytes
 /// land in `<from>.part` and only a completed, fsynced file is renamed onto our own placeholder.
-pub(crate) fn undo_moves(moves: &[(PathBuf, PathBuf)]) -> (usize, usize, usize) {
-    let (mut ok, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-    log_event(&format!("undo-move: restoring {} file(s)", moves.len()));
-    for (from, to) in moves.iter().rev() {
-        if !to.exists() {
-            log_event(&format!("undo-move: source gone (skipped) {}", to.display()));
-            skipped += 1;
-            continue;
-        }
-        // Claim the ORIGINAL path atomically — never clobber a file that reappeared there since.
-        // The handle is handed to `move_via_part`, which owns it from here (it drops it up front:
-        // the reservation stays on disk as the 0-byte file the rename replaces).
-        if part_blocks_claim(to, from) {
-            failed += 1;
-            log_event(&format!("undo-move: temporary destination needs attention; output not replaced {}", from.display()));
-            continue;
-        }
-        let claimed = match claim_new(from) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                log_event(&format!("undo-move: original exists (skipped) {}", from.display()));
-                skipped += 1;
-                continue;
-            }
-            Err(e) => {
-                log_event(&format!("undo-move: cannot claim {} ({e})", from.display()));
-                failed += 1;
-                continue;
-            }
-        };
-        match move_via_part(to, from, claimed) {
-            Ok(_) => {
-                ok += 1;
-                log_event(&format!("undo-move: {} → {}", to.display(), from.display()));
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(from); // drop the empty placeholder we claimed
-                failed += 1;
-                log_event(&format!("undo-move: FAILED {} → {} ({e})", to.display(), from.display()));
-            }
+///
+/// Fix round 1 (1 November, CS-26): the record also holds the XMP sidecars the move carried. Photo
+/// files are restored first, then the sidecars, so a sidecar never comes back before its photo. The
+/// three counts stay counts of photo files; the fourth is the sidecars not restored (a sidecar whose
+/// ./Rejected copy is gone is logged only).
+pub(crate) fn undo_moves(moves: &[(PathBuf, PathBuf)]) -> (usize, usize, usize, usize) {
+    let (mut ok, mut skipped, mut failed, mut side_not) = (0usize, 0usize, 0usize, 0usize);
+    let (sides, photos): (Vec<_>, Vec<_>) = moves.iter().partition(|(from, _)| is_side_file(from));
+    log_event(&format!("undo-move: restoring {} file(s) and {} side file(s)", photos.len(), sides.len()));
+    for (from, to) in photos.into_iter().rev() {
+        match undo_one_move(from, to) {
+            UndoStep::Restored => ok += 1,
+            UndoStep::Gone | UndoStep::Exists => skipped += 1,
+            UndoStep::Failed => failed += 1,
         }
     }
-    log_event(&format!("undo-move: done — {ok} restored, {skipped} skipped, {failed} failed"));
-    (ok, skipped, failed)
+    for (from, to) in sides.into_iter().rev() {
+        match undo_one_move(from, to) {
+            UndoStep::Restored | UndoStep::Gone => {}
+            UndoStep::Exists | UndoStep::Failed => side_not += 1,
+        }
+    }
+    log_event(&format!(
+        "undo-move: done — {ok} restored, {skipped} skipped, {failed} failed, {side_not} side file(s) not restored"
+    ));
+    (ok, skipped, failed, side_not)
+}
+
+/// One pair's outcome in [`undo_moves`].
+enum UndoStep {
+    Restored,
+    /// The ./Rejected copy is gone.
+    Gone,
+    /// The original name is taken again (never clobbered).
+    Exists,
+    Failed,
+}
+
+/// Move one recorded file back (`to` → `from`) — the body `undo_moves` always had, per pair.
+fn undo_one_move(from: &Path, to: &Path) -> UndoStep {
+    if !to.exists() {
+        log_event(&format!("undo-move: source gone (skipped) {}", to.display()));
+        return UndoStep::Gone;
+    }
+    // Claim the ORIGINAL path atomically — never clobber a file that reappeared there since.
+    // The handle is handed to `move_via_part`, which owns it from here (it drops it up front:
+    // the reservation stays on disk as the 0-byte file the rename replaces).
+    if part_blocks_claim(to, from) {
+        log_event(&format!("undo-move: temporary destination needs attention; output not replaced {}", from.display()));
+        return UndoStep::Failed;
+    }
+    let claimed = match claim_new(from) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            log_event(&format!("undo-move: original exists (skipped) {}", from.display()));
+            return UndoStep::Exists;
+        }
+        Err(e) => {
+            log_event(&format!("undo-move: cannot claim {} ({e})", from.display()));
+            return UndoStep::Failed;
+        }
+    };
+    match move_via_part(to, from, claimed) {
+        Ok(_) => {
+            log_event(&format!("undo-move: {} → {}", to.display(), from.display()));
+            UndoStep::Restored
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(from); // drop the empty placeholder we claimed
+            log_event(&format!("undo-move: FAILED {} → {} ({e})", to.display(), from.display()));
+            UndoStep::Failed
+        }
+    }
 }
 
 /// W3d: how many top-level FILES does `<dir>/Rejected` hold? Drives the Empty button's enabled
@@ -35191,6 +38189,16 @@ pub(crate) fn export_web_run_with_decoder(
         // The narrower question is asked first. A PASSENGER is untouched by the order: the RAW is
         // its picture, so `mint_finished` gives it `kind == Jpeg`, never `Unsupported`, and it
         // still lands in the RAW-only arm below — which is the owner's default for that bucket.
+        //
+        // Open-time check (2 November): a pick nobody has viewed carries only its name, so its bytes
+        // decide these arms here. Not a file made online-only since the answer: the last look below
+        // reports that one, and opening it here would download it.
+        let checked = if s.jpg.as_deref().is_some_and(|p| !cloud_ok.contains(&i) && is_cloud(p)) {
+            std::borrow::Cow::Borrowed(s)
+        } else {
+            falcon_decode::shot_by_bytes(s)
+        };
+        let s: &Shot = &checked;
         if s.is_unsupported() {
             unsupported += 1;
             log_event(&format!("web-export: skip (unsupported format) {}", s.name));
@@ -35569,18 +38577,17 @@ pub(crate) enum UndoEntry {
     /// "Rating"). One entry = one cap slot through the SHARED `push_undo_bulk`, so a 300-photo bulk
     /// flag can never flood the 500-entry stack and can never need 300 Ctrl+Z presses.
     ///
-    /// RAW-INDEX ADDRESSED, DELIBERATELY, AND IT DEPENDS ON A CLEAR. Like `Cull` this entry carries
-    /// no generation and no name, because the stack offers no survival guarantee: `apply_scan` wipes
-    /// `UndoRedo` UNCONDITIONALLY, and every post-op rescan and sort pick re-enters it -- so an entry
-    /// can never outlive a re-index. IF A FUTURE ROUND EVER MAKES THE STACK SURVIVE A SAME-FOLDER
-    /// RESCAN, `Bulk` BECOMES A MASS MIS-WRITE and must gain name identity in the same change.
-    /// Stated here, at the enum, because this is the only place a reader of that future change is
-    /// guaranteed to look.
+    /// RAW-INDEX ADDRESSED, AND A LIST CHANGE MOVES IT. Like `Cull` this entry carries no generation
+    /// and no name. Keeping prepared work (2 November): the stack now survives a same-folder rescan,
+    /// and what stops `Bulk` being a mass mis-write is `photo_open::remap_history`, which moves every
+    /// index by exact file identity in the same `apply_scan` call as the list swap (the only place
+    /// positions change). When the carry is refused, `apply_scan` wipes the stack as it always did,
+    /// so an unmapped entry can never survive. Stated here, at the enum, because this is the only
+    /// place a reader of a future change to that is guaranteed to look.
     ///
-    /// HONEST LIMITATION (accepted): "one Ctrl+Z reverts all N" is FALSE ACROSS A DELETE. The
-    /// delete's own rescan wipes this stack and Ctrl+Z then routes to delete-recovery. That is
-    /// exactly what single-shot edits do today -- not a regression -- and the recovery arm must NOT
-    /// be disturbed: anything left on the stack across a delete would silently disable it.
+    /// HONEST LIMITATION (accepted): a group drops whole if any member left the list, never trimmed:
+    /// rate 12, delete one of them, and that one Ctrl+Z is gone for all 12, while the stars stay. The
+    /// delete's own record still wins Ctrl+Z, because its stamp is newer (`live_undo_arm`).
     // WAVE 1 SHIPS THE ENTRY, WAVE 2 PRODUCES IT: the pop arms (main.rs on_undo / on_redo) and the
     // unit table exercise it now; `push_undo_bulk`'s callers are the bulk flag / reject / rate
     // operations, which land next round. The allow goes away with them.
@@ -35613,11 +38620,12 @@ pub(crate) enum UndoEntry {
 ///
 /// Falcon's reversible history is not one stack. It is this stack (cull + rotation + bulk) plus
 /// TWO single-slot records that live outside it — the delete record ([`DeleteRecord`], v0.8.37)
-/// and the move record (`main.rs::last_move`, #11) — because both of those ops end in a re-scan
-/// and `apply_scan` replaces `UndoRedo` UNCONDITIONALLY on every scan ("undo + redo history is
-/// per-folder"). v0.8.37's A2 rule ordered the stack against the delete record by a PROXY:
+/// and the move record (`main.rs::last_move`, #11) — because both of those ops end in a re-scan.
+/// v0.8.37's A2 rule ordered the stack against the delete record by a PROXY:
 /// *"an empty stack + a live delete record means the delete is the latest reversible action"* —
-/// true exactly because the delete's own re-scan is what emptied the stack.
+/// true back then because the delete's own re-scan emptied the stack. Keeping prepared work
+/// (2 November): a same-folder re-scan now keeps the stack by file, with these stamps unchanged,
+/// so Recover still comes first and the older stars follow it.
 ///
 /// THE PROXY CANNOT ORDER THE TWO RECORDS AGAINST EACH OTHER, and v0.8.186 puts moves on Ctrl+Z,
 /// so it now has to. "Delete a photo, then Move rejected" and "Move rejected, then delete a
@@ -35629,7 +38637,7 @@ pub(crate) enum UndoEntry {
 /// So every undoable act takes a stamp off ONE monotonic counter (`main.rs::next_act_seq`) and
 /// the three histories are ordered by comparing stamps — A2's "most-recent undoable op"
 /// implemented exactly rather than approximated (see [`undo_arm`]). The counter lives in `main`,
-/// NOT in this struct: `apply_scan` replaces the whole `UndoRedo`, and a counter reset there
+/// NOT in this struct: `apply_scan` replaces the whole `UndoRedo` at a folder change, and a counter reset there
 /// would let a fresh post-scan edit claim a LOWER number than the delete record that survived
 /// the scan — the records are deliberately not cleared by it.
 pub(crate) struct Act {
@@ -35638,7 +38646,8 @@ pub(crate) struct Act {
     pub(crate) entry: UndoEntry,
 }
 
-/// Undo + redo stacks (interleaved cull + rotation edits). Cleared on folder swap.
+/// Undo + redo stacks (interleaved cull + rotation edits). Cleared on folder swap, kept by file
+/// across a same-folder rescan (`photo_open::remap_history`).
 #[derive(Default)]
 pub(crate) struct UndoRedo {
     pub(crate) undo: Vec<Act>,
@@ -35733,8 +38742,8 @@ pub(crate) fn act_turns_name(a: &Act, name: &str) -> bool {
 }
 
 /// v0.8.129 (W1-0): the ONE sentence a grouped revert / re-apply prints -- with an HONEST applied
-/// count. An index that is out of range when the entry pops (it cannot happen while `apply_scan`
-/// clears the stack, but the walk is written not to depend on that) is skipped and SAID, rather
+/// count. An index that is out of range when the entry pops (it cannot happen while
+/// `photo_open::remap_history` moves the stack, but the walk is written not to depend on that) is skipped and SAID, rather
 /// than counted as done. Pure -> table-tested.
 ///
 /// Language packs (round 2): `verb` (the bulk family — "Rating", "Clear", "Flag", "Reject",
@@ -35860,14 +38869,6 @@ pub(crate) fn sync_cull_ui(a: &MainWindow, rating: i32, mark: u8) {
     a.set_flagged(mark & MARK_FLAG != 0);
     a.set_rejected(mark & MARK_REJECT != 0);
 }
-pub(crate) fn legacy_seed() -> BTreeMap<String, Sel> {
-    load_ratings()
-        .into_iter()
-        .filter(|(_, r)| *r > 0)
-        .map(|(name, r)| (name, Sel { rating: r.clamp(0, 5) as u8, flag: false, reject: false }))
-        .collect()
-}
-
 /// Write the folder's selection atomically into the folder itself. Returns the entry count
 /// written or an error string for the UI; logs failures (the folder may be read-only — e.g.
 /// a locked SD card — which must not crash or silently lose data).
@@ -35876,8 +38877,27 @@ pub(crate) fn save_selection(
     map: &BTreeMap<String, Sel>,
     rotations: &BTreeMap<String, u8>,
     attrs: &FolderAttrs, // v0.8.49: sort/resume attrs ride the same file — EVERY writer must pass the live ones or a flush would erase them
-) -> Result<usize, String> {
+) -> Result<usize, ReviewSaveError> {
     save_selection_via(dir, map, rotations, attrs, enqueue_review_data)
+}
+
+/// R6 (1 November safety round): why a review save did not reach the writer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReviewSaveError {
+    /// The folder's review file couldn't be read when it was opened ([`ReviewLoad::Unresolved`]),
+    /// so nothing is saved over it. The open already warned; callers show nothing more.
+    Unreadable,
+    /// Serializing or queueing the save failed.
+    Failed(String),
+}
+impl std::fmt::Display for ReviewSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Log text only (English): `flush_sel` shows no notice for it.
+            Self::Unreadable => f.write_str("not saved: the folder's review data couldn't be read when it was opened, so it is left untouched"),
+            Self::Failed(e) => f.write_str(e),
+        }
+    }
 }
 
 /// Issue #11 batch B1 (the owner's plan): does a FINAL flush (shutdown, folder switch) write? Only if
@@ -35900,7 +38920,7 @@ pub(crate) fn final_review_flush(
     attrs: &FolderAttrs,
     baseline: &RefCell<String>,
     enqueue: impl FnOnce(&Path, Vec<u8>) -> std::io::Result<()>,
-) -> Result<bool, String> {
+) -> Result<bool, ReviewSaveError> {
     let j = selection_dirty_json(map, rotations, attrs);
     let unsure = matches!(review_final_status(dir), Some(ReviewSaveStatus::Pending | ReviewSaveStatus::Failed));
     if !final_flush_needed(*baseline.borrow() != j, unsure) {
@@ -35920,9 +38940,22 @@ fn save_selection_via(
     rotations: &BTreeMap<String, u8>,
     attrs: &FolderAttrs,
     enqueue: impl FnOnce(&Path, Vec<u8>) -> std::io::Result<()>,
-) -> Result<usize, String> {
+) -> Result<usize, ReviewSaveError> {
     if dir.as_os_str().is_empty() {
         return Ok(0);
+    }
+    // R6 (1 November safety round): THE choke point every review save passes (the tick's flush,
+    // both final flushes, the rotation-apply flush, the rescue flush). A folder whose review file
+    // couldn't be read at its open is never written: its changes stay in memory, and reopening
+    // the folder reads the file again ([`note_review_load`]). Logged once; no retry, no wait.
+    if let Some(first) = review_save_refused(dir) {
+        if first {
+            log_event(&format!(
+                "review-data: changes in {} are kept in memory only — its review data couldn't be read when it was opened, so nothing is saved over it",
+                dir.display()
+            ));
+        }
+        return Err(ReviewSaveError::Unreadable);
     }
     // v0.3.61: keep folders CLEAN — never CREATE a selection JSON for a folder with no cull state
     // (no ratings/flags/rejects, no moved-out entries) AND no manual rotations (v0.8.0). If a file
@@ -35932,7 +38965,12 @@ fn save_selection_via(
     // whose conversion was refused already has a review file, and skipping the write because the
     // NEW name is absent would have dropped the session's edits on the floor. No conversion runs
     // here: the save path never converts (that is the read side's job, once per folder open).
-    if map.is_empty() && rotations.is_empty() && !review_data_exists(dir) {
+    // Safety round review R1 (1 November): …nor a folder whose newest save is still queued or failed
+    // ([`review_save_unsettled`]). Its unsaved bytes are what the next open reads, so clearing the last
+    // mark must replace them, and the writer's queue lands this empty state after any older queued
+    // write. Asked BEFORE the file: a write lands before it releases its bytes, so once none are held
+    // the file is already there.
+    if map.is_empty() && rotations.is_empty() && !review_save_unsettled(dir) && !review_data_exists(dir) {
         return Ok(0);
     }
     let file = SelectionFile {
@@ -35949,14 +38987,14 @@ fn save_selection_via(
         // v0.8.138 (X3): …and the third element becomes its own new key.
         info_view: attrs.panel_min.map(|(_, _, v)| v),
     };
-    let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&file).map_err(|e| ReviewSaveError::Failed(e.to_string()))?;
     // v0.8.36: enqueue onto the background writer (durable fsync OFF the UI thread — the smoothness
     // foundation). A disk/read-only/locked failure is now surfaced ASYNC by the writer (log_event +
     // events centre, after a retry) rather than returned here; `Ok(count)` means the payload is safely
     // queued (or, if the writer isn't up — early boot / a unit test — synchronously durably written).
     // v0.8.131 (F-P3 rule 6): addressed by FOLDER — the writer thread picks the file name from
     // on-disk facts at write time (see `WriteMsg::ReviewData`).
-    enqueue(dir, json.into_bytes()).map_err(|e| e.to_string())?;
+    enqueue(dir, json.into_bytes()).map_err(|e| ReviewSaveError::Failed(e.to_string()))?;
     Ok(map.len())
 }
 /// v0.8.36 (ITEM 2): a corrupt-settings warning stashed at load (before the events centre exists) and
@@ -36231,16 +39269,6 @@ fn enqueue_settings(
 pub(crate) fn settings_final_save_needed(baseline: &str, s: &Settings, status: Option<ReviewSaveStatus>) -> bool {
     let changed = serde_json::to_string_pretty(s).map_or(true, |j| j != baseline);
     final_flush_needed(changed, matches!(status, Some(ReviewSaveStatus::Pending | ReviewSaveStatus::Failed)))
-}
-/// Ratings persist keyed by filename (`%LOCALAPPDATA%\Falcon\ratings.json`) so they
-/// survive re-scans / reordering, unlike a positional index.
-pub(crate) fn load_ratings() -> HashMap<String, i32> {
-    config_dir()
-        .map(|d| d.join("ratings.json"))
-        .filter(|p| !config_file_over_cap(p, "ratings")) // v0.8.151: the cap its two peers have
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
 }
 /// v0.8.66 (C3 audit): is this char one of Slint's Private-Use-Area special-key sentinels
 /// (U+E000..=U+F8FF)? Slint 1.17 delivers arrows Up/Down, PageUp/PageDown, Insert, the F-keys, etc.
@@ -37133,8 +40161,13 @@ pub(crate) fn edit_say_route(notif_open: bool) -> EditSay {
 /// publish (the per-row and header pills' gate), `on_undo_move`'s own re-check, and — new this
 /// round — [`undo_arm`]'s move candidate. The three used to be three hand-copies of `!p.is_empty()
 /// && *f == *cur_dir`; adding a fourth reader is exactly how L21/L26 defects start. Pure.
-pub(crate) fn move_undo_live(folder_tag: &str, pairs: usize, cur_dir: &str) -> bool {
-    pairs > 0 && folder_tag == cur_dir
+///
+/// 1.1.x (safety round R2): the open folder is `scanned_dir`, the folder ON SCREEN, not `cur_dir`
+/// (the last folder that had photos, kept for next-launch memory). An empty landing or a plain
+/// launch leaves `cur_dir` on the previous folder, so keying here on it offered — and performed —
+/// an Undo move in a folder the user had left. Every reader passes `scanned_dir` now.
+pub(crate) fn move_undo_live(folder_tag: &str, pairs: usize, scanned_dir: &str) -> bool {
+    pairs > 0 && folder_tag == scanned_dir
 }
 
 /// v0.8.186 (U1) — **WHICH HISTORY Ctrl+Z REACHES**, and the stamp of the act it would reverse.
@@ -37198,17 +40231,19 @@ pub(crate) fn undo_arm(
 /// they are not two mirrors of one rule, they are one call. The gates are the shared predicates
 /// the handlers themselves guard with: `recover_offer_live` for the delete record (the M6 rule)
 /// and [`move_undo_live`] for the move record (#11's folder tag).
+///
+/// 1.1.x (safety round R2): ONE folder for both records — the folder on screen. The move arm used
+/// to take a second `cur_dir` parameter, which an empty landing leaves on the previous folder.
 pub(crate) fn live_undo_arm(
     undo_top: Option<u64>,
     delete_rec: Option<(&str, u64)>,
     scanned_dir: &str,
     move_rec: Option<(&str, usize, u64)>,
-    cur_dir: &str,
 ) -> Option<UndoArm> {
     undo_arm(
         undo_top,
         delete_rec.filter(|(d, _)| recover_offer_live(d, scanned_dir)).map(|(_, s)| s),
-        move_rec.filter(|(f, p, _)| move_undo_live(f, *p, cur_dir)).map(|(_, _, s)| s),
+        move_rec.filter(|(f, p, _)| move_undo_live(f, *p, scanned_dir)).map(|(_, _, s)| s),
     )
 }
 
@@ -37272,8 +40307,8 @@ pub(crate) fn seq_row_index(rows: impl Iterator<Item = Option<u64>>, target: Opt
 /// `bulk_done_sentence` / `bulk_rate_done` for the grouped acts — verbatim, including the "Unmarked"
 /// word for a Clear, so the pinned row reads exactly like the toast the same act raises.
 ///
-/// An EMPTY STRING means "cannot describe this honestly, mount nothing": an unnamed subject (a
-/// stale index after a rescan) or an act whose values did not move. `note_offscreen_edit` keeps the
+/// An EMPTY STRING means "cannot describe this honestly, mount nothing": an unnamed subject (an
+/// index no list holds, which `photo_open::remap_history` drops first) or an act whose values did not move. `note_offscreen_edit` keeps the
 /// same rule — a sentence naming nothing is worse than no sentence.
 pub(crate) fn last_act_sentence(act: &UndoEntry, subject: &str, cur_r: i32, cur_m: u8) -> String {
     match act {
@@ -37320,8 +40355,8 @@ pub(crate) fn last_act_sentence(act: &UndoEntry, subject: &str, cur_r: i32, cur_
                     if cur_m & MARK_REJECT != 0 { "Rejected" } else { "Un-rejected" },
                     n,
                 ),
-                // The first target's own values did not move (a stale index after a rescan, or an
-                // unknown verb): no direction can be read, so say nothing rather than guess.
+                // The first target's own values did not move (another edit put them back), or an
+                // unknown verb: no direction can be read, so say nothing rather than guess.
                 _ => String::new(),
             }
         }
@@ -37374,10 +40409,9 @@ pub(crate) fn cull_undo_armed(
     delete_rec: Option<(&str, u64)>,
     scanned_dir: &str,
     move_rec: Option<(&str, usize, u64)>,
-    cur_dir: &str,
 ) -> (Option<UndoArm>, bool) {
     (
-        live_undo_arm(undo_top, delete_rec, scanned_dir, move_rec, cur_dir),
+        live_undo_arm(undo_top, delete_rec, scanned_dir, move_rec),
         redo_len > 0,
     )
 }
@@ -37760,17 +40794,17 @@ mod round_b_copy_tests {
         // second field. Reading the tuple this way is exactly what the tick does.
         let armed = |a: (Option<UndoArm>, bool)| (a.0.is_some(), a.1);
         // (a) nothing at all — both dead.
-        assert_eq!(armed(cull_undo_armed(None, 0, None, cur, None, cur)), (false, false));
+        assert_eq!(armed(cull_undo_armed(None, 0, None, cur, None)), (false, false));
         // (b) a rating/rotation edit on the stack — undo only (a fresh edit clears redo).
-        assert_eq!(armed(cull_undo_armed(Some(1), 0, None, cur, None, cur)), (true, false));
+        assert_eq!(armed(cull_undo_armed(Some(1), 0, None, cur, None)), (true, false));
         // (c) an undo just happened — redo only.
-        assert_eq!(armed(cull_undo_armed(None, 1, None, cur, None, cur)), (false, true));
+        assert_eq!(armed(cull_undo_armed(None, 1, None, cur, None)), (false, true));
         // (d) THE DELETE ARM: empty stack + a record from THIS folder ⇒ Ctrl+Z recovers, so the
         //     rows must be live. There is deliberately no redo-of-delete.
-        assert_eq!(armed(cull_undo_armed(None, 0, del(cur), cur, None, cur)), (true, false));
+        assert_eq!(armed(cull_undo_armed(None, 0, del(cur), cur, None)), (true, false));
         // (e) …and the same state with a FOREIGN record stays dark: `on_recover_delete` refuses
         //     it, and an enabled control may not resolve to a refusal.
-        assert_eq!(armed(cull_undo_armed(None, 0, del("E:/other"), cur, None, cur)), (false, false));
+        assert_eq!(armed(cull_undo_armed(None, 0, del("E:/other"), cur, None)), (false, false));
         // (f) THE BOTH-EMPTY DEGENERATE CASE, and it is the row that actually pins the
         //     photo-less-landing term (v0.8.184 verify: the first draft passed `Some(cur)` with an
         //     empty scanned dir, which stays false with the term REMOVED too — "D:/shoot" == "" is
@@ -37779,22 +40813,22 @@ mod round_b_copy_tests {
         //     true and this row flips to (true, false). That is the F20/M6 rule: a photo-less
         //     landing moved the scan domain, so the offer retires rather than reading the
         //     both-empty case as agreement.
-        assert_eq!(armed(cull_undo_armed(None, 0, del(""), "", None, cur)), (false, false));
+        assert_eq!(armed(cull_undo_armed(None, 0, del(""), "", None)), (false, false));
         // ── v0.8.186 (U1 / F-B): THE MOVE ARM ────────────────────────────────────────────────
         // (g) a live move record from THIS folder arms Undo — the whole point of the round, and
         //     the state a user reaches by pressing "Move rejected" and nothing else.
-        assert_eq!(armed(cull_undo_armed(None, 0, None, cur, mv(cur, 12), cur)), (true, false));
+        assert_eq!(armed(cull_undo_armed(None, 0, None, cur, mv(cur, 12))), (true, false));
         // (h) DIFFERENTIAL against (g) on the FOLDER alone: the same record tagged elsewhere must
         //     not arm anything — `on_undo_move` returns without touching a file, so a lit control
         //     would be an enabled no-op (L15/L21).
-        assert_eq!(armed(cull_undo_armed(None, 0, None, cur, mv("E:/other", 12), cur)), (false, false));
+        assert_eq!(armed(cull_undo_armed(None, 0, None, cur, mv("E:/other", 12))), (false, false));
         // (i) DIFFERENTIAL against (g) on the PAIR COUNT alone: an emptied record is nothing to
         //     undo. Drop `pairs > 0` from `move_undo_live` and this row flips.
-        assert_eq!(armed(cull_undo_armed(None, 0, None, cur, mv(cur, 0), cur)), (false, false));
+        assert_eq!(armed(cull_undo_armed(None, 0, None, cur, mv(cur, 0))), (false, false));
         // (j) …and the move NEVER arms redo: there is deliberately no re-move, exactly as there is
         //     no re-delete. Delete the `redo_len > 0` and give the pair the arm's answer and this
         //     row reddens on its second field.
-        assert!(!armed(cull_undo_armed(None, 0, None, cur, mv(cur, 12), cur)).1);
+        assert!(!armed(cull_undo_armed(None, 0, None, cur, mv(cur, 12))).1);
     }
 
     /// v0.8.186 (fix wave, review finding 5) — **the Undo control greys for the ONE arm that can
@@ -37835,8 +40869,8 @@ mod round_b_copy_tests {
     /// Falcon keeps three reversible histories — the cull stack, the delete record, the move
     /// record — and until this round only the first two were on Ctrl+Z, ordered by v0.8.37's
     /// PROXY: *"an empty stack + a live delete record means the delete is the latest reversible
-    /// action"*. That proxy is sound for those two because the delete's own re-scan is what
-    /// empties the stack (`apply_scan` replaces `UndoRedo` on every scan).
+    /// action"*. That proxy was sound for those two while the delete's own re-scan emptied the
+    /// stack (a same-folder re-scan keeps it by file since 2 November).
     ///
     /// IT CANNOT ORDER THE TWO RECORDS AGAINST EACH OTHER, and row (2) is the reachable sequence
     /// that proves it: delete a photo, then Move rejected. Both ops re-scan, so the stack is empty;
@@ -37869,44 +40903,44 @@ mod round_b_copy_tests {
         // (1) A2 PRESERVED: an edit made AFTER a delete is popped first — the rule v0.8.37 shipped,
         //     now a consequence of the stamps rather than of the empty-stack proxy.
         assert_eq!(
-            live_undo_arm(Some(31), Some((cur, 30)), cur, None, cur),
+            live_undo_arm(Some(31), Some((cur, 30)), cur, None),
             Some(UndoArm::Stack(31))
         );
         // (2) THE HEADLINE: delete (30) → Move rejected (40). Both re-scans emptied the stack;
         //     both records are live in this folder. The move is newer, so the move is what Ctrl+Z
         //     undoes. The crude rule answers Delete(30) here and ONLY here.
         assert_eq!(
-            live_undo_arm(None, Some((cur, 30)), cur, Some((cur, 12, 40)), cur),
+            live_undo_arm(None, Some((cur, 30)), cur, Some((cur, 12, 40))),
             Some(UndoArm::Move(40))
         );
         // (3) …AND THE MIRROR SEQUENCE, which the crude rule gets right by luck: Move rejected
         //     (40) → delete (50) ⇒ the delete. Without this row (2) alone could be satisfied by a
         //     rule that simply always prefers the move.
         assert_eq!(
-            live_undo_arm(None, Some((cur, 50)), cur, Some((cur, 12, 40)), cur),
+            live_undo_arm(None, Some((cur, 50)), cur, Some((cur, 12, 40))),
             Some(UndoArm::Delete(50))
         );
         // (4) NOTHING LIVE ⇒ no arm. `on_undo` keeps the cross-folder nudge as its own last arm;
         //     it is deliberately not a candidate here, because the surfaces light on `is_some()`.
-        assert_eq!(live_undo_arm(None, Some(("E:/other", 30)), cur, None, cur), None);
-        assert_eq!(live_undo_arm(None, None, cur, None, cur), None);
+        assert_eq!(live_undo_arm(None, Some(("E:/other", 30)), cur, None), None);
+        assert_eq!(live_undo_arm(None, None, cur, None), None);
         // (5) ALL THREE LIVE: the newest wins whichever one it is — the same three stamps, read
         //     three ways, so no arm can be hard-wired to win.
-        let all = |a, b, c| live_undo_arm(Some(a), Some((cur, b)), cur, Some((cur, 12, c)), cur);
+        let all = |a, b, c| live_undo_arm(Some(a), Some((cur, b)), cur, Some((cur, 12, c)));
         assert_eq!(all(9, 8, 7), Some(UndoArm::Stack(9)));
         assert_eq!(all(7, 9, 8), Some(UndoArm::Delete(9)));
         assert_eq!(all(8, 7, 9), Some(UndoArm::Move(9)));
         // (6) THE DELETE FOLDER GATE, differential against (3): the same two records, the record's
         //     folder changed and nothing else ⇒ the move wins instead.
         assert_eq!(
-            live_undo_arm(None, Some(("E:/other", 50)), cur, Some((cur, 12, 40)), cur),
+            live_undo_arm(None, Some(("E:/other", 50)), cur, Some((cur, 12, 40))),
             Some(UndoArm::Move(40))
         );
         // (7) THE MOVE FOLDER GATE, differential against (2): the same two records, the move's tag
         //     changed and nothing else ⇒ the delete wins instead. This is the "move in folder A,
         //     swap to B" row — the move arm is not offered at all.
         assert_eq!(
-            live_undo_arm(None, Some((cur, 30)), cur, Some(("E:/other", 12, 40)), cur),
+            live_undo_arm(None, Some((cur, 30)), cur, Some(("E:/other", 12, 40))),
             Some(UndoArm::Delete(30))
         );
         // (8) THE LABEL rides the arm and nothing else (U2): only the move renames the button.
@@ -47453,7 +50487,7 @@ mod writer_tests {
         let (tx, rx) = channel::<WriteMsg>();
         tx.send(WriteMsg::Log { target: "falcon.log".into(), line: "discard".into(), ticket: 1 }).unwrap();
         tx.send(WriteMsg::Write { target: "settings.json".into(), data: vec![7] }).unwrap();
-        tx.send(WriteMsg::ReviewData { dir: "photos".into(), data: vec![8], ticket: 0 }).unwrap();
+        tx.send(WriteMsg::ReviewData { dir: "photos".into(), data: vec![8].into(), ticket: 0 }).unwrap();
         tx.send(WriteMsg::XmpRating { sidecar: "photo.xmp".into(), rating: 5 }).unwrap();
         let (ack, done) = channel();
         tx.send(WriteMsg::Barrier(ack)).unwrap();
@@ -48636,16 +51670,17 @@ mod writer_tests {
     /// exactly the soft file the skip refuses, under the passenger's name, with nothing in the
     /// toast to say so.
     ///
-    /// THE FIXTURE IS THE 09-03 ONE: AVIF magic bytes in a file called `.jpg`, beside a RAW. The
-    /// scan sniffs the bytes (never the name — L42), mints `(Jpeg, has_jpg = false)`, and the shot
-    /// that reaches the run is a real passenger. No testkit file is needed: every arm this row
-    /// drives decides BEFORE any decode, so the RAW's own bytes are never read.
+    /// THE FIXTURE IS THE 09-03 ONE: AVIF magic bytes in a file called `.jpg`, beside a RAW.
+    /// Open-time check (2 November): the scan goes by the name (`has_jpg` true), and the export
+    /// loop's own check makes it a real passenger before these arms run. No testkit file is needed:
+    /// every arm this row drives decides BEFORE any decode, so the RAW's own bytes are never read.
     ///
     /// RED-FIRST at `b2027bb`: with the skip reading `s.jpg.is_none()` the run does not skip, and
     /// the row reddens on the counter clause.
     ///
     /// FALSIFIER (L28): change the skip back to `s.jpg.is_none()` and the "1 RAW-only skipped"
-    /// assert fails; delete the skip entirely and the "nothing was written" assert fails too.
+    /// assert fails; delete the skip entirely and the "nothing was written" assert fails too; delete
+    /// the check line above the arms and the run decodes (arm 2 fails, arm 1 ships the preview).
     #[test]
     fn a_passenger_pick_is_skipped_by_the_web_export_not_shipped_as_a_preview() {
         use std::fs;
@@ -48683,7 +51718,8 @@ mod writer_tests {
             fs::write(real.join("IMG_0002.jpg"), &avif).unwrap();
             let rshots = falcon_decode::scan_folder(&real).expect("scan the real fixture");
             assert_eq!(rshots.len(), 1);
-            assert!(rshots[0].jpg.is_some() && !rshots[0].has_jpg, "a real passenger");
+            assert!(rshots[0].jpg.is_some() && rshots[0].has_jpg, "the scan's name state");
+            assert!(!falcon_decode::shot_by_bytes(&rshots[0]).has_jpg, "a real passenger, once checked");
             // ANTI-VACUITY: this RAW's preview really is decodable, so a run that does NOT skip
             // would have something to write. Without it the assert below could pass emptily.
             assert!(
@@ -48726,6 +51762,8 @@ mod writer_tests {
         // The fixture must actually BE a passenger, or the row proves nothing about the class.
         assert!(s.has_raw, "the RAW is there");
         assert!(s.jpg.is_some(), "the passenger file is on the shot (visible, deletable)");
+        assert!(s.has_jpg, "the scan went by the name, so this pick's own check decides the arm");
+        let s = falcon_decode::shot_by_bytes(s);
         assert!(!s.has_jpg, "…but it is not the PICTURE — this is the state the old test missed");
         assert!(!s.is_unsupported(), "and the shot is NOT unsupported: the RAW is the picture");
 
@@ -48783,17 +51821,17 @@ mod writer_tests {
         let progress = ExportProgress::default();
         
         // ONE folder, all four shapes the mint can produce:
-        //   SOLO.jpg          — undecodable bytes, NO RAW      → unsupported
+        //   SOLO.avif         — undecodable, NO RAW            → unsupported
         //   RAWONLY.CR3       — a RAW with no finished file    → raw_only
-        //   PSGR.CR3+PSGR.jpg — a RAW with a dead sibling      → raw_only (kind == Jpeg, never Unsupported)
+        //   PSGR.CR3+PSGR.avif — a RAW with a dead sibling     → raw_only (kind == Jpeg, never Unsupported)
         //   REAL.jpg          — a decodable finished file      → written
         let base = std::env::temp_dir().join(format!("falcon_web_order_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
-        fs::write(base.join("SOLO.jpg"), &avif).unwrap();
+        fs::write(base.join("SOLO.avif"), &avif).unwrap();
         fs::write(base.join("RAWONLY.CR3"), b"a RAW nobody decodes in this row").unwrap();
         fs::write(base.join("PSGR.CR3"), b"a RAW nobody decodes in this row").unwrap();
-        fs::write(base.join("PSGR.jpg"), &avif).unwrap();
+        fs::write(base.join("PSGR.avif"), &avif).unwrap();
         let real = falcon_decode::encode_jpeg_rgb(&[180u8; 8 * 8 * 3], 8, 8, 90).expect("a source");
         fs::write(base.join("REAL.jpg"), &real).unwrap();
         
@@ -48841,6 +51879,40 @@ mod writer_tests {
             .unwrap_or_default();
         assert_eq!(wrote, vec!["REAL.jpg".to_string()], "exactly the deliverable the scan counted");
         assert_eq!(wrote.len(), deliverables, "the modal's M is the run's own write count");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Open-time check (2 November): **a pick made online-only since the answer is not opened by the
+    /// export's own check.** The run's last look reports it, and nothing downloads.
+    ///
+    /// FALSIFIER (L28): remove the cloud guard on the check in the export loop. The check then reads
+    /// the file (a download in real life), sees a passenger and counts it RAW-only, not cloud.
+    #[test]
+    fn a_pick_made_online_only_since_the_answer_is_not_checked_by_the_export() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("falcon_web_ot_cloud_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("IMG.CR3"), b"a RAW nobody reads in this row").unwrap();
+        fs::write(base.join("IMG.jpg"), avif_bytes()).unwrap();
+        let shots = falcon_decode::scan_folder(&base).expect("scan");
+        assert!(shots[0].has_jpg, "the scan's name state, so the answer depends on the check");
+        let marks = vec![MARK_FLAG; shots.len()];
+        let deltas = HashMap::new();
+        let progress = ExportProgress::default();
+        let (msg, _) = export_web_run_with_decoder(
+            WebRun {
+                dir: &base, shots: &shots, marks: &marks, filt: 0, want: MARK_FLAG, long: 1600, quality: 82,
+                wm: None, auto_orient: false, deltas: &deltas, suffix: None, fmt: falcon_decode::WebFormat::Jpeg,
+                raw_policy: RawExportPolicy::Skip, collide: WebCollide::NotAsked,
+                cloud_ok: HashSet::new(),
+                is_cloud: |p| p.file_name().is_some_and(|n| n == "IMG.jpg"),
+            },
+            &progress,
+            |_, _, _, _| panic!("nothing here is decoded"),
+        );
+        assert!(msg.contains(&clause_cloud_now(1)), "counted as only in the cloud now: {msg}");
+        assert!(!msg.contains("RAW-only skipped"), "the check did not read it, so it isn't a passenger: {msg}");
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -48998,7 +52070,7 @@ mod writer_tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("RAWONLY.CR3"), b"a RAW with no preview in it").unwrap();
-        fs::write(base.join("SOLO.jpg"), avif_bytes()).unwrap();
+        fs::write(base.join("SOLO.avif"), avif_bytes()).unwrap();
         let shots = falcon_decode::scan_folder(&base).expect("scan");
         assert_eq!(shots.len(), 2);
         let marks = vec![MARK_FLAG; shots.len()];
@@ -49060,7 +52132,7 @@ mod writer_tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         fs::copy(kit, base.join("IMG_0002.CR3")).unwrap();
-        fs::write(base.join("IMG_0002.jpg"), avif_bytes()).unwrap();
+        fs::write(base.join("IMG_0002.avif"), avif_bytes()).unwrap();
 
         let shots = falcon_decode::scan_folder(&base).expect("scan");
         assert_eq!(shots.len(), 1, "the RAW and its passenger are ONE shot");
@@ -49211,8 +52283,8 @@ mod writer_tests {
         fs::write(base.join("JPGONLY.jpg"), &real).unwrap(); // a finished file, no RAW
         fs::write(base.join("RAWONLY.CR3"), b"a RAW").unwrap(); // no finished file at all
         fs::write(base.join("PSGR.CR3"), b"a RAW").unwrap();
-        fs::write(base.join("PSGR.jpg"), avif_bytes()).unwrap(); // undecodable sibling → passenger
-        fs::write(base.join("SOLO.jpg"), avif_bytes()).unwrap(); // undecodable ALONE → no RAW
+        fs::write(base.join("PSGR.avif"), avif_bytes()).unwrap(); // undecodable sibling → passenger
+        fs::write(base.join("SOLO.avif"), avif_bytes()).unwrap(); // undecodable ALONE → no RAW
 
         let shots = falcon_decode::scan_folder(&base).expect("scan");
         assert_eq!(shots.len(), 5, "five shots: the pair and the passenger are one each");
@@ -50090,7 +53162,7 @@ mod writer_tests {
         assert_eq!(review_data_state(&dir), ReviewDataState { outcome: ReviewDataRename::Renamed, read_legacy: false });
         assert!(dir.join(SELECTION_FILE).exists() && !dir.join(LEGACY_SELECTION_FILE).exists());
         let slot = Mutex::new(None);
-        let (loaded, _rots, _attrs) = load_selection(review_data_state(&dir), &dir, &slot);
+        let (loaded, _rots, _attrs, _load) = load_selection(review_data_state(&dir), &dir, &slot);
         assert_eq!(loaded.get("A.jpg").map(|s| s.rating), Some(5), "one history, across the rename");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -50110,8 +53182,8 @@ mod writer_tests {
         // message, converted by the time the second is written.
         let converted = Rc::new(Cell::new(false));
         let conv = converted.clone();
-        tx.send(WriteMsg::ReviewData { dir: PathBuf::from("/f"), data: vec![1], ticket: 0 }).unwrap();
-        tx.send(WriteMsg::ReviewData { dir: PathBuf::from("/f"), data: vec![2], ticket: 0 }).unwrap();
+        tx.send(WriteMsg::ReviewData { dir: PathBuf::from("/f"), data: vec![1].into(), ticket: 0 }).unwrap();
+        tx.send(WriteMsg::ReviewData { dir: PathBuf::from("/f"), data: vec![2].into(), ticket: 0 }).unwrap();
         drop(tx);
         writer_loop(
             rx,
@@ -50319,11 +53391,38 @@ mod writer_tests {
         std::fs::create_dir_all(&deb).unwrap();
         std::fs::write(deb.join(SELECTION_FILE), b"").unwrap();
         let slot = Mutex::new(None);
-        let (m, _r, _a) = load_selection(review_data_state(&deb), &deb, &slot);
-        assert!(m.is_empty() || !m.is_empty(), "the map is whatever the legacy seed holds — the point is the absence of noise");
+        let (m, _r, _a, load) = load_selection(review_data_state(&deb), &deb, &slot);
+        assert!(m.is_empty(), "0 bytes opens with no stars");
+        assert_eq!(load, ReviewLoad::Absent, "R6: 0 bytes is a clean empty start, never a refusal to save");
         assert!(slot.lock().unwrap().is_none(), "0 bytes raises no corruption warning");
         assert!(!deb.join("falcon_review_data.json.corrupt").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R5 (1 November safety round): a folder's stars come only from that folder's own review file.
+    /// Every arm that finds no readable file (absent, 0 bytes, damaged, over the cap) opens with
+    /// nothing, whatever else is on the machine.
+    ///
+    /// FALSIFIER (L28): make one arm return ratings read from outside the folder (the 1.1.0
+    /// behaviour) and, with such a source present, that arm's row reddens.
+    #[test]
+    fn a_folder_without_readable_review_data_opens_with_no_stars() {
+        let root = std::env::temp_dir().join(format!("falcon_r5_nostars_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for case in ["absent", "debris", "damaged", "over-cap"] {
+            let dir = root.join(case);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join(SELECTION_FILE);
+            match case {
+                "debris" => std::fs::write(&file, b"").unwrap(),
+                "damaged" => std::fs::write(&file, b"{ not json").unwrap(),
+                "over-cap" => std::fs::File::create(&file).unwrap().set_len(SELECTION_MAX_BYTES + 1).unwrap(),
+                _ => {}
+            }
+            let (m, r, _a, _load) = load_selection(review_data_state(&dir), &dir, &Mutex::new(None));
+            assert_eq!((m.len(), r.len()), (0, 0), "{case}: the folder opens with no stars: {m:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 4b (v0.8.63): the selection-file byte-cap predicate. At/under the cap reads clean; over it trips;
@@ -53102,7 +56201,7 @@ mod multiselect_menu_tests {
         assert_eq!(shots[2].finished_file_format(), None, "premise: the sniffed one cannot, honestly");
         let marks = [MARK_FLAG, MARK_FLAG, MARK_FLAG];
         let never = AtomicBool::new(false);
-        let (ok, _sk, fail, _nc, _att, _dv, (unopenable, fmts), _ops) = export_marked(
+        let (ok, _sk, fail, _nc, _att, _dv, (unopenable, fmts), _side, _ops) = export_marked(
             &dir, &shots, &marks, MARK_FLAG, "Picks", false, CopyContent::JpgOnly, &never, false,
         );
         assert_eq!((ok, fail), (3, 0), "all three finished files are COPIED — 2.2b (a) keeps copying them");
@@ -53873,7 +56972,7 @@ mod review_save_recovery_tests {
         let shown = || std::mem::take(&mut *notices.lock().unwrap());
         let root = Path::new("/falcon-save-failure-test");
         let (shoot_a, shoot_b) = (root.join("a").join("shoot"), root.join("b").join("shoot"));
-        let review = |dir: &Path| WriteMsg::ReviewData { dir: dir.to_path_buf(), data: b"{}".to_vec(), ticket: 0 };
+        let review = |dir: &Path| WriteMsg::ReviewData { dir: dir.to_path_buf(), data: b"{}".as_slice().into(), ticket: 0 };
         let settings = || WriteMsg::Write { target: root.join("settings.json"), data: b"{}".to_vec() };
         let xmp = || WriteMsg::XmpRating { sidecar: root.join("a").join("IMG_1.xmp"), rating: 3 };
         let kinds: [(&str, &dyn Fn() -> WriteMsg); 3] =
@@ -53929,6 +57028,8 @@ mod review_save_recovery_tests {
         assert!(!review_save_needs_retry(dir, false));
         begin_review_visit();
         assert_ne!(review_visit(), first_visit);
+        // `pending` makes a visit record only. A real save's newest attempt also reaches
+        // REVIEW_LATEST, and a failed one there is still retried (CS-53).
         assert!(!review_save_needs_retry(dir, true));
         let later = pending(dir);
         review_save_complete(dir, first, false); review_save_complete(dir, first, true);
@@ -53958,7 +57059,7 @@ mod review_save_recovery_tests {
         let old = pending(dir); begin_review_visit(); let new = pending(dir);
         let (tx, rx) = channel();
         for (ticket, bytes) in [(old, b"old visit".as_slice()), (new, b"Apply rebased".as_slice()), (new, b"exit".as_slice())] {
-            tx.send(WriteMsg::ReviewData { dir: dir.into(), data: bytes.to_vec(), ticket }).unwrap();
+            tx.send(WriteMsg::ReviewData { dir: dir.into(), data: bytes.into(), ticket }).unwrap();
         }
         drop(tx);
         let mut failures = Vec::new(); let mut attempts = 0;
@@ -54055,7 +57156,7 @@ mod review_save_recovery_tests {
     /// final flush runs (nothing changed since) gets one more attempt; the folder swap's visit runs
     /// between; the writer fails both tries of the first write and the final attempt lands. Then a
     /// same-folder rescan clears the visit before a write fails: the exit flush still retries. A fresh
-    /// open forgets the old attempts. Falsifier: ignore the status in `final_review_flush`, or read the
+    /// open after a save that landed forgets it. Falsifier: ignore the status in `final_review_flush`, or read the
     /// visit's `review_save_status` there instead of `review_final_status`, or make
     /// `forget_review_attempts` a no-op.
     #[test]
@@ -54098,16 +57199,276 @@ mod review_save_recovery_tests {
         assert_eq!(final_review_flush(&dir, &edit, &rots, &attrs, &baseline, enqueue_review_data), Ok(true), "the exit retries");
         assert_eq!(on_disk(&dir), edit);
 
-        // A fresh open reads disk: a failure from before it is moot.
+        // A fresh open after a save that landed reads disk and forgets the attempt. (R1: after a save
+        // that failed it reads that save's bytes instead and keeps the attempt; see
+        // `a_failed_save_survives_leaving_and_reopening_the_folder`.)
+        let edit = stars(&[("IMG_1", 1)]);
         let (tx, rx) = std::sync::mpsc::channel();
-        save_selection_via(&dir, &stars(&[("IMG_1", 1)]), &rots, &attrs, |d, data| enqueue_review_data_via(Some(&tx), d, data)).unwrap();
+        save_selection_via(&dir, &edit, &rots, &attrs, |d, data| enqueue_review_data_via(Some(&tx), d, data)).unwrap();
         drop(tx);
-        run(rx, usize::MAX);
+        run(rx, 0);
         forget_review_attempts(&dir);
+        assert_eq!(review_final_status(&dir), None, "a saved attempt is forgotten");
         let reloaded = RefCell::new(selection_dirty_json(&edit, &rots, &attrs));
         assert_eq!(final_review_flush(&dir, &edit, &rots, &attrs, &reloaded, enqueue_review_data), Ok(false));
         let _ = std::fs::remove_dir_all(&dir);
         begin_review_visit(); // hygiene
+    }
+
+    // ── R1 (1 November safety round): a quick return never adopts stale review data ──
+    fn r1_shot(name: &str) -> Shot {
+        Shot { id: 0, name: name.into(), jpg: Some(PathBuf::from(format!("{name}.jpg"))), raw: None,
+            has_jpg: true, has_raw: false, kind: falcon_decode::SrcKind::Jpeg, cloud_placeholder: false, sniffed: None }
+    }
+    /// What `apply_scan` makes the load's baseline (main.rs; a census there pins the wiring).
+    fn r1_baseline(map: &BTreeMap<String, Sel>, attrs: &FolderAttrs, from_ledger: bool) -> RefCell<String> {
+        RefCell::new(if adopted_baseline_stays_dirty(from_ledger, true, false, "") { String::new() }
+            else { selection_dirty_json(map, &BTreeMap::new(), attrs) })
+    }
+
+    /// A → B → A while A's outgoing save is still queued, through the production pieces: the save
+    /// record, the folder-open read, the real `writer_loop` and `write_atomic`, the XMP journal reseed
+    /// and the final flush. The file says 1★; A was left at 5★. The reopen reads 5★ (the file is still
+    /// 1★); the journal reseeds to the 5★ the sidecars already hold; an OLDER save landing meanwhile
+    /// keeps the newer bytes; the queued save then lands between the read and the acceptance, which
+    /// releases them; browsing (a new resume position) writes 5★, never 1★.
+    /// FALSIFIER: skip the record in `load_selection_through_ledger`, record no bytes in
+    /// `enqueue_review_data_via`, or release them on any ticket's success in `review_save_complete`.
+    #[test]
+    fn a_quick_return_reads_the_queued_save_not_the_older_file() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = b1_dir("r1-queued");
+        let (rots, attrs) = (BTreeMap::new(), FolderAttrs::default());
+        let (one, three, five) = (stars(&[("IMG_1", 1)]), stars(&[("IMG_1", 3)]), stars(&[("IMG_1", 5)]));
+        save_selection(&dir, &one, &rots, &attrs).unwrap(); // the file as A was opened
+        forget_review_attempts(&dir);
+        let land = |rx: std::sync::mpsc::Receiver<WriteMsg>| writer_loop(rx, write_atomic, |_, _| Ok(()),
+            |_, _, _| panic!("no failures in this row"), review_write_target, |_, _, _| {});
+        // In A: a 3★ save queued, then leaving A queues 5★. Neither has reached the disk.
+        let (older_tx, older_rx) = std::sync::mpsc::channel();
+        save_selection_via(&dir, &three, &rots, &attrs, |d, data| enqueue_review_data_via(Some(&older_tx), d, data)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        save_selection_via(&dir, &five, &rots, &attrs, |d, data| enqueue_review_data_via(Some(&tx), d, data)).unwrap();
+        drop(older_tx);
+        land(older_rx); // the older save lands first: 3★ on disk, and it says nothing about 5★
+        assert_eq!(on_disk(&dir), three);
+        // Reopen A: the read both loaders share.
+        let slot = Mutex::new(None);
+        let (map, _rots, loaded_attrs, from_ledger, _load) = load_selection_through_ledger(review_data_state(&dir), &dir, &slot);
+        assert_eq!((&map, from_ledger), (&five, true), "the reopen reads the queued 5★, not the file");
+        assert!(slot.lock().unwrap().is_none(), "no notice");
+        // The XMP journal reseeds from the ratings that land, so it matches the 5★ sidecars.
+        let shots = [r1_shot("IMG_1")];
+        let (ratings, _marks) = apply_selection(&map, &shots);
+        let journal = RefCell::new(HashMap::new());
+        reseed_xmp_journal(&shots, &ratings, &journal);
+        assert_eq!(journal.borrow().get("IMG_1"), Some(&5));
+        assert!(xmp_rating_deltas(&shots, &ratings, &mut journal.borrow_mut()).is_empty(), "no sidecar writes on open");
+        // The queued save lands between the read and the acceptance: its own ticket releases the bytes.
+        drop(tx);
+        land(rx);
+        assert_eq!(on_disk(&dir), five);
+        assert!(unsaved_review_bytes(&dir).is_none(), "written: released");
+        // The acceptance: a fresh visit (begin_review_visit, forget, the dirty baseline).
+        begin_review_visit();
+        forget_review_attempts(&dir);
+        assert_eq!(review_final_status(&dir), None);
+        let baseline = r1_baseline(&map, &loaded_attrs, from_ledger);
+        let browsed = FolderAttrs { resume_shot: Some("IMG_1".into()), ..loaded_attrs };
+        assert_eq!(final_review_flush(&dir, &map, &rots, &browsed, &baseline, enqueue_review_data), Ok(true));
+        assert_eq!(on_disk(&dir), five, "browsing the reopened folder keeps 5★");
+        let _ = std::fs::remove_dir_all(&dir);
+        begin_review_visit(); // hygiene
+    }
+
+    /// The failed-write variant: leaving A queues 5★ and the writer fails both tries (the file stays
+    /// 1★, the user saw one "not saved" notice). Today the bytes died with the message. Now they stay
+    /// on the save record, the reopen reads them, the fresh open keeps the attempt, the backstop's
+    /// question (the dirty baseline) says write, and the write lands 5★ and releases them.
+    /// FALSIFIER: release the bytes on a failure in `review_save_complete`, let
+    /// `forget_review_attempts` drop unsaved bytes, or make `adopted_baseline_stays_dirty` false.
+    #[test]
+    fn a_failed_save_survives_leaving_and_reopening_the_folder() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = b1_dir("r1-failed");
+        let (rots, attrs) = (BTreeMap::new(), FolderAttrs::default());
+        let (one, five) = (stars(&[("IMG_1", 1)]), stars(&[("IMG_1", 5)]));
+        save_selection(&dir, &one, &rots, &attrs).unwrap();
+        forget_review_attempts(&dir);
+        let (tx, rx) = std::sync::mpsc::channel();
+        save_selection_via(&dir, &five, &rots, &attrs, |d, data| enqueue_review_data_via(Some(&tx), d, data)).unwrap();
+        begin_review_visit(); // the swap to B
+        drop(tx);
+        let mut failures = 0;
+        writer_loop(rx, |_, _| Err(denied()), |_, _| Ok(()), |_, _, _| failures += 1, review_write_target, |_, _, _| {});
+        assert_eq!((failures, on_disk(&dir)), (1, one.clone()), "one notice; the file is still 1★");
+        assert_eq!(review_final_status(&dir), Some(ReviewSaveStatus::Failed));
+        // Back to A.
+        let slot = Mutex::new(None);
+        let (map, _rots, loaded_attrs, from_ledger, _load) = load_selection_through_ledger(review_data_state(&dir), &dir, &slot);
+        assert_eq!((&map, from_ledger), (&five, true), "the failed save's 5★, not the file's 1★");
+        begin_review_visit();
+        forget_review_attempts(&dir);
+        assert_eq!(review_final_status(&dir), Some(ReviewSaveStatus::Failed), "kept while its bytes are unsaved");
+        let baseline = r1_baseline(&map, &loaded_attrs, from_ledger);
+        // The tick's backstop question (a fresh visit has no retry of its own).
+        let j = selection_dirty_json(&map, &rots, &loaded_attrs);
+        assert!(*baseline.borrow() != j || review_save_needs_retry(&dir, true), "the backstop writes it again");
+        assert_eq!(final_review_flush(&dir, &map, &rots, &loaded_attrs, &baseline, enqueue_review_data), Ok(true));
+        assert_eq!(on_disk(&dir), five);
+        assert_eq!(review_final_status(&dir), Some(ReviewSaveStatus::Saved));
+        assert!(unsaved_review_bytes(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        begin_review_visit(); // hygiene
+    }
+
+    /// CS-53 (fix 8a): a save fails while the folder is on screen (the file is locked), then a
+    /// same-folder rescan (a sort pick, a delete, a move, an undo) runs: `flush_old`'s final flush
+    /// retries once and fails again, the swap starts a new visit (clearing the visit's record), and
+    /// the landing's baseline matches the map it read. The tick's backstop must still retry, and stop
+    /// once the write lands. FALSIFIER: drop the `review_final_status` term of `review_save_needs_retry`.
+    #[test]
+    fn a_failed_save_is_still_retried_after_a_same_folder_rescan() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = b1_dir("cs53-rescan");
+        let (rots, attrs) = (BTreeMap::new(), FolderAttrs::default());
+        let (one, five) = (stars(&[("IMG_1", 1)]), stars(&[("IMG_1", 5)]));
+        save_selection(&dir, &one, &rots, &attrs).unwrap(); // the file as the folder was opened
+        forget_review_attempts(&dir);
+        begin_review_visit();
+        let fail_all = |rx: std::sync::mpsc::Receiver<WriteMsg>| writer_loop(rx, |_, _| Err(denied()),
+            |_, _| Ok(()), |_, _, _| {}, review_write_target, |_, _, _| {});
+        // The tick saves 5★ and advances its baseline; the writer fails both tries.
+        let baseline = RefCell::new(String::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        save_selection_via(&dir, &five, &rots, &attrs, |d, data| enqueue_review_data_via(Some(&tx), d, data)).unwrap();
+        *baseline.borrow_mut() = selection_dirty_json(&five, &rots, &attrs);
+        drop(tx);
+        fail_all(rx);
+        assert!(review_save_needs_retry(&dir, true), "the visit that saw the failure retries");
+        // A sort pick: `flush_old` retries once (queued), then the swap starts a new visit.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let via = |d: &Path, data: Vec<u8>| enqueue_review_data_via(Some(&tx), d, data);
+        assert_eq!(final_review_flush(&dir, &five, &rots, &attrs, &baseline, via), Ok(true), "unsure: one more attempt");
+        begin_review_visit();
+        assert_eq!(review_save_status(&dir), None, "the new visit has no record of its own");
+        // The rescan reads the queued bytes; a same-folder landing with a baseline keeps it clean.
+        let slot = Mutex::new(None);
+        let (map, _rots, loaded_attrs, from_ledger, _load) = load_selection_through_ledger(review_data_state(&dir), &dir, &slot);
+        assert_eq!((&map, from_ledger), (&five, true));
+        assert!(!adopted_baseline_stays_dirty(from_ledger, true, true, &baseline.borrow()));
+        *baseline.borrow_mut() = selection_dirty_json(&map, &rots, &loaded_attrs);
+        drop(tx);
+        fail_all(rx); // the retry fails too
+        assert_eq!(on_disk(&dir), one, "the file is still 1★");
+        // The tick's backstop question, with nothing changed since the rescan.
+        let j = selection_dirty_json(&map, &rots, &loaded_attrs);
+        assert_eq!(*baseline.borrow(), j);
+        assert!(review_save_needs_retry(&dir, true), "the 15-second retry goes on after the rescan");
+        assert!(!review_save_needs_retry(&dir, false), "an empty view still never retries");
+        // The lock clears: the tick's retry writes 5★, and the retries stop.
+        save_selection_via(&dir, &map, &rots, &loaded_attrs, enqueue_review_data).unwrap();
+        assert_eq!(on_disk(&dir), five);
+        assert!(!review_save_needs_retry(&dir, true), "written: no more retries");
+        let _ = std::fs::remove_dir_all(&dir);
+        begin_review_visit(); // hygiene
+    }
+
+    // ── Safety round review R1 (1 November): clearing the last mark supersedes an unsaved save ──
+    /// The photos and rotations of `dir`'s review file.
+    fn rv1_on_disk(dir: &Path) -> (BTreeMap<String, Sel>, BTreeMap<String, u8>) {
+        let file: SelectionFile = serde_json::from_slice(&std::fs::read(review_write_target(dir)).unwrap()).unwrap();
+        (file.photos, file.rotations)
+    }
+
+    /// A folder with NO review file on media that refuses writes: the first mark (a star, or a manual
+    /// turn) fails to save, so its bytes stay on the save record. Clearing it must queue the empty
+    /// state over them, or leaving and reopening the folder reads the cleared mark back. An untouched
+    /// folder (no save record) still queues nothing and gets no file, attrs or not (owner rule).
+    /// FALSIFIER: drop `review_save_unsettled` from `save_selection_via`'s clean-folder skip.
+    #[test]
+    fn clearing_the_last_mark_after_a_failed_first_save_stays_cleared() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let none = (BTreeMap::new(), BTreeMap::new());
+        let attrs = FolderAttrs { sort: Some("rating.desc".into()), resume_shot: Some("IMG_1".into()), panel_min: None };
+        let untouched = |_: &Path, _: Vec<u8>| -> std::io::Result<()> { panic!("an untouched folder queued a save") };
+        let rotated: BTreeMap<String, u8> = [("IMG_1".to_string(), 1u8)].into();
+        for (what, map, rots) in [("a star", stars(&[("IMG_1", 1)]), BTreeMap::new()), ("a turn", BTreeMap::new(), rotated)] {
+            let dir = b1_dir("rv1-failed");
+            begin_review_visit();
+            // Untouched: nothing queued, no file, attrs or not.
+            assert_eq!(save_selection_via(&dir, &none.0, &none.1, &attrs, untouched), Ok(0), "{what}");
+            assert!(!review_data_exists(&dir) && review_final_status(&dir).is_none(), "{what}: an untouched folder stays clean");
+            // The first mark: queued, and the writer fails both tries.
+            let (tx, rx) = std::sync::mpsc::channel();
+            save_selection_via(&dir, &map, &rots, &attrs, |d, data| enqueue_review_data_via(Some(&tx), d, data)).unwrap();
+            drop(tx);
+            writer_loop(rx, |_, _| Err(denied()), |_, _| Ok(()), |_, _, _| {}, review_write_target, |_, _, _| {});
+            assert_eq!(review_final_status(&dir), Some(ReviewSaveStatus::Failed), "{what}");
+            assert!(unsaved_review_bytes(&dir).is_some() && !review_data_exists(&dir), "{what}: kept in memory only");
+            // Clear it: the empty state is queued as the newest save.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut queued = 0;
+            save_selection_via(&dir, &none.0, &none.1, &attrs, |d, data| {
+                queued += 1;
+                enqueue_review_data_via(Some(&tx), d, data)
+            }).unwrap();
+            assert_eq!((queued, review_final_status(&dir)), (1, Some(ReviewSaveStatus::Pending)), "{what}: the clear is queued");
+            // Leave and reopen the folder (its save still queued): nothing comes back.
+            begin_review_visit();
+            let slot = Mutex::new(None);
+            let (map2, rots2, _attrs, _from_ledger, _load) = load_selection_through_ledger(review_data_state(&dir), &dir, &slot);
+            assert_eq!((&map2, &rots2), (&none.0, &none.1), "{what}: the cleared mark stays cleared on reopening");
+            // The media is writable again: the empty state lands and releases the bytes.
+            drop(tx);
+            writer_loop(rx, write_atomic, |_, _| Ok(()), |_, _, _| panic!("no failure here"), review_write_target, |_, _, _| {});
+            assert_eq!(rv1_on_disk(&dir), none, "{what}: the file holds the empty state");
+            assert_eq!(review_final_status(&dir), Some(ReviewSaveStatus::Saved), "{what}");
+            assert!(unsaved_review_bytes(&dir).is_none(), "{what}: released");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        begin_review_visit(); // hygiene
+    }
+
+    /// The still-queued variant (a slow disk; older than this round): the first star's save is queued
+    /// and has not landed when the star is cleared. The clear queues behind it, so the old write can't
+    /// be the last word: a reopen before either lands reads no star, and the disk ends empty.
+    /// FALSIFIER: as above.
+    #[test]
+    fn clearing_the_last_mark_while_its_first_save_is_queued_stays_cleared() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = b1_dir("rv1-queued");
+        let (empty, rots, attrs) = (BTreeMap::new(), BTreeMap::new(), FolderAttrs::default());
+        begin_review_visit();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let via = |d: &Path, data: Vec<u8>| enqueue_review_data_via(Some(&tx), d, data);
+        save_selection_via(&dir, &stars(&[("IMG_1", 1)]), &rots, &attrs, via).unwrap();
+        save_selection_via(&dir, &empty, &rots, &attrs, via).unwrap(); // cleared before the first save lands
+        let slot = Mutex::new(None);
+        let (map, _rots, _attrs, _from_ledger, _load) = load_selection_through_ledger(review_data_state(&dir), &dir, &slot);
+        assert!(map.is_empty(), "a reopen before either save lands reads no star");
+        drop(tx);
+        writer_loop(rx, write_atomic, |_, _| Ok(()), |_, _, _| panic!("no failure here"), review_write_target, |_, _, _| {});
+        assert_eq!(rv1_on_disk(&dir), (empty, rots), "the old star's write landed first; the clear lands last");
+        assert!(unsaved_review_bytes(&dir).is_none(), "released");
+        let _ = std::fs::remove_dir_all(&dir);
+        begin_review_visit(); // hygiene
+    }
+
+    /// Which landings start dirty. FALSIFIER: drop any term of `adopted_baseline_stays_dirty`.
+    #[test]
+    fn only_an_adopted_landing_with_photos_starts_its_baseline_dirty() {
+        let clean = "{\"photos\":{}}";
+        for (from_ledger, has_photos, same_folder, baseline, dirty, why) in [
+            (true, true, false, clean, true, "a fresh visit read unsaved bytes"),
+            (false, true, false, clean, false, "a fresh visit read the file"),
+            (true, false, false, clean, false, "an empty landing: cur_dir is still the previous folder"),
+            (true, true, true, clean, false, "a same-folder rescan carries live state, just flushed"),
+            (true, true, true, "", true, "a photo-first open's later batch keeps the first batch's dirt"),
+            (false, true, true, "", false, "nothing read from the record"),
+        ] {
+            assert_eq!(adopted_baseline_stays_dirty(from_ledger, has_photos, same_folder, baseline), dirty, "{why}");
+        }
     }
 
     /// A journal folder opened with MRU memory to migrate (or a rescan keeping live attrs not yet on
@@ -54196,5 +57557,243 @@ mod review_save_recovery_tests {
         assert!(root.join("settings.json").is_file());
         assert!(!settings_final_save_needed(&baseline, &s, saves.status()), "saved and unchanged: skip");
         let _ = std::fs::remove_dir_all(&root);
+    }
+    // ── R6 (1 November safety round): a review file that exists but can't be read is never replaced ──
+    // The owner-approved warnings, word for word.
+    const R6_READ: &str = "Couldn't read this folder's review data — it may be only in the cloud while you're offline, open in another program, or blocked by folder permissions. It's left untouched, and changes made here won't be saved. Reopen the folder to try again.";
+    const R6_DAMAGED: &str = "This folder's review data looks damaged, and Falcon couldn't set it aside — another program may have it open. It's left untouched, and changes made here won't be saved. Reopen the folder to try again.";
+    const R6_LARGE: &str = "This folder's review data is too large to read (over 16 MB), which usually means it's damaged. It's left untouched, and changes made here won't be saved. To start fresh, move falcon_review_data.json out of the folder.";
+
+    /// Another program holding the review file while it is opened. `readable`: it still lets others
+    /// read it, but not rename it (so setting it aside fails); otherwise it can't be read at all.
+    #[cfg(windows)]
+    fn r6_hold(file: &Path, readable: bool) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ (1) allows reads but no rename; no sharing (0) refuses reads too.
+        std::fs::OpenOptions::new().read(true).share_mode(if readable { 1 } else { 0 }).open(file).unwrap()
+    }
+    /// The same two holds elsewhere: a folder that refuses renames, or a file with no read permission.
+    #[cfg(unix)]
+    struct R6Hold(PathBuf, u32);
+    #[cfg(unix)]
+    impl Drop for R6Hold {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+    #[cfg(unix)]
+    fn r6_hold(file: &Path, readable: bool) -> R6Hold {
+        use std::os::unix::fs::PermissionsExt;
+        let (target, held, restore) =
+            if readable { (file.parent().unwrap().to_path_buf(), 0o555, 0o755) } else { (file.to_path_buf(), 0o000, 0o644) };
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(held)).unwrap();
+        R6Hold(target, restore)
+    }
+
+    /// The open finds a review file it can't use: locked, damaged while another program holds it (in
+    /// text or not UTF-8), or over the cap. The hold clears before the visit's first save, the moment
+    /// 1.1.0 replaced the file with the visit's state. Through the production pieces: the read both
+    /// loaders share, the landing's mark and warning, and every save route (the choke point asked
+    /// three times as the backstop would, the tick's `save_selection`, the switch/quit
+    /// `final_review_flush`). The file stays byte for byte, nothing is queued or kept for a later
+    /// open to adopt (no forced rewrite), and the warning is the approved sentence for the cause.
+    /// Reopening once the cause is gone reads it again (or starts fresh), clears the mark, and saves.
+    /// FALSIFIER: ignore the mark in `save_selection_via`; read a read error, an over-cap file or an
+    /// unpreserved damaged one as absent; send text that isn't UTF-8 to the absent arm; never set or
+    /// never clear the mark in `note_review_load`.
+    #[test]
+    fn a_review_file_that_cant_be_read_is_never_replaced() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let three = br#"{"photos":{"IMG_1":{"rating":3}}}"#;
+        for case in ["locked", "damaged, held", "not UTF-8, held", "over the cap"] {
+            let dir = b1_dir("r6-unread");
+            let file = dir.join(SELECTION_FILE);
+            match case {
+                "damaged, held" => std::fs::write(&file, b"{ \"photos\": { \"IMG_1\": ").unwrap(),
+                "not UTF-8, held" => std::fs::write(&file, b"{\"photos\":{\"IMG_1\":{\"rating\":3}}}\xff").unwrap(),
+                _ => std::fs::write(&file, three).unwrap(),
+            }
+            if case == "over the cap" {
+                std::fs::OpenOptions::new().write(true).open(&file).unwrap().set_len(SELECTION_MAX_BYTES + 1).unwrap();
+            }
+            let original = std::fs::read(&file).unwrap();
+            let (why, warning) = match case {
+                "locked" => (ReviewUnreadable::ReadError, R6_READ),
+                "over the cap" => (ReviewUnreadable::TooLarge, R6_LARGE),
+                _ => (ReviewUnreadable::Damaged, R6_DAMAGED),
+            };
+            // The open, with the file held as the case says.
+            let slot = Mutex::new(None);
+            let hold = (case != "over the cap").then(|| r6_hold(&file, case != "locked"));
+            let (map, rots, attrs, from_ledger, load) = load_selection_through_ledger(review_data_state(&dir), &dir, &slot);
+            drop(hold);
+            assert_eq!((map.len(), rots.len(), from_ledger, load), (0, 0, false, ReviewLoad::Unresolved(why)), "{case}");
+            assert!(slot.lock().unwrap().is_none(), "{case}: no red 'starting fresh' line");
+            assert!(!adopted_baseline_stays_dirty(from_ledger, true, false, ""), "{case}: no forced rewrite");
+            // The landing marks the folder and gives the amber warning for the cause.
+            assert_eq!(note_review_load(&dir, load).as_deref(), Some(warning), "{case}");
+            assert!(review_data_unresolved(&dir), "{case}");
+            // The visit: a star and a resume position. Every save route refuses; nothing is queued.
+            let edit = stars(&[("IMG_1", 5)]);
+            let browsed = FolderAttrs { resume_shot: Some("IMG_1".into()), ..attrs };
+            let baseline = RefCell::new(selection_dirty_json(&map, &rots, &FolderAttrs::default()));
+            let mut queued = 0;
+            for _ in 0..3 {
+                let refused = save_selection_via(&dir, &edit, &rots, &browsed, |_, _| { queued += 1; Ok(()) });
+                assert_eq!(refused, Err(ReviewSaveError::Unreadable), "{case}: the backstop's save");
+            }
+            assert_eq!(save_selection(&dir, &edit, &rots, &browsed), Err(ReviewSaveError::Unreadable), "{case}: the tick's save");
+            let last = final_review_flush(&dir, &edit, &rots, &browsed, &baseline, |_, _| { queued += 1; Ok(()) });
+            assert_eq!(last, Err(ReviewSaveError::Unreadable), "{case}: the folder switch and quit");
+            assert_eq!(queued, 0, "{case}: nothing reaches the writer");
+            assert!(unsaved_review_bytes(&dir).is_none() && review_final_status(&dir).is_none(), "{case}: nothing to adopt later");
+            assert!(std::fs::read(&file).unwrap() == original, "{case}: the file is untouched");
+            // Reopen once the cause is gone (the oversized file moved out of the folder).
+            if case == "over the cap" {
+                std::fs::rename(&file, dir.join("moved-out.json")).unwrap();
+            }
+            let (reread, _, _, _, again) = load_selection_through_ledger(review_data_state(&dir), &dir, &Mutex::new(None));
+            let expect = if case == "locked" { (ReviewLoad::Loaded, stars(&[("IMG_1", 3)])) } else { (ReviewLoad::Absent, BTreeMap::new()) };
+            assert_eq!((again, reread), expect, "{case}: reopened");
+            assert_eq!(note_review_load(&dir, again), None, "{case}: no warning");
+            assert!(!review_data_unresolved(&dir), "{case}: the mark is cleared");
+            save_selection(&dir, &edit, &rots, &browsed).expect("saves again once the file reads");
+            assert_eq!(on_disk(&dir), edit, "{case}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A review file that isn't UTF-8 (disk or sync damage, a hand edit saved as UTF-16) is a damaged
+    /// file: set aside as `.corrupt` with the red "kept as" line, and the folder starts fresh. 1.1.0
+    /// read it as missing, with no copy and no message, and the next save replaced it.
+    /// FALSIFIER: send text that isn't UTF-8 to the absent arm.
+    #[test]
+    fn review_data_that_isnt_utf8_is_set_aside_like_any_damaged_file() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = b1_dir("r6-utf8");
+        let file = dir.join(SELECTION_FILE);
+        let bytes = b"\xff\xfe{\x00\"\x00p\x00";
+        std::fs::write(&file, bytes).unwrap();
+        let slot = Mutex::new(None);
+        let (map, _rots, _attrs, load) = load_selection(review_data_state(&dir), &dir, &slot);
+        assert_eq!((map.len(), load), (0, ReviewLoad::Absent), "set aside: a clean start");
+        assert!(!file.exists(), "moved aside, so nothing can overwrite it");
+        assert_eq!(std::fs::read(dir.join(format!("{SELECTION_FILE}.corrupt"))).unwrap(), bytes, "kept for recovery");
+        let (msg, severity, _, _) = slot.lock().unwrap().take().expect("the red line");
+        assert_eq!((msg.as_str(), severity), ("Review data was unreadable — kept as falcon_review_data.json.corrupt and starting fresh", OpSeverity::Error));
+        assert_eq!(note_review_load(&dir, load), None, "no amber warning, no mark");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix 2's rule still holds over a file that can't be read: this process's unsaved save for the
+    /// folder wins without the file being touched, so the open is `Loaded` (from the ledger), no mark
+    /// is set, and the queued save lands as fix 2 designed.
+    /// FALSIFIER: skip the save record in `load_selection_through_ledger`.
+    #[test]
+    fn unsaved_bytes_still_win_over_a_review_file_that_cant_be_read() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = b1_dir("r6-ledger");
+        let (rots, attrs, five) = (BTreeMap::new(), FolderAttrs::default(), stars(&[("IMG_1", 5)]));
+        let file = dir.join(SELECTION_FILE);
+        std::fs::write(&file, br#"{"photos":{"IMG_1":{"rating":3}}}"#).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        save_selection_via(&dir, &five, &rots, &attrs, |d, data| enqueue_review_data_via(Some(&tx), d, data)).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&file).unwrap().set_len(SELECTION_MAX_BYTES + 1).unwrap();
+        let (map, _rots, _attrs, from_ledger, load) = load_selection_through_ledger(review_data_state(&dir), &dir, &Mutex::new(None));
+        assert_eq!((&map, from_ledger, load), (&five, true, ReviewLoad::Loaded), "the queued 5★, not the oversized file");
+        assert_eq!(note_review_load(&dir, load), None);
+        assert!(!review_data_unresolved(&dir), "no mark: the visit saves");
+        drop(tx);
+        writer_loop(rx, write_atomic, |_, _| Ok(()), |_, _, _| panic!("no failures in this row"), review_write_target, |_, _, _| {});
+        assert_eq!(on_disk(&dir), five);
+        assert!(unsaved_review_bytes(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mark is per folder: one folder's unreadable file never stops another folder's saves. Each
+    /// cause has its own approved sentence; a refused save is logged once per mark; a read that
+    /// isn't `Unresolved` clears it.
+    /// FALSIFIER: never set or never clear the mark; log every refusal.
+    #[test]
+    fn the_unreadable_mark_is_per_folder_and_the_next_read_clears_it() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (a, b) = (b1_dir("r6-mark-a"), b1_dir("r6-mark-b"));
+        for (why, sentence) in [(ReviewUnreadable::ReadError, R6_READ), (ReviewUnreadable::Damaged, R6_DAMAGED),
+            (ReviewUnreadable::TooLarge, R6_LARGE)] {
+            assert_eq!(note_review_load(&a, ReviewLoad::Unresolved(why)).as_deref(), Some(sentence));
+            assert_eq!((review_save_refused(&a), review_save_refused(&a)), (Some(true), Some(false)), "{why:?}: logged once");
+            assert_eq!(review_save_refused(&b), None, "{why:?}: the other folder saves");
+        }
+        assert!(review_data_unresolved(&a) && !review_data_unresolved(&b));
+        assert_eq!(save_selection(&b, &stars(&[("IMG_1", 2)]), &BTreeMap::new(), &FolderAttrs::default()), Ok(1));
+        for clean in [ReviewLoad::Absent, ReviewLoad::Loaded] {
+            note_review_load(&a, ReviewLoad::Unresolved(ReviewUnreadable::ReadError));
+            assert_eq!(note_review_load(&a, clean), None);
+            assert!(!review_data_unresolved(&a) && review_save_refused(&a).is_none(), "{clean:?} clears the mark");
+        }
+        let _ = (std::fs::remove_dir_all(&a), std::fs::remove_dir_all(&b));
+    }
+
+    /// Safety round review R2 (1 November, owner: grey it out): Apply rotations waits exactly while
+    /// the folder it acts on is marked unreadable, through the real reads and `note_review_load`. The
+    /// folder is named as `apply_scan` names it: the mark under `PathBuf::from(dir.display().to_string())`,
+    /// Apply's `cur_dir` as `dir.display().to_string()`. A review file holding one pending turn is
+    /// locked at the open, then released with the mark kept (Apply still waits: the old turn is still
+    /// unseen); a folder with no file, one that reads, and one served from this window's unsaved save
+    /// over a file it can't read never wait; the reopen that reads brings the old turn back and ends
+    /// the wait. The handlers and the button ask this one function (census in `main.rs`, rig row in
+    /// `tipgeom_tests.rs`).
+    /// FALSIFIER: never wait; ask another folder than Apply's; never clear the mark.
+    #[test]
+    fn apply_rotations_waits_exactly_while_the_review_file_cant_be_read() {
+        let _save_state = SAVE_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let land = |dir: &Path| {
+            let load = load_selection_through_ledger(review_data_state(dir), dir, &Mutex::new(None));
+            note_review_load(&PathBuf::from(dir.display().to_string()), load.4);
+            load
+        };
+        let shown = b1_dir("rv2-apply");
+        let cur_dir = shown.display().to_string();
+        let file = shown.join(SELECTION_FILE);
+        std::fs::write(&file, br#"{"photos":{},"rotations":{"IMG_1.jpg":1}}"#).unwrap();
+        assert!(!apply_rotations_waits(""), "no folder open: nothing waits");
+        assert!(!apply_rotations_waits(&cur_dir), "never opened: not marked");
+        // The open, with another program holding the file: no turn is loaded, the folder is marked.
+        let hold = r6_hold(&file, false);
+        let (_, rots, _, _, load) = land(&shown);
+        drop(hold);
+        assert_eq!((rots.len(), load), (0, ReviewLoad::Unresolved(ReviewUnreadable::ReadError)));
+        assert!(apply_rotations_waits(&cur_dir), "marked: Apply waits");
+        assert!(apply_rotations_waits(&cur_dir), "the lock is gone but the mark stays until a reopen reads");
+        // Folders that aren't marked never wait, and never end another folder's wait.
+        let absent = b1_dir("rv2-absent");
+        assert_eq!(land(&absent).4, ReviewLoad::Absent);
+        let loaded = b1_dir("rv2-loaded");
+        std::fs::write(loaded.join(SELECTION_FILE), br#"{"photos":{},"rotations":{"IMG_2.jpg":3}}"#).unwrap();
+        assert_eq!(land(&loaded).4, ReviewLoad::Loaded);
+        let ledger = b1_dir("rv2-ledger");
+        let ledger_file = ledger.join(SELECTION_FILE);
+        std::fs::write(&ledger_file, br#"{"photos":{}}"#).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let turned = BTreeMap::from([("IMG_3.jpg".to_string(), 1u8)]);
+        save_selection_via(&ledger, &BTreeMap::new(), &turned, &FolderAttrs::default(),
+            |d, data| enqueue_review_data_via(Some(&tx), d, data)).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&ledger_file).unwrap().set_len(SELECTION_MAX_BYTES + 1).unwrap();
+        let (_, rots, _, from_ledger, load) = land(&ledger);
+        assert_eq!((rots, from_ledger, load), (turned, true, ReviewLoad::Loaded), "this window's unsaved save, not the file");
+        for other in [&absent, &loaded, &ledger] {
+            assert!(!apply_rotations_waits(&other.display().to_string()), "{other:?}: not marked, Apply works");
+        }
+        assert!(apply_rotations_waits(&cur_dir), "the marked folder still waits");
+        // The reopen reads: the old turn comes back, and Apply works again.
+        let (_, rots, _, _, load) = land(&shown);
+        assert_eq!((rots, load), (BTreeMap::from([("IMG_1.jpg".to_string(), 1u8)]), ReviewLoad::Loaded));
+        assert!(!apply_rotations_waits(&cur_dir), "the reopen that reads ends the wait");
+        drop(tx);
+        writer_loop(rx, write_atomic, |_, _| Ok(()), |_, _, _| panic!("no failures in this row"), review_write_target, |_, _, _| {});
+        for dir in [&shown, &absent, &loaded, &ledger] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

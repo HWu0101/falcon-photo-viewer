@@ -1632,7 +1632,12 @@ pub(crate) fn step_wheel_advance(
     // early return — a hold that ends while the bank happens to be empty must still re-arm, or the
     // next hold would be silent. `support::note_wheel_hold` is a store and nothing else.
     support::note_wheel_hold(held_dir != 0 && support::HELD_KEY_OWNS_NAV);
-    if wheel_accum.get() == 0 || len == 0 {
+    // R4 (1 November safety round): an empty folder has no photo to step to, so a notch banked here
+    // is spent, not kept — kept, it paid out into whichever folder landed next.
+    if len == 0 {
+        wheel_accum.set(0);
+    }
+    if wheel_accum.get() == 0 {
         return None;
     }
     let mut blocked: Option<usize> = None;
@@ -1835,6 +1840,27 @@ pub(crate) fn step_wheel_advance(
         }
     }
     blocked
+}
+
+/// R4 (1 November safety round): the browse gestures a folder CHANGE ends. `apply_scan` calls it on
+/// an actual change only (`!scan_same_folder`), ahead of this tick's `step_wheel_advance`, so a
+/// notch banked in the folder being left can no longer move the new one off its landing photo. A
+/// same-folder landing (the photo-first promotion, a re-sort, a post-op rescan) keeps all three.
+/// - `held_dir` → 0: a key still down simply restarts, as a tap, on its next OS repeat (no
+///   fresh-press latch; not in scope). `scrubbing` is `ViewReset::reset_for_swap`'s.
+/// - `wheel_accum` → 0: the banked notches.
+/// - `wheel_advance` → `now`: the wheel's pace credit, as the `Bank` arm drops it, so the new
+///   folder's first notches do not burst on the old spin's credit. The held key's `last_advance`
+///   needs no reset: it is re-stamped whenever a scrub arms (N10), and `wheel_at` by every notch.
+pub(crate) fn end_gestures_on_folder_change(
+    now: Instant,
+    held_dir: &RefCell<i32>,
+    wheel_accum: &Cell<i32>,
+    wheel_advance: &RefCell<Instant>,
+) {
+    *held_dir.borrow_mut() = 0;
+    wheel_accum.set(0);
+    *wheel_advance.borrow_mut() = now;
 }
 
 /// 4c) v0.8.126 (R6b / audit N9+N15+N27+N39): the COMPARE wheel's banked, gated, paced applier.
@@ -2485,7 +2511,15 @@ pub(crate) fn step_prefetch_fast(
     // and deliberately not folded into it: that argument governs the COSTLY CONCURRENCY BUDGET (who
     // spends the costly ceiling — the sheet's ruling), and this one is a hold on the ASK. Two
     // mechanisms, two arguments.
+    // Nearby photos (2 November): the call site now also holds on open-priming where priming rations
+    // instead of shutting the window, so this is a wider input to the backpressure count below too. That
+    // is harmless: frames parked under it are not counted, and at most `open_near` each side can ask.
     fast_hold: bool,
+    // Nearby photos (2 November): how far from `c` an ask may pass the opening holds (per shot, never a
+    // HEIC); 0 means no let-through. It rations at the ask, not the window, so retention, the runway and
+    // the meter stay as they are. These photos are not displayed and not exempt: the cloud-only mark,
+    // below-normal priority, the cap and the pause all still apply.
+    open_near: usize,
     // v0.8.195 (EFFICIENCY MODE, consumers 3 + 5): the posture bit, evaluated ONCE per tick at the
     // call site. It does TWO things in this step and they are deliberately separate cuts:
     //   * consumer 3 — EVERY format reads costly, so every format spends the costly concurrency
@@ -2943,8 +2977,12 @@ pub(crate) fn step_prefetch_fast(
             .into_iter()
             .filter(|&i| {
                 let is_exempt = exempt(i);
+                // Nearby photos (2 November): loosens this hold only, and follows the live `c`. With
+                // `open_near` 0 only `c` can pass, and `c` is already exempt, so the filter is as before.
+                let let_through =
+                    i.abs_diff(c) <= open_near && shots.get(i).is_some_and(|s| s.kind != SrcKind::Heic);
                 is_exempt
-                    || !(support::fast_speculation_held(fast_hold, is_exempt)
+                    || !((support::fast_speculation_held(fast_hold, is_exempt) && !let_through)
                         || backpressured
                         || stale_upgrades.contains(&i))
             })
@@ -9968,6 +10006,9 @@ pub(crate) struct NotifEntry {
     // since the row shipped — and `toast_pick`'s ladder LEANS on the persisted row when it demotes
     // the resume ask below a warn, so a reader checking that premise found it denied here.
     pub(crate) jump_to: i32,
+    // R6 (Date taken sort): that photo's name. `jump_to` only says an offer stands: the order can
+    // change on its own after the offer, so the button finds the photo by this at the click.
+    pub(crate) jump_name: String,
     // v0.8.104 (Round-A C12): an "Open Settings" pill on the toast. The A4 boot-failure notice's own
     // recovery (Settings → Output colour gamut → Load profile…) had to be RECALLED from the one
     // surface every affected user sees, because the toast carries no route at all — H6 / §14.4
@@ -10007,7 +10048,7 @@ pub(crate) struct NotifEntry {
 
 impl NotifEntry {
     /// Base constructor: `reveal_path`/`undoable`/`jump_to`/`open_settings` default to "no button"
-    /// (""/false/-1/false). Prefer the severity-named shortcuts below; use `with_jump_to` for the
+    /// (""/false/-1/false). Prefer the severity-named shortcuts below; use `with_resume` for the
     /// Resume-button toasts and `with_open_settings` for the colour-profile failure notice.
     pub(crate) fn new(text: impl Into<String>, kind: i32, created: Instant) -> Self {
         NotifEntry {
@@ -10016,6 +10057,7 @@ impl NotifEntry {
             reveal_path: String::new(),
             undoable: false,
             jump_to: -1,
+            jump_name: String::new(),
             open_settings: false,
             recover: false,
             dir: String::new(),
@@ -10040,8 +10082,9 @@ impl NotifEntry {
         Self::new(text, 3, created)
     }
     /// Attach a shot index for a "Resume" button (toast-only; the events row lets it go stale). Builder.
-    pub(crate) fn with_jump_to(mut self, idx: i32) -> Self {
+    pub(crate) fn with_resume(mut self, idx: i32, name: &str) -> Self {
         self.jump_to = idx;
+        self.jump_name = name.to_string();
         self
     }
     /// v0.8.104 (C12): attach the "Open Settings" pill — the recovery route for a failure whose fix
@@ -10153,7 +10196,7 @@ pub(crate) fn op_result_notification(
     let undoable = kind == 1 && can_undo_move;
     NotifEntry {
         text, kind: severity.notif_kind(), reveal_path: result_reveal_path(kind, &dir),
-        undoable, jump_to: -1, open_settings: false, recover: false, dir,
+        undoable, jump_to: -1, jump_name: String::new(), open_settings: false, recover: false, dir,
         seq: if undoable { move_seq } else { None }, created: now,
     }
 }
@@ -10709,6 +10752,7 @@ pub(crate) fn rebuild_notif_model(
             reveal_path: e.reveal_path.as_str().into(),
             undoable: e.undoable,
             jump_to: resume_target(&e.dir, live_dir, e.jump_to), // D2 + O6: a persisted-row Resume, scoped to its own folder
+            jump_name: e.jump_name.as_str().into(),
             recover: e.recover, // v0.8.120 (O5): ANDed with the live `can-recover` at the mount
             // v0.8.121 (Round-B fix F19 = audit Y16): the colour-profile failure's "Open Settings"
             // pill was the ONLY toast action with no persisted twin — Undo, Resume and Recover all
@@ -10905,7 +10949,7 @@ pub(crate) fn step_notifs(
     }
     // Fold pending → log (newest first, bounded), and choose which entry the toast raises.
     // v0.8.104 (Round-A C7): the choice is `toast_pick`, not "the last one drained" — see its doc.
-    let mut newest: Option<(String, i32, String, bool, i32, bool, bool, String)> = None;
+    let mut newest: Option<(String, i32, String, bool, (i32, String), bool, bool, String)> = None;
     let added = {
         let mut p = pending.borrow_mut();
         let n = p.len();
@@ -10934,7 +10978,7 @@ pub(crate) fn step_notifs(
                         e.kind,
                         e.reveal_path.clone(),
                         e.undoable,
-                        e.jump_to,
+                        (e.jump_to, e.jump_name.clone()),
                         e.open_settings,
                         e.recover,
                         e.dir.clone(),
@@ -10948,7 +10992,7 @@ pub(crate) fn step_notifs(
         }
         n
     };
-    if let Some((text, kind, reveal_path, undoable, jump_to, open_settings, recover, entry_dir)) =
+    if let Some((text, kind, reveal_path, undoable, (jump_to, jump_name), open_settings, recover, entry_dir)) =
         newest
     {
         rebuild_notif_model(model, &log.borrow(), now, &live_dir.borrow());
@@ -10979,6 +11023,7 @@ pub(crate) fn step_notifs(
             app.set_toast_reveal_path(reveal_path.as_str().into());
             app.set_toast_undoable(undoable);
             app.set_toast_jump(jump_to); // D2: -1 = no Resume button
+            app.set_toast_jump_name(jump_name.as_str().into());
             // v0.8.120 (design-sweep O5): the delete result is a NotifEntry now, so its Recover
             // rides the entry rather than being written straight onto the toast properties behind
             // this channel's back. Set FROM the entry (never sticky — the same reset discipline the
@@ -11672,6 +11717,10 @@ pub(crate) fn step_persistence(
                                 panel_lru.borrow_mut().retain(|(d, _)| d != &dir); // v0.8.89: now a json folder
                             }
                         }
+                        // R6 (1 November safety round): refused because this folder's review file
+                        // couldn't be read when it opened. The landing already warned (amber), the
+                        // refusal is logged once, and the changes stay in memory: nothing more here.
+                        Err(crate::support::ReviewSaveError::Unreadable) => {}
                         Err(e) => {
                             save_warned.borrow_mut().insert(warning_key.clone());
                             // 1.0.15 (SAVE-O2, review R2): once per failure of this folder's review file,
@@ -11873,6 +11922,47 @@ fn heal_cloud_notes(
         }
     }
     local.len()
+}
+
+/// Open-time check (2 November): the photo at `idx` takes what a reader learned from its bytes, so
+/// its label corrects itself while you look at it. The drop_cloud_tags pattern: interface thread,
+/// copy-on-write, only `kind`, `has_jpg` and `sniffed` change, nothing moves or is renamed, and no
+/// new generation. Every surface reads the live list each tick; the tile keys carry `thumb_gen`.
+pub(crate) fn step_checked_kind(
+    idx: usize,
+    shots_owner: &std::sync::Mutex<std::sync::Arc<Vec<Shot>>>,
+    thumb_gen: &std::cell::Cell<u64>,
+) -> bool {
+    if !falcon_decode::bytes_learned_any() {
+        return false;
+    }
+    let mut owner = shots_owner.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(fixed) = owner.get(idx).and_then(falcon_decode::learned_from_bytes) else { return false };
+    if let Some(shot) = std::sync::Arc::make_mut(&mut *owner).get_mut(idx) {
+        falcon_decode::take_checked_kind(shot, &fixed);
+    }
+    thumb_gen.set(thumb_gen.get().wrapping_add(1));
+    true
+}
+
+/// Open-time check (2 November): before a new list is compared with the live one (`apply_scan`),
+/// the live list takes the same answers the new list is about to, from one snapshot. Otherwise
+/// `photo_open::same_photo` would see a corrected photo and its uncorrected rescan as two photos,
+/// and promotion would drop its frames, zoom and undo. Clones the list only when something changes.
+pub(crate) fn correct_list_from(
+    learned: &falcon_decode::BytesLearned,
+    shots_owner: &std::sync::Mutex<std::sync::Arc<Vec<Shot>>>,
+) {
+    let mut owner = shots_owner.lock().unwrap_or_else(|e| e.into_inner());
+    let fixes: Vec<(usize, Shot)> =
+        owner.iter().enumerate().filter_map(|(i, s)| learned.corrected(s).map(|f| (i, f))).collect();
+    if fixes.is_empty() {
+        return;
+    }
+    let list = std::sync::Arc::make_mut(&mut *owner);
+    for (i, fixed) in fixes {
+        falcon_decode::take_checked_kind(&mut list[i], &fixed);
+    }
 }
 
 /// The scan's cloud tag leaves these photos: `meta.cloud_tagged`, the retry ledger, and
@@ -15875,6 +15965,8 @@ mod pool_posture_enqueue_tests {
         split: Cell<f32>,
         // The cloud-only round: the workers' notes of files found only in the cloud.
         cloud: support::CloudNotes,
+        // Nearby photos (2 November): the let-through the step is handed. 0 for every other row.
+        open_near: Cell<usize>,
     }
 
     impl Rig {
@@ -15905,6 +15997,7 @@ mod pool_posture_enqueue_tests {
                 cmp_b: Cell::new(0),
                 split: Cell::new(0.67),
                 cloud: Mutex::new(HashSet::new()),
+                open_near: Cell::new(0),
             }
         }
 
@@ -16066,7 +16159,7 @@ mod pool_posture_enqueue_tests {
                 self.split.get(),
                 1, &self.l2, ram_l2, 2048, &self.gamut, &self.sup, &self.tx, &self.hits,
                 false, interactive_busy, derive_c, &self.c_serves, &self.rot, fast_hold,
-                limits, &self.cloud,
+                self.open_near.get(), limits, &self.cloud,
             );
             let p = self.fast.pump.0.lock().unwrap();
             p.queue.iter().copied().collect()
@@ -17651,6 +17744,64 @@ mod pool_posture_enqueue_tests {
             100, &shots, costly_view(), cap, false, false, false, None, hold(ms(250), ms(1_500)), false,
         );
         assert_eq!(slow_notch, free, "a paced 80-frame refill is ~20 s — an outage, not a throttle");
+    }
+
+    /// Nearby photos (2 November): **THE OPENING HOLDS LET TWO PHOTOS EACH SIDE THROUGH, AND NO HEIC.**
+    /// The real step, held, asserting the pump queue and the cloud-only mark it writes. The distance
+    /// follows the live `c`, each shot's format is judged on its own, and these asks are still
+    /// speculation: they keep the cloud-only mark and the pause.
+    ///
+    /// FALSIFIERS (L28, run as NP-9 to NP-13): remove `&& !let_through` and the JPEG row reads [100];
+    /// remove the `s.kind != SrcKind::Heic` test and the HEIC rows list HEIC ids; key the distance on a
+    /// fixed index and the moved row reddens; leave let-through photos off the cloud-only mark and that
+    /// assert reddens; let them past the pause and the Power saver row reddens.
+    #[test]
+    fn the_opening_holds_let_two_photos_each_side_through_and_no_heic() {
+        let cap = support::costly_prefetch_cap(18);
+        let shots: Vec<Shot> = (0..200).map(jpeg).collect();
+        let rig = Rig::new();
+        let held = |rig: &Rig, c: usize, shots: &[Shot]| {
+            rig.tick_gate(c, shots, costly_view(), cap, false, false, false, None, true, false)
+        };
+        let sorted = |mut q: Vec<usize>| {
+            q.sort_unstable();
+            q
+        };
+
+        assert_eq!(held(&rig, 100, &shots), vec![100], "no let-through: only the current photo asks");
+
+        rig.open_near.set(2);
+        let near = held(&rig, 100, &shots);
+        assert_eq!(near[0], 100, "the current photo still comes first");
+        assert_eq!(sorted(near), vec![98, 99, 100, 101, 102], "two each side, nothing further out");
+        {
+            let p = rig.fast.pump.0.lock().unwrap();
+            for i in [98, 99, 101, 102] {
+                assert!(p.local_only_q.contains(&i), "{i} is not on screen, so it never downloads");
+            }
+            assert!(!p.local_only_q.contains(&100), "the photo on screen may");
+        }
+
+        let all_heic: Vec<Shot> = (0..200).map(heic).collect();
+        assert_eq!(held(&rig, 100, &all_heic), vec![100], "a HEIC folder dispatches what it did before");
+
+        let mut mixed = shots.clone();
+        mixed[101] = heic(101);
+        assert_eq!(sorted(held(&rig, 100, &mixed)), vec![98, 99, 100, 102], "a HEIC beside the photo stays held");
+
+        assert_eq!(sorted(held(&rig, 120, &shots)), vec![118, 119, 120, 121, 122], "it follows the live photo");
+        assert_eq!(sorted(held(&rig, 0, &shots)), vec![0, 1, 2], "the folder's edge");
+
+        // Power saver pauses every preview that is not on screen while the on-screen photo's decode is
+        // pending. The first tick is the premise: the same asks leave when nothing is pending.
+        let saver = support::mode_limits(
+            support::MODE_POWER_SAVER, support::CustomLimits::BALANCED_COPY, None, 18, 30.0, None, None, None,
+        );
+        let mode = |busy: bool| {
+            rig.tick_mode_full(100, &shots, costly_view(), cap, busy, false, false, None, true, false, saver)
+        };
+        assert_eq!(sorted(mode(false)), vec![98, 99, 100, 101, 102], "the premise");
+        assert_eq!(mode(true), vec![100], "the mode's pause still bites");
     }
 
     /// **…AND NO SPECULATIVE RAM SERVE EITHER.** The other half of the dispatch hold, and the reason
@@ -21669,4 +21820,120 @@ mod cloud_only_tests {
 // Keep the cropped menu scheduler's actual predicate directly testable with the UI.
 pub(crate) fn menu_backdrop_active(app: &MainWindow) -> bool {
     app.get_ctx_open() || app.get_sel_ctx_open() || app.get_sort_open()
+}
+
+/// Open-time check (2 November): the label corrects itself when the photo is looked at.
+#[cfg(test)]
+mod open_time_check_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    const PNG: &[u8] = include_bytes!("../../crates/falcon-decode/tests/fixtures/mismatch/png_named_jpg.jpg");
+    const AVIF: &[u8] = b"\0\0\0\x18ftypavif\0\0\0\0mif1miaf";
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("falcon_ot_tick_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// **The photo on screen takes what its bytes said, and nothing moves.**
+    ///
+    /// FALSIFIER (L28): the step writes `kind` only (`has_jpg` or `sniffed` stay stale), skips the
+    /// `thumb_gen` bump, or calls `make_mut` when nothing changed (the Arc is no longer pointer-equal).
+    #[test]
+    fn the_photo_on_screen_takes_what_its_bytes_said_and_nothing_moves() {
+        let dir = scratch("onscreen");
+        std::fs::write(dir.join("a.jpg"), PNG).unwrap();
+        std::fs::write(dir.join("liar.JPG"), PNG).unwrap();
+        std::fs::write(dir.join("raw_mate.CR3"), b"a RAW nobody reads in this row").unwrap();
+        std::fs::write(dir.join("raw_mate.jpg"), AVIF).unwrap();
+        std::fs::write(dir.join("z.jpg"), PNG).unwrap();
+        let shots = falcon_decode::scan_folder(&dir).unwrap();
+        let idx = |n: &str| shots.iter().position(|s| s.name == n).unwrap();
+        let (liar, mate, a) = (idx("liar"), idx("raw_mate"), idx("a"));
+        assert_eq!((shots[liar].kind, shots[liar].sniffed), (SrcKind::Jpeg, None), "the scan's name state");
+        assert!(shots[mate].has_jpg, "the scan's name state");
+        let owner = Mutex::new(Arc::new(shots.clone()));
+        let thumb_gen = Cell::new(7u64);
+
+        // A reader opens the photo on screen, and the next tick's step takes the answer.
+        let _ = falcon_decode::shot_by_bytes(&shots[liar]);
+        assert!(step_checked_kind(liar, &owner, &thumb_gen));
+        let live = owner.lock().unwrap().clone();
+        assert_eq!((live[liar].kind, live[liar].has_jpg, live[liar].sniffed), (SrcKind::Png, true, Some(SrcKind::Png)));
+        assert_eq!(thumb_gen.get(), 8, "the tiles rebuild");
+        for (now, was) in live.iter().zip(shots.iter()) {
+            assert_eq!(
+                (now.id, &now.name, &now.raw, &now.jpg, now.cloud_placeholder),
+                (was.id, &was.name, &was.raw, &was.jpg, was.cloud_placeholder),
+                "nothing moves or is renamed"
+            );
+        }
+
+        // Nothing more to take: no second clone, no second rebuild.
+        let held = live.clone();
+        assert!(!step_checked_kind(liar, &owner, &thumb_gen));
+        assert!(Arc::ptr_eq(&held, &owner.lock().unwrap()), "no copy of the list when nothing changed");
+        assert_eq!(thumb_gen.get(), 8);
+        assert!(!step_checked_kind(a, &owner, &thumb_gen), "a photo nobody has read stays as it is");
+        assert!(!step_checked_kind(9_999, &owner, &thumb_gen), "an empty or shorter list is not a panic");
+
+        // A RAW whose same-name file is an AVIF named .jpg: the RAW becomes the picture.
+        let _ = falcon_decode::shot_by_bytes(&shots[mate]);
+        assert!(step_checked_kind(mate, &owner, &thumb_gen));
+        let live = owner.lock().unwrap().clone();
+        assert_eq!(
+            (live[mate].kind, live[mate].has_jpg, live[mate].sniffed),
+            (SrcKind::Jpeg, false, Some(SrcKind::Unsupported)),
+            "a passenger: the file stays on the shot, the RAW is the picture"
+        );
+        assert!(live[mate].jpg.is_some(), "still visible and deletable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Every new list carries what readers learned**, on both sides of the comparison, so promotion
+    /// keeps its frames, zoom and undo and no rescan puts the name's format back.
+    ///
+    /// FALSIFIER (L28): drop the `make_mut` pass in `correct_list_from` (`same_photo` fails for the
+    /// misnamed photo). The order inside `apply_scan` is pinned by `folder_open_tests`.
+    #[test]
+    fn every_new_list_carries_what_readers_learned() {
+        let dir = scratch("newlist");
+        std::fs::write(dir.join("a.jpg"), PNG).unwrap();
+        std::fs::write(dir.join("liar.JPG"), PNG).unwrap();
+        std::fs::write(dir.join("z.png"), PNG).unwrap();
+        let live = falcon_decode::scan_folder(&dir).unwrap();
+        let mut incoming = falcon_decode::scan_folder(&dir).unwrap();
+        let liar = live.iter().position(|s| s.name == "liar").unwrap();
+        let _ = falcon_decode::shot_by_bytes(&live[liar]);
+        // The live list has already been corrected on screen; a rescan comes back with the name.
+        let owner = Mutex::new(Arc::new(live));
+        assert!(step_checked_kind(liar, &owner, &Cell::new(0)));
+        let corrected = owner.lock().unwrap().clone();
+        assert!(!crate::photo_open::same_photo(&corrected[liar], &incoming[liar]), "the shape the overlay exists for");
+
+        let learned = falcon_decode::BytesLearned::snapshot().expect("this row just learned a file");
+        correct_list_from(&learned, &owner);
+        for s in incoming.iter_mut() {
+            if let Some(fixed) = learned.corrected(s) {
+                *s = fixed;
+            }
+        }
+        let live = owner.lock().unwrap().clone();
+        for (a, b) in live.iter().zip(incoming.iter()) {
+            assert!(crate::photo_open::same_photo(a, b), "{} is the same photo on both lists", a.name);
+        }
+        assert_eq!(incoming[liar].kind, SrcKind::Png, "and the rescan did not put the name back");
+
+        // A live list that hasn't been corrected yet (a neighbour learned from a thumbnail) takes it too.
+        let fresh = falcon_decode::scan_folder(&dir).unwrap();
+        let held = Arc::new(fresh);
+        let owner = Mutex::new(held.clone());
+        correct_list_from(&learned, &owner);
+        assert_eq!(owner.lock().unwrap()[liar].kind, SrcKind::Png);
+        assert_eq!(held[liar].kind, SrcKind::Jpeg, "copy-on-write: a worker's snapshot keeps its list");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

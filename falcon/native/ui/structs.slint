@@ -91,7 +91,8 @@
         when: string,       // relative time, e.g. "just now" / "2m" / "1h"
         reveal-path: string, // absolute result-folder path for a "Show" button ("" = none)
         undoable: bool,     // a still-reversible "Move rejected" → an "Undo" button
-        jump-to: int,       // D2 resume: a shot index to jump to → a "Resume" button (< 0 = none)
+        jump-to: int,       // D2 resume: >= 0 → a "Resume" button (< 0 = none)
+        jump-name: string,  // R6: the photo that button goes to, found by name at the click
         // v0.8.120 (design-sweep O5): this row is a DELETE result that offered Recover. The pill
         // mounts only while `can-recover` is also live (the same shape `undoable` + `can-undo-move`
         // has), i.e. while the delete record still exists AND the user is still on the folder the

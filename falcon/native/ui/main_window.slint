@@ -970,6 +970,10 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // that was still exporting the set the title named. A progress card must say what its own
         // run is doing; the live property stays live for the sheet, which is where live is right.
         in property <string> web-progress-run-title: @tr("falcon" => "Exporting");
+        // Date taken sort: the capture-date read's card, all three written by the tick.
+        in property <bool> dates-reading-show: false;
+        in property <float> dates-reading-frac: 0;
+        in property <string> dates-reading-text;
         in property <string> out-confirm-body: "";
         // ── v0.8.132 (OQ1, owner-ruled 08-03): THE REJECTED-PHOTOGRAPHS TOGGLE ───────────
         // The adapting column targets what is DISPLAYED, and a Reviewed / Rated / Rotated view can
@@ -1189,6 +1193,13 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         in property <int> count-rejects: 0;
         in property <int> count-rotated: 0;              // v0.8.0: distinct shots with a manual rotation
         in property <bool> sel-busy: false;              // a copy/move/export is running (disables actions)
+        // Safety round review R2 (1 November, owner: grey it out): the folder's review file couldn't be
+        // read, so Apply rotations fades until a reopen reads it (set from support::apply_rotations_waits).
+        in property <bool> apply-rotations-waits: false;
+        // Fix round 1 (1 November, owner: "Apply rotations only"): an Apply rotations batch is running,
+        // so the sort menu's nine rows grey (a re-sort mid-Apply would lose track of the photos written
+        // after it). Re-derived each tick from the worker's switch; Copy, Move and the rest don't set it.
+        in property <bool> applying-rotations: false;
         // Unified events / notifications centre (top-right bell) — the single place all warnings + results surface.
         in property <[NotifRow]> notif-model;            // recent notifications, newest first
         in property <int> notif-unread: 0;               // count since the panel was last opened → bell badge
@@ -1204,7 +1215,8 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         in property <int> toast-kind: 0;
         in property <string> toast-reveal-path: "";      // absolute result-folder path for the toast's "Show" ("" = none)
         in property <bool> toast-undoable: false;
-        in property <int> toast-jump: -1;                // D2: shot index for a "Resume" toast button (-1 = none)
+        in property <int> toast-jump: -1;                // D2: >= 0 → a "Resume" toast button (-1 = none)
+        in property <string> toast-jump-name;            // R6: the photo that button goes to, found by name at the click
         in-out property <bool> toast-recover: false;     // v0.8.37 (FIX A1): the delete toast Recover action (restore from the OS Recycle Bin)
         // v0.8.129 (W1-5): the selection clear-recovery action ("Selection cleared (12) [Restore]").
         in-out property <bool> toast-restore: false;
@@ -2455,6 +2467,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         callback clear-mark();           // clear flag+reject on the current shot
         callback set-filter(int);        // Selection-panel filter chip
         callback sel-jump(int);          // jump to a shot index from the Selection list
+        callback resume-jump(string);    // R6: the Resume offer's button, by the photo's name
         // ── v0.8.160 (B2/U9): THE LAST ARGUMENT OF THE NEXT FOUR IS "A MENU SENT THIS". ─────────
         // D1b's ruling is about POPUP-TARGETED actions — a menu that captured an index while the
         // current shot moved on. The hook landed on these four SHARED callbacks, which the grid
@@ -9101,7 +9114,9 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                             // !sel-busy`) has always produced.
                             ActionBtn {
                                 label: @tr("falcon" => "Apply rotations"); variant: 2; rim: 1; // blue — the destination the rotations travel to
-                                enabled: root.count-rotated > 0 && !root.sel-busy;
+                                // Safety round review R2 (1 November, owner: grey it out): the same fade while
+                                // the folder's review file couldn't be read. Discard below stays: it writes no photo.
+                                enabled: root.count-rotated > 0 && !root.sel-busy && !root.apply-rotations-waits;
                                 // The cloud-only round (owner answer 10): Rust counts the cloud-only files
                                 // first, sets `apply-cloud-notice`, then raises kind 5.
                                 clicked => { root.apply-rotations-ask(); }
@@ -9260,6 +9275,32 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 }
                 ActionBtn { label: @tr("falcon" => "Cancel"); variant: 2; enabled: !root.export-stopping;
                             clicked => { root.cancel-export(); } }
+            }
+        }
+
+        // ── Date taken sort: reading the capture dates. The Export card's style and bar, with no Cancel
+        //    (choosing another sort cancels it). No TouchArea: presses go through to the photo, because
+        //    this one sits over the photo while browsing. Lower than Export's spot, which would cover
+        //    the Compare bar and the Loading pill, and to the right of the Review panel when it is open.
+        //    A proposal for the owner's eye. ──
+        if root.dates-reading-show && !root.export-running && !root.modal-open : GlassPanel {
+            property <length> stage-centred: root.stage-x + (root.stage-w - self.width) / 2;
+            width: max(300px, Theme.fit-text ? min(datesreadingtext.preferred-width + 2 * Theme.space-3, root.width - 16px) : 0px);
+            x: root.sel-open && !root.immersive ? max(self.stage-centred, min(511px, root.width - self.width - 3px)) : self.stage-centred;
+            y: root.content-top + 48px;
+            height: datesreading.preferred-height;
+            backdrop: root.blur-backdrop; sw: root.content-w; sh: root.content-h; ox: 0px; oy: (root.content-top);
+            datesreading := VerticalLayout {
+                padding: Theme.space-3; spacing: Theme.space-2;
+                datesreadingtext := Text { text: root.dates-reading-text; color: Theme.text; font-weight: 500; font-size: Theme.font-md; }
+                Rectangle {
+                    height: 6px; border-radius: 3px; background: Theme.block;
+                    Rectangle {
+                        x: 0px; height: parent.height; border-radius: 3px; background: Theme.accent;
+                        width: parent.width * root.dates-reading-frac;
+                        animate width { duration: Theme.anim; easing: ease; }
+                    }
+                }
             }
         }
 
@@ -9431,7 +9472,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 // list click (the user decided: ask, never auto-jump).
                 if root.toast-jump >= 0 && toastcard.hot : VerticalLayout {
                     alignment: center;
-                    PillBtn { text: @tr("falcon" => "Resume"); clicked => { root.sel-jump(root.toast-jump); root.dismiss-toast(); } }
+                    PillBtn { text: @tr("falcon" => "Resume"); clicked => { root.resume-jump(root.toast-jump-name); root.dismiss-toast(); } }
                 }
                 if root.toast-reveal-path != "" && toastcard.hot : VerticalLayout {
                     alignment: center;
@@ -9781,7 +9822,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                     // must be actionable from the events panel too (the toast's twin).
                                     if row.jump-to >= 0 : VerticalLayout {
                                         alignment: center;
-                                        PillBtn { text: @tr("falcon" => "Resume"); clicked => { root.sel-jump(row.jump-to); root.notif-open = false; } }
+                                        PillBtn { text: @tr("falcon" => "Resume"); clicked => { root.resume-jump(row.jump-name); root.notif-open = false; } }
                                     }
                                     if row.reveal-path != "" : VerticalLayout {
                                         alignment: center;
@@ -13520,16 +13561,16 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                     // is worse than an honest grey row (showing the strip recentres it anyway).
                     MenuItem { edge-to-edge: true; text: @tr("falcon" => "Scroll to current"); enabled: root.film-visible || root.grid-open; clicked => { root.film-recenter(); root.sort-open = false; } }
                     MenuSep { extra-inset: 3px; }
-                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Name"); enabled: !root.opening-photo; checked: root.sort-method == 0; clicked => { root.sort-pick(0); } }
-                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Date taken"); enabled: !root.opening-photo; checked: root.sort-method == 1; clicked => { root.sort-pick(1); } }
-                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Date modified"); enabled: !root.opening-photo; checked: root.sort-method == 2; clicked => { root.sort-pick(2); } }
-                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Date created"); enabled: !root.opening-photo; checked: root.sort-method == 3; clicked => { root.sort-pick(3); } }
-                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Size"); enabled: !root.opening-photo; checked: root.sort-method == 4; clicked => { root.sort-pick(4); } }
-                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Type"); enabled: !root.opening-photo; checked: root.sort-method == 5; clicked => { root.sort-pick(5); } }
-                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Rating"); enabled: !root.opening-photo; checked: root.sort-method == 6; clicked => { root.sort-pick(6); } }
+                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Name"); enabled: !root.opening-photo && !root.applying-rotations; checked: root.sort-method == 0; clicked => { root.sort-pick(0); } }
+                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Date taken"); enabled: !root.opening-photo && !root.applying-rotations; checked: root.sort-method == 1; clicked => { root.sort-pick(1); } }
+                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Date modified"); enabled: !root.opening-photo && !root.applying-rotations; checked: root.sort-method == 2; clicked => { root.sort-pick(2); } }
+                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Date created"); enabled: !root.opening-photo && !root.applying-rotations; checked: root.sort-method == 3; clicked => { root.sort-pick(3); } }
+                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Size"); enabled: !root.opening-photo && !root.applying-rotations; checked: root.sort-method == 4; clicked => { root.sort-pick(4); } }
+                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Type"); enabled: !root.opening-photo && !root.applying-rotations; checked: root.sort-method == 5; clicked => { root.sort-pick(5); } }
+                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Rating"); enabled: !root.opening-photo && !root.applying-rotations; checked: root.sort-method == 6; clicked => { root.sort-pick(6); } }
                     MenuSep { extra-inset: 3px; }
-                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Ascending"); enabled: !root.opening-photo; checked: !root.sort-desc; clicked => { root.sort-dir-pick(false); } }
-                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Descending"); enabled: !root.opening-photo; checked: root.sort-desc; clicked => { root.sort-dir-pick(true); } }
+                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Ascending"); enabled: !root.opening-photo && !root.applying-rotations; checked: !root.sort-desc; clicked => { root.sort-dir-pick(false); } }
+                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Descending"); enabled: !root.opening-photo && !root.applying-rotations; checked: root.sort-desc; clicked => { root.sort-dir-pick(true); } }
                 }
             }
         }

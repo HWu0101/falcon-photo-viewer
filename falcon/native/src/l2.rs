@@ -118,6 +118,7 @@ pub(crate) fn full_res_serves(
 /// side, so the sub/supersample tier choice never skews the comparison. `gamut` is the frame's
 /// SOURCE gamut, kept so a re-upload from RAM runs the identical GPU colour-manage to whatever the
 /// live output gamut is (the CPU only ever holds source-gamut pixels — the CM happens on the GPU).
+#[derive(Clone)]
 pub(crate) struct L2Entry {
     pub(crate) rgba: Arc<[u8]>,
     pub(crate) w: u32,
@@ -332,6 +333,24 @@ impl L2Store {
     pub(crate) fn clear(&mut self) {
         self.map.clear();
         self.bytes = 0;
+    }
+
+    /// Keeping prepared work (2 November): the residents a same-folder rescan keeps, at their new
+    /// positions. The bytes are `Arc`s in source gamut and unrotated, so a clone is a count and the
+    /// later [`clear`](Self::clear) frees only what was left behind. Every field stays as it is,
+    /// including a stale tier's `dim` of 0.
+    pub(crate) fn carried(&self, rekey: impl Fn(usize) -> Option<usize>) -> Vec<(usize, L2Entry)> {
+        self.map.iter().filter_map(|(&i, e)| rekey(i).map(|n| (n, e.clone()))).collect()
+    }
+
+    /// …and back, after the clear. No eviction: this is a subset of what already fit.
+    pub(crate) fn restore_carried(&mut self, kept: Vec<(usize, L2Entry)>) {
+        for (i, e) in kept {
+            self.bytes += e.bytes();
+            if let Some(old) = self.map.insert(i, e) {
+                self.bytes -= old.bytes();
+            }
+        }
     }
 
     /// v0.8.196 fix tail (skeptic B, R6 — CONFIRMED): **every resident is now the WRONG SAMPLING
@@ -565,6 +584,37 @@ mod tests {
     }
     fn has(s: &L2Store, idx: usize) -> bool {
         s.get(idx, 0).is_some() // want 0: any dim satisfies — presence only
+    }
+
+    /// Keeping prepared work (2 November): frames beyond graphics memory survive a Delete at their
+    /// new positions, the running total stays true, and nothing about a frame's claim changes.
+    ///
+    /// FALSIFIER (L28): `restore_carried` doesn't add to `bytes`, or inserts through a path that
+    /// resets `dim` or `epoch`; `carried` ignores the rekey.
+    #[test]
+    fn a_rescan_carries_ram_frames_and_the_byte_total_follows() {
+        let mut s = store32();
+        // A stale tier's resident (`dim` 0, the `mark_stale_tier` state) must stay stale.
+        s.insert(3, L2Entry { master: true, epoch: 7, gamut: Gamut::DisplayP3, ..entry(0, MIB) }, 3, &unprotected);
+        s.insert(5, entry(1024, 2 * MIB), 3, &unprotected);
+        s.insert(8, entry(2048, 4 * MIB), 3, &unprotected);
+        // 3 moves to 1, 5 moves to 9, 8 left the list.
+        let kept = s.carried(|i| match i { 3 => Some(1), 5 => Some(9), _ => None });
+        s.clear();
+        assert_eq!((s.len(), s.bytes()), (0, 0));
+        s.restore_carried(kept);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.bytes(), 3 * MIB, "the total is the survivors' sum");
+        for gone in [3, 5, 8] {
+            assert!(!s.map.contains_key(&gone), "{gone}: the old positions hold nothing");
+        }
+        let a = s.map.get(&1).expect("the frame follows its file");
+        assert_eq!((a.rgba.len(), a.dim, a.epoch, a.master, a.gamut), (MIB, 0, 7, true, Gamut::DisplayP3));
+        let b = s.map.get(&9).expect("and the other one");
+        assert_eq!((b.rgba.len(), b.dim, b.epoch, b.master), (2 * MIB, 1024, 0, false));
+        // Replacing later still corrects the total.
+        s.insert(1, entry(2048, MIB / 2), 1, &unprotected);
+        assert_eq!(s.bytes(), 2 * MIB + MIB / 2);
     }
     /// A small store with a tiny nominal for the eviction-shape tests (pressure paths untested here).
     fn small(budget: usize) -> L2Store {
