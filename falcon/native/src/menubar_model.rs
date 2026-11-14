@@ -145,12 +145,15 @@ pub(crate) struct MenuSnapshot {
     /// else in this table keeps reading `modal`.
     pub(crate) modal_fs: bool,
     pub(crate) context: Option<u64>, // identity of an open photo context for queued key equivalents
-    pub(crate) opening_photo: bool, // folder-wide sort is unavailable in either early-edit mode
+    /// A photo-first open whose folder is still loading. Stars, flags, rejects and turns work then
+    /// (queue entry 6), so `modal` no longer carries it; the rows whose handlers wait for the whole
+    /// folder (sorting, Copy, Move to Trash, XMP sync, Compare) grey on it, the in-app twins' gates.
+    pub(crate) opening_photo: bool,
     /// Fix round 1 (1 November, F13-apply-4, L21/L26): Apply rotations is running, so sorting is
     /// unavailable (`apply_pick` refuses then). The `.slint` `applying-rotations` property the
     /// in-app sort rows grey on.
     pub(crate) applying_rotations: bool,
-    pub(crate) inspect_open: bool, // ready photo may be inspected while View only blocks collection actions
+    pub(crate) inspect_open: bool, // while a folder loads, the zoom rows wait only for the opened photo itself
     pub(crate) compare: bool,
     pub(crate) at_fit: bool, // single-view zoom == 1.0 (±0.01 — on_photo_clicked's own tolerance); drives the honest Zoom 1:1 / Zoom to Fit enablement split (L17)
     pub(crate) immersive: bool,
@@ -186,6 +189,9 @@ pub(crate) struct MenuSnapshot {
     // count-selected, bulk-flag-on, bulk-reject-on, bulk-uniform-rating), so they are four scalar
     // property reads inside the v0.9.60 allocation-free probe — no new walk, no new AppKit work,
     // and no second producer for numbers the Review panel's own controls already render from.
+    /// R27: the Trash row goes at once, with no dialog: a local volume, and the photo on screen is in any
+    /// selection. `false` keeps the ellipsis, which is the safe side.
+    pub(crate) trash_at_once: bool,
     /// How many photographs are in the transient selection (0 = none). NOT by itself the arming
     /// question — see [`bulk_count`], which asks `support::bulk_actions_allowed` about this.
     pub(crate) sel_count: i32,
@@ -529,8 +535,11 @@ pub(crate) fn top_menus(s: &MenuSnapshot) -> Vec<(TopMenu, Vec<ItemDef>)> {
     // (`support::bulk_delete_title` → "Delete 12 photos?"). The armed title deliberately drops the
     // "Move to Trash" phrasing: the verb the dialog uses is Delete, and a row promising a plural
     // action should be answerable by reading the dialog it opens.
+    // R27 (Delete round): the ellipsis promises that dialog, so it goes where the row goes at once.
     let trash_title = match bulk {
+        Some(n) if s.trash_at_once => tr_plural!(n, "Delete {n} Photo", "Delete {n} Photos"),
         Some(n) => tr_plural!(n, "Delete {n} Photo…", "Delete {n} Photos…"),
+        None if s.trash_at_once => i18n::tr(crate::platform::PLATFORM.move_to_trash).to_string(),
         None => tr_format!("{title}…", title = i18n::tr(crate::platform::PLATFORM.move_to_trash)),
     };
     photo.push(ItemDef::act(TAG_TRASH, hint(&trash_title, &k.delete)));
@@ -652,16 +661,20 @@ pub(crate) fn enabled_for(tag: i32, s: &MenuSnapshot) -> bool {
         TAG_RECENT_PARENT => !s.recents.is_empty(),
         TAG_RECENT_EMPTY => false,
         t if t >= TAG_RECENT_BASE => ((t - TAG_RECENT_BASE) as usize) < s.recents.len(),
-        TAG_REVEAL | TAG_COPY => photo_ok,
+        TAG_REVEAL => photo_ok,
+        // Queue entry 6: Copy, Move to Trash, XMP sync and Compare wait for the whole folder in
+        // their handlers (`copy_shortcut`, `delete_key`, `toggle_xmp_sync`, `toggle_compare` read
+        // `get_opening_photo()`), so their rows grey while it loads, as they did when `modal` had it.
+        TAG_COPY => photo_ok && !s.opening_photo,
         TAG_UNDO => s.undo != UndoKind::None && !s.modal,
         t if (TAG_RATE1..=TAG_RATE5).contains(&t) => photo_ok,
         TAG_RATE0 | TAG_FLAG | TAG_REJECT | TAG_UNMARK => photo_ok,
-        TAG_ROT_LEFT | TAG_ROT_RIGHT | TAG_XMP => photo_ok,
-        // L15: Trash's dispatch (invoke_delete_key → delete_key_allowed, main.rs) is compare-gated
-        // (A|B has two candidates), so an enabled item in compare is a silent no-op. Mirror that gate
-        // here; text_focus is unreachable from a menu click and modal is folded into photo_ok.
-        TAG_TRASH => photo_ok && !s.compare,
-        TAG_COMPARE => photo_ok && s.count >= 2,
+        TAG_ROT_LEFT | TAG_ROT_RIGHT => photo_ok,
+        TAG_XMP => photo_ok && !s.opening_photo,
+        // L15: Trash's dispatch (invoke_delete_key → delete_key_allowed, main.rs). In Compare it takes the
+        // active half (R5). text_focus is unreachable from a menu click and modal is folded into photo_ok.
+        TAG_TRASH => photo_ok && !s.opening_photo,
+        TAG_COMPARE => photo_ok && s.count >= 2 && !s.opening_photo,
         TAG_SWAP | TAG_PIN => s.compare && !s.modal,
         // L17 zoom-pair enablement honesty. Single view: "Zoom 1:1" dispatches the on_photo_clicked
         // TOGGLE (Fit→1:1, but ANY zoom→Fit), so it tells the truth ONLY from Fit; "Zoom to Fit"
@@ -669,8 +682,10 @@ pub(crate) fn enabled_for(tag: i32, s: &MenuSnapshot) -> bool {
         // pair can never duplicate. Compare: "Zoom 1:1" is invoke_compare_one_to_one (one-way, always
         // honest) and "Zoom to Fit" is on_pan_reset, which resets the shared zoom AND recentres the
         // compare pan (cmp_pan_fx/fy) — real work — so both stay live.
-        TAG_ZOOM_11 => (photo_ok || s.inspect_open) && (s.compare || s.at_fit),
-        TAG_ZOOM_FIT => (photo_ok || s.inspect_open) && (s.compare || !s.at_fit),
+        // While a folder loads, the zoom pair waits only for the opened photo (`inspect_open`), as
+        // the zoom commands themselves do; `photo_ok` alone would light it before the photo shows.
+        TAG_ZOOM_11 => ((photo_ok && !s.opening_photo) || s.inspect_open) && (s.compare || s.at_fit),
+        TAG_ZOOM_FIT => ((photo_ok && !s.opening_photo) || s.inspect_open) && (s.compare || !s.at_fit),
         // v0.9.24 (L21): the info row's dispatch is the tick arm that invokes the SHARED
         // `toggle-info-panel` callback (main.rs). Deliberately NOT compare-gated: the callback works
         // in compare (the expanded panel mounts over the A/B split), and the compare-mode recovery
@@ -842,6 +857,7 @@ pub(crate) fn probe_literal() -> MenuSnapshot {
         count: 5,
         modal: true,
         modal_fs: true, // v0.9.67 (OWNER RULING 08-08 (ii))
+        trash_at_once: true,
         opening_photo: true,
         applying_rotations: true, // fix round 1
         inspect_open: true,
@@ -1451,8 +1467,8 @@ mod tests {
     /// (resets the shared zoom + recentres the compare pan).
     #[test]
     fn a_ready_opening_photo_keeps_its_zoom_rows_while_view_only_blocks_edits() {
-        // v1.0.6: View only makes `modal` true while a photo opens. The zoom rows follow the
-        // inspection gate instead, so they stay live for a ready photo and only for zoom.
+        // v1.0.6: while a photo opens the zoom rows follow the inspection gate, so they stay live
+        // for a ready photo and only for zoom. (Queue entry 6: `modal` no longer carries the opening.)
         let km = default_keymap();
         for at_fit in [true, false] {
             let mut s = snap_with(&km);
@@ -1517,21 +1533,22 @@ mod tests {
         }
     }
 
-    /// L15 Trash-in-compare honesty: TAG_TRASH disables in A|B compare (its dispatch is compare-gated
-    /// — an enabled item would be a silent no-op), while the OTHER Photo-menu actions (rate/flag) stay
-    /// enabled — encoding the audit's exact surprise case.
+    /// R5 (Delete round): Del works on the active half of A|B compare, so Trash is enabled there with the
+    /// other Photo-menu actions. It keeps every other term: an item that can only no-op is the L15 defect.
+    ///
+    /// FALSIFIER (L28): put `&& !s.compare` back on `TAG_TRASH`: the first row.
     #[test]
-    fn trash_disabled_in_compare() {
+    fn trash_goes_with_the_key_in_compare() {
         let km = default_keymap();
         let mut s = snap_with(&km);
         s.compare = true;
-        assert!(!enabled_for(TAG_TRASH, &s), "trash must disable in compare (dispatch no-ops there)");
-        // The maximal-surprise contrast: sibling Photo actions still work in compare.
+        assert!(enabled_for(TAG_TRASH, &s), "trash takes the active half, as the key does");
         assert!(enabled_for(TAG_RATE1 + 2, &s), "rate stays enabled in compare");
         assert!(enabled_for(TAG_FLAG, &s), "flag stays enabled in compare");
-        // Outside compare (single view) trash is enabled again (photo_ok holds).
         s.compare = false;
         assert!(enabled_for(TAG_TRASH, &s), "trash enabled in single view");
+        s.has_photo = false;
+        assert!(!enabled_for(TAG_TRASH, &s), "nothing to delete");
     }
 
     /// Undo dynamic title honesty: delete-record state retitles to "Undo Delete"; plain undo keeps
@@ -1940,6 +1957,15 @@ mod tests {
         assert_eq!(photo_row(&one, TAG_FLAG).title, hint("Flag 1 Photo", &g("flag")));
         assert_eq!(photo_row(&one, TAG_UNMARK).title, hint("Unmark 1 Photo", &g("unflag")));
         assert_eq!(photo_row(&one, TAG_TRASH).title, hint("Delete 1 Photo…", &g("delete")));
+        // R27: the ellipsis promises a dialog, so it goes where the row goes at once.
+        let at_once = MenuSnapshot { trash_at_once: true, ..snap(12, true, true, -1) };
+        assert_eq!(photo_row(&at_once, TAG_TRASH).title, hint("Delete 12 Photos", &g("delete")));
+        let at_once_one = MenuSnapshot { trash_at_once: true, ..snap(0, true, true, -1) };
+        assert_eq!(
+            photo_row(&at_once_one, TAG_TRASH).title,
+            hint(crate::platform::PLATFORM.move_to_trash, &g("delete")),
+            "with no selection, a plain Move to Trash"
+        );
         assert_eq!(photo_row(&one, TAG_RATE0).title, hint("Clear Rating on 1 Photo", &g("rate0")));
 
         // ── THE FIVE RULED ROWS, at the ruling's own count ─────────────────────────────────────
@@ -2091,16 +2117,19 @@ mod tests {
         // (v) THE TRASH ARM — one call, and it is the key's. No delete of its own.
         let trash_arm = between("mm::TAG_TRASH => {", "mm::TAG_XMP =>");
         assert!(trash_arm.contains("app.invoke_delete_key();"), "the arm is the delete KEY's twin");
+        // R18, R19: a press can delete with no dialog now, so a held key is one press here too, and the
+        // bell panel stops it, as the key's own arm in the window does.
+        assert!(trash_arm.contains("&& !command.repeated && !app.get_notif_open()"), "held, or with the bell panel open, it does nothing");
         for forbidden in ["BulkOp::", "trash_", "delete_shot", "set_del_bulk"] {
             assert!(!trash_arm.contains(forbidden), "the Trash row must not {forbidden} on its own");
         }
         // …and the body it reaches sends a live selection to the count-naming confirm.
-        let dk = between("app.on_delete_key(move ||", "open_delete_confirm(&app,");
+        let dk = between("app.on_delete_key(move ||", "delete_one_dk(&app,");
         in_order(&dk, &["if bulk_armed(&app, &ss_dk)", "open_bulk_dk();"]);
         let confirm = between("let open_bulk_delete: Rc<dyn Fn()> = {", "app.on_bulk_delete_ask");
         in_order(
             &confirm,
-            &["support::bulk_delete_title(", "a.set_del_bulk(true);", "a.set_confirm_kind(6);"],
+            &["support::bulk_delete_words(", "a.set_del_bulk(true);", "a.set_confirm_kind(6);"],
         );
     }
 
@@ -2130,8 +2159,8 @@ mod tests {
         s.raw_open = !s.raw_open;
         assert_ne!(f4, fingerprint(&s), "hiding/showing the develop panel re-titles the row");
     }
-    // Falsifier: gate native sorting only on modal; Allow photo edits removes
-    // that modal while Rust still refuses every partial-folder sort request.
+    // Falsifier: gate native sorting only on modal; a folder still loading is no longer
+    // in that modal (queue entry 6) while Rust still refuses every partial-folder sort request.
     #[test]
     fn refinement_native_sort_waits_for_discovery_in_both_opening_modes() {
         let mut s=MenuSnapshot { has_photo:true,count:21,opening_photo:true,..Default::default() };
@@ -2143,6 +2172,46 @@ mod tests {
         }
         s.opening_photo=false; s.modal=false;
         assert!(enabled_for(TAG_SORT_M0,&s));
+    }
+
+    /// Queue entry 6 (owner, 2 November 2026: "always allow and remove the setting"): while a folder
+    /// loads, `modal` is false (no dialog) and the Photo menu's rating, flag, reject, unmark and turn
+    /// rows are live, as their keys are. The rows whose handlers wait for the whole folder stay grey:
+    /// Copy, Move to Trash, XMP sync, Compare, and the zoom pair until the opened photo shows. Once the
+    /// folder has loaded, all of them are live again.
+    ///
+    /// FALSIFIER (L28): drop `!s.opening_photo` from TAG_COPY, TAG_TRASH, TAG_XMP or TAG_COMPARE; light
+    /// the zoom pair on `photo_ok` alone; or grey a review row on `opening_photo`.
+    #[test]
+    fn while_a_folder_loads_review_rows_are_live_and_folder_rows_wait() {
+        let km = default_keymap();
+        let mut s = snap_with(&km);
+        s.compare = false;
+        s.at_fit = true;
+        s.opening_photo = true;
+        s.modal = false;
+        let review = [TAG_RATE1, TAG_RATE5, TAG_RATE0, TAG_FLAG, TAG_REJECT, TAG_UNMARK, TAG_ROT_LEFT, TAG_ROT_RIGHT];
+        let waiting = [TAG_COPY, TAG_TRASH, TAG_XMP, TAG_COMPARE];
+        for ready in [false, true, false, true] {
+            s.inspect_open = ready;
+            for tag in review {
+                assert!(enabled_for(tag, &s), "tag {tag}: a review row works while the folder loads (ready={ready})");
+            }
+            for tag in waiting {
+                assert!(!enabled_for(tag, &s), "tag {tag}: waits for the whole folder (ready={ready})");
+            }
+            assert_eq!(enabled_for(TAG_ZOOM_11, &s), ready, "Zoom 1:1 waits only for the opened photo");
+        }
+        s.modal = true;
+        s.inspect_open = false;
+        for tag in review {
+            assert!(!enabled_for(tag, &s), "tag {tag}: a real dialog still disables it");
+        }
+        s.modal = false;
+        s.opening_photo = false;
+        for tag in review.into_iter().chain(waiting).chain([TAG_ZOOM_11]) {
+            assert!(enabled_for(tag, &s), "tag {tag}: live once the folder has loaded");
+        }
     }
 
     /// Fix round 1 (1 November, F13-apply-4, owner: "Apply rotations only"; L21/L26): the Mac Sort

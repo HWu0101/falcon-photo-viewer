@@ -11,8 +11,80 @@ fn partial_photo_edits_do_not_enable_whole_folder_or_file_operations() {
         let marker = format!("app.on_{callback}(move");
         let body = source.split_once(&marker).unwrap().1.split_once("{ return; }").unwrap().0;
         assert!(body.contains("a.get_opening_photo()"), "{callback} must wait for the folder");
-        assert!(!body.contains("get_photo_open_edits"), "{callback} is not a per-photo edit");
+        assert!(body.trim_end().ends_with("a.get_opening_photo())"), "{callback}: the opening alone decides");
     }
+}
+
+/// Queue entry 6 (owner, 2 November 2026: "always allow and remove the setting"; recorded then as
+/// "sorting, selection and file or whole-folder actions still wait"). The callbacks are closures in
+/// `main`, so the row reads their gates from the source, as the row above does:
+/// - The eleven review handlers (a star, a flag, a reject, a clear, a turn, Ctrl+Z, Ctrl+Y, and the
+///   grid's, the Review list's and the menus' by-index forms) carry no wait for the folder.
+/// - Every sort, selection gesture, bulk form over a selection, Compare, "next unrated", copy, delete,
+///   move and their ways back still starts with the folder's wait.
+/// - Ctrl+Z waits for the folder before taking back a delete or a move, and before the nudge.
+///
+/// FALSIFIER (L28): put `a.get_opening_photo()` back at the top of `on_set_rating`; drop it from
+/// `on_sort_pick`, `on_bulk_mark` or `on_recover_delete`; take the arm check out of `on_undo`.
+#[test]
+fn review_actions_never_wait_for_the_folder_and_folder_actions_still_do() {
+    let source = include_str!("main.rs");
+    let body = |callback: &str| {
+        let marker = format!("app.on_{callback}(move");
+        let (_, rest) = source.split_once(&marker).unwrap_or_else(|| panic!("{callback} is wired"));
+        rest.split_once("app.on_").map_or(rest, |(b, _)| b)
+    };
+    for review in ["set_rating", "set_flag", "set_reject", "clear_mark", "rotate_shot", "undo", "redo",
+        "sel_set_rating", "sel_toggle_flag", "sel_toggle_reject", "sel_unmark"] {
+        let first = body(review).split_once("{ return; }").map_or("", |(head, _)| head);
+        assert!(!first.contains("get_opening_photo"), "{review} is a review action: it never waits for the folder");
+    }
+    for waits in ["sort_pick", "sort_dir_pick", "set_filter", "sel_gesture", "select_all_displayed", "clear_selection",
+        "restore_selection", "bulk_mark", "bulk_rate_ask", "bulk_unmark", "bulk_rate_ask_key", "bulk_rate_yes", "bulk_rotate",
+        "bulk_delete_ask", "reveal_selected", "select_new_edited", "toggle_compare", "sel_to_compare", "next_unrated",
+        "copy_files", "copy_selected", "copy_shortcut", "delete_key", "delete_shot", "delete_flag_reject", "recover_delete",
+        "undo_move", "empty_rejected"] {
+        // Its own gate, at the top of its body, before anything is done (Ctrl+C and Del ask the open
+        // menu's row first, which waits too).
+        let gate = body(waits).find(".is_some_and(|a| a.get_opening_photo()) { return; }");
+        assert!(gate.is_some_and(|at| at < 700), "{waits} still waits for the whole folder");
+    }
+    let undo = body("undo");
+    let wait = "if !matches!(arm, Some(support::UndoArm::Stack(_))) && awz_u.upgrade().is_some_and(|a| a.get_opening_photo()) {";
+    let at = |s: &str| undo.find(s).unwrap_or_else(|| panic!("on_undo: {s}"));
+    assert!(at(wait) < at("if support::undo_waits_for_landing(arm, returning) {"), "a delete or move taken back waits first");
+    assert!(at(wait) < at("let nudge = history_u.borrow_mut().nudge_once();"), "and the nudge isn't spent");
+}
+
+/// Queue entry 6 (the owner's row: "browsing keys work while the browse-speed panel or Settings is
+/// open"), the Rust half. Home, End and the grid's arrows step through `on_sel_jump`, which now waits
+/// only for the real dialogs and the welcome guide (`browse-blocked`); the grid's arrows at an
+/// unfinished edge step through `on_grid_boundary_step`, which reads the keys' own gate. The clicks that
+/// reach `on_sel_jump` keep waiting for the two panels: the Resume button asks `inspection-blocked`
+/// itself, the thumbnails ask `neighbour-browse-allowed` (the rig row
+/// `the_browsing_keys_work_with_settings_or_the_speed_panel_open`), and the filmstrip's own click is
+/// unchanged. The callbacks are closures in `main`, so this reads their gates from the source.
+///
+/// FALSIFIER (L28): `on_sel_jump` reads `get_inspection_blocked()` again; the Resume button loses its
+/// own check; `on_grid_boundary_step` reads `get_photo_popup_open()` again.
+#[test]
+fn browsing_keys_step_in_rust_with_the_two_panels_open_and_clicks_still_wait() {
+    let source = include_str!("main.rs");
+    let body = |callback: &str| {
+        let marker = format!("app.on_{callback}(move");
+        let (_, rest) = source.split_once(&marker).unwrap_or_else(|| panic!("{callback} is wired"));
+        rest.split_once("app.on_").map_or(rest, |(b, _)| b)
+    };
+    let jump = body("sel_jump");
+    let at = |s: &str, what: &str| jump.find(what).unwrap_or_else(|| panic!("{s}: {what}"));
+    assert!(at("sel_jump", "if a.get_browse_blocked() {") < at("sel_jump", "photo_open::pending_direction("), "Home, End and the grid's arrows step with either panel open");
+    assert!(!jump.contains("get_inspection_blocked"), "sel_jump no longer waits for the two panels");
+    let resume = body("resume_jump");
+    let check = resume.find("if !a.get_inspection_blocked() {").expect("the Resume button waits for the two panels");
+    assert!(check < resume.find("a.invoke_sel_jump(idx as i32);").unwrap(), "…before it steps");
+    let edge = body("grid_boundary_step");
+    assert!(edge.find("if a.get_browse_keys_blocked() { return; }").is_some_and(|g| g < 120), "the grid's arrows at an edge read the keys' gate first");
+    assert!(body("film_clicked").contains("if a.get_photo_popup_open() { return; }"), "the filmstrip's click is unchanged");
 }
 
 #[test]
@@ -325,7 +397,7 @@ fn explicit_opens_compare_folder_identities_off_the_interface_thread() {
     assert!(resolved.contains("if let Some((dir, sel)) = again {") && !resolved.contains("reload(path, None)"));
     assert!(!resolved.contains("folder_identity"), "no file-system identity read on the interface thread");
     assert_eq!(resolved.matches(" had_file, from_ledger, identity, manifest").count(), 3, "first photo, nearby, final");
-    let reload = section("    let reload: Rc<dyn Fn(PathBuf, Option<usize>)> = {", "\n    };");
+    let reload = section("    let reload: Rc<dyn Fn(PathBuf)> = {", "\n    };");
     assert!(reload.contains(" had_file, from_ledger, identity: None, manifest,"), "the synchronous rescan reads none");
     assert!(source.contains("*scanned_dir.borrow_mut() = dir.display().to_string(); // v0.8.121 (F20): same rule, same line\n            shown_folder.borrow_mut().record(&dir.display().to_string(), identity);"));
 }
@@ -368,7 +440,7 @@ fn a_reopen_scans_off_the_interface_thread_and_keeps_edits_made_meanwhile() {
     let (release_tx, release_rx) = channel::<()>();
     let worker = std::thread::spawn(move || {
         let warn = Mutex::new(None);
-        support::reopen_scan(id, rescan_dir, sel, live_sort, &[], 10, None, &warn, |dir: &Path| {
+        support::reopen_scan(id, rescan_dir, sel, live_sort, &[], 10, None, false, &warn, |dir: &Path| {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             falcon_decode::scan_folder_with_metadata(dir)
@@ -403,7 +475,7 @@ fn a_reopen_scans_off_the_interface_thread_and_keeps_edits_made_meanwhile() {
     assert_eq!(names(&done.shots), names(&sync));
     // A folder that can't be read lands nothing: the list on screen stays.
     let warn = Mutex::new(None);
-    let unread = support::reopen_scan(8, dir.clone(), None, None, &[], 10, None, &warn, |_: &Path| Err(std::io::Error::other("offline")));
+    let unread = support::reopen_scan(8, dir.clone(), None, None, &[], 10, None, false, &warn, |_: &Path| Err(std::io::Error::other("offline")));
     assert!(unread.is_err());
 }
 
@@ -455,7 +527,7 @@ fn explicit_reopens_scan_on_a_worker_and_settle_at_acceptance() {
     assert!(branch.contains("let live_sort = folder_attrs.borrow().sort.clone();"));
     for wired in [
         "let read = |dir: &Path| falcon_decode::scan_folder_with_metadata_cancellable(dir, cancelled);",
-        "support::reopen_scan(id, dir.clone(), sel, live_sort, &sort_lru_snap, sort_cap, date_read, &local_warn, read)",
+        "support::reopen_scan(id, dir.clone(), sel, live_sort, &sort_lru_snap, sort_cap, date_read, false, &local_warn, read)",
         "if support::publish_latest(&scan_id, &scan_done, id, done) {",
     ] {
         assert!(branch[spawn..].contains(wired), "the reopen worker: {wired}");
@@ -482,7 +554,7 @@ fn explicit_reopens_scan_on_a_worker_and_settle_at_acceptance() {
     for half in ["tick::step_checked_kind(cmp_a_idx_t.get(), &shots_t, &thumb_gen_t);", "tick::step_checked_kind(cmp_b_idx_t.get(), &shots_t, &thumb_gen_t);"] {
         assert!(compare_halves.contains(half), "both Compare halves are looked at: {half}");
     }
-    let reload = section("    let reload: Rc<dyn Fn(PathBuf, Option<usize>)> = {", "\n    };");
+    let reload = section("    let reload: Rc<dyn Fn(PathBuf)> = {", "\n    };");
     let retire = reload.find("if reopen_pending.borrow_mut().superseded_by_rescan(scan_id.load(Ordering::Relaxed)) {\n                support::begin_explicit_scan(&scan_id, &scan_done);\n            }")
         .expect("a rescan retires a reopen still scanning");
     assert!(retire < reload.find("flush_old();").unwrap());
@@ -573,8 +645,8 @@ fn the_landing_is_the_photo_on_screen_now() {
     let pick = section("let apply_pick = Rc::new(move |method: SortMethod, desc: bool| {", "\n        });");
     assert!(!pick.contains("land_file") && !pick.contains("landing_file(") && !pick.contains("file_name()"), "the pick captures no landing");
     assert!(source.contains("let sort_reload_req = Arc::new(Mutex::new(None::<PathBuf>));"), "the request carries only the folder");
-    let drain = section("if let Some(p) = sort_reload_t.try_lock().ok().and_then(|mut g| g.take()) {", "mk!(\"reload_req\");");
-    let order = ["let snap = shots_t.lock()", "support::landing_file(&snap, *cur_t.borrow())", "keep_view_req_t.set(true);", "(&*reload_t)(path, None);", "keep_view_req_t.set(false);"];
+    let drain = section("if let Some(p) = sort_asked {", "mk!(\"reload_req\");");
+    let order = ["let snap = shots_t.lock()", "support::landing_file(&snap, *cur_t.borrow())", "(&*reload_t)(path);"];
     let spots: Vec<usize> = order.iter().map(|s| drain.find(s).unwrap_or_else(|| panic!("the drain: {s}"))).collect();
     assert!(spots.windows(2).all(|w| w[0] < w[1]), "the drain's order: {spots:?}");
 }
@@ -593,7 +665,7 @@ fn kept_tiles_return_after_the_clear() {
     assert!(book < append && append < publish, "right after the clear, before any step asks for tiles");
     let apply = source.split_once("    let apply_scan: Rc<dyn Fn(ScanDone)> = {").unwrap().1.split_once("\n    };").unwrap().0;
     let order = [
-        "let kept_view = if keep_view_req.take() {",
+        "let kept_view = rescan_carry.as_ref().and_then(|carry| {",
         "*listing_stamps.borrow_mut() = new_stamps;",
         "*s = new_arc.clone();",
         "reset_transient_ui(&a, &del_pending, id != 0);",
@@ -602,6 +674,45 @@ fn kept_tiles_return_after_the_clear() {
     ];
     let spots: Vec<usize> = order.iter().map(|s| apply.find(s).unwrap_or_else(|| panic!("apply_scan: {s}"))).collect();
     assert!(spots.windows(2).all(|w| w[0] < w[1]), "read before the swap, restored after every reset: {spots:?}");
+}
+
+/// R3 and the view rule, the wiring no rig reaches: `apply_scan` reads the scroll before the swap and the
+/// reset, puts the strip back and replaces the slot after them, at every landing. The tick takes it
+/// before `step_selection` rebuilds the rows the panel's half reads, and each half runs before the step
+/// that would recentre. Nothing asks for the view any more: every carrying reread keeps it.
+/// FALSIFIER: take the slot after `step_selection`, run the grid's half after `step_folder_grid`, read
+/// the free scroll after `reset_for_swap`, set the slot only when there is something in it, or bring
+/// the request back.
+#[test]
+fn a_landings_scroll_is_read_first_and_held_beside_its_steps() {
+    let source = include_str!("main.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+    assert!(!source.contains("keep_view_req"), "every carrying reread keeps the view");
+    let apply = source.split_once("    let apply_scan: Rc<dyn Fn(ScanDone)> = {").unwrap().1.split_once("\n    };").unwrap().0;
+    let order = [
+        "let kept_scroll = rescan_carry.as_ref().and_then(|carry| {",
+        "carry.keep_scroll(*current.borrow(), generation.load(Ordering::Relaxed), leading, view.free_scroll())",
+        "*s = new_arc.clone();",
+        "view.reset_for_swap(start);",
+        "kept.restore(&a, &view.compare, (&cmp_a_idx, &cmp_b_idx), &roi);",
+        "if let Some(strip) = kept_scroll.as_ref().and_then(|kept| kept.strip) {",
+        "view.restore_free_scroll(strip);",
+        "landing_scroll.set(photo_open::KeptScroll::after(landing_scroll.take(), kept_scroll));",
+    ];
+    let spots: Vec<usize> = order.iter().map(|s| apply.find(s).unwrap_or_else(|| panic!("apply_scan: {s}"))).collect();
+    assert!(spots.windows(2).all(|w| w[0] < w[1]), "apply_scan's order: {spots:?}");
+    let set_at_top_level = apply.split_once("view.restore_free_scroll(strip);").unwrap().1;
+    assert!(set_at_top_level.trim_start().starts_with("}\n            landing_scroll.set(photo_open::KeptScroll::after(landing_scroll.take(), kept_scroll));"), "set at every landing, so a re-sort leaves nothing behind");
+    let order = [
+        "let kept_scroll = landing_scroll_t.take();",
+        "tick::sel_hold_start(&app, kept, gen_now, &last_sel_view, &sel_model)",
+        "step_selection(",
+        "tick::sel_hold_finish(&app, hold, &sel_model, &sel_vp_prog);",
+        "tick::hold_grid_on_landing(&app, kept, gen_now, len, &last_grid_view, &last_grid_c, &grid_vp_prog);",
+        "step_folder_grid(",
+    ];
+    let tick = source.split_once(order[0]).expect("the tick takes it").1;
+    let spots: Vec<usize> = order[1..].iter().map(|s| tick.find(s).unwrap_or_else(|| panic!("the tick: {s}"))).collect();
+    assert!(spots.windows(2).all(|w| w[0] < w[1]), "the tick's order: {spots:?}");
 }
 
 /// Falsifier (1.1.0-rc.1, issue #11 batch M5): show the permission hint off the Mac, for an

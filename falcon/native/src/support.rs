@@ -1090,6 +1090,29 @@ pub(crate) fn speculative_read_refused(
     read_file(shot, tier).filter(|(_, p)| probe(p)).map(|(f, _)| f)
 }
 
+/// Fix round 2 (11 November 2026, `CS-13`) — **THE WHITE-BALANCE READING NEVER OPENS AN ONLINE-ONLY
+/// RAW THAT THE VIEW DOES NOT READ.** The info panel's colour temperature comes from the RAW. In
+/// Preview (JPEG) mode the stage reads a pair's JPEG, so opening its online-only RAW for the reading
+/// would download a file viewing never asked for (logic.md, "Each kind of work is judged by the file it
+/// reads"). `raw_viewed` (RAW mode, or a photo with no finished picture) is decided by the tick when it
+/// asks; `probe` is metadata only. In RAW mode, or for a RAW on this device, the RAW is read as before.
+///
+/// FALSIFIER (L28): drop the `raw_viewed` exemption and `the_white_balance_reading_skips_only_a_cloud_raw_the_view_does_not_read`
+/// reddens on the RAW-mode row; drop the probe and it reddens on the Preview-mode row.
+#[must_use]
+pub(crate) fn wb_read_refused(raw_viewed: bool, raw: &std::path::Path, probe: impl Fn(&std::path::Path) -> bool) -> bool {
+    !raw_viewed && probe(raw)
+}
+
+/// What the white-balance worker answers: the reading (`None` when the RAW carries no usable white
+/// balance, cached like any reading), or that it opened nothing because the RAW is only in the cloud
+/// and the view does not read it ([`wb_read_refused`]; never cached, so RAW mode can ask again).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WbAnswer {
+    Kelvin(Option<u32>),
+    CloudOnly,
+}
+
 /// R1 (Codex's review, 29 October 2026) — **ONE FULL-RESOLUTION JOB, ONE READ OF THE RAW-MODE
 /// SWITCH.** The detail worker reads the switch here, once, and both the cloud check and the job's
 /// reads (orientation, development, the finished-file decode) take the answer. Read twice, an
@@ -1296,14 +1319,29 @@ pub(crate) enum OpSeverity {
     Success,
     Warn,
     Error,
+    /// Delete round, R48 (owner, 11 November 2026: "2 B just make sure the notification is still there even
+    /// though the bell doesn't light up"): a success with nothing else to say, from Move rejected and Undo
+    /// move only. It renders as a success, card and row as ever, and it doesn't light the bell.
+    Clean,
 }
 impl OpSeverity {
     /// The `NotifEntry.kind` this renders as (0 info / 1 success / 2 warn / 3 error).
     pub(crate) fn notif_kind(self) -> i32 {
         match self {
-            OpSeverity::Success => 1,
+            OpSeverity::Success | OpSeverity::Clean => 1,
             OpSeverity::Warn => 2,
             OpSeverity::Error => 3,
+        }
+    }
+    /// R48: Move rejected's and Undo move's severity. A failed photo is an error, as `from_err` says. With none,
+    /// a result whose sentence says nothing more (`said`: what its clauses count, skipped files, side files left,
+    /// manifest divergences, files needing attention) is clean. Anything said is a plain success that still
+    /// lights the bell, as today.
+    pub(crate) fn of_result(fail: usize, said: usize) -> Self {
+        match (fail, said) {
+            (0, 0) => OpSeverity::Clean,
+            (0, _) => OpSeverity::Success,
+            _ => OpSeverity::Error,
         }
     }
     /// The old two-valued call shape, kept for the file ops whose only question really is "did
@@ -1367,7 +1405,15 @@ pub(crate) struct RoiReq {
     pub(crate) gen: u64,
     pub(crate) rects: Vec<(f32, f32, f32, f32, u32)>,
     pub(crate) raw: bool, // RAW-develop mode active: develop the RAW (per-shot, if it has one) instead of the JPG source
+    // Fix round 2 (`CS-77`): asked by Compare (`step_roi_compare`), so the worker records the time of
+    // its decodes as Compare's, not the single view's (`RoiDecodeMs`).
+    pub(crate) compare: bool,
 }
+
+/// Fix round 2 (`CS-77`): each view's most recent completed zoom decode, in ms (index 0 the single
+/// view, 1 Compare; 0 = none yet this session). Written by the zoom worker after a request that really
+/// decoded a source (a cached source does not count), read by the tick for `tick::zoom_stillness`.
+pub(crate) type RoiDecodeMs = Arc<[AtomicU32; 2]>;
 /// One decoded region tile + the (clamped) normalised source rect it covers. `src_long`
 /// is the source long side it was cropped from (full vs a quick preview), so the cache
 /// can prefer the sharpest tile. `preview` = from the fast low-res decode (upgrade later).
@@ -6531,9 +6577,9 @@ pub(crate) struct Settings {
     pub(crate) sort_last_used: String,
     pub(crate) sort_folders: Vec<(String, String)>,
     pub(crate) sort_cap_tier: i32,
-    /// Owner-approved A/B setting; old settings retain the view-only default.
-    #[serde(default)]
-    pub(crate) photo_open_edits: bool,
+    // Queue entry 6 (owner, 2 November 2026: "always allow and remove the setting"): the
+    // `photo_open_edits` key ("While the folder is loading") is gone. A file that still has it loads
+    // as before (no `deny_unknown_fields`) and the next save drops it.
     pub(crate) sort_cap_custom: i32,
     // v0.8.89: the per-folder FLOATING-PANEL min-state MRU (owner feature) — mirrors `sort_folders`: a
     // capped LRU of (folder → encoded "IR" 2-char states, encode_panel_min). Folders whose
@@ -8755,14 +8801,14 @@ fn taken_key(row: impl Fn(&PathBuf) -> Option<(Option<std::time::SystemTime>, Op
     }
 }
 
-/// How many dates a reread may read on the interface thread, when no read is running for the folder.
+/// How many dates a reread may read, when no read is running for the folder.
 /// This keeps the normal flow right: a photo saved beside the original, or a few rotated ones, sort to
 /// their real date at the next reread. Anything larger waits for the next open's date read.
 pub(crate) const INLINE_DATE_READS: usize = 32;
 
 /// R3: read at most `budget` photos that have no row for their listed modified time, and store them.
-/// Never a cloud-only photo, by the scan's tag or by the listing's metadata. Runs before the sort, on
-/// `reload` only: the sort itself reads nothing.
+/// Never a cloud-only photo, by the scan's tag or by the listing's metadata. Runs before the sort, in
+/// `reload` and on a file operation's reread: the sort itself reads nothing.
 pub(crate) fn read_dates_inline(shots: &[Shot], metadata: &BTreeMap<PathBuf, std::fs::Metadata>, budget: usize) -> usize {
     read_dates_inline_with(shots, metadata, budget, falcon_decode::metadata_is_cloud_placeholder, |shot, stamp| {
         read_taken_row_with(shot, stamp, falcon_decode::metadata_is_cloud_placeholder, falcon_decode::file_is_cloud_placeholder)
@@ -9263,8 +9309,8 @@ pub(crate) fn date_card_text(done: usize, total: usize) -> String {
 pub(crate) const LANDING_SCROLL_SETTLE: Duration = Duration::from_secs(2);
 
 /// What a landing that arrives on its own has to wait for, because every landing closes or ends it
-/// (`reset_transient_ui`, `view.reset_for_swap`) or lands on a position in the order before it. Export
-/// and Copy picks are not here: they end in no position landing and can run for minutes. Nor is the
+/// (`reset_transient_ui`, `view.reset_for_swap`), or because its own reread lands first. Export and
+/// Copy picks are not here: they end in no reread and can run for minutes. Nor is the
 /// zoom tile overlay: a kept view brings it back.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LandingHolds {
@@ -9275,9 +9321,10 @@ pub(crate) struct LandingHolds {
     pub(crate) open_menu_open: bool,
     pub(crate) scanning: bool,
     pub(crate) opening_photo: bool,
-    /// Move rejected, Undo move or Empty is running.
+    /// Move rejected or Empty is running, or the file queue isn't quiet (a delete, a Recover, an Undo move).
     pub(crate) position_op: bool,
-    /// A file operation's reread is posted and not yet drained (its landing is a position).
+    /// A file operation's reread is wanted or running (it lands first, in the order on screen). Only a
+    /// Date taken landing reads this. The reread's own holds leave it out, or it would wait for itself.
     pub(crate) reload_pending: bool,
     pub(crate) applying_rotations: bool,
     pub(crate) film_dragging: bool,
@@ -9748,7 +9795,7 @@ mod sort_tests {
     /// a release build WRAPPED to a nonsense sort key (Cargo's default `overflow-checks = false`)
     /// and a debug build or `cargo test` PANICKED — so a crafted file could abort a debug boot or a
     /// fixture-driven test run, and silently mis-sort a shipping one. Reached from a date read's
-    /// threads, and from the few dates a reread reads on the interface thread.
+    /// threads, and from the few dates a reread reads.
     ///
     /// FALSIFIER (L28): delete the `h`/`mi`/`se` clauses from the guard and the first row panics
     /// with an arithmetic overflow under `cargo test` — which is the finding, executed.
@@ -10052,7 +10099,7 @@ mod sort_tests {
         assert!(!taken.contains("*sort_rl.lock()"), "nothing is posted until the read ends");
         let land = section("PassDue::Land => {", "mk!(\"reload_req\");");
         // Its own statement: a `borrow_mut()` held into `reload` would panic when it reads the slot.
-        let order = ["let landing_pass = taken_pass_t.borrow_mut().take();", "active.handle.merge_finished();", "support::remember_sort(", "keep_view_req_t.set(true);", "reload_t(path, None);", "keep_view_req_t.set(false);"];
+        let order = ["let landing_pass = taken_pass_t.borrow_mut().take();", "active.handle.merge_finished();", "support::remember_sort(", "reload_t(path);"];
         let spots: Vec<usize> = order.iter().map(|s| land.find(s).unwrap_or_else(|| panic!("the landing: {s}"))).collect();
         assert!(spots.windows(2).all(|w| w[0] < w[1]), "rows, then memory, then one reread: {spots:?}");
         // The memory's routing, and that the old order is what the next reread reads until then.
@@ -10257,22 +10304,22 @@ mod sort_tests {
 
     fn stale_scan_for_pass() -> ScanDone {
         ScanDone { changed_sources: HashSet::new(), stamps: None, partial: false, pending_edges: (false, false), source_order: Vec::new(), id: 9, dir: PathBuf::from("retired"), shots: Vec::new(), ratings: Vec::new(),
-            marks: Vec::new(), start: 0, land: None, extra: BTreeMap::new(), rotations: BTreeMap::new(),
+            marks: Vec::new(), start: 0, land: None, land_by_photo: None, extra: BTreeMap::new(), rotations: BTreeMap::new(),
             attrs: FolderAttrs::default(), had_file: false, from_ledger: false, identity: None, manifest: None,
-            sort: (SortMethod::Taken, false), scan_err: false, scan_denied: false, unlisted_target: None, review_load: ReviewLoad::Loaded, taken_pass: None }
+            sort: (SortMethod::Taken, false), scan_err: false, scan_denied: false, unlisted_target: None, review_load: ReviewLoad::Loaded, taken_pass: None, delete_asks: None }
     }
 
     /// One Delete of the photo on screen, as the reread after it runs: the file leaves, the folder is
-    /// listed and sorted by the sort the folder has now, and the landing is the deleted position.
+    /// listed and sorted by the sort the folder has now, and the landing is by photo.
     fn delete_on_screen(dir: &Path, on_screen: &[Shot], at: usize, method: SortMethod) -> (Vec<Shot>, usize) {
         std::fs::remove_file(primary_file(&on_screen[at]).unwrap()).unwrap();
         let after = listed(dir, method, false);
-        let land = post_op_land(at, after.len());
+        let land = land_by_photo(on_screen, at, &after, &[]);
         (after, land)
     }
 
-    /// The memo doesn't change until the landing, so a Delete during the read lands by position on the
-    /// next photo, in the order on screen, each time it is pressed. Two cases: a pick (the reread is
+    /// The memo doesn't change until the landing, so a Delete during the read lands on the next photo,
+    /// in the order on screen, each time it is pressed. Two cases: a pick (the reread is
     /// still in the old order) and an open handed over (the list is in file-date order, unmerged). A
     /// Delete can also arrive after the read ended, with the landing held behind its dialog. Then the
     /// landing keeps the person on the same photo. Named by photo, never by position (L52, L53).
@@ -10475,6 +10522,83 @@ mod sort_tests {
         drop(big);
         assert_eq!(classify_date_cache(&folder.0), DateCacheState::LeaveAlone);
         assert_eq!(read_with_counter(&folder.0, false).0, 3);
+    }
+
+    /// 14 November 2026 (the date-read fix): a version 1 file's "no date" rows were written by a
+    /// reader that missed an iPhone HEIC's date (and a JPEG's cut off at 64 KiB), so they are not
+    /// trusted: only those photos are read again, the dated rows are served, and the file is
+    /// rewritten as version 2, whose rows are all trusted. A photo that again has no date is stored
+    /// as a version 2 "no date" row, so it is read once and not on every open.
+    ///
+    /// FALSIFIER (L28): keep version 1's "no date" rows (the code before the fix, where
+    /// `DATE_CACHE_VERSION` was 1: nothing is read again), accept only the current version in
+    /// `decode_date_cache` (every photo is read), or write version 1 again (the second open reads the
+    /// no-date photo again).
+    #[test]
+    fn a_version_1_no_date_row_is_read_again_once() {
+        let folder = dated_folder("v1", &[("A", 1_000), ("B", 2_000), ("C", 3_000)]);
+        let file = folder.0.join(DATE_CACHE_NAME);
+        let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+        let stamps = listing_stamps_of(&scan.metadata);
+        let path = |name: &str| folder.0.join(format!("{name}.png"));
+        let row = |name: &str, date| TakenRow { modified: Some(stamps[&path(name)].1), path: path(name), date };
+        let version_1 = |rows: &[TakenRow]| {
+            let mut bytes = encode_date_cache(rows);
+            bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+            bytes
+        };
+        // One open, as a pick of Date taken does. The reader finds B's date; A and C have none.
+        let open = || {
+            let read = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = read.clone();
+            let reader: PassReader = Arc::new(move |s, stamp| {
+                seen.lock().unwrap().push(s.name.clone());
+                Some(TakenRow { path: primary_file(s).unwrap().clone(), modified: stamp, date: (s.name == "B").then_some(77) })
+            });
+            let scan = falcon_decode::scan_folder_with_metadata(&folder.0).unwrap();
+            let input = PassInput { dir: folder.0.clone(), shots: Arc::new(scan.shots), stamps: listing_stamps_of(&scan.metadata), order_desc: None, write_allowed: true };
+            let handle = TakenPass::start_with(input, reader, 2);
+            wait_ended(&handle);
+            writer_barrier(Duration::from_secs(5)); // the write, if the writer is up in this test process
+            let rows = handle.0.finished.lock().unwrap().take().map_or(Vec::new(), |f| f.rows);
+            let mut read = read.lock().unwrap().clone();
+            read.sort();
+            (read, rows)
+        };
+        let date = |rows: &[TakenRow], name: &str| rows.iter().find(|r| r.path == path(name)).map(|r| r.date);
+        let version = || u32::from_le_bytes(std::fs::read(&file).unwrap()[16..20].try_into().unwrap());
+
+        // Dated and "no date" rows: the dated one is served, the no-date ones are read again.
+        std::fs::write(&file, version_1(&[row("A", Some(5)), row("B", None), row("C", None)])).unwrap();
+        let (read, rows) = open();
+        assert_eq!(read, ["B", "C"], "only the version 1 no-date rows are read again");
+        assert_eq!(date(&rows, "A"), Some(Some(5)), "a dated version 1 row is served");
+        assert_eq!(date(&rows, "B"), Some(Some(77)), "B gets its date");
+        assert_eq!(date(&rows, "C"), Some(None), "C really has none");
+        assert_eq!(version(), 2, "rewritten as version 2");
+        assert_eq!(classify_date_cache(&folder.0), DateCacheState::Ours);
+        // Version 2 is trusted in full: C's no-date row is not read again, and nothing is written.
+        let written = std::fs::read(&file).unwrap();
+        let (read, rows) = open();
+        assert!(read.is_empty(), "a version 2 file is trusted: read {read:?}");
+        assert_eq!((rows.len(), date(&rows, "B"), date(&rows, "C")), (3, Some(Some(77)), Some(None)));
+        assert_eq!(std::fs::read(&file).unwrap(), written, "an unchanged folder writes nothing");
+
+        // Every re-read photo again has no date: still rewritten, so the next open reads nothing.
+        std::fs::write(&file, version_1(&[row("A", None), row("B", Some(6)), row("C", Some(7))])).unwrap();
+        let (read, rows) = open();
+        assert_eq!(read, ["A"]);
+        assert_eq!(date(&rows, "A"), Some(None));
+        assert_eq!(version(), 2, "rewritten although nothing new was dated");
+        assert!(open().0.is_empty(), "…so the folder is not read again on every open");
+
+        // A version 1 file with no "no date" row is trusted as it is, and stays as it is.
+        let dated = version_1(&[row("A", Some(5)), row("B", Some(6)), row("C", Some(7))]);
+        std::fs::write(&file, &dated).unwrap();
+        let (read, rows) = open();
+        assert!(read.is_empty(), "nothing to read again: read {read:?}");
+        assert_eq!(date(&rows, "C"), Some(Some(7)));
+        assert_eq!(std::fs::read(&file).unwrap(), dated, "left exactly as it was");
     }
 
     /// A cloud-only `falcon.cache` is never opened, replaced or removed: reading it would download it.
@@ -15346,7 +15470,6 @@ impl Default for Settings {
             gpu_backend_timings: String::new(), // v0.8.43: filled by the first auto-tune (organic) boot
             sort_last_used: "name.asc".to_string(), // v0.8.49: Name ascending = the historic scan order
             sort_folders: Vec::new(),
-            photo_open_edits: false,
             sort_cap_tier: 2, // v0.8.49: default = 10 folders (the resume cap's tiers, shared)
             sort_cap_custom: 0, // 0 = tier-driven
             panel_folders: Vec::new(), // v0.8.89: per-folder floating-panel min-state MRU (shares the sort cap)
@@ -15446,6 +15569,18 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 // rows of 24 bytes, sorted by hash: u64 fnv1a64 of the primary file's name, i64 modified time in
 // nanoseconds since 1970 (the memo compares `SystemTime` exactly), i64 capture date in the sort's
 // seconds, `i64::MIN` for "read, no date". 16,775 photos are 402,632 bytes.
+//
+// Version 2 (14 November 2026, the date-read fix). The reader that wrote version 1 found no date for
+// an iPhone HEIC whose Exif item lies past 64 KiB (about a third of a real phone library) or a JPEG
+// whose Exif segment ends past it, and stored "read, no date" for them; nothing would ever read those
+// files again, as their modified time does not change. So a version 1 file keeps its DATED rows,
+// which were right, and its "no date" rows count as not read: those photos alone are read again, and
+// the file is rewritten as version 2 by the ordinary rule (rewritten only for rows actually read; a
+// photo that again has no date becomes a version 2 "no date" row, so it is read once, not on every
+// open). A version 1 file with no "no date" row is right as it stands and is left as it is. A version
+// 2 file is trusted in full; any other version is no rows and is rewritten, as before. An older Falcon
+// meeting a version 2 file finds the version wrong, reads the folder again and writes version 1:
+// that costs it one read and nothing else. The format of a row is the same in both versions.
 
 pub(crate) const DATE_CACHE_NAME: &str = "falcon.cache";
 /// Owner: "2,000 is fine". Decides only whether a file is CREATED: at several threads a read of this
@@ -15455,7 +15590,9 @@ pub(crate) const DATE_CACHE_MIN_PHOTOS: usize = 2_000;
 /// About 700,000 photos. The file is never read past this, like every other 16 MiB reader here.
 const DATE_CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DATE_CACHE_MAGIC: &[u8; 16] = b"FalconDateCache\n";
-const DATE_CACHE_VERSION: u32 = 1;
+const DATE_CACHE_VERSION: u32 = 2;
+/// The version before the date-read fix: its dated rows are trusted, its "no date" rows are not.
+const DATE_CACHE_VERSION_1: u32 = 1;
 const DATE_CACHE_HEADER: usize = 32;
 const DATE_CACHE_ROW: usize = 24;
 const DATE_CACHE_NO_DATE: i64 = i64::MIN;
@@ -15563,11 +15700,16 @@ impl DateCacheRows {
 }
 
 /// All of length, magic, version and checksum must hold. Otherwise the file counts as no rows, and it
-/// is rewritten after the read.
+/// is rewritten after the read. A version 1 file's "no date" rows are dropped here, so those photos
+/// count as not read (see the format note above).
 fn decode_date_cache(bytes: &[u8]) -> Option<DateCacheRows> {
     let header = bytes.get(..DATE_CACHE_HEADER)?;
     let u32_at = |at: usize| Some(u32::from_le_bytes(header.get(at..at + 4)?.try_into().ok()?));
-    if &header[..DATE_CACHE_MAGIC.len()] != DATE_CACHE_MAGIC || u32_at(16)? != DATE_CACHE_VERSION {
+    if &header[..DATE_CACHE_MAGIC.len()] != DATE_CACHE_MAGIC {
+        return None;
+    }
+    let version = u32_at(16)?;
+    if version != DATE_CACHE_VERSION && version != DATE_CACHE_VERSION_1 {
         return None;
     }
     let count = u32_at(20)? as usize;
@@ -15576,9 +15718,10 @@ fn decode_date_cache(bytes: &[u8]) -> Option<DateCacheRows> {
         return None;
     }
     let field = |row: &[u8], at: usize| -> [u8; 8] { row[at..at + 8].try_into().expect("eight bytes") };
+    // Dropping rows keeps the order, so the rows stay sorted by hash for `date_of`.
     Some(DateCacheRows(body.chunks_exact(DATE_CACHE_ROW).map(|row| {
         (u64::from_le_bytes(field(row, 0)), i64::from_le_bytes(field(row, 8)), i64::from_le_bytes(field(row, 16)))
-    }).collect()))
+    }).filter(|row| version != DATE_CACHE_VERSION_1 || row.2 != DATE_CACHE_NO_DATE).collect()))
 }
 
 /// Worker only. Classified first, so a cloud-only file is never opened.
@@ -15841,8 +15984,9 @@ pub(crate) fn graceful_shutdown_steps(wait_for_file_op: bool, step: &mut dyn FnM
 
 /// Fix round 1 (1 November, CS-32): does this exit wait for a file operation first? Yes on the
 /// immediate-quit route (⌘Q / the Mac terminate hook, as before) and, on both platforms, whenever
-/// one is still running (`sel_busy`): a second × mid-Apply, a device-lost exit. The save sequence
-/// raises `op_cancel` before the wait, so it ends after the photo or file in flight.
+/// one is still running (`sel_busy`, or a file queue that isn't quiet): a second × mid-Apply, a
+/// device-lost exit. The save sequence raises `op_cancel` before the wait, so it ends after the photo
+/// or file in flight. A queued delete has no cancel: it runs, within the wait's 10 s bound.
 pub(crate) fn shutdown_waits_for_file_op(immediate: bool, file_op_busy: bool) -> bool {
     immediate || file_op_busy
 }
@@ -28838,6 +28982,133 @@ mod decode_instrumentation_tests {
         assert_eq!(read_file(&undecodable, dev), None);
     }
 
+    /// Fix round 2 (`CS-27`): the copy confirm's download count is FILES — the ones the copy reads under
+    /// the "what to copy" choice, online-only now, not already in ./Picks — and only cloud-tagged
+    /// photos are asked about.
+    #[test]
+    fn the_copy_download_count_is_the_files_the_copy_will_read() {
+        use std::path::{Path, PathBuf};
+        let pair = |n: &str| Shot {
+            id: 0, name: n.into(), has_raw: true, has_jpg: true,
+            raw: Some(PathBuf::from(format!("/f/{n}.CR3"))), jpg: Some(PathBuf::from(format!("/f/{n}.JPG"))),
+            kind: SrcKind::Jpeg, cloud_placeholder: true, sniffed: None,
+        };
+        // a: both files online-only · b: only the RAW (its JPEG was downloaded by viewing) ·
+        // c: online-only but already copied to ./Picks · d: untagged (never asked about).
+        let shots = vec![pair("a"), pair("b"), pair("c"), pair("d")];
+        let cloud = |p: &Path| {
+            let s = p.to_string_lossy();
+            s.contains("/a.") || s.ends_with("b.CR3") || s.contains("/c.") || s.contains("/d.")
+        };
+        let exists = |p: &Path| p == Path::new("/f/Picks/c.JPG") || p == Path::new("/f/Picks/c.CR3");
+        let tagged = |i: usize| i != 3;
+        let count = |order: &[usize], c: CopyContent| copy_cloud_files(order, &shots, c, tagged, cloud, exists);
+        assert_eq!(count(&[0], CopyContent::Both), 2, "a pair with both files online-only downloads 2 files");
+        assert_eq!(count(&[0], CopyContent::JpgOnly), 1);
+        assert_eq!(count(&[0], CopyContent::RawOnly), 1);
+        assert_eq!(count(&[1], CopyContent::JpgOnly), 0, "its JPEG is on this device: nothing downloads");
+        assert_eq!(count(&[1], CopyContent::Both), 1);
+        assert_eq!(count(&[2], CopyContent::Both), 0, "already in ./Picks: the copy skips it and reads nothing");
+        assert_eq!(count(&[3], CopyContent::Both), 0, "untagged: not asked");
+        let asked = std::cell::Cell::new(0);
+        let _ = copy_cloud_files(&[3], &shots, CopyContent::Both, tagged, |_: &Path| { asked.set(asked.get() + 1); true }, exists);
+        assert_eq!(asked.get(), 0, "an untagged photo makes no metadata call");
+        assert_eq!(count(&[0, 1, 2, 3], CopyContent::Both), 3);
+
+        // The same table through the count as the tick takes it (`copy_download_count`), over a
+        // made-up listing that says the same things: every row gives the same number.
+        use std::ffi::OsString;
+        let reads = std::cell::Cell::new(0);
+        let listing = |_: &Path, wanted: &HashSet<OsString>| {
+            reads.set(reads.get() + 1);
+            let says = |names: &[&str]| -> HashSet<OsString> {
+                names.iter().map(OsString::from).filter(|n| wanted.contains(n)).collect()
+            };
+            CopyCountListing {
+                online: Some(says(&["a.JPG", "a.CR3", "b.CR3", "c.JPG", "c.CR3", "d.JPG", "d.CR3"])),
+                in_picks: says(&["c.JPG", "c.CR3"]),
+            }
+        };
+        let via = |order: &[usize], c: CopyContent| copy_download_count(order, &shots, c, tagged, &listing);
+        for (order, c, want) in [
+            (&[0usize][..], CopyContent::Both, 2), (&[0], CopyContent::JpgOnly, 1), (&[0], CopyContent::RawOnly, 1),
+            (&[1], CopyContent::JpgOnly, 0), (&[1], CopyContent::Both, 1), (&[2], CopyContent::Both, 0),
+            (&[3], CopyContent::Both, 0), (&[0, 1, 2, 3], CopyContent::Both, 3),
+        ] {
+            assert_eq!(via(order, c), want, "{order:?}: the listing gives the table's number");
+            assert_eq!(via(order, c), count(order, c), "{order:?}: …the same as the per-file count");
+        }
+        reads.set(0);
+        let _ = via(&[3], CopyContent::Both);
+        assert_eq!(reads.get(), 0, "no tagged target: nothing is listed");
+    }
+
+    /// Fix round 2 (`CS-27`): the count's cost with the product's code (`copy_download_count` over
+    /// `CopyCountListing::read`) on real temporary files: a folder of 1,000 RAW+JPEG pairs, all of them
+    /// cloud-tagged targets. Printed, not bounded (the main session's ceiling was about 30 ms). The
+    /// 16,000-photo folder is the ignored measurement below (it makes 32,000 files).
+    #[test]
+    fn the_copy_download_count_cost_is_printed() {
+        let ms = copy_count_measure(1000, 1000);
+        println!("copy download count (listing), folder of 1,000 pairs, 1,000 tagged targets: {ms:.2} ms");
+    }
+
+    /// Fix round 2 (`CS-27`): the listing grows with the folder, so: a folder of 16,000 RAW+JPEG pairs
+    /// (32,000 files), 1,000 of them cloud-tagged targets. A measurement, run by hand (`--ignored`):
+    /// it writes 32,000 temporary files. The main session's ceiling was about 20 ms.
+    #[test]
+    #[ignore = "measurement: writes 32,000 temporary files; run with --ignored"]
+    fn the_copy_download_count_cost_in_a_16000_photo_folder_is_printed() {
+        let ms = copy_count_measure(16_000, 1000);
+        println!("copy download count (listing), folder of 16,000 pairs, 1,000 tagged targets: {ms:.2} ms");
+    }
+
+    /// Writes a folder of `pairs` RAW+JPEG pairs (none online-only: local temporary files) and returns
+    /// the best of five timed counts over the first `targets`, all tagged.
+    fn copy_count_measure(pairs: usize, targets: usize) -> f64 {
+        let dir = std::env::temp_dir().join(format!("falcon_copy_count_{}_{pairs}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(PICKS_SUBFOLDER)).unwrap();
+        let shots: Vec<Shot> = (0..pairs)
+            .map(|i| {
+                let (raw, jpg) = (dir.join(format!("IMG_{i:05}.CR3")), dir.join(format!("IMG_{i:05}.JPG")));
+                std::fs::write(&raw, b"r").unwrap();
+                std::fs::write(&jpg, b"j").unwrap();
+                Shot { id: i, name: format!("IMG_{i:05}"), has_raw: true, has_jpg: true, raw: Some(raw), jpg: Some(jpg),
+                    kind: SrcKind::Jpeg, cloud_placeholder: true, sniffed: None }
+            })
+            .collect();
+        let order: Vec<usize> = (0..targets).collect();
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let n = copy_download_count(&order, &shots, CopyContent::Both, |_| true, &CopyCountListing::read);
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(n, 0, "local temporary files are not online-only");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        best
+    }
+
+    /// Fix round 2 (`CS-13`): the white-balance reading opens a RAW only when the view reads it (RAW
+    /// mode, or no finished picture) or when it is on this device; the probe is not even asked in RAW
+    /// mode.
+    #[test]
+    fn the_white_balance_reading_skips_only_a_cloud_raw_the_view_does_not_read() {
+        let raw = std::path::Path::new("a.CR3");
+        let cloud = |_: &std::path::Path| true;
+        let local = |_: &std::path::Path| false;
+        assert!(wb_read_refused(false, raw, cloud), "Preview, RAW only in the cloud: not opened");
+        assert!(!wb_read_refused(true, raw, cloud), "RAW mode (or a RAW-only photo): the view reads it");
+        assert!(!wb_read_refused(false, raw, local), "a RAW on this device is read as before");
+        let asked = std::cell::Cell::new(false);
+        let _ = wb_read_refused(true, raw, |_: &std::path::Path| {
+            asked.set(true);
+            true
+        });
+        assert!(!asked.get(), "no metadata call when the view reads the RAW anyway");
+    }
+
     /// 2026-10-28 (the cloud-only round, design 4) — **THE ONE REFUSAL RULE THE PREVIEW AND
     /// FULL-RESOLUTION WORKERS SHARE, AND THE NOTE IT LEAVES.** Only a read nobody is looking at, of
     /// a file that is online-only, is refused; the photo on screen never is. The note is per file and
@@ -29236,8 +29507,7 @@ mod decode_instrumentation_tests {
     ///
     /// FALSIFIER (L28): make the probe's error arm count as ABSENT (i.e. `present` returning false
     /// on error) and the third row reddens — a permission fault would then mint a DeleteRecord
-    /// naming files that are still in the folder, and the GF6 newest-only rule would demote a good
-    /// record to seat it.
+    /// naming files that are still in the folder.
     #[test]
     fn a_partial_recycle_is_reconciled_against_the_folder() {
         let f = |n: &str| PathBuf::from(format!("C:/f/{n}"));
@@ -30735,6 +31005,10 @@ const REOPEN_HOLD_LIMIT: Duration = Duration::from_secs(30);
 /// Ratings, marks and rotations changed while this runs are newer than anything it read, so
 /// `apply_scan` carries them at acceptance and sorts again (`carry_live_review_on_rescan`,
 /// `photo_open::settle_reopen`).
+///
+/// R13 (Delete round): a file operation's reread is this read too, with `id` 0
+/// (`file_queue::run_listing`). `inline_dates` is `reload`'s rule for a reread, which never starts a date
+/// read: with none running it reads a few dates, so a photo saved beside the original sorts to its real date.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reopen_scan(
     id: u64,
@@ -30744,6 +31018,7 @@ pub(crate) fn reopen_scan(
     sort_lru: &[(String, String)],
     sort_cap: usize,
     date_read: Option<&dyn Fn() -> bool>,
+    inline_dates: bool,
     warn: &Mutex<Option<OpResult>>,
     read: impl FnOnce(&Path) -> std::io::Result<falcon_decode::FolderScan>,
 ) -> std::io::Result<ScanDone> {
@@ -30764,15 +31039,19 @@ pub(crate) fn reopen_scan(
     let taken_pass = date_read.filter(|_| method == SortMethod::Taken).and_then(|cancelled| {
         taken_before_sort(PassInput { dir: dir.clone(), shots: Arc::new(shots.clone()), stamps: listing_stamps_of(&scan.metadata), order_desc: Some(desc), write_allowed: sort_cap > 0 }, cancelled)
     });
+    if inline_dates && method == SortMethod::Taken {
+        read_dates_inline(&shots, &scan.metadata, INLINE_DATE_READS);
+    }
     sort_scanned_shots(&mut shots, method, desc, &sel_map, &scan.metadata);
     let matched = select_match(&shots, &sel);
     let unlisted_target = unlisted_target(false, &sel, matched);
     let (ratings, marks) = apply_selection(&sel_map, &shots);
     // R6: moved-out leftovers come only from a review file (or unsaved save) that was read.
     let extra = if review_load == ReviewLoad::Loaded { selection_leftover(sel_map, &shots) } else { BTreeMap::new() };
+    let asks = delete_asks(&dir); // R21: each reread refreshes the drive's answer
     Ok(ScanDone { changed_sources: HashSet::new(), stamps: Some(listing_stamps(scan.metadata)), partial: false, pending_edges: (false, false), source_order, id, dir, shots,
-        ratings, marks, start: matched.unwrap_or(0), land: None, extra, rotations, attrs, had_file, from_ledger,
-        identity: None, manifest, sort: (method, desc), scan_err: false, scan_denied: false, unlisted_target, review_load, taken_pass })
+        ratings, marks, start: matched.unwrap_or(0), land: None, land_by_photo: None, extra, rotations, attrs, had_file, from_ledger,
+        identity: None, manifest, sort: (method, desc), scan_err: false, scan_denied: false, unlisted_target, review_load, taken_pass, delete_asks: Some(asks) })
 }
 
 /// Explicit opens validate on a worker. In particular, a missing argv file must
@@ -30868,18 +31147,267 @@ pub(crate) fn folder_denied_notice(denied: bool, macos: bool) -> Option<&'static
     (denied && macos).then_some(tr_noop!("Falcon couldn't read this folder because access was denied. Check the folder's permissions and System Settings → Privacy & Security → Files and Folders, then try again."))
 }
 
-/// Post-op rescan landing (v0.8.34, C3/G1): clamp a desired shot index into the freshly-scanned list.
-/// Used ONLY by the SYNC reload path after a delete / move-rejects / undo-move — NEVER the normal open,
-/// which resumes via [`select_start`]. `new_len == 0` (folder emptied) → 0. A single delete passes the
-/// DELETED index: every shot above it shifts down one, so the clamp lands on the shot that took its place
-/// (the "next" shot), or the new last shot when the last was deleted. Move-rejects / undo-move pass the
-/// CURRENT index → the viewer stays near where it was, clamped in case the list shrank past it.
-pub(crate) fn post_op_land(desired: usize, new_len: usize) -> usize {
-    if new_len == 0 {
-        0
-    } else {
-        desired.min(new_len - 1)
+/// Landing by photo (Delete round, 3 November): where a same-folder reread lands, worked out on the
+/// interface thread at acceptance, while `on_screen` is still the list the person sees and `anchor`
+/// the photo they are on right now, never the one at the press (L54). People think in photos, so this
+/// replaces v0.8.34's position number for Delete, a selection delete, Move rejected, Undo move and
+/// Recover (L52), and the first photo a reread fell back to when its named photo had gone. In order:
+/// 1. A photo `named` lists, if it is in `new`: the first such photo in the new order. Only Recover
+///    names one, while the person hasn't navigated ([`Named::files_if_not_moved`]).
+/// 2. The anchor, if it stayed. Tidying other photos away doesn't move you.
+/// 3. The first photo after it on screen that stayed. A photo that arrived in the same listing was
+///    never on screen, so it is never landed on in place of the next one: on P3 of P1 P2 P3 P4, P3
+///    deleted, with NEW P1 P2 P4 listed, this gives P4, where the number gave P2.
+/// 4. The nearest photo before it that stayed, when nothing after it did.
+/// 5. 0, which means nothing stayed: the folder is empty, or it is another folder.
+///
+/// "Stayed" is exact identity (`photo_open::identity_map`) or, failing that, any file in common, so a
+/// half-deleted RAW+JPEG pair or a cloud flag the listing has just noticed doesn't read as "my photo
+/// left". Undo steps and prepared work stay on exact identity.
+pub(crate) fn land_by_photo(on_screen: &[Shot], anchor: usize, new: &[Shot], named: &[PathBuf]) -> usize {
+    fn files(s: &Shot) -> impl Iterator<Item = &PathBuf> {
+        s.jpg.iter().chain(s.raw.iter())
     }
+    if !named.is_empty() {
+        let named: HashSet<&PathBuf> = named.iter().collect();
+        if let Some(i) = new.iter().position(|s| files(s).any(|f| named.contains(f))) {
+            return i;
+        }
+    }
+    let exact = crate::photo_open::identity_map(on_screen, new);
+    if let Some(i) = exact.get(anchor).copied().flatten() {
+        return i;
+    }
+    StayedWalk::new(on_screen, new, &exact).from(anchor, None).unwrap_or(0)
+}
+
+/// "Stayed", as [`land_by_photo`] means it. The files are only mapped when a photo's exact identity has
+/// failed, so a large Move or a large selection's Recover isn't quadratic.
+struct StayedWalk<'a> {
+    on_screen: &'a [Shot],
+    exact: &'a [Option<usize>],
+    by_file: HashMap<&'a PathBuf, usize>,
+}
+
+impl<'a> StayedWalk<'a> {
+    fn new(on_screen: &'a [Shot], new: &'a [Shot], exact: &'a [Option<usize>]) -> Self {
+        let by_file = new.iter().enumerate().flat_map(|(i, s)| s.jpg.iter().chain(s.raw.iter()).map(move |f| (f, i))).collect();
+        Self { on_screen, exact, by_file }
+    }
+
+    /// Where this photo of the list on screen is now, if it stayed.
+    fn stayed(&self, i: usize) -> Option<usize> {
+        let shot = self.on_screen.get(i)?;
+        self.exact.get(i).copied().flatten().or_else(|| shot.jpg.iter().chain(shot.raw.iter()).find_map(|f| self.by_file.get(f).copied()))
+    }
+
+    /// The first photo at or after `at` on screen that stayed, else the nearest before it. `not` is a
+    /// place in the new list that doesn't count.
+    fn from(&self, at: usize, not: Option<usize>) -> Option<usize> {
+        let stayed = |i: usize| self.stayed(i).filter(|&now| Some(now) != not);
+        let len = self.on_screen.len();
+        (at.min(len)..len).find_map(stayed)
+            .or_else(|| (0..at.min(len)).rev().find_map(stayed))
+    }
+}
+
+/// Compare's two halves as they are at a landing, and which has the focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ComparePair {
+    pub(crate) a: usize,
+    pub(crate) b: usize,
+    pub(crate) focus: i32,
+}
+
+impl ComparePair {
+    /// `current` mirrors this half (`tick::step_compare_retarget`), and a cull key lands on it.
+    pub(crate) fn focused(&self) -> usize {
+        crate::tick::compare_cull_target(self.focus, self.a, self.b)
+    }
+}
+
+/// R5: the half a delete emptied, by photo, for that delete's Ctrl+Z. `half` is 0 for A and 1 for B.
+/// `replacement` is what took its place, so Ctrl+Z can tell whether the half still shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompareSeat {
+    pub(crate) half: i32,
+    pub(crate) photo: Vec<PathBuf>,
+    pub(crate) replacement: Vec<PathBuf>,
+}
+
+/// Fix round 2 (11 November 2026, `F14-input-1`) — **A HELD STAR, FLAG OR REJECT KEY MARKS ONCE.** The
+/// mark keys toggle (a rating key clears its own rating when "Press current rating again to clear" is
+/// on, the default; P, X and U flip; with a selection they act on all of it), so the operating
+/// system's key repeat flipped the mark on and off for as long as the key was held, one Undo step per
+/// flip. A repeat of a mark action is ignored; every other action keeps repeating as before (the arrow
+/// keys never pass through here at all).
+///
+/// FALSIFIER (L28): return `false` for a repeat and
+/// `a_held_mark_key_acts_once_and_other_keys_keep_repeating` reddens on every mark row.
+pub(crate) fn key_repeat_ignored(action: &str, repeat: bool) -> bool {
+    repeat && matches!(action, "rate0" | "rate1" | "rate2" | "rate3" | "rate4" | "rate5" | "flag" | "reject" | "unflag")
+}
+
+#[cfg(test)]
+mod key_repeat_tests {
+    use super::key_repeat_ignored;
+
+    #[test]
+    fn a_held_mark_key_acts_once_and_other_keys_keep_repeating() {
+        for a in ["rate0", "rate1", "rate2", "rate3", "rate4", "rate5", "flag", "reject", "unflag"] {
+            assert!(key_repeat_ignored(a, true), "{a}: a repeat is ignored");
+            assert!(!key_repeat_ignored(a, false), "{a}: the first press acts");
+        }
+        for a in ["nextunrated", "rotcw", "rotccw", "compare", "info", "zoom", "full", "selpanel"] {
+            assert!(!key_repeat_ignored(a, true), "{a}: not a mark key, repeats as before");
+        }
+    }
+}
+
+/// Fix round 2 (11 November 2026, `CS-66`) — **SENDING A PHOTO TO ONE COMPARE HALF: WHAT THE OTHER
+/// HALF SHOWS.** `half` 0 is A, 1 is B; returns `(a, b)`. With Compare closed (`was_on` false) the other
+/// half is the next photo, or the previous one at the end of the list, the same as pressing C,
+/// whatever an earlier Compare session left behind, in this folder or another. The owner, 11 November
+/// 2026, choosing between that and "the photo from the last Compare in this folder": "a, the next
+/// photo". With Compare already open the other half stays as it is (only moved off the sent photo, or
+/// back inside the list), as it always has.
+///
+/// FALSIFIER (L28): keep the leftover half when Compare was closed and
+/// `sending_to_a_closed_compare_pairs_with_the_next_photo` reddens on its first row.
+pub(crate) fn compare_halves_after_send(was_on: bool, half: i32, idx: usize, len: usize, (a, b): (usize, usize)) -> (usize, usize) {
+    let next = if idx + 1 < len { idx + 1 } else { idx.saturating_sub(1) };
+    let kept = if half == 0 { b } else { a };
+    let other = if !was_on || kept == idx || kept >= len { next } else { kept };
+    if half == 0 { (idx, other) } else { (other, idx) }
+}
+
+#[cfg(test)]
+mod compare_send_tests {
+    use super::compare_halves_after_send as send;
+
+    /// Fix round 2 (`CS-66`): with Compare closed, the other half is always the next photo (the
+    /// previous one at the end); with Compare open, the other half stays unless it would show the same
+    /// photo or lies outside the list.
+    #[test]
+    fn sending_to_a_closed_compare_pairs_with_the_next_photo() {
+        assert_eq!(send(false, 0, 10, 60, (3, 50)), (10, 11), "a leftover half (50) from an earlier Compare is not used");
+        assert_eq!(send(false, 1, 10, 60, (50, 3)), (11, 10), "…sending to B: A is the next photo");
+        assert_eq!(send(false, 0, 59, 60, (0, 0)), (59, 58), "at the end of the list: the previous photo");
+        assert_eq!(send(false, 0, 10, 60, (10, 11)), (10, 11), "the leftover happened to be the next: same answer");
+        assert_eq!(send(true, 0, 10, 60, (3, 50)), (10, 50), "Compare open: the other half stays");
+        assert_eq!(send(true, 1, 10, 60, (10, 50)), (11, 10), "…unless it would show the sent photo");
+        assert_eq!(send(true, 0, 10, 20, (3, 50)), (10, 11), "…or lies outside the list");
+    }
+}
+
+/// R5 (Delete round; owner chose B): what Compare's halves show after a landing, or `None` if Compare
+/// can't stay, with fewer than two photos to show.
+///
+/// "You compare two frames of a burst at 100%, B is soft, and you want it gone and the next frame in its
+/// place." So a half whose photo stayed follows it, and a half whose photo left takes the next photo that
+/// stayed, as the landing walks ([`land_by_photo`]), never the photo in the other half: a comparison of a
+/// photo with itself isn't what anyone asked for. A half that has only lost one file of a pair, or whose
+/// cloud flag the listing has just noticed, still shows that photo.
+///
+/// `seats` are what the Recovers landing here remember, oldest press first: a photo that came back goes
+/// back in its half if that half still shows what took its place. Two Ctrl+Z in one listing put back the
+/// second's photo only because the first's has gone back. If the person has browsed that half on, the
+/// photo just returns to the list.
+pub(crate) fn halves_after(on_screen: &[Shot], new: &[Shot], (a, b): (usize, usize), seats: &[CompareSeat]) -> Option<(usize, usize)> {
+    fn files(s: &Shot) -> impl Iterator<Item = &PathBuf> {
+        s.jpg.iter().chain(s.raw.iter())
+    }
+    if new.len() < 2 {
+        return None;
+    }
+    let exact = crate::photo_open::identity_map(on_screen, new);
+    let (mut at_a, mut at_b) = (exact.get(a).copied().flatten(), exact.get(b).copied().flatten());
+    if at_a.is_none() || at_b.is_none() {
+        let walk = StayedWalk::new(on_screen, new, &exact);
+        at_a = at_a.or_else(|| walk.stayed(a));
+        at_b = at_b.or_else(|| walk.stayed(b));
+        // Both left: the earlier one walks first, so the pair keeps its order on the way forward.
+        if b < a {
+            at_b = at_b.or_else(|| walk.from(b, at_a));
+            at_a = at_a.or_else(|| walk.from(a, at_b));
+        } else {
+            at_a = at_a.or_else(|| walk.from(a, at_b));
+            at_b = at_b.or_else(|| walk.from(b, at_a));
+        }
+    }
+    let (mut at_a, mut at_b) = (at_a?, at_b?);
+    for seat in seats {
+        let at = if seat.half == 1 { &mut at_b } else { &mut at_a };
+        if new.get(*at).is_some_and(|s| files(s).any(|f| seat.replacement.contains(f))) {
+            if let Some(back) = new.iter().position(|s| files(s).any(|f| seat.photo.contains(f))) {
+                *at = back;
+            }
+        }
+    }
+    Some((at_a, at_b))
+}
+
+/// R5: at the press of a delete in Compare, the halves it empties and what takes their place, for its
+/// record. A half that keeps its photo has nothing to go back to.
+pub(crate) fn seats_emptied(pair: (usize, usize), on_screen: &[Shot], new: &[Shot]) -> Vec<CompareSeat> {
+    fn files(s: &Shot) -> impl Iterator<Item = &PathBuf> {
+        s.jpg.iter().chain(s.raw.iter())
+    }
+    let Some((a, b)) = halves_after(on_screen, new, pair, &[]) else { return Vec::new() };
+    [(0, pair.0, a), (1, pair.1, b)].into_iter().filter_map(|(half, was, now)| {
+        let (gone, took) = (on_screen.get(was)?, new.get(now)?);
+        let replacement: Vec<PathBuf> = files(took).cloned().collect();
+        let kept = files(gone).any(|f| replacement.contains(f));
+        (!kept).then(|| CompareSeat { half, photo: files(gone).cloned().collect(), replacement })
+    }).collect()
+}
+
+/// Landing by photo, R2: the photo a reread names. Only Recover names one, so Ctrl+Z shows the photo
+/// that came back. `files` are its record's files; any one of them in the new list names it (the
+/// side files match nothing). `nav_at_press` is the person's navigation count at the press
+/// ([`note_navigation`]). The reread's request slot holds one, so the newest press's name wins. The
+/// default names nothing. `seats` are for Compare, where the photo goes back in its half or not at all
+/// ([`halves_after`]), and they add up from each press that lands here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Named {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) nav_at_press: u64,
+    pub(crate) seats: Vec<CompareSeat>,
+    /// R17, R36: a clean Recover said nothing when its job reported, so it still owes the person a word.
+    pub(crate) clean: Option<CleanRecover>,
+}
+
+/// R17, R36: what a clean Recover has left to say. The person is waiting for the photo, not for the file: if
+/// that takes a while, `wait` says it's working, until the landing. And `words` are for a landing that
+/// doesn't put the photo on screen, since a person who has moved on can't see it come back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CleanRecover {
+    pub(crate) words: String,
+    pub(crate) wait: crate::file_queue::Waited,
+}
+
+/// R36: can the person see this photo, on the stage or in either half of Compare? `files` are the photo's
+/// (a Recover's). Its answer decides whether a clean Recover has to say anything.
+pub(crate) fn recovered_on_screen(files: &[PathBuf], shots: &[Shot], current: usize, halves: Option<(usize, usize)>) -> bool {
+    let shows = |at: usize| shots.get(at).is_some_and(|s| [&s.raw, &s.jpg].into_iter().flatten().any(|f| files.contains(f)));
+    match halves {
+        Some((a, b)) => shows(a) || shows(b),
+        None => shows(current),
+    }
+}
+
+impl Named {
+    /// R2: the name holds while the person hasn't navigated since the press. Falcon's own landings
+    /// don't count, so three fast Ctrl+Z each show their photo at any pace. Asked at acceptance.
+    pub(crate) fn files_if_not_moved(&self, nav_now: u64) -> &[PathBuf] {
+        if self.nav_at_press == nav_now { &self.files } else { &[] }
+    }
+}
+
+/// Landing by photo, R2: one more of the person's own navigation steps (an arrow, the strip, a jump,
+/// a held key, the wheel, a Compare half). `apply_scan` never calls this: a landing is Falcon's move.
+pub(crate) fn note_navigation(count: &Cell<u64>) {
+    count.set(count.get().wrapping_add(1));
 }
 
 /// Keeping prepared work (2 November): each listed file's size and modified time, by the same paths
@@ -30894,6 +31422,85 @@ pub(crate) fn listing_stamps(metadata: BTreeMap<PathBuf, std::fs::Metadata>) -> 
 /// [`listing_stamps`] for a worker that still needs the metadata for its sort.
 pub(crate) fn listing_stamps_of(metadata: &BTreeMap<PathBuf, std::fs::Metadata>) -> ListingStamps {
     metadata.iter().filter_map(|(p, m)| m.modified().ok().map(|t| (p.clone(), (m.len(), t)))).collect()
+}
+
+/// R13: does the listing's cloud flag differ from the list on screen, for a photo in both? Stamps can't see
+/// it: a file OneDrive frees or downloads keeps its size and date, and every reread used to heal it, so
+/// an unchanged reread would leave a freed photo marked local. By path, on the listing's own thread.
+/// A photo only one of them has isn't a flip, and the stamps see that anyway.
+pub(crate) fn cloud_flag_differs(live: &[Shot], listed: &[Shot]) -> bool {
+    fn files(s: &Shot) -> impl Iterator<Item = &PathBuf> {
+        s.raw.iter().chain(s.jpg.iter())
+    }
+    let flags: HashMap<&PathBuf, bool> = live.iter().flat_map(|s| files(s).map(move |f| (f, s.cloud_placeholder))).collect();
+    listed.iter().any(|s| files(s).any(|f| flags.get(f).is_some_and(|&was| was != s.cloud_placeholder)))
+}
+
+/// What the last landing applied, for a take-out's list ([`take_out_scan`]), which reads nothing. The sort
+/// isn't the menu's: that can be a pending pick, with the list still in the old order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AppliedScan {
+    pub(crate) sort: (SortMethod, bool),
+    pub(crate) review_load: ReviewLoad,
+}
+
+/// Delete round, Stage B: the list without the photos leaving, for `apply_scan`, at the press. It reads no
+/// disk, so the next photo shows at once and the file goes behind it. The order stays, whatever the sort,
+/// and the stamps lose the files of the photos leaving, so what's ready for the rest is kept
+/// (`photo_open::RescanCarry`). A pair goes whole.
+///
+/// `apply_scan` carries the live ratings, marks, moved-out entries and rotations over this by name
+/// (`carry_live_review_on_rescan`), so a star on a photo leaving waits in the moved-out entries and comes
+/// back with it. It lands by photo: the photo on screen if it stayed, otherwise the next that did. `id` 0
+/// means no promotion and no resume offer, as for any reread. The attrs and the baseline are the
+/// live ones, flushed at the top of `apply_scan`, so a delete rewrites no review file.
+///
+/// R12: `Shot.id` is renumbered, because the swap machinery reads it as a position: the cloud-only set is
+/// keyed by it (`meta::PerShotMeta::on_folder_swap`), and a photo would otherwise say another's "not
+/// downloaded". A real listing does the same on its way here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn take_out_scan(
+    live: &[Shot],
+    targets: &[(usize, Shot)],
+    dir: PathBuf,
+    stamps: Option<&ListingStamps>,
+    attrs: FolderAttrs,
+    had_file: bool,
+    manifest: Option<BTreeMap<String, ManifestRec>>,
+    applied: AppliedScan,
+) -> ScanDone {
+    fn files(s: &Shot) -> impl Iterator<Item = &PathBuf> {
+        s.raw.iter().chain(s.jpg.iter())
+    }
+    let leaving: HashSet<&PathBuf> = targets.iter().flat_map(|(_, s)| files(s)).collect();
+    let mut shots: Vec<Shot> = live.iter().filter(|s| !files(s).any(|f| leaving.contains(f))).cloned().collect();
+    for (i, s) in shots.iter_mut().enumerate() {
+        s.id = i;
+    }
+    let stamps = stamps.map(|all| {
+        let mut kept = all.clone();
+        for file in &leaving {
+            kept.remove(*file);
+        }
+        kept
+    });
+    let len = shots.len();
+    ScanDone { changed_sources: HashSet::new(), stamps, partial: false, pending_edges: (false, false), source_order: Vec::new(), id: 0, dir, shots,
+        ratings: vec![0; len], marks: vec![0; len], start: 0, land: None, land_by_photo: Some(Named::default()), extra: BTreeMap::new(), rotations: BTreeMap::new(),
+        attrs, had_file, from_ledger: false, identity: None, manifest, sort: applied.sort, scan_err: false, scan_denied: false, unlisted_target: None,
+        review_load: applied.review_load, taken_pass: None, delete_asks: None }
+}
+
+/// R6 (Delete round; owner chose A): after a delete's landing the preview shows at once and sharpens in
+/// place, even with "When zoomed: Always sharp", because the deleted photo left on screen reads as "it
+/// didn't work". `landing` names the photo a take-out landed on, until the person leaves it. Is that the
+/// photo on screen? Leaving it forgets it, so an arrow there and back holds as an arrow always has.
+pub(crate) fn on_preview_landing(landing: &RefCell<Option<String>>, on_screen: Option<&str>) -> bool {
+    let mut slot = landing.borrow_mut();
+    if slot.as_deref() != on_screen {
+        *slot = None;
+    }
+    slot.is_some()
 }
 
 /// R6: where the Resume offer's photo is now, worked out at the click, because the order can change on
@@ -30920,12 +31527,16 @@ pub(crate) struct ScanDone {
     pub(crate) ratings: Vec<i32>,
     pub(crate) marks: Vec<u8>,
     pub(crate) start: usize,
-    // v0.8.37 (FIX A3): the post-op LANDING HINT that produced `start` (delete / move-rejects /
-    // undo-move / recover pass Some(idx); a genuine folder OPEN passes None). apply_scan suppresses
-    // the resume-position offer whenever this is Some — a hinted landing must not be second-guessed
-    // by the saved resume position (`resume_offer_allowed`). Distinct from `id`: the SYNC path is
-    // always id==0, so `id` alone can't tell a hinted post-op rescan from a same-folder re-open.
+    // v0.8.37 (FIX A3): the LANDING HINT that produced `start` (the photo-first open's two partial
+    // stages pass Some; a final OPEN passes None, and so does every synchronous reread, which lands
+    // by photo, `land_by_photo`). apply_scan suppresses the resume-position offer whenever this is
+    // Some (`resume_offer_allowed`), and for every reread because its `id` is 0.
     pub(crate) land: Option<usize>,
+    /// Landing by photo (Delete round, 3 November): `Some` for a reread whose `start` is worked out
+    /// at acceptance (`photo_open::settle_by_photo`), from the list on screen and the photo the
+    /// person is on then. `None`: `start` stands (an open, a reopen, a reread that found the file it
+    /// was asked for).
+    pub(crate) land_by_photo: Option<Named>,
     // N8: loaded selection entries with no matching file in this scan (photos moved to ./Rejected,
     // renamed, or removed externally) — carried in memory + re-merged into every save so their cull
     // state survives the move and re-applies when the file comes back (undo-move).
@@ -30963,6 +31574,9 @@ pub(crate) struct ScanDone {
     /// Date taken sort (R2): an open's date read that outlived its wait, for the list to adopt. Last,
     /// so builders read as before; dropping a retired `ScanDone` stops the read.
     pub(crate) taken_pass: Option<PassHandle>,
+    /// R21: whether a delete here asks first, from the thread that read the folder. `None`: this list read
+    /// no disk (a take-out), and the answer stands.
+    pub(crate) delete_asks: Option<bool>,
     /// 1.1.0-rc.1 (issue #11 batch, O2): the explicitly opened file name when the final scan lists no
     /// shot for it (`unlisted_target`); apply_scan then says it opened the folder instead.
     pub(crate) unlisted_target: Option<String>,
@@ -31742,7 +32356,7 @@ pub(crate) fn out_confirm_title(filt: i32, n: usize) -> String {
 pub(crate) fn out_confirm_body(filt: i32, n: usize, content: i32) -> String {
     // ── v0.8.194 HOTFIX (§1F, OWNER ORDER 08-18: "fix the export dialog too") ────────────────────
     // WORDING ONLY, and verified as such before editing: the op's own per-shot selection is
-    // `CopyContent::JpgOnly => s.jpg.as_ref()` (this file, inside `export_marked`) — the
+    // `CopyContent::JpgOnly => s.jpg.as_ref()` (this file, `copy_files_of`, which `export_marked` uses) — the
     // FINISHED-IMAGE slot, which `falcon_decode::Shot` documents as "JPG/PNG/TIFF, or an
     // unsupported standalone image". There is no extension test anywhere on that path, so this
     // choice has ALWAYS copied a PNG folder's PNGs; only the sentence said otherwise. Same defect
@@ -32374,8 +32988,14 @@ pub(crate) fn bulk_ask_stale() -> String {
 // menus now carry the RATING STAR ROW itself, so the direction is not named in a label at all, it is
 // shown by which stars are filled, and the press goes through the same ask the keyboard raises.
 /// "Delete 12 photos…" — the ellipsis is the confirm dialog.
-pub(crate) fn bulk_delete_label(n: usize) -> String {
-    tr_plural!(n, "Delete {n} photo…", "Delete {n} photos…")
+///
+/// R27 (Delete round): the ellipsis promises a dialog, so it stays only where one opens.
+pub(crate) fn bulk_delete_label(n: usize, asks: bool) -> String {
+    if asks {
+        tr_plural!(n, "Delete {n} photo…", "Delete {n} photos…")
+    } else {
+        tr_plural!(n, "Delete {n} photo", "Delete {n} photos")
+    }
 }
 /// v1.0.0-rc (queue item 27, sheet 2.1 B2 b): the plural ROTATE rows' label — "Rotate 12 right".
 ///
@@ -32592,6 +33212,45 @@ pub(crate) fn bulk_delete_body(shots: usize, files: usize, sidecars: usize) -> S
     )
 }
 
+/// What a delete's dialog says, and it comes from the same [`DeleteRoute`] the job then runs (R22).
+pub(crate) struct DeleteWords {
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) confirm: String,
+}
+
+/// R28: the plural dialog's words. On the bin route they're the ones above, and true. On a drive with no
+/// bin and for photos only in the cloud they say so, because the photos won't come back.
+pub(crate) fn bulk_delete_words(route: &DeleteRoute, shots: usize, files: usize, sidecars: usize) -> DeleteWords {
+    let note = match sidecars {
+        0 => String::new(),
+        k => tr_plural!(k, " (one XMP sidecar goes too)", " ({n} XMP sidecars go too)"),
+    };
+    match route {
+        DeleteRoute::Bin { .. } => DeleteWords {
+            title: bulk_delete_title(shots),
+            body: bulk_delete_body(shots, files, sidecars),
+            confirm: crate::i18n::tr(crate::platform::PLATFORM.move_to_trash).to_string(),
+        },
+        DeleteRoute::NoBin => DeleteWords {
+            title: crate::platform::no_bin_title_many(shots),
+            body: crate::platform::no_bin_body_many(shots, files, &note),
+            confirm: crate::platform::no_bin_confirm(),
+        },
+        DeleteRoute::CloudOnly(cloud) if cloud.len() >= shots => DeleteWords {
+            title: crate::platform::cloud_only_title_many(shots),
+            body: format!("{}{note}", crate::platform::cloud_only_body_many(shots)),
+            confirm: crate::platform::cloud_only_confirm(),
+        },
+        // R24: some are only in the cloud, and the rest go to the bin.
+        DeleteRoute::CloudOnly(cloud) => DeleteWords {
+            title: bulk_delete_title(shots),
+            body: format!("{}{note}", crate::platform::cloud_only_body_mixed(cloud.len(), shots)),
+            confirm: crate::i18n::tr("Delete").to_string(),
+        },
+    }
+}
+
 
 /// Which file(s) of each pick to copy to `./Picks` — the photographer's editing-handoff
 /// choice (logic.md §6 "output triad"). RAW-only is the common case (send the .CR3s to the
@@ -32613,6 +33272,141 @@ impl CopyContent {
     }
 }
 
+/// Fix round 2 (11 November 2026, `CS-27`) — **THE FILES A COPY READS FOR ONE PHOTO**, under the
+/// "what to copy" choice. One function for the copy itself ([`export_marked`]) and for the count of
+/// downloads its confirm shows ([`copy_cloud_files`]), so the two cannot describe different files.
+pub(crate) fn copy_files_of(s: &Shot, content: CopyContent) -> Vec<&PathBuf> {
+    match content {
+        CopyContent::Both => [s.jpg.as_ref(), s.raw.as_ref()].into_iter().flatten().collect(),
+        CopyContent::RawOnly => s.raw.as_ref().into_iter().collect(),
+        CopyContent::JpgOnly => s.jpg.as_ref().into_iter().collect(),
+    }
+}
+
+/// Fix round 2 (`CS-27`) — **HOW MANY ONLINE-ONLY FILES THIS COPY WILL DOWNLOAD.** Counted fresh,
+/// metadata only, when the copy's confirm is open, the way Apply rotations and web export count: for
+/// each target photo, each file [`copy_files_of`] picks that `is_cloud` says is online-only now, and
+/// whose copy is not already in `./Picks` (the copy skips those and reads nothing). Only photos the
+/// folder scan tagged as cloud (`is_tagged`) are asked about, so a local folder makes no metadata call
+/// at all. A file freed up after the folder was opened (untagged) is not counted — the rare case,
+/// left alone.
+///
+/// FALSIFIER (L28): count photos instead of files and the both-online pair row reads 1; skip the
+/// "what to copy" choice and the JPEG-only row reads 1; drop the existing-copy test and its row reads 1.
+pub(crate) fn copy_cloud_files(
+    order: &[usize],
+    shots: &[Shot],
+    content: CopyContent,
+    is_tagged: impl Fn(usize) -> bool,
+    is_cloud: impl Fn(&Path) -> bool,
+    copy_exists: impl Fn(&Path) -> bool,
+) -> usize {
+    let mut n = 0;
+    for &i in order {
+        let Some(s) = shots.get(i).filter(|_| is_tagged(i)) else { continue };
+        for src in copy_files_of(s, content) {
+            if !is_cloud(src) {
+                continue;
+            }
+            let dest = src.parent().zip(src.file_name()).map(|(d, f)| d.join(PICKS_SUBFOLDER).join(f));
+            if dest.as_deref().is_some_and(&copy_exists) {
+                continue;
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Fix round 2 (`CS-27`) — **THE COPY CONFIRM'S DOWNLOAD COUNT, AS THE TICK TAKES IT**: the
+/// cloud-tagged targets; none → 0 with nothing listed (a local folder pays nothing); else one
+/// [`CopyCountListing`] of their folder (`read`; `CopyCountListing::read` in production) and
+/// [`copy_cloud_files`] over it.
+pub(crate) fn copy_download_count(
+    order: &[usize],
+    shots: &[Shot],
+    content: CopyContent,
+    is_tagged: impl Fn(usize) -> bool,
+    read: &dyn Fn(&Path, &HashSet<std::ffi::OsString>) -> CopyCountListing,
+) -> usize {
+    let tagged: Vec<usize> = order.iter().copied().filter(|&i| is_tagged(i)).collect();
+    let Some(dir) = copy_count_folder(&tagged, shots, content) else { return 0 };
+    let listing = read(&dir, &copy_wanted_names(&tagged, shots, content));
+    copy_cloud_files(&tagged, shots, content, |_| true, |p| listing.is_cloud(p), |p| listing.copy_exists(p))
+}
+
+/// Fix round 2 (`CS-27`): the folder the copy count lists — the folder of the first file of the first
+/// cloud-tagged target (every photo of an open folder is in that folder), or `None` when no target is
+/// tagged, in which case nothing is listed or asked at all.
+pub(crate) fn copy_count_folder(tagged: &[usize], shots: &[Shot], content: CopyContent) -> Option<PathBuf> {
+    tagged.iter().find_map(|&i| shots.get(i).and_then(|s| copy_files_of(s, content).first().and_then(|p| p.parent().map(Path::to_path_buf))))
+}
+
+/// The names the count needs facts about: every file the copy reads for the tagged targets. The
+/// listings keep only these, so their memory and hashing follow the picks, not the folder.
+pub(crate) fn copy_wanted_names(tagged: &[usize], shots: &[Shot], content: CopyContent) -> HashSet<std::ffi::OsString> {
+    tagged
+        .iter()
+        .filter_map(|&i| shots.get(i))
+        .flat_map(|s| copy_files_of(s, content))
+        .filter_map(|p| p.file_name().map(|n| n.to_os_string()))
+        .collect()
+}
+
+/// Fix round 2 (`CS-27`) — **WHAT ONE LISTING OF THE FOLDER AND ONE OF ./Picks SAY**, for the copy
+/// confirm's download count ([`copy_cloud_files`]). Read on the interface thread when the confirm opens,
+/// only when a cloud-tagged photo is among the targets.
+///
+/// * **Online-only files** (`online`). On Windows the folder listing itself carries each entry's
+///   attributes (the folder scan reads its cloud flag the same way), so one listing answers for every
+///   file with no call per file: 0.9 ms for 2,000 files, 7-16 ms for 16,000-32,000 (measured,
+///   `the_copy_download_count_cost_is_printed`). On a Mac a listing carries no file flags (the folder
+///   scan pays a `stat` per entry, on its worker); listing the folder there would mean one `stat` per
+///   entry of the whole folder on the interface thread, so `online` is `None` and each file the copy
+///   reads for a TAGGED photo is asked once (`file_is_cloud_placeholder`, one `lstat`, no open): that
+///   cost follows the cloud picks, not the folder. Not measured on a Mac.
+/// * **Copies already in ./Picks** (`in_picks`): names only, on both platforms, no call per file.
+///
+/// Both keep only the `wanted` names ([`copy_wanted_names`]).
+#[derive(Default)]
+pub(crate) struct CopyCountListing {
+    pub(crate) online: Option<HashSet<std::ffi::OsString>>,
+    pub(crate) in_picks: HashSet<std::ffi::OsString>,
+}
+
+impl CopyCountListing {
+    pub(crate) fn read(dir: &Path, wanted: &HashSet<std::ffi::OsString>) -> Self {
+        let names = |d: &Path, keep: &dyn Fn(&std::fs::DirEntry) -> bool| -> HashSet<std::ffi::OsString> {
+            std::fs::read_dir(d)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .filter(|e| wanted.contains(&e.file_name()) && keep(e))
+                .map(|e| e.file_name())
+                .collect()
+        };
+        #[cfg(windows)]
+        let online = Some(names(dir, &|e| {
+            // Windows: `DirEntry::metadata` is the listing's own data (no extra system call).
+            e.metadata().is_ok_and(|m| falcon_decode::metadata_is_cloud_placeholder(&m))
+        }));
+        #[cfg(not(windows))]
+        let online = None;
+        CopyCountListing { online, in_picks: names(&dir.join(PICKS_SUBFOLDER), &|_| true) }
+    }
+
+    pub(crate) fn is_cloud(&self, p: &Path) -> bool {
+        match &self.online {
+            Some(set) => p.file_name().is_some_and(|n| set.contains(n)),
+            None => falcon_decode::file_is_cloud_placeholder(p),
+        }
+    }
+
+    pub(crate) fn copy_exists(&self, dest: &Path) -> bool {
+        dest.file_name().is_some_and(|n| self.in_picks.contains(n))
+    }
+}
+
 // Export-sheet tier → actual value (the sliders pick a NAMED tier; these are the values applied).
 // Export tiers (audited against intent — each step is a distinct, useful choice and the
 // number matches the label). Opacity: Faint is a true ghost (30 %, not the old 40 %);
@@ -32630,6 +33424,11 @@ pub(crate) const OUT_QUALITY_TIERS: [i32; 4] = [75, 80, 90, 97]; // JPEG q  Web 
 /// `show_transient_toast` applies to whatever a caller passes, so there is one number and one place
 /// to change it (L29: a clock constant that appears in two loops is one drifted copy from a bug).
 pub(crate) const TOAST_MS_MAX: i32 = 10_000;
+/// R29 (owner chose B, "about 3 s", tune by clicking): a clean delete's card. It asks for no attention: the
+/// next photo is the confirmation, and this names the one that went and offers the way back.
+pub(crate) const CLEAN_DELETE_CARD_MS: i32 = 3_000;
+/// R36: a clean Recover's short card, for a person who has moved on, as long as the other plain notices.
+pub(crate) const RECOVERED_CARD_MS: i32 = 5_000;
 /// v1.0.0-rc (queue item 30, §1.A — OWNER RULING 2.3a): **A QUESTION'S OWN LINGER**, in the same
 /// wall-clock milliseconds. [`TOAST_MS_MAX`] is the cap for NOTICES — v0.8.155's ruling 2 is about
 /// how long the app should keep TELLING you something — and the ask-first bulk rating is not a
@@ -32643,10 +33442,10 @@ pub(crate) const ASK_MS: i32 = 20_000;
 ///
 /// COUNTED, not remembered: it was FIVE hand-written `1500`s in `main.rs` — the cull key's gate,
 /// the compare 1:1 refusal, the both-halves-pinned navigation refusal, the close-request deferral
-/// and the delete-key-in-compare refusal — and item 30 adds a SIXTH caller in `tick.rs`. The ruling
-/// is "the same brief toast the other refusal shows", so the sameness has to be a fact of the code
-/// and not a coincidence of six literals that happen to agree (L29: a clock constant appearing in
-/// more than one loop is one drifted copy away from a bug). All six read this.
+/// and the delete-key-in-compare refusal, gone since Del works in Compare (R5) — and item 30 adds a
+/// caller in `tick.rs`. The ruling is "the same brief toast the other refusal shows", so the sameness
+/// has to be a fact of the code and not a coincidence of literals that happen to agree (L29: a clock
+/// constant appearing in more than one loop is one drifted copy away from a bug). All of them read this.
 ///
 /// The `Duration::from_millis(1500)` that survives in `main.rs` is NOT one of these: it is the
 /// `FALCON_DEBUG_SETTINGS` hook's one-shot open delay, a different clock with one caller.
@@ -34164,11 +34963,11 @@ mod rescan_review_tests {
     fn stale_scan(shots: Vec<Shot>) -> ScanDone {
         let len = shots.len();
         ScanDone { changed_sources: HashSet::new(), stamps: None, partial: false, pending_edges: (false, false), source_order: Vec::new(), id: 0, dir: PathBuf::from("same-folder"), shots, ratings: vec![1; len],
-            marks: vec![MARK_FLAG; len], start: 1, land: Some(1),
+            marks: vec![MARK_FLAG; len], start: 1, land: Some(1), land_by_photo: None,
             extra: BTreeMap::from([("STALE_DISK_ONLY".into(), Sel { rating: 5, ..Sel::default() })]),
             rotations: BTreeMap::from([("CLEARED".into(), 2), ("A".into(), 2)]),
             attrs: FolderAttrs::default(), had_file: true, from_ledger: false, identity: None, manifest: None,
-            sort: (SortMethod::Rating, true), scan_err: false, scan_denied: false, unlisted_target: None, review_load: ReviewLoad::Loaded, taken_pass: None }
+            sort: (SortMethod::Rating, true), scan_err: false, scan_denied: false, unlisted_target: None, review_load: ReviewLoad::Loaded, taken_pass: None, delete_asks: None }
     }
 
     #[test]
@@ -34268,7 +35067,8 @@ mod rescan_review_tests {
             assert_eq!(names, if desc { vec!["A", "C", "B"] } else { vec!["B", "A", "C"] });
             let target = select_start(&shots, &Some("C.png".into()));
             assert_eq!(shots[target].name, "C", "explicit file identity survives the live rating sort");
-            assert_eq!(post_op_land(1, shots.len()), 1, "post-op landing keeps its positional contract");
+            // The person was on B before this sort. Named by photo, wherever the sort put it (L52).
+            assert_eq!(shots[land_by_photo(&old, 1, &shots, &[])].name, "B", "a reread that names nothing stays on the photo");
         }
     }
 }
@@ -36410,12 +37210,9 @@ pub(crate) fn export_marked(
         if marks.get(i).copied().unwrap_or(0) & want == 0 {
             continue;
         }
-        // Select which file(s) of this capture to hand off, per the output-triad choice.
-        let files: Vec<&PathBuf> = match content {
-            CopyContent::Both => [s.jpg.as_ref(), s.raw.as_ref()].into_iter().flatten().collect(),
-            CopyContent::RawOnly => s.raw.as_ref().into_iter().collect(),
-            CopyContent::JpgOnly => s.jpg.as_ref().into_iter().collect(),
-        };
+        // Select which file(s) of this capture to hand off, per the output-triad choice — the same
+        // choice the confirm's download count makes (fix round 2, `CS-27`).
+        let files: Vec<&PathBuf> = copy_files_of(s, content);
         if files.is_empty() {
             no_content += 1;
             continue;
@@ -36709,13 +37506,12 @@ pub(crate) fn rejected_file_count(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Send every FILE directly inside `<dir>/Rejected` to the OS Recycle Bin (#24) — the "archive now,
-/// discard later" tail of the cull. Recoverable (Recycle Bin, not a hard delete). Only touches regular
-/// files at the top level (leaves any sub-directories alone); logs every step. Returns (recycled, failed).
-pub(crate) fn empty_rejected_to_bin(dir: &Path) -> (usize, usize, String) {
+/// The regular files at the top level of `<dir>/Rejected` (it leaves any sub-directories alone), or the
+/// result to report when there's nothing to do. Shared by both of Empty's calls.
+fn rejected_files_to_empty(dir: &Path) -> Result<(PathBuf, Vec<PathBuf>), (usize, usize, String)> {
     let rejected = dir.join("Rejected");
     if !is_safe_dir(&rejected) {
-        return (0, 0, i18n::tr("Nothing to empty — no ./Rejected folder.").to_string());
+        return Err((0, 0, i18n::tr("Nothing to empty — no ./Rejected folder.").to_string()));
     }
     let mut paths: Vec<PathBuf> = Vec::new();
     match std::fs::read_dir(&rejected) {
@@ -36729,12 +37525,24 @@ pub(crate) fn empty_rejected_to_bin(dir: &Path) -> (usize, usize, String) {
         }
         Err(e) => {
             log_event(&format!("empty-rejected: cannot read {} ({e})", rejected.display()));
-            return (0, 1, tr_format!("Couldn't read ./Rejected ({error})", error = e));
+            return Err((0, 1, tr_format!("Couldn't read ./Rejected ({error})", error = e)));
         }
     }
     if paths.is_empty() {
-        return (0, 0, i18n::tr("./Rejected is already empty.").to_string());
+        return Err((0, 0, i18n::tr("./Rejected is already empty.").to_string()));
     }
+    Ok((rejected, paths))
+}
+
+/// Send every FILE directly inside `<dir>/Rejected` to the OS Recycle Bin (#24) — the "archive now,
+/// discard later" tail of the cull. Recoverable (Recycle Bin, not a hard delete). Only touches regular
+/// files at the top level (leaves any sub-directories alone); logs every step. Returns (recycled, failed).
+/// On a drive with no bin, Falcon's dialog has said so and [`empty_rejected_for_good`] runs instead (R23).
+pub(crate) fn empty_rejected_to_bin(dir: &Path) -> (usize, usize, String) {
+    let (rejected, paths) = match rejected_files_to_empty(dir) {
+        Ok(found) => found,
+        Err(done) => return done,
+    };
     log_event(&format!("empty-rejected: sending {} file(s) from {} to the Recycle Bin", paths.len(), rejected.display()));
     let err = match trash::delete_all(&paths) {
         Ok(()) => None,
@@ -36770,11 +37578,271 @@ pub(crate) fn empty_rejected_to_bin(dir: &Path) -> (usize, usize, String) {
     (ok, fail, msg)
 }
 
+/// R23 (Delete round): Empty ./Rejected on a drive with no Recycle Bin. Falcon's dialog has said it's for
+/// good, and this makes that true whatever Windows would have done with the crate's call. A file that
+/// refuses stays, the rest go, and the re-stat says which. Same shape as [`empty_rejected_to_bin`].
+pub(crate) fn empty_rejected_for_good(dir: &Path) -> (usize, usize, String) {
+    let (rejected, paths) = match rejected_files_to_empty(dir) {
+        Ok(found) => found,
+        Err(done) => return done,
+    };
+    log_event(&format!("empty-rejected: deleting {} file(s) from {} for good", paths.len(), rejected.display()));
+    for p in &paths {
+        if let Err(e) = std::fs::remove_file(p) {
+            log_event(&format!("empty-rejected: couldn't delete {} ({e})", file_name_lossy(p)));
+        }
+    }
+    let (gone, fail) = reconcile_recycled(&paths, still_present);
+    let ok = gone.len();
+    log_event(&format!("empty-rejected: {ok} file(s) deleted for good, {fail} still there"));
+    let msg = if fail == 0 {
+        crate::platform::empty_for_good_toast_text(ok)
+    } else if ok == 0 {
+        i18n::tr("Couldn't empty ./Rejected — the files are still there").to_string()
+    } else {
+        crate::platform::partial_for_good_toast_text(ok, paths.len(), fail)
+    };
+    (ok, fail, msg)
+}
+
+// ── Delete round, Stage B: at once, cards and sticks (R21 to R26). The owner's rule: if it can come back,
+// don't stop me; if it can't, tell me before, not after. So a fixed disk goes at once, because the photo
+// goes to its bin and Ctrl+Z brings it back. Anything else gets Falcon's dialog, which says what will
+// happen, and Falcon then deletes the files itself so that's what does happen, whatever Windows would have
+// done with the bin call. The drive's answer is kept with the folder's list and read again at each reread
+// (`ScanDone::delete_asks`). It's never saved, because drive letters get reused. ──
+
+/// What `GetDriveTypeW` says for a fixed disk. A local copy, because `DRIVE_FIXED` lives in a module of
+/// the `windows` crate this build doesn't enable.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+const DRIVE_FIXED: u32 = 3;
+
+/// Whether this build has a for-good route. The Mac doesn't: a card there has a Trash, and the OS answers
+/// per file (R26, owner chose A). Compile-checked only.
+pub(crate) const HAS_FOR_GOOD_ROUTE: bool = !cfg!(target_os = "macos");
+
+/// The drive's root as `GetDriveTypeW` wants it, trailing backslash included. `None` for anything that
+/// isn't a drive letter: UNC, `\\?\UNC\`, a device path, a relative or an empty path. Those ask.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn drive_root(dir: &Path) -> Option<String> {
+    use std::path::{Component, Prefix};
+    let Some(Component::Prefix(prefix)) = dir.components().next() else { return None };
+    match prefix.kind() {
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => Some(format!("{}:\\", letter as char)),
+        _ => None,
+    }
+}
+
+/// R21: `GetDriveTypeW` alone. The owner's own reason is what matters to the person, "as I recall sd cards
+/// have no bin": can the photo come back? Exactly a fixed disk goes at once. That's internal drives and
+/// portable SSDs and hard disks, and also a CFexpress card or a fast stick that reports as a disk, which do
+/// have a bin. Every other answer asks, as does every other kind of path, with no call made. The probe
+/// only asks about the drive's root, never a photo, so it can't touch a cloud file.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn delete_asks_with(dir: &Path, drive_type: impl Fn(&str) -> u32) -> bool {
+    drive_root(dir).is_none_or(|root| drive_type(&root) != DRIVE_FIXED)
+}
+
+#[cfg(windows)]
+fn drive_type_of(root: &str) -> u32 {
+    unsafe { windows::Win32::Storage::FileSystem::GetDriveTypeW(&windows::core::HSTRING::from(root)) }
+}
+
+/// Does a delete in this folder ask first? On the scan's thread, with the listing.
+#[cfg(windows)]
+pub(crate) fn delete_asks(dir: &Path) -> bool {
+    delete_asks_with(dir, drive_type_of)
+}
+
+/// R26 (owner chose A): at once on any local volume, by `NSURLVolumeIsLocalKey`, since a Mac card appears
+/// to have a Trash. A network volume keeps the dialog, and any error asks. Apple's removable key isn't read,
+/// because it's a poor test of anything to do with a Trash. Compile-checked only.
+#[cfg(target_os = "macos")]
+pub(crate) fn delete_asks(dir: &Path) -> bool {
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2_foundation::{NSString, NSURLVolumeIsLocalKey, NSURL};
+    objc2::rc::autoreleasepool(|_| unsafe {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&dir.to_string_lossy()));
+        let mut value: Option<Retained<AnyObject>> = None;
+        if url.getResourceValue_forKey_error(&mut value, NSURLVolumeIsLocalKey).is_err() {
+            return true;
+        }
+        value.is_none_or(|local| {
+            let local: Bool = objc2::msg_send![&*local, boolValue];
+            !local.as_bool()
+        })
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(crate) fn delete_asks(_dir: &Path) -> bool {
+    true
+}
+
+/// [`delete_asks`] for a folder being opened, with its one log line: the letter and the type only, since a
+/// folder's name is private. Enough to read any later report about a card that went at once.
+pub(crate) fn delete_asks_at_open(dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let asks = delete_asks_with(dir, |root| {
+            let kind = drive_type_of(root);
+            log_event(&format!("delete: this folder is on {root}, drive type {kind}"));
+            kind
+        });
+        if drive_root(dir).is_none() {
+            log_event("delete: this folder has no drive letter, so a delete asks");
+        }
+        asks
+    }
+    #[cfg(not(windows))]
+    {
+        let asks = delete_asks(dir);
+        log_event(&format!("delete: this folder's volume asks first: {asks}"));
+        asks
+    }
+}
+
+/// How a press's photos leave, decided once: when the dialog opens, or at the press when no dialog does.
+/// It's stored with the pending identity and it's what both the words and the job read, so what the person
+/// read and what runs can't differ, whatever the drive's answer does while the dialog is open (R22).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeleteRoute {
+    /// To the bin. `asks`: on a Mac's network volume, which keeps the dialog (R26).
+    Bin { asks: bool },
+    /// This drive has no Recycle Bin: a card, a stick, a network drive or a path with no drive letter.
+    /// Falcon deletes every target itself (R22).
+    NoBin,
+    /// These photos, by name, are only in the cloud. Microsoft says deleting one skips this PC's bin, so
+    /// Falcon deletes them itself, and the rest of the press goes to the bin (R24).
+    CloudOnly(Vec<String>),
+}
+
+impl DeleteRoute {
+    /// Does a person have to be told first? A selection adds its own reason ([`selection_goes_at_once`]).
+    pub(crate) fn asks(&self) -> bool {
+        !matches!(self, DeleteRoute::Bin { asks: false })
+    }
+
+    /// Does this photo skip the bin?
+    pub(crate) fn goes_for_good(&self, shot: &Shot) -> bool {
+        match self {
+            DeleteRoute::Bin { .. } => false,
+            DeleteRoute::NoBin => true,
+            DeleteRoute::CloudOnly(names) => names.contains(&shot.name),
+        }
+    }
+}
+
+/// R21, R24: the route for these photos. `drive_asks` is the folder's answer, kept with its list. The cloud
+/// check is live, one attribute read per file and no download (`falcon_decode::file_is_cloud_placeholder`),
+/// because a photo downloaded a minute ago goes at once. It reads nothing on a drive that asks anyway. A
+/// pair goes together, so one cloud-only file makes the whole photo cloud-only.
+pub(crate) fn delete_route_on(has_for_good: bool, drive_asks: bool, targets: &[&Shot], cloud_only: impl Fn(&Path) -> bool) -> DeleteRoute {
+    if !has_for_good {
+        return DeleteRoute::Bin { asks: drive_asks };
+    }
+    if drive_asks {
+        return DeleteRoute::NoBin;
+    }
+    let cloud: Vec<String> = targets
+        .iter()
+        .filter(|s| [&s.raw, &s.jpg].into_iter().flatten().any(|f| cloud_only(f)))
+        .map(|s| s.name.clone())
+        .collect();
+    if cloud.is_empty() { DeleteRoute::Bin { asks: false } } else { DeleteRoute::CloudOnly(cloud) }
+}
+
+/// [`delete_route_on`] for this build and the real disk.
+pub(crate) fn delete_route(drive_asks: bool, targets: &[&Shot]) -> DeleteRoute {
+    delete_route_on(HAS_FOR_GOOD_ROUTE, drive_asks, targets, falcon_decode::file_is_cloud_placeholder)
+}
+
+/// R27: does a menu row's dialog open? From the list's own flag, because a menu reads no disk: the press
+/// reads the file itself. The Mac has no cloud reason to ask (R26).
+pub(crate) fn delete_label_asks(drive_asks: bool, cloud_flag: bool) -> bool {
+    drive_asks || (HAS_FOR_GOOD_ROUTE && cloud_flag)
+}
+
+/// R23: the Empty ./Rejected dialog's headline phrase, body and button, for what it will really do.
+pub(crate) fn empty_words(for_good: bool, n: usize) -> (String, String, String) {
+    if for_good {
+        (crate::platform::empty_for_good_confirm_title(n), crate::platform::empty_for_good_confirm_body(), crate::platform::no_bin_confirm())
+    } else {
+        (crate::platform::empty_confirm_title(n), crate::platform::empty_rejected_confirm_body(), crate::i18n::tr(crate::platform::PLATFORM.empty_to_trash).to_string())
+    }
+}
+
+/// R25 (owner chose B): a selection goes at once when the photo on screen is in it. When it isn't, the
+/// photos going aren't the one being looked at, so the count dialog names them.
+pub(crate) fn selection_goes_at_once(route: &DeleteRoute, targets: &[usize], on_screen: usize) -> bool {
+    !route.asks() && targets.contains(&on_screen)
+}
+
+/// R6: the photo the person is on isn't what's on stage yet, so a key can't act on it. A stand-in passes:
+/// `shown` names the photo it stands in for. Shared by the cull keys and Del.
+pub(crate) fn photo_not_on_stage(shown: Option<usize>, current: usize) -> bool {
+    shown != Some(current)
+}
+
+/// R34: a fold line's name and the pair's label apart, so the line shortens only the name and keeps
+/// "[RAW+JPG]" whole. `subject` is [`photo_subject`]'s: a language that puts the label first keeps one part.
+pub(crate) fn label_parts(subject: &str, name: &str) -> (String, String) {
+    match subject.strip_prefix(name) {
+        Some(tag) if !tag.trim().is_empty() => (name.to_string(), tag.trim().to_string()),
+        _ => (subject.to_string(), String::new()),
+    }
+}
+
+/// The photo as a message names it: its name, and for a pair the label that says two files went.
+pub(crate) fn photo_subject(shot: &Shot) -> String {
+    match (&shot.raw, &shot.jpg, shot.finished_file_format()) {
+        (Some(_), Some(_), Some(format)) => tr_format!("{name} [RAW+{format}]", name = shot.name, format = format),
+        _ => shot.name.clone(),
+    }
+}
+
+/// R22: one photo's files, deleted by Falcon itself, after its own dialog has said so. Not the crate: with
+/// `FOF_NO_UI` and the nuke flag together nothing says whether Windows would prompt, and a prompt with no
+/// owner window could sit behind Falcon and stall the queue. This makes the dialog's words true whatever
+/// Windows would have done, and needs no bin. (gone, failed, the files that really went, as
+/// [`recycle_shot_files`] has them, and why not, for the log). It stops at the first failure inside a photo, so a
+/// locked RAW leaves the JPEG and the pair whole. The re-stat is what's reported, on every path, as in
+/// [`recycle_shot_files`] (v0.8.131 F-P11): only a definite `NotFound` counts as gone.
+pub(crate) fn delete_photo_for_good(files: &[PathBuf]) -> (usize, usize, Vec<PathBuf>, String) {
+    delete_photo_for_good_with(files, |p| std::fs::remove_file(p), still_present)
+}
+
+pub(crate) fn delete_photo_for_good_with(
+    files: &[PathBuf],
+    mut remove: impl FnMut(&Path) -> std::io::Result<()>,
+    present: impl Fn(&Path) -> bool,
+) -> (usize, usize, Vec<PathBuf>, String) {
+    let mut why = String::new();
+    for f in files {
+        match remove(f) {
+            Ok(()) => {}
+            // It's gone already, which is what was wanted: another program removed it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                why = format!("{} ({e})", file_name_lossy(f));
+                break;
+            }
+        }
+    }
+    let (gone, fail) = reconcile_recycled(files, present);
+    let gone: Vec<PathBuf> = gone.into_iter().cloned().collect();
+    (gone.len(), fail, gone, why)
+}
+
 /// v0.8.13 — Falcon's FIRST direct single-shot delete path. Send `paths` (one shot's RAW/JPG member(s)
-/// plus any Falcon-owned XMP sidecar the caller already resolved) to the OS Recycle Bin — recoverable,
-/// NEVER a hard delete. Belt-and-braces: only regular FILES are recycled (a dir / missing path is filtered
+/// plus any Falcon-owned XMP sidecar the caller already resolved) to the OS Recycle Bin — recoverable.
+/// This route is never a hard delete: the one that is, [`delete_photo_for_good`], runs only after Falcon's
+/// own dialog has said so (R22). Belt-and-braces: only regular FILES are recycled (a dir / missing path is filtered
 /// out here even though the caller already asserts `is_file`), and the whole set goes in ONE `delete_all`
-/// call. Logs every step in the `empty_rejected_to_bin` style. Returns (recycled, failed, msg).
+/// call. Logs every step in the `empty_rejected_to_bin` style. Returns (recycled, failed, the files that
+/// really went). R47: what a person reads is `file_queue::run_delete`'s, in photos, and the system's own
+/// error stays in the log here: Falcon can't know why a file refused.
 ///
 /// v0.8.15 (F5) — NOT atomic. On Windows, trash 5.2.6 drives `IFileOperation`, which deletes the items
 /// SEQUENTIALLY; a lock (or permission fault) part-way through a batch can leave the EARLIER files already
@@ -36783,12 +37851,12 @@ pub(crate) fn empty_rejected_to_bin(dir: &Path) -> (usize, usize, String) {
 /// Therefore the caller MUST rescan the folder on ANY attempt (success OR failure) so the shot list is
 /// reconciled to what actually remains on disk — never assume "Err ⇒ folder unchanged".
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn recycle_shot_files(paths: &[PathBuf]) -> (usize, usize, Vec<PathBuf>, String) {
+pub(crate) fn recycle_shot_files(paths: &[PathBuf]) -> (usize, usize, Vec<PathBuf>) {
     let files: Vec<PathBuf> = paths.iter().filter(|p| p.is_file()).cloned().collect();
     if files.is_empty() {
         // Nothing on disk to recycle (the shot's files vanished between popup-open and confirm) — treat as
         // a benign no-op rather than an error; the caller still rescans so the (now absent) shot drops out.
-        return (0, 0, Vec::new(), i18n::tr("Nothing to delete — files already gone.").to_string());
+        return (0, 0, Vec::new());
     }
     log_event(&format!("delete-recycle: sending {} file(s) to the Recycle Bin", files.len()));
     let err = match trash::delete_all(&files) {
@@ -36819,18 +37887,7 @@ pub(crate) fn recycle_shot_files(paths: &[PathBuf]) -> (usize, usize, Vec<PathBu
             files.len()
         )),
     }
-    let msg = if fail == 0 && err.is_none() {
-        crate::platform::recycle_toast_text(ok)
-    } else if ok == 0 {
-        // Language packs (round 2): the `trash` crate's error text is a value, never a message.
-        match err {
-            Some(e) => tr_format!("Delete did not complete — {error}", error = e),
-            None => i18n::tr("Delete did not complete — the files are still in the folder").to_string(),
-        }
-    } else {
-        crate::platform::partial_recycle_toast_text(ok, files.len(), fail)
-    };
-    (ok, fail, recycled, msg)
+    (ok, fail, recycled)
 }
 
 /// v0.8.131 (F-P11 rule 2): is this path STILL THERE? The reconciliation probe, deliberately
@@ -36840,7 +37897,7 @@ pub(crate) fn recycle_shot_files(paths: &[PathBuf]) -> (usize, usize, Vec<PathBu
 /// Present and is never hydrated by the probe). Any other error — a permission fault, a drive that
 /// went away mid-batch — reads PRESENT, i.e. "not recycled": the cost of being wrong that way is a
 /// missing Recover offer, and the cost of being wrong the other way is a DeleteRecord naming files
-/// that are still in the folder, which the GF6 rule would then let overwrite a good record.
+/// that are still in the folder.
 pub(crate) fn still_present(p: &Path) -> bool {
     !matches!(std::fs::symlink_metadata(p), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
 }
@@ -36872,11 +37929,12 @@ pub(crate) fn reconcile_recycled<'a>(
 ///
 /// Non-atomic, exactly like the Windows contract (v0.8.15 F5): the loop trashes file-by-file, so a
 /// mid-batch failure leaves the ALREADY-trashed files trashed and reports a partial `fail` count — the
-/// caller rescans on ANY attempt, never assuming "Err ⇒ folder unchanged". The first four return
-/// values keep the exact `(recycled, failed, reconciled-subset, msg)` shape the Windows fn uses; the
-/// 5th is the (original, in-Trash) pairs of the files that actually landed, i.e. the exact list
-/// `recover_recycled_files` renames back. Runs on the UI thread (the delete callback), so
-/// `defaultManager` is used without a thread hop.
+/// caller rescans on ANY attempt, never assuming "Err ⇒ folder unchanged". The first three return
+/// values keep the exact `(recycled, failed, reconciled-subset)` shape the Windows fn uses; the
+/// 4th is the (original, in-Trash) pairs of the files that actually landed, i.e. the exact list
+/// `recover_recycled_files` renames back. Runs on the file queue's thread (Delete round, Stage B), inside
+/// the autorelease pool each of its jobs has. `defaultManager` has no main-thread marker. Compile-checked
+/// only: no native Mac run has happened since it left the UI thread.
 ///
 /// v0.9.63 (branch rider — THE macOS TRASH INHERITS F-P11's RECONCILIATION): the Mac arm used to
 /// report the loop's own `ok`/`fail` counts and hand back every pair it captured, and the caller
@@ -36893,7 +37951,7 @@ pub(crate) fn reconcile_recycled<'a>(
 ///     none — a captured `resultingItemURL` is a STRONGER confirmation than a bin scan, because the
 ///     OS told us where it put that exact file. So the returned subset is (gone ∩ paired), and the
 ///     pairs are filtered to it, which means an externally-removed file can never enter a
-///     DeleteRecord and can never demote a good older record under the GF6 newest-only rule.
+///     DeleteRecord.
 ///   • rule 4 is the caller's (`can_recover = !recover_files.is_empty()`), and it is now reachable:
 ///     a partial delete offers Recover for precisely the files that reached the Trash.
 /// `ok` is the reconciled count, so it and the third value can never disagree.
@@ -36905,13 +37963,13 @@ pub(crate) fn reconcile_recycled<'a>(
 #[cfg(target_os = "macos")]
 pub(crate) fn recycle_shot_files(
     paths: &[PathBuf],
-) -> (usize, usize, Vec<PathBuf>, String, Vec<(PathBuf, PathBuf)>) {
+) -> (usize, usize, Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
     use objc2::rc::Retained;
     use objc2_foundation::{NSFileManager, NSString, NSURL};
     let files: Vec<PathBuf> = paths.iter().filter(|p| p.is_file()).cloned().collect();
     if files.is_empty() {
         // Same benign no-op as the Windows arm — the caller still rescans, so the absent shot drops out.
-        return (0, 0, Vec::new(), i18n::tr("Nothing to delete — files already gone.").to_string(), Vec::new());
+        return (0, 0, Vec::new(), Vec::new());
     }
     log_event(&format!("delete-recycle: sending {} file(s) to the Trash", files.len()));
     let fm = unsafe { NSFileManager::defaultManager() };
@@ -36973,20 +38031,7 @@ pub(crate) fn recycle_shot_files(
             files.len()
         ));
     }
-    let msg = if fail == 0 {
-        crate::platform::recycle_toast_text(ok)
-    } else if ok == 0 {
-        tr_plural!(
-            files.len(),
-            "Delete did not complete — {failed} of {n} file(s) couldn't be moved to the {bin}",
-            "Delete did not complete — {failed} of {n} file(s) couldn't be moved to the {bin}",
-            failed = fail,
-            bin = crate::platform::bin_noun()
-        )
-    } else {
-        crate::platform::partial_recycle_toast_text(ok, files.len(), fail)
-    };
-    (ok, fail, recycled, msg, pairs)
+    (ok, fail, recycled, pairs)
 }
 
 /// v0.9.63 (F-P11 rule 3, the Mac arm's own confirmation) — intersect the files the folder says are
@@ -37011,56 +38056,567 @@ pub(crate) fn mac_confirm_trashed(
     (recycled, kept)
 }
 
-/// v0.8.37 (FIX A) — session record of the most-recent single-shot delete, holding everything a
-/// recovery needs. ONE slot (an `Option`, replaced by each delete) matches the transient toast's
-/// lifetime; the shape stays extensible to a small ring later. `dir` is the folder the delete ran in
-/// — the recover GATE compares it to the LIVE folder (the files return to THIS folder, so recovery
-/// is only offered while the user is still on it); `gen`/`idx`/`name` mirror the `del_pending`
-/// identity (idx doubles as the post-recover landing hint — a restored file returns to its sorted
-/// position, so the old index is correct); `files` is the exact list handed to the Recycle Bin;
-/// `op_time` is UNIX-seconds captured just BEFORE the recycle (the bin-item time-filter lower bound).
+/// v0.8.37 (FIX A) — session record of one delete, holding everything a recovery needs. It lives in
+/// [`FileHistory`] (Delete round, 3 November; it was one slot until then). `dir` is the folder the
+/// delete ran in — the recover GATE compares it to the LIVE folder (the files return to THIS folder,
+/// so recovery is only offered while the user is still on it); `gen`/`name` mirror the `del_pending`
+/// identity; `steps` are the undo steps of the photos that left (R8, [`park_steps`]).
 ///
-/// v0.8.186 (U1): `seq` is the act stamp, written when the record is ARMED (each clean recycle
-/// replaces the record and therefore re-stamps it). It is what orders this record against the
-/// cull stack and the move record — see [`undo_arm`]. It is NOT part of the record's identity:
-/// `recover_offer_live` still decides whether a recovery may be OFFERED, and the stamp only
-/// decides whether this record is the NEWEST thing Ctrl+Z could reverse.
-#[derive(Clone)]
+/// Delete round, Stage B: the record exists from the PRESS, so Ctrl+Z reaches it while its job is still
+/// queued. What the job found out arrives in `outcome`, which only the job writes
+/// (`file_queue::run_job`). The tick then settles the record to what really left
+/// ([`FileHistory::settle_delete`]).
+///
+/// v0.8.186 (U1): `seq` is the act stamp, written when the record is ARMED. It is what orders this
+/// record against the cull stack and the move records — see [`undo_arm`] — and it is how a row, a
+/// toast or a press names this record. It does not decide whether a recovery may be OFFERED:
+/// `recover_offer_live` does.
 pub(crate) struct DeleteRecord {
     pub(crate) dir: String,
     pub(crate) gen: u64,
-    pub(crate) idx: usize,
     pub(crate) name: String,
     /// Language packs (round 2): how many photographs a PLURAL delete recorded, 0 for one
     /// photograph. `name` stays English (the log lines read it, and for a plural delete it is
     /// "N photos"); [`DeleteRecord::shown_name`] is the same subject as the screen says it.
     pub(crate) photos: usize,
+    /// One photograph as a message names it ([`photo_subject`]), which says a pair went as a pair. It goes by
+    /// what really left once the job has said.
+    pub(crate) subject: String,
+    pub(crate) seq: u64,
+    /// R8: the undo steps of the photos that left, by name, at their old stamps. They go back on the
+    /// stack when the photo lands again ([`return_parked_steps`]).
+    pub(crate) steps: Vec<ParkedStep>,
+    /// Unset until the delete's job has run, and left unset if that job crashed. A Recover job queues
+    /// behind its delete, so it finds this set, or treats unset as "nothing sent" (R15).
+    pub(crate) outcome: Arc<std::sync::OnceLock<DeleteOutcome>>,
+    /// R14: its job has reported, and the bin check hasn't been asked about it yet.
+    pub(crate) unconfirmed: bool,
+    /// R14: what the bin check found isn't in the bin. A file in here can't come back.
+    pub(crate) not_in_bin: Vec<PathBuf>,
+    /// R5: the Compare halves this delete emptied, for its Ctrl+Z ([`halves_after`]).
+    pub(crate) seats: Vec<CompareSeat>,
+}
+
+/// One photograph at least one of whose files is in the bin: its `name`, how a message names it (a pair's
+/// label only if both files went), and those photo files.
+pub(crate) struct LeftPhoto {
+    pub(crate) name: String,
+    pub(crate) subject: String,
     pub(crate) files: Vec<PathBuf>,
+}
+
+/// What a delete's job found out. `files` is the reconciled subset that left the folder for the Recycle
+/// Bin (it replaced the list handed to the bin at v0.8.131, F-P11); `left` is the photographs at least
+/// one of whose files is in it (F-P11 rule 5: the record describes the SUBSET that actually left, never
+/// the batch that was attempted).
+pub(crate) struct DeleteOutcome {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) left: Vec<LeftPhoto>,
     /// UNIX-seconds captured just before the recycle — the WINDOWS bin-item time-filter lower bound
     /// (`match_recycled_items`). macOS restores from the captured Trash URL directly (no bin scan, no
-    /// time filter), so it is unread there; `allow(dead_code)` keeps the Windows record shape untouched.
+    /// time filter), so it is unread there; `allow(dead_code)` keeps the Windows shape untouched.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) op_time: i64,
-    pub(crate) seq: u64,
-    /// macOS (v0.9.18): each just-deleted original paired with its in-Trash URL, in delete order (a
-    /// clean delete records one pair per file — `can_recover` only fires when `fail == 0`). The Mac
+    /// macOS (v0.9.18): each just-deleted original paired with its in-Trash URL, in delete order. The Mac
     /// Recover renames each Trash path back to its original — the exact restore the `trash` crate never
     /// provided on macOS. Absent on Windows, which lists/restores through the OS Recycle Bin instead, so
-    /// the Windows record shape is unchanged.
+    /// the Windows shape is unchanged.
     #[cfg(target_os = "macos")]
     pub(crate) trash_paths: Vec<(PathBuf, PathBuf)>,
+}
+
+impl DeleteOutcome {
+    /// R14: the same, less what the bin check found missing, for a Recover to restore.
+    pub(crate) fn without(&self, gone: &[PathBuf]) -> Self {
+        let gone: HashSet<&PathBuf> = gone.iter().collect();
+        let kept = |files: &[PathBuf]| -> Vec<PathBuf> { files.iter().filter(|f| !gone.contains(f)).cloned().collect() };
+        Self {
+            files: kept(&self.files),
+            left: self.left.iter().filter_map(|photo| {
+                let files = kept(&photo.files);
+                (!files.is_empty()).then(|| LeftPhoto { name: photo.name.clone(), subject: photo.subject.clone(), files })
+            }).collect(),
+            op_time: self.op_time,
+            #[cfg(target_os = "macos")]
+            trash_paths: self.trash_paths.iter().filter(|(orig, _)| !gone.contains(orig)).cloned().collect(),
+        }
+    }
+}
+
+/// R14: what the bin check made of one delete, for its amber line. `subjects` names what can't come back:
+/// a photo with nothing in the bin, or the one file of a pair that isn't. A side file alone says nothing.
+pub(crate) struct NotInBin {
+    pub(crate) dir: String,
+    pub(crate) subjects: Vec<String>,
+    pub(crate) record_gone: bool,
 }
 
 impl DeleteRecord {
     /// The record's subject as the screen says it: the photograph's name, or for a plural delete
     /// "N photos" (English keeps "photos" for every count).
     pub(crate) fn shown_name(&self) -> String {
-        if self.photos == 0 {
-            self.name.clone()
-        } else {
-            tr_plural!(self.photos, "{n} photos", "{n} photos")
+        deleted_subject(&self.subject, self.photos)
+    }
+}
+
+/// [`DeleteRecord::shown_name`] from its two parts, for a Recover job, which counts what really left.
+pub(crate) fn deleted_subject(name: &str, photos: usize) -> String {
+    if photos == 0 {
+        name.to_string()
+    } else {
+        tr_plural!(photos, "{n} photos", "{n} photos")
+    }
+}
+
+#[cfg(test)]
+impl DeleteRecord {
+    pub(crate) fn for_test(dir: &str, name: &str, photos: usize, files: Vec<PathBuf>, seq: u64, steps: Vec<ParkedStep>) -> Self {
+        let outcome = DeleteOutcome {
+            left: vec![LeftPhoto { name: name.to_string(), subject: name.to_string(), files: files.clone() }], files, op_time: 0,
+            #[cfg(target_os = "macos")]
+            trash_paths: Vec::new(),
+        };
+        Self { dir: dir.to_string(), gen: 1, name: name.to_string(), photos, subject: name.to_string(), seq, steps, outcome: Arc::new(outcome.into()), unconfirmed: false, not_in_bin: Vec::new(), seats: Vec::new() }
+    }
+
+    pub(crate) fn files(&self) -> &[PathBuf] {
+        self.outcome.get().map_or(&[], |o| &o.files)
+    }
+}
+
+/// One Move rejected that can be undone (#11). The folder tag is its correctness anchor: the pairs name
+/// absolute paths in ONE shoot folder, so a same-folder re-scan keeps the undo valid, while a folder
+/// switch invalidates it by identity. `seq` is stamped when the tick folds the worker's pairs in. `steps`
+/// are the undo steps of the photos it moved (R44, the same as a delete's). `subject` is what its Undo
+/// says it brought back ([`moved_subject`]).
+pub(crate) struct MoveRecord {
+    pub(crate) folder: String,
+    pub(crate) pairs: Vec<(PathBuf, PathBuf)>,
+    pub(crate) seq: u64,
+    pub(crate) steps: Vec<ParkedStep>,
+    pub(crate) subject: String,
+}
+
+/// One undo step of a photo that left with a delete (R8), by name, because its position means nothing
+/// once it has left. `seq` is the step's old stamp, so it goes back where it was in the line of things
+/// the person did. A member of a group step carries what it needs to rejoin that group, or to stand as
+/// a group of one if the group has gone from the stack by then. A move's photos park the same way (R44).
+pub(crate) struct ParkedStep {
+    pub(crate) seq: u64,
+    pub(crate) name: String,
+    pub(crate) entry: ParkedEntry,
+}
+
+/// What a [`ParkedStep`] restores, the same values the [`UndoEntry`] it came from held.
+pub(crate) enum ParkedEntry {
+    Cull { rating: i32, mark: u8 },
+    Rot { delta: u8 },
+    BulkMember { rating: i32, mark: u8, verb: &'static str },
+    BulkRotMember { delta: u8 },
+}
+
+/// R8 (Delete round, 3 November): star, Del, Ctrl+Z, Ctrl+Z ends unstarred on that photo, because the
+/// owner's order is "one by one, then the previous action". Take the undo steps of the photos that left
+/// out of the stack, before the reread would drop them. `left`
+/// is each photo's place in the list these indices address, and its name. A group step keeps its other
+/// members (`photo_open::remap_history` keeps them for any other way of leaving, too). The redo branch
+/// isn't read: the press has just cleared it (R7).
+///
+/// R44 (owner, 3 November, asked whether Ctrl+Z after Move rejected should work the same way: "yes fix
+/// it"): X, X, Move rejected, Ctrl+Z, Ctrl+Z. The first brings the photos back, the second takes off the
+/// last X. A move parks its photos' steps too ([`photos_in_pairs`]), when the tick files the move.
+pub(crate) fn park_steps(history: &mut UndoRedo, left: &[(usize, &str)]) -> Vec<ParkedStep> {
+    let names: HashMap<usize, &str> = left.iter().copied().collect();
+    let mut parked = Vec::new();
+    history.undo.retain_mut(|act| {
+        let seq = act.seq;
+        match &mut act.entry {
+            UndoEntry::Cull { idx, rating, mark } => {
+                let Some(name) = names.get(idx) else { return true };
+                parked.push(ParkedStep { seq, name: name.to_string(), entry: ParkedEntry::Cull { rating: *rating, mark: *mark } });
+                false
+            }
+            UndoEntry::Rot { name, idx, delta } => {
+                if !names.contains_key(idx) {
+                    return true;
+                }
+                parked.push(ParkedStep { seq, name: name.clone(), entry: ParkedEntry::Rot { delta: *delta } });
+                false
+            }
+            UndoEntry::Bulk { edits, verb } => {
+                edits.retain(|(idx, rating, mark)| {
+                    let Some(name) = names.get(idx) else { return true };
+                    parked.push(ParkedStep { seq, name: name.to_string(), entry: ParkedEntry::BulkMember { rating: *rating, mark: *mark, verb } });
+                    false
+                });
+                !edits.is_empty()
+            }
+            UndoEntry::BulkRot { turns } => {
+                turns.retain(|(name, idx, delta)| {
+                    if !names.contains_key(idx) {
+                        return true;
+                    }
+                    parked.push(ParkedStep { seq, name: name.clone(), entry: ParkedEntry::BulkRotMember { delta: *delta } });
+                    false
+                });
+                !turns.is_empty()
+            }
+        }
+    });
+    parked
+}
+
+/// R44: the photos a Move rejected took, for [`park_steps`]: each photo with a file among the pairs, in
+/// the list these indices address. A photo that has only half gone counts, as it does for a delete.
+pub(crate) fn photos_in_pairs<'a>(shots: &'a [Shot], pairs: &[(PathBuf, PathBuf)]) -> Vec<(usize, &'a str)> {
+    let moved: HashSet<&Path> = pairs.iter().map(|(from, _)| from.as_path()).collect();
+    shots.iter().enumerate()
+        .filter(|(_, s)| [&s.raw, &s.jpg].into_iter().flatten().any(|p| moved.contains(p.as_path())))
+        .map(|(i, s)| (i, s.name.as_str()))
+        .collect()
+}
+
+/// What an Undo move says it brought back (owner-approved): the photo by name, with the pair's label if both
+/// files moved, or how many. Empty if none of these files is a photo on the list: it then counts files.
+pub(crate) fn moved_subject(shots: &[Shot], pairs: &[(PathBuf, PathBuf)]) -> String {
+    let moved = photos_in_pairs(shots, pairs);
+    match moved[..] {
+        [] => String::new(),
+        [(at, name)] => {
+            let shot = &shots[at];
+            let both = [&shot.raw, &shot.jpg].into_iter().flatten().all(|f| pairs.iter().any(|(from, _)| from == f));
+            if both { photo_subject(shot) } else { name.to_string() }
+        }
+        _ => deleted_subject("", moved.len()),
+    }
+}
+
+/// R8: a photo that came back has its undo steps back, at their old stamps, with the index it has now.
+/// Called at the landing, after `photo_open::RescanCarry` has put the remapped stack back, so the
+/// indices here and the stack's address the same list. A member rejoins its group while the group is
+/// there. A step whose photo didn't come back drops: the list is the truth by then. The stack stays
+/// ordered by stamp and capped, like every other push.
+pub(crate) fn return_parked_steps(history: &mut UndoRedo, steps: Vec<ParkedStep>, shots: &[Shot]) {
+    if steps.is_empty() {
+        return;
+    }
+    let places: HashMap<&str, usize> = shots.iter().enumerate().map(|(i, s)| (s.name.as_str(), i)).collect();
+    for ParkedStep { seq, name, entry } in steps {
+        let Some(&idx) = places.get(name.as_str()) else { continue };
+        let at = history.undo.partition_point(|a| a.seq < seq);
+        let group = history.undo.get_mut(at).filter(|a| a.seq == seq).map(|a| &mut a.entry);
+        let entry = match (entry, group) {
+            (ParkedEntry::BulkMember { rating, mark, .. }, Some(UndoEntry::Bulk { edits, .. })) => {
+                edits.push((idx, rating, mark));
+                continue;
+            }
+            (ParkedEntry::BulkRotMember { delta }, Some(UndoEntry::BulkRot { turns })) => {
+                turns.push((name, idx, delta));
+                continue;
+            }
+            (ParkedEntry::Cull { rating, mark }, _) => UndoEntry::Cull { idx, rating, mark },
+            (ParkedEntry::Rot { delta }, _) => UndoEntry::Rot { name, idx, delta },
+            (ParkedEntry::BulkMember { rating, mark, verb }, _) => UndoEntry::Bulk { edits: vec![(idx, rating, mark)], verb },
+            (ParkedEntry::BulkRotMember { delta }, _) => UndoEntry::BulkRot { turns: vec![(name, idx, delta)] },
+        };
+        history.undo.insert(at, Act { seq, entry });
+    }
+    let over = history.undo.len().saturating_sub(FILE_HISTORY_CAP);
+    history.undo.drain(..over);
+}
+
+/// R7 (Delete round, 3 November; owner: Del, Ctrl+Z, then Ctrl+Y does nothing). The press of a delete
+/// and of a move ends what Ctrl+Y could re-apply, as a fresh edit does, because there is no redo of a
+/// delete or a move. Without it, Ctrl+Y after Del, Ctrl+Z reached an older undone star on another photo
+/// and jumped there. A Recover doesn't clear it: what's on the redo branch was undone since that delete.
+pub(crate) fn note_file_press(undo: &RefCell<UndoRedo>) {
+    undo.borrow_mut().redo.clear();
+}
+
+/// How many deletes, and how many moves, the session remembers: the stack's own number. The events log
+/// holds 50 rows, so a row someone can still see always has its record. A fold's lines are capped at it too
+/// (R39): a run is one row, however many deletes it holds.
+pub(crate) const FILE_HISTORY_CAP: usize = 500;
+
+/// The file half of the one history (Delete round, 3 November; owner: "If they are selected and deleted
+/// at the same time, bring back all 3; if sequentially, one by one, then the previous action").
+///
+/// Lists rather than single slots, each ordered by stamp, oldest first. A slot lost the first delete to
+/// the second, then Ctrl+Z reached an older star on another photo (`docs/design/ux-mental-models.md`).
+/// Entries are independent, because a file that left can't be in a later entry, so an older row's
+/// Recover or Undo works out of order, and nothing demotes it. It does not go inside [`UndoRedo`]:
+/// that is replaced at every folder change, remaps by index, and shares its cap with stars. Lifetime is
+/// the session. Folder gates and order are `live_undo_arm`'s, which takes the newest in the folder on
+/// screen from here.
+#[derive(Default)]
+pub(crate) struct FileHistory {
+    pub(crate) deletes: Vec<DeleteRecord>,
+    pub(crate) moves: Vec<MoveRecord>,
+    /// Ctrl+Z has said once that the deletes it could reach are in another folder. It speaks again in
+    /// the next folder, or after the next delete.
+    pub(crate) nudged: bool,
+    /// R8: undo steps of photos brought back, waiting for the landing that gives them an index.
+    pub(crate) returning: Vec<ParkedStep>,
+    /// Steps of the Recovers and Undo moves still on the queue, by the taken act's stamp. They join
+    /// `returning` when that job has finished: another job's reread may land first, without the photo.
+    pub(crate) on_the_way: Vec<(u64, Vec<ParkedStep>)>,
+    /// R29: the stamp of the newest delete pressed. A clean result older than this has been overtaken, so
+    /// it joins the bell list quietly and the newest press names the card.
+    pub(crate) newest_press: u64,
+    /// R29, R35: the small pictures of a press, by photo, waiting for its job's report to put them on the card
+    /// and on the lines of its row. Cloned from the strip's thumbnails at the press. Memory only, on this thread.
+    pub(crate) pictures: Vec<(u64, String, slint::Image)>,
+    /// R46: the files of the photos the person brought back, a Recover's or an Undo move's, waiting for the
+    /// landing that lists them (`apply_scan` takes them, and `file_queue::no_landing` drops them). The blue
+    /// edge's only source, so a photo nobody brought back (another program's, the refresh's) can't light it.
+    pub(crate) brought_back: Vec<PathBuf>,
+}
+
+impl FileHistory {
+    pub(crate) fn push_delete(&mut self, record: DeleteRecord) {
+        self.deletes.push(record);
+        let over = self.deletes.len().saturating_sub(FILE_HISTORY_CAP);
+        self.deletes.drain(..over);
+        self.nudged = false;
+    }
+
+    pub(crate) fn push_move(&mut self, record: MoveRecord) {
+        self.moves.push(record);
+        let over = self.moves.len().saturating_sub(FILE_HISTORY_CAP);
+        self.moves.drain(..over);
+    }
+
+    /// The newest delete in `dir`, in the shape `live_undo_arm` takes, through the handler's own gate.
+    pub(crate) fn delete_arm(&self, dir: &str) -> Option<(&str, u64)> {
+        self.deletes.iter().rev().find(|r| recover_offer_live(&r.dir, dir)).map(|r| (r.dir.as_str(), r.seq))
+    }
+
+    /// The newest move in `dir`, in the shape `live_undo_arm` takes, through the handler's own gate.
+    pub(crate) fn move_arm(&self, dir: &str) -> Option<(&str, usize, u64)> {
+        self.moves.iter().rev().find(|m| move_undo_live(&m.folder, m.pairs.len(), dir)).map(|m| (m.folder.as_str(), m.pairs.len(), m.seq))
+    }
+
+    pub(crate) fn delete_by_seq(&self, seq: u64) -> Option<&DeleteRecord> {
+        self.deletes.iter().find(|r| r.seq == seq)
+    }
+
+    pub(crate) fn move_by_seq(&self, seq: u64) -> Option<&MoveRecord> {
+        self.moves.iter().find(|m| m.seq == seq)
+    }
+
+    pub(crate) fn has_delete(&self, seq: u64) -> bool {
+        self.delete_by_seq(seq).is_some()
+    }
+
+    /// R29, R35: the picture of one of a press's photos, until its job has reported.
+    pub(crate) fn hold_picture(&mut self, seq: u64, photo: &str, picture: slint::Image) {
+        self.pictures.push((seq, photo.to_string(), picture));
+    }
+
+    /// A press's pictures, by photo, in the order it held them.
+    pub(crate) fn take_pictures(&mut self, seq: u64) -> Vec<(String, slint::Image)> {
+        let (taken, kept) = std::mem::take(&mut self.pictures).into_iter().partition(|(s, _, _)| *s == seq);
+        self.pictures = kept;
+        taken.into_iter().map(|(_, photo, picture): (u64, String, slint::Image)| (photo, picture)).collect()
+    }
+
+    /// R33 (owner: "2 can use the foldable notification"): one photo of a selection comes back on its own, from
+    /// its line in the bell list. Its files, its side files, its undo steps and its Compare seat become a record
+    /// of their own under `stamp`, for `file_queue::press_recover` to take at once. The selection keeps the rest
+    /// under its own stamp, so Ctrl+Z still brings back everything left of it in one press, and with one photo
+    /// left it reads by name (R25's rule). `false`: no such selection, its job hasn't said what left, or that
+    /// photo is the only one left of it, which its whole Recover brings back.
+    pub(crate) fn split_photo(&mut self, seq: u64, photo: &str, stamp: u64) -> bool {
+        let Some(at) = self.deletes.iter().position(|r| r.seq == seq) else { return false };
+        let record = &mut self.deletes[at];
+        let Some(sent) = record.outcome.get() else { return false };
+        let Some(one) = sent.left.iter().position(|p| p.name == photo).filter(|_| record.photos > 0 && sent.left.len() >= 2) else { return false };
+        // Its photo files, and the side files Falcon sent with them (`files_to_send`'s names).
+        let photo_files = &sent.left[one].files;
+        let its: HashSet<&PathBuf> = sent.files.iter().filter(|f| {
+            photo_files.contains(f) || photo_files.iter().any(|p| [falcon_decode::sidecar_path_for(p, true), falcon_decode::sidecar_path_for(p, false)].contains(f))
+        }).collect();
+        let part = |mine: bool| DeleteOutcome {
+            files: sent.files.iter().filter(|f| its.contains(f) == mine).cloned().collect(),
+            left: sent.left.iter().enumerate().filter(|(i, _)| (*i == one) == mine)
+                .map(|(_, p)| LeftPhoto { name: p.name.clone(), subject: p.subject.clone(), files: p.files.clone() }).collect(),
+            op_time: sent.op_time,
+            #[cfg(target_os = "macos")]
+            trash_paths: sent.trash_paths.iter().filter(|(orig, _)| its.contains(orig) == mine).cloned().collect(),
+        };
+        let (taken, rest) = (part(true), part(false));
+        let (steps, kept): (Vec<ParkedStep>, Vec<ParkedStep>) = std::mem::take(&mut record.steps).into_iter().partition(|s| s.name == photo);
+        record.steps = kept;
+        let (not_in_bin, still): (Vec<PathBuf>, Vec<PathBuf>) = std::mem::take(&mut record.not_in_bin).into_iter().partition(|f| its.contains(f));
+        record.not_in_bin = still;
+        let (seats, others): (Vec<CompareSeat>, Vec<CompareSeat>) = std::mem::take(&mut record.seats).into_iter().partition(|s| s.photo.iter().any(|f| its.contains(f)));
+        record.seats = others;
+        let subject = taken.left[0].subject.clone();
+        let split = DeleteRecord {
+            dir: record.dir.clone(), gen: record.gen, name: photo.to_string(), photos: 0, subject, seq: stamp, steps,
+            outcome: Arc::new(taken.into()), unconfirmed: record.unconfirmed, not_in_bin, seats,
+        };
+        // What's left of the selection: how many, or by name at one.
+        match &rest.left[..] {
+            [last] => {
+                record.photos = 0;
+                record.name = last.name.clone();
+                record.subject = last.subject.clone();
+            }
+            many => {
+                record.photos = many.len();
+                record.name = format!("{} photos", many.len());
+            }
+        }
+        record.outcome = Arc::new(rest.into());
+        self.deletes.push(split);
+        true
+    }
+
+    /// Whether this move can still be undone from `dir`: the toast's Undo goes when it can't.
+    pub(crate) fn move_live(&self, seq: u64, dir: &str) -> bool {
+        self.move_by_seq(seq).is_some_and(|m| move_undo_live(&m.folder, m.pairs.len(), dir))
+    }
+
+    pub(crate) fn take_delete(&mut self, seq: u64) -> Option<DeleteRecord> {
+        let at = self.deletes.iter().position(|r| r.seq == seq)?;
+        Some(self.deletes.remove(at))
+    }
+
+    pub(crate) fn take_move(&mut self, seq: u64) -> Option<MoveRecord> {
+        let at = self.moves.iter().position(|m| m.seq == seq)?;
+        Some(self.moves.remove(at))
+    }
+
+    /// A Recover or an Undo move has been pressed: its act has left the history, and its steps wait for
+    /// its job. The next Ctrl+Z reaches the act before, or waits for these ([`undo_waits_for_landing`]).
+    pub(crate) fn start_return(&mut self, seq: u64, steps: Vec<ParkedStep>) {
+        self.on_the_way.push((seq, steps));
+    }
+
+    /// That job has finished, and its reread is next. A photo that didn't come back drops its steps at
+    /// the landing ([`return_parked_steps`]), so this doesn't ask how the job went.
+    pub(crate) fn send_back(&mut self, seq: u64) {
+        if let Some(at) = self.on_the_way.iter().position(|(s, _)| *s == seq) {
+            let (_, steps) = self.on_the_way.remove(at);
+            self.returning.extend(steps);
         }
     }
+
+    /// A delete's job has finished, so its record says what really left. F-P11 rule 4: the gate is
+    /// `can_recover`, something reached the bin. Nothing did: the record goes, as nothing can come back.
+    /// Either way a photo that never left has its steps back at the reread that follows, so a delete that
+    /// failed loses no undo step. A record Ctrl+Z has already taken isn't here: its Recover job speaks.
+    pub(crate) fn settle_delete(&mut self, seq: u64, can_recover: bool, left: &[String]) {
+        let Some(at) = self.deletes.iter().position(|r| r.seq == seq) else { return };
+        if !can_recover {
+            let record = self.deletes.remove(at);
+            self.returning.extend(record.steps);
+            return;
+        }
+        let record = &mut self.deletes[at];
+        if record.photos > 0 {
+            // v0.8.131 (F-P11 rule 5): the SUBSET that actually left, never the batch that was attempted.
+            record.photos = left.len().max(1);
+            record.name = format!("{} photos", record.photos);
+        } else if let Some(photo) = record.outcome.get().and_then(|sent| sent.left.first()) {
+            record.subject = photo.subject.clone(); // half a pair isn't the pair
+        }
+        let left: HashSet<&str> = left.iter().map(String::as_str).collect();
+        let (stay, back): (Vec<ParkedStep>, Vec<ParkedStep>) =
+            std::mem::take(&mut record.steps).into_iter().partition(|s| left.contains(s.name.as_str()));
+        record.steps = stay;
+        self.returning.extend(back);
+    }
+
+    /// R14: the bin check can ask about this delete at the next quiet second. A record that has already
+    /// gone, because nothing left or Ctrl+Z has taken it, has nothing to ask.
+    pub(crate) fn note_unconfirmed(&mut self, seq: u64) {
+        if let Some(record) = self.deletes.iter_mut().find(|r| r.seq == seq) {
+            record.unconfirmed = true;
+        }
+    }
+
+    /// R14: what the bin check has to look at, once each. A record Ctrl+Z has taken isn't here (R14's "a
+    /// Recover removes its seq from the pending set"), and neither is its file by then.
+    pub(crate) fn take_bin_asks(&mut self) -> Vec<crate::file_queue::BinAsk> {
+        self.deletes.iter_mut().filter(|r| r.unconfirmed).filter_map(|record| {
+            record.unconfirmed = false;
+            let sent = record.outcome.get()?;
+            Some(crate::file_queue::BinAsk { seq: record.seq, op_time: sent.op_time, files: sent.files.clone() })
+        }).collect()
+    }
+
+    /// R14: the bin check found `missing` isn't in the bin. The record shrinks to what can come back, or
+    /// goes, through the same settling a job's report has, with the steps of a photo that stayed sent
+    /// back. `None`: Ctrl+Z has taken the record since the check started, so the file it couldn't find
+    /// is back in the folder, and nothing is wrong.
+    pub(crate) fn settle_not_in_bin(&mut self, seq: u64, missing: Vec<PathBuf>) -> Option<NotInBin> {
+        let record = self.deletes.iter_mut().find(|r| r.seq == seq)?;
+        let outcome = record.outcome.clone();
+        let sent = outcome.get()?;
+        record.not_in_bin.extend(missing);
+        let dir = record.dir.clone();
+        let gone: HashSet<&PathBuf> = record.not_in_bin.iter().collect();
+        let (mut subjects, mut left) = (Vec::new(), Vec::new());
+        for photo in &sent.left {
+            let (out, kept): (Vec<&PathBuf>, Vec<&PathBuf>) = photo.files.iter().partition(|f| gone.contains(f));
+            if kept.is_empty() {
+                subjects.push(photo.subject.clone());
+                continue;
+            }
+            left.push(photo.name.clone());
+            subjects.extend(out.iter().map(|f| file_name_lossy(f)));
+        }
+        let record_gone = sent.files.iter().all(|f| gone.contains(f));
+        self.settle_delete(seq, !record_gone, &left);
+        Some(NotInBin { dir, subjects, record_gone })
+    }
+
+    /// Empty ./Rejected recycled the moved files, so nothing can come back from that folder. The stamps
+    /// that went, for the rows that offered them.
+    pub(crate) fn drop_moves_in(&mut self, folder: &str) -> Vec<u64> {
+        let gone = self.moves.iter().filter(|m| m.folder == folder).map(|m| m.seq).collect();
+        self.moves.retain(|m| m.folder != folder);
+        gone
+    }
+
+    /// The delete Ctrl+Z can answer with the "another folder" sentence, while it hasn't said so yet.
+    /// Asked only when no arm is live, so a delete here means one in another folder.
+    pub(crate) fn nudge_seq(&self) -> Option<u64> {
+        self.deletes.last().filter(|_| !self.nudged).map(|r| r.seq)
+    }
+
+    /// Ctrl+Z with no arm live: the delete to answer about, once.
+    pub(crate) fn nudge_once(&mut self) -> Option<u64> {
+        let nudge = self.nudge_seq();
+        self.nudged = true;
+        nudge
+    }
+
+    /// A take-out lands from the list on screen, without any photo on its way back, and a landing keeps
+    /// only the steps whose photo it lists. So their steps sit this landing out, until the reread that
+    /// lists their photo ([`Self::release_returning`]).
+    pub(crate) fn hold_returning(&mut self) -> Vec<ParkedStep> {
+        std::mem::take(&mut self.returning)
+    }
+
+    pub(crate) fn release_returning(&mut self, held: Vec<ParkedStep>) {
+        self.returning.extend(held);
+    }
+
+    /// The newest undo step still on its way back with its photo (R8).
+    pub(crate) fn newest_returning(&self) -> Option<u64> {
+        let on_the_way = self.on_the_way.iter().flat_map(|(_, steps)| steps);
+        self.returning.iter().chain(on_the_way).map(|s| s.seq).max()
+    }
+}
+
+/// R8: Ctrl+Z pressed while the newest thing to take back is a star on a photo that hasn't landed yet.
+/// Taking the next thing instead would reach an older star on another photo, so the press waits for the
+/// landing: the tick asks again after each reread. `arm` is the act the press would otherwise reach.
+pub(crate) fn undo_waits_for_landing(arm: Option<UndoArm>, returning: Option<u64>) -> bool {
+    returning.is_some_and(|r| arm.is_none_or(|a| r > a.seq()))
 }
 
 /// v0.8.37 (FIX B) — the same-key rating-clear decision, isolated so the KEYBOARD number-key dispatch
@@ -37078,9 +38634,10 @@ pub(crate) fn same_key_clear_target(pressed: i32, current: i32, enabled: bool) -
 }
 
 /// v0.8.37 (FIX A3) — the resume-position offer rule. A genuine folder OPEN (async, no landing hint)
-/// offers "resume where you were"; a post-op rescan that carries an explicit landing HINT (delete /
-/// move-rejects / undo-move / recover — the `reload_req` `Some(idx)` tuple) never does, so the hinted
-/// landing is never second-guessed by the saved resume position. Pure mirror of the apply_scan gate.
+/// offers "resume where you were". A partial stage's landing HINT never does, and neither does a
+/// reread (delete, move-rejects, undo-move, recover), which is not an async open and lands by photo
+/// ([`land_by_photo`]), so a landing is never second-guessed by the saved resume position. Pure
+/// mirror of the apply_scan gate.
 pub(crate) fn resume_offer_allowed(async_open: bool, has_landing_hint: bool) -> bool {
     async_open && !has_landing_hint
 }
@@ -37097,6 +38654,25 @@ pub(crate) fn norm_win_path(p: &Path) -> String {
     s
 }
 
+/// R10 (Delete round, 3 November; CS-47): a bin item with its whole file name. The crate reads `name`
+/// from the shell's display name, which drops the extension under Windows' default "Hide extensions
+/// for known file types". Then the item's original path would never match the file we sent, and a
+/// restore would bring it back with no extension. `id` is the item's `$R` file in the bin, which keeps
+/// the extension, so `name` takes it from there when it lacks it. A name that already ends in it (in
+/// any case) stays, and so does a file with no extension.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn bin_item_with_whole_name(item: &trash::TrashItem) -> trash::TrashItem {
+    let mut item = item.clone();
+    if let Some(ext) = Path::new(&item.id).extension() {
+        let ends_in_it = Path::new(&item.name).extension().is_some_and(|e| e.eq_ignore_ascii_case(ext));
+        if !ends_in_it {
+            item.name.push(".");
+            item.name.push(ext);
+        }
+    }
+    item
+}
+
 /// v0.8.37 (FIX A1) — pure bin-item matcher (no bin I/O, so unit-testable with synthetic items).
 /// From every item currently in the Recycle Bin, pick the ones that recover our just-deleted shot: a
 /// bin item matches an `original` path when their normalised full original paths are equal AND it was
@@ -37105,6 +38681,9 @@ pub(crate) fn norm_win_path(p: &Path) -> String {
 /// (max `time_deleted`) wins — that is the one we just sent. Returns at most one item per original,
 /// in `originals` order. (Unused on macOS until `os_limited` lands, but compiles — pure `TrashItem`
 /// logic; kept ungated so the Windows `recover_tests` still reference it.)
+///
+/// R10: every item is read with its whole name ([`bin_item_with_whole_name`]), and the items returned
+/// carry it, so the restore that follows puts each file back under its real name.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn match_recycled_items(
     bin: &[trash::TrashItem],
@@ -37112,6 +38691,7 @@ pub(crate) fn match_recycled_items(
     op_time: i64,
 ) -> Vec<trash::TrashItem> {
     const SLACK_SECS: i64 = 3; // the shell stores whole seconds; our op_time can be finer / skewed
+    let bin: Vec<trash::TrashItem> = bin.iter().map(bin_item_with_whole_name).collect();
     let mut out = Vec::new();
     for orig in originals {
         let want = norm_win_path(orig);
@@ -37129,35 +38709,33 @@ pub(crate) fn match_recycled_items(
 /// v0.8.131 (F-P11 rule 3): RECORD TIGHTENING. A file that is missing after a delete is not
 /// necessarily a file WE recycled — an external actor (a sync client, another app, the user) can
 /// remove one in the same beat. Writing a DeleteRecord for it would offer a Recover that cannot
-/// work, and, worse, the GF6 newest-only rule would demote a still-good older record to make room
-/// for it.
+/// work.
 ///
 /// So the missing set is confirmed against the bin itself, through the same op-time-gated matcher
 /// the recovery uses. If the bin cannot be listed (a listing can fail) the bare re-stat stands: the
-/// pessimistic fallback is the shipped behaviour, not a new risk.
+/// pessimistic fallback is the shipped behaviour, not a new risk (`file_queue::FileIo::missing_from_bin`).
 ///
-/// v0.9.63: WINDOWS-ONLY. `trash::os_limited` does not exist on macOS (v0.9.7 gated it), so this
-/// body cannot compile there — and it is not wanted: the Mac arm confirms against the captured
-/// `resultingItemURL`s inside `recycle_shot_files` (`mac_confirm_trashed`), which is a stronger
-/// answer to the same question than a bin scan. Rule 3 holds on both trunks by different evidence.
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn confirm_recycled_in_bin(recycled: &[PathBuf], op_time: i64) -> Vec<PathBuf> {
-    if recycled.is_empty() {
-        return Vec::new();
-    }
-    let Ok(bin) = trash::os_limited::list() else {
-        log_event("delete-recycle: the bin could not be listed — the re-stat's verdict stands");
-        return recycled.to_vec();
-    };
-    let matched = match_recycled_items(&bin, recycled, op_time);
+/// R14 (Delete round): this used to run inside the delete, so the job waited for a listing of the whole
+/// bin, and so did a Ctrl+Z behind it. It now runs after the job, at a quiet second, once for a whole
+/// burst, on its own thread (`file_queue::BinCheck`), and the record starts from the re-stat. Which also
+/// means a file the bypassed bin swallowed (a drive with no bin in effect, a file too big for it) gets
+/// the amber line, where it used to be a silent missing Recover. This answers from one listing.
+///
+/// v0.9.63: unused on macOS. `trash::os_limited` does not exist there (v0.9.7 gated it), and it is not
+/// wanted: the Mac arm confirms against the captured `resultingItemURL`s inside `recycle_shot_files`
+/// (`mac_confirm_trashed`), which is a stronger answer to the same question than a bin scan. Rule 3 holds
+/// on both trunks by different evidence.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn missing_from_bin(bin: &[trash::TrashItem], recycled: &[PathBuf], op_time: i64) -> Vec<PathBuf> {
+    let matched = match_recycled_items(bin, recycled, op_time);
     let found: std::collections::HashSet<String> =
         matched.iter().map(|it| norm_win_path(&it.original_path())).collect();
     let out: Vec<PathBuf> =
-        recycled.iter().filter(|p| found.contains(&norm_win_path(p))).cloned().collect();
-    if out.len() != recycled.len() {
+        recycled.iter().filter(|p| !found.contains(&norm_win_path(p))).cloned().collect();
+    if !out.is_empty() {
         log_event(&format!(
             "delete-recycle: {} of {} missing file(s) are NOT in the bin — something else removed them; they are not recorded for recovery",
-            recycled.len() - out.len(),
+            out.len(),
             recycled.len()
         ));
     }
@@ -37477,6 +39055,336 @@ fn file_name_lossy(p: &Path) -> String {
 }
 
 #[cfg(test)]
+mod at_once_tests {
+    use super::*;
+    use falcon_decode::SrcKind;
+
+    fn photo(name: &str) -> Shot {
+        Shot { id: 0, name: name.into(), raw: None, jpg: Some(PathBuf::from(format!("{name}.JPG"))), has_raw: false, has_jpg: true, kind: SrcKind::Jpeg, cloud_placeholder: false, sniffed: None }
+    }
+
+    fn pair(name: &str) -> Shot {
+        Shot { raw: Some(PathBuf::from(format!("{name}.CR3"))), has_raw: true, ..photo(name) }
+    }
+
+    /// R21: exactly a fixed disk goes at once. Every other answer asks, and so does every other kind of
+    /// path, with no call made. The probe is asked about the drive's root, trailing backslash included.
+    ///
+    /// FALSIFIER (L28): treat type 2 (`DRIVE_REMOVABLE`) as at once: its row. Treat `Prefix::UNC` as a drive,
+    /// or call the probe with no prefix: the rows that read `asked`. Drop the trailing backslash: the root.
+    #[cfg(windows)]
+    #[test]
+    fn delete_asks_table() {
+        let asked: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let ask = |dir: &str, kind: u32| {
+            asked.borrow_mut().clear();
+            delete_asks_with(Path::new(dir), |root| {
+                asked.borrow_mut().push(root.to_string());
+                kind
+            })
+        };
+        for (kind, what, asks) in [
+            (0, "unknown", true),
+            (1, "no root directory", true),
+            (2, "removable: SD cards and ordinary sticks", true),
+            (3, "fixed: internal drives, portable SSDs", false),
+            (4, "remote", true),
+            (5, "optical", true),
+            (6, "RAM disk", true),
+            (77, "an answer nobody documented", true),
+        ] {
+            for dir in [r"X:\shoot\day one", r"\\?\X:\shoot"] {
+                assert_eq!(ask(dir, kind), asks, "{what} at {dir}");
+                assert_eq!(*asked.borrow(), [r"X:\".to_string()], "{what} at {dir}: the drive's root, and only once");
+            }
+        }
+        assert!(!ask(r"c:\lower\case", 3));
+        assert_eq!(*asked.borrow(), [r"C:\".to_string()], "the path's own reading of the letter: a drive has no case");
+        for dir in [r"\\nas\share\shoot", r"\\?\UNC\nas\share\shoot", r"\\.\COM1", "relative\\shoot", ""] {
+            assert!(ask(dir, 3), "{dir:?} asks, even with a probe that would say fixed");
+            assert!(asked.borrow().is_empty(), "{dir:?} makes no call");
+        }
+    }
+
+    /// The real question, once. Your temp folder's drive answers without any file being touched, and a
+    /// letter nothing is mounted on asks.
+    ///
+    /// FALSIFIER (L28): `drive_type_of` passes the root without its terminator, or a wrong encoding: the
+    /// call fails, answers 1, and the first assertion reds.
+    #[cfg(windows)]
+    #[test]
+    fn the_real_question_answers_for_the_drive_and_asks_on_a_letter_with_nothing_there() {
+        let temp = std::env::temp_dir();
+        let root = drive_root(&temp).expect("the temp folder has a drive letter");
+        assert_ne!(drive_type_of(&root), 1, "{root}: the call found the drive");
+        assert_eq!(delete_asks(&temp), drive_type_of(&root) != DRIVE_FIXED, "the same question");
+        if let Some(letter) = ('A'..='Z').rev().find(|l| drive_type_of(&format!(r"{l}:\")) == 1) {
+            assert!(delete_asks(Path::new(&format!(r"{letter}:\shoot"))), "nothing is at {letter}:");
+        }
+    }
+
+    /// R21, R24, R26: the route. The drive's rule first. On a fixed disk, a cloud-only photo asks and the
+    /// rest go at once, read live from the file and not from the list's flag, because a photo downloaded a
+    /// minute ago goes at once. One cloud-only file makes the whole photo cloud-only, since a pair goes
+    /// together. The Mac has no for-good route at all, whatever the drive or the cloud.
+    ///
+    /// FALSIFIER (L28): read `shot.cloud_placeholder` instead of the probe: the two "stale flag" rows. Read
+    /// only the JPEG: the pair row. `HAS_FOR_GOOD_ROUTE`'s gate gone: the Mac rows. The drive's answer second:
+    /// the row whose probe panics.
+    #[test]
+    fn a_cloud_only_photo_asks_and_one_already_downloaded_goes_at_once() {
+        let (ant, bee, cat) = (photo("ANT"), pair("BEE"), photo("CAT"));
+        let bee_raw_in_cloud = |f: &Path| f == Path::new("BEE.CR3");
+        let route = |targets: &[&Shot]| delete_route_on(true, false, targets, bee_raw_in_cloud);
+        assert_eq!(route(&[&ant]), DeleteRoute::Bin { asks: false }, "ANT is on this PC, so at once");
+        assert!(!route(&[&ant]).asks());
+        let only_bee = DeleteRoute::CloudOnly(vec!["BEE".to_string()]);
+        assert_eq!(route(&[&bee]), only_bee, "BEE's RAW is only in the cloud, and BEE is one photo");
+        assert!(only_bee.asks());
+        assert_eq!(route(&[&ant, &bee, &cat]), only_bee, "a selection names only those");
+        assert!(only_bee.goes_for_good(&bee) && !only_bee.goes_for_good(&ant) && !only_bee.goes_for_good(&cat));
+        // The list's flag is what was true when it was read. The file is what's true now.
+        let stale_downloaded = Shot { cloud_placeholder: true, ..ant.clone() };
+        assert_eq!(route(&[&stale_downloaded]), DeleteRoute::Bin { asks: false }, "stale flag: it has been downloaded since");
+        let stale_evicted = Shot { cloud_placeholder: false, ..bee.clone() };
+        assert_eq!(route(&[&stale_evicted]), only_bee, "stale flag: it has been freed up since");
+        // A drive that asks is the drive's reason, and reads no file.
+        let never = |_: &Path| -> bool { panic!("no attribute read on a drive that asks anyway") };
+        assert_eq!(delete_route_on(true, true, &[&ant, &bee], never), DeleteRoute::NoBin);
+        assert!(DeleteRoute::NoBin.asks() && DeleteRoute::NoBin.goes_for_good(&ant) && DeleteRoute::NoBin.goes_for_good(&bee));
+        // The Mac: a dialog only for a network volume, and neither ever goes for good.
+        let mac_local = delete_route_on(false, false, &[&ant, &bee], never);
+        assert_eq!(mac_local, DeleteRoute::Bin { asks: false });
+        let mac_network = delete_route_on(false, true, &[&ant, &bee], never);
+        assert_eq!(mac_network, DeleteRoute::Bin { asks: true });
+        assert!(mac_network.asks() && !mac_network.goes_for_good(&bee), "it asks, and still goes to the Trash");
+        assert_eq!(HAS_FOR_GOOD_ROUTE, !cfg!(target_os = "macos"));
+    }
+
+    /// R25 (owner chose B): at once when the photo on screen is in the selection, the dialog when it isn't,
+    /// or when anything about it asks.
+    ///
+    /// FALSIFIER (L28): drop `targets.contains(&on_screen)`: the second row. Drop `!route.asks()`: the
+    /// no-bin and cloud rows.
+    #[test]
+    fn a_selection_goes_at_once_only_with_the_photo_on_screen_in_it() {
+        let (ant, bee, cat, dog) = (0, 1, 2, 3);
+        let selected = [ant, bee, cat];
+        let bin = DeleteRoute::Bin { asks: false };
+        assert!(selection_goes_at_once(&bin, &selected, bee), "on BEE, and BEE is in it");
+        assert!(!selection_goes_at_once(&bin, &selected, dog), "on DOG: three others would go and DOG would stay");
+        assert!(!selection_goes_at_once(&DeleteRoute::NoBin, &selected, bee), "no bin: it says so first");
+        assert!(!selection_goes_at_once(&DeleteRoute::CloudOnly(vec!["ANT".into()]), &selected, bee), "cloud-only: it says so first");
+        assert!(!selection_goes_at_once(&DeleteRoute::Bin { asks: true }, &selected, bee), "a Mac's network volume keeps the dialog");
+    }
+
+    /// R27: a menu row's ellipsis. A menu reads no disk, so it has the list's flag; the press reads the file.
+    ///
+    /// FALSIFIER (L28): the cloud term loses `HAS_FOR_GOOD_ROUTE`: the Mac's own build reds. Either term goes:
+    /// the row naming it.
+    #[test]
+    fn a_delete_row_promises_a_dialog_only_where_one_opens() {
+        assert!(!delete_label_asks(false, false), "a fixed disk, a photo on it");
+        assert!(delete_label_asks(true, false), "a card");
+        assert_eq!(delete_label_asks(false, true), HAS_FOR_GOOD_ROUTE, "a cloud-only photo, where that has a dialog");
+    }
+
+    /// R6: the same answer the cull keys read. A stand-in names the photo it stands in for, so it passes.
+    ///
+    /// FALSIFIER (L28): `photo_not_on_stage` compares nothing, or answers `true` for "nothing shown": a row.
+    #[test]
+    fn a_photo_is_on_stage_when_it_is_what_shows() {
+        assert!(!photo_not_on_stage(Some(4), 4));
+        assert!(photo_not_on_stage(Some(3), 4), "the deleted photo's frame is still up");
+        assert!(photo_not_on_stage(None, 4), "nothing is up");
+    }
+
+    /// The pair label. A photo with no format word keeps its name, because nothing false is said.
+    ///
+    /// FALSIFIER (L28): the label on a single file, or no space before the bracket: a row.
+    #[test]
+    fn a_pair_says_it_is_a_pair() {
+        assert_eq!(photo_subject(&pair("IMG_1234")), "IMG_1234 [RAW+JPG]");
+        assert_eq!(photo_subject(&Shot { kind: SrcKind::Heic, ..pair("IMG_2") }), "IMG_2 [RAW+HEIC]");
+        assert_eq!(photo_subject(&photo("IMG_1234")), "IMG_1234");
+        assert_eq!(photo_subject(&Shot { jpg: None, has_jpg: false, ..pair("IMG_3") }), "IMG_3", "RAW alone isn't a pair");
+    }
+
+    /// R22: the re-stat is what's reported, on every path. A remove that said yes while the file is still
+    /// there isn't gone, and a remove that said no while the file has left is. Only a definite `NotFound`
+    /// counts, through `still_present`, as for the bin. A file another program already removed doesn't stop
+    /// the rest of the photo.
+    ///
+    /// FALSIFIER (L28): count the attempts instead of `reconcile_recycled`: the first two rows. Stop on
+    /// `NotFound`: the third. Remove a file after the failure: the order row.
+    #[test]
+    fn the_re_stat_decides_what_went_for_good() {
+        let files = [PathBuf::from("IMG_7.CR3"), PathBuf::from("IMG_7.CR3.xmp"), PathBuf::from("IMG_7.JPG")];
+        let (ok, fail, gone, why) = delete_photo_for_good_with(&files, |_| Ok(()), |_| true);
+        assert_eq!((ok, fail, gone.len(), why.as_str()), (0, 3, 0, ""), "it said yes, and they're all still there");
+        let (ok, fail, gone, why) = delete_photo_for_good_with(&files, |_| Err(std::io::Error::other("refused")), |_| false);
+        assert_eq!((ok, fail, gone.len()), (3, 0, 3), "it said no, and they've gone: another program");
+        assert!(why.contains("IMG_7.CR3") && why.contains("refused"), "the log still hears it: {why}");
+        let removed = RefCell::new(Vec::new());
+        let (ok, fail, _, why) = delete_photo_for_good_with(&files, |p| {
+            removed.borrow_mut().push(p.to_path_buf());
+            if p == Path::new("IMG_7.CR3") { Err(std::io::ErrorKind::NotFound.into()) } else { Ok(()) }
+        }, |_| false);
+        assert_eq!((ok, fail, why.as_str()), (3, 0, ""), "already gone is what was wanted");
+        assert_eq!(removed.borrow().len(), 3, "and the rest of the photo goes on");
+        removed.borrow_mut().clear();
+        let _ = delete_photo_for_good_with(&files, |p| {
+            removed.borrow_mut().push(p.to_path_buf());
+            if p == Path::new("IMG_7.CR3.xmp") { Err(std::io::Error::other("locked")) } else { Ok(()) }
+        }, |p| p != Path::new("IMG_7.CR3"));
+        assert_eq!(*removed.borrow(), files[..2], "it stops at the first failure, in the order given: RAW, its side file, then the JPEG");
+    }
+
+    /// What an Undo move says it brought back, by photo. A pair is one photo with its label, and half a pair
+    /// moved isn't the pair. Several photos are counted, whatever their files. A file that's no photo on the
+    /// list names nothing.
+    ///
+    /// FALSIFIER (L28): count files: the plural row. Always use the pair's label: the half row. Name the first of
+    /// several: the plural row.
+    #[test]
+    fn an_undo_move_names_the_photos_it_brought_back() {
+        let shot = |name: &str, pair: bool| Shot {
+            id: 0, name: name.into(), raw: pair.then(|| PathBuf::from(format!("{name}.CR3"))), jpg: Some(PathBuf::from(format!("{name}.JPG"))),
+            has_raw: pair, has_jpg: true, kind: falcon_decode::SrcKind::Jpeg, cloud_placeholder: false, sniffed: None,
+        };
+        let list = [shot("ANT", false), shot("BEE", true), shot("CAT", true)];
+        let moved = |files: &[&str]| files.iter().map(|f| (PathBuf::from(f), PathBuf::from("Rejected").join(f))).collect::<Vec<_>>();
+        assert_eq!(moved_subject(&list, &moved(&["ANT.JPG"])), "ANT");
+        assert_eq!(moved_subject(&list, &moved(&["BEE.CR3", "BEE.xmp", "BEE.JPG", "BEE.JPG.xmp"])), photo_subject(&list[1]), "the pair, side files aside");
+        assert_eq!(moved_subject(&list, &moved(&["BEE.CR3"])), "BEE", "half of it");
+        assert_eq!(moved_subject(&list, &moved(&["ANT.JPG", "BEE.CR3", "BEE.JPG", "CAT.CR3"])), deleted_subject("", 3), "three photos, not four files");
+        assert_eq!(moved_subject(&list, &moved(&["GONE.JPG"])), "");
+    }
+
+    /// R23: Empty ./Rejected on a drive with no bin: it deletes the files, leaves a folder inside alone, keeps
+    /// what refuses, and says so. On generated files.
+    ///
+    /// FALSIFIER (L28): `empty_rejected_for_good` calls the bin: a generated file reaches the real bin, and
+    /// this row can't tell, which is why the wiring row below pins the call. `rejected_files_to_empty` takes
+    /// folders too: `sub` goes. Stops at the first failure: `DOG` stays. Counts attempts: the partial words.
+    #[cfg(windows)]
+    #[test]
+    fn empty_rejected_for_good_takes_the_files_and_keeps_what_refuses() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("falcon_empty_for_good_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rejected = dir.join("Rejected");
+        std::fs::create_dir_all(rejected.join("sub")).unwrap();
+        for name in ["ANT.JPG", "BEE.JPG", "DOG.JPG"] {
+            std::fs::write(rejected.join(name), b"generated").unwrap();
+        }
+        std::fs::write(rejected.join("sub").join("kept.txt"), b"generated").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(rejected.join("BEE.JPG")).unwrap();
+        let (ok, fail, msg) = empty_rejected_for_good(&dir);
+        assert_eq!((ok, fail, msg.as_str()), (2, 1, "Deleted 2 of 3 files from ./Rejected for good. 1 is still there."));
+        assert!(rejected.join("BEE.JPG").is_file() && !rejected.join("ANT.JPG").exists() && !rejected.join("DOG.JPG").exists());
+        let (ok, fail, msg) = empty_rejected_for_good(&dir);
+        assert_eq!((ok, fail, msg.as_str()), (0, 1, "Couldn't empty ./Rejected — the files are still there"));
+        drop(held);
+        let (ok, fail, msg) = empty_rejected_for_good(&dir);
+        assert_eq!((ok, fail, msg.as_str()), (1, 0, "Deleted 1 file from ./Rejected for good."));
+        assert!(rejected.join("sub").join("kept.txt").is_file(), "a folder inside is left alone");
+        assert_eq!(empty_rejected_for_good(&dir).2, "./Rejected is already empty.");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(empty_rejected_for_good(&dir).2, "Nothing to empty — no ./Rejected folder.");
+    }
+
+    /// R23, R28: the Empty dialog says what the call does. The bin's words are unchanged, and true.
+    ///
+    /// FALSIFIER (L28): `empty_words` reads its argument the wrong way round, or a sentence changes: a row.
+    #[cfg(windows)]
+    #[test]
+    fn the_empty_dialog_says_what_the_call_does() {
+        let (title, body, confirm) = empty_words(true, 8);
+        assert_eq!(title, "files in ./Rejected → gone for good");
+        assert_eq!(body, "Deletes every file in ./Rejected for good. This drive has no Recycle Bin, so they can't be brought back. Photos NOT yet moved to ./Rejected are untouched.");
+        assert_eq!(confirm, "Delete for good");
+        assert_eq!(empty_words(true, 1).0, "file in ./Rejected → gone for good");
+        let (title, body, confirm) = empty_words(false, 8);
+        assert_eq!(title, "files in ./Rejected → Recycle Bin");
+        assert!(body.starts_with("Sends every file currently in ./Rejected to the OS Recycle Bin"), "{body}");
+        assert_eq!(confirm, "Empty to Bin");
+    }
+
+    /// R22, R24, R28: what a dialog says, for one photo and for several, by the route. The approved words are
+    /// here word for word (`QUESTIONS.md`, second set, question 6). The plan's "no Recycle Bin in for-good
+    /// text" can't mean the approved "This drive has no Recycle Bin", so the row reads what it's for: none
+    /// promises the bin, or a way back. The bin's own dialog stays, and is true there.
+    ///
+    /// FALSIFIER (L28): `one_delete_words` or `bulk_delete_words` gives a route another's words: its row. A
+    /// sentence changes: its row. `cloud.len() >= shots` always true or always false: the mixed row, the
+    /// whole-selection row.
+    #[cfg(windows)]
+    #[test]
+    fn the_words_say_what_the_route_does() {
+        let (double, solo) = (pair("IMG_1234"), photo("IMG_1234"));
+        let one = |route: &DeleteRoute, shot: &Shot, sidecars: usize| {
+            let w = crate::one_delete_words(route, shot, sidecars);
+            (w.title, w.body, w.confirm)
+        };
+        let s = |t: &str| t.to_string();
+        // The card or stick dialog.
+        assert_eq!(one(&DeleteRoute::NoBin, &double, 0), (s("Delete photo for good?"), s("IMG_1234 [RAW+JPG]. This drive has no Recycle Bin, so it can't be brought back."), s("Delete for good")));
+        assert_eq!(one(&DeleteRoute::NoBin, &solo, 0).1, "IMG_1234. This drive has no Recycle Bin, so it can't be brought back.");
+        assert_eq!(one(&DeleteRoute::NoBin, &solo, 1).1, "IMG_1234. This drive has no Recycle Bin, so it can't be brought back. (its XMP sidecar goes too)");
+        // The cloud-only dialog.
+        let cloud = DeleteRoute::CloudOnly(vec![s("IMG_1234")]);
+        assert_eq!(one(&cloud, &solo, 0), (
+            s("Delete photo from OneDrive?"),
+            s("IMG_1234 is only in OneDrive. Deleting it removes it from OneDrive, and Falcon can't bring it back. OneDrive keeps it in its online recycle bin for a while."),
+            s("Delete from OneDrive"),
+        ));
+        // The bin's, for a selection of one that isn't the photo on screen, which is true of it.
+        for asks in [false, true] {
+            let (title, body, confirm) = one(&DeleteRoute::Bin { asks }, &double, 0);
+            assert_eq!((title.as_str(), confirm.as_str()), ("Delete photo?", "Move to Recycle Bin"));
+            assert_eq!(body, "IMG_1234 — RAW + image pair, both files go to the Recycle Bin");
+        }
+        let many = |route: &DeleteRoute, shots, files, sidecars| {
+            let w = bulk_delete_words(route, shots, files, sidecars);
+            (w.title, w.body, w.confirm)
+        };
+        assert_eq!(many(&DeleteRoute::NoBin, 5, 9, 0), (s("Delete 5 photos for good?"), s("5 selected photos, 9 files. This drive has no Recycle Bin, so they can't be brought back."), s("Delete for good")));
+        assert_eq!(many(&DeleteRoute::NoBin, 5, 9, 2).1, "5 selected photos, 9 files (2 XMP sidecars go too). This drive has no Recycle Bin, so they can't be brought back.");
+        let all_cloud = DeleteRoute::CloudOnly(vec![s("A"), s("B"), s("C")]);
+        assert_eq!(many(&all_cloud, 3, 3, 0), (
+            s("Delete 3 photos from OneDrive?"),
+            s("3 selected photos are only in OneDrive. Deleting them removes them from OneDrive, and Falcon can't bring them back. OneDrive keeps them in its online recycle bin for a while."),
+            s("Delete from OneDrive"),
+        ));
+        // R24's mixed selection, not shown to the owner yet: for correction when clicked.
+        assert_eq!(many(&DeleteRoute::CloudOnly(vec![s("A"), s("B")]), 5, 5, 0), (
+            s("Delete 5 photos?"),
+            s("2 of 5 selected photos are only in OneDrive. Deleting them removes them from OneDrive, and Falcon can't bring them back. OneDrive keeps them in its online recycle bin for a while. The other 3 go to the Recycle Bin."),
+            s("Delete"),
+        ));
+        assert_eq!(many(&DeleteRoute::CloudOnly(vec![s("A")]), 2, 2, 0).1,
+            "1 of 2 selected photos is only in OneDrive. Deleting it removes it from OneDrive, and Falcon can't bring it back. OneDrive keeps it in its online recycle bin for a while. The other 1 goes to the Recycle Bin.");
+        let (title, body, confirm) = many(&DeleteRoute::Bin { asks: false }, 5, 9, 0);
+        assert_eq!(title, "Delete 5 photos?");
+        assert!(body.contains("go to the Recycle Bin") && body.contains("Recoverable from there"), "true on this route: {body}");
+        assert_eq!(confirm, "Move to Recycle Bin");
+        // What the person mustn't be told on a route that can't come back.
+        for (route, words) in [
+            ("no bin", many(&DeleteRoute::NoBin, 5, 9, 2)),
+            ("no bin, one", one(&DeleteRoute::NoBin, &double, 2)),
+            ("cloud", many(&all_cloud, 3, 3, 2)),
+            ("cloud, one", one(&cloud, &solo, 2)),
+        ] {
+            let all = format!("{} {} {}", words.0, words.1, words.2);
+            for false_word in ["Recoverable", "recoverable", "go to the Recycle Bin", "goes to the Recycle Bin", "Move to Recycle Bin", "Recover restores"] {
+                assert!(!all.contains(false_word), "{route}: {false_word:?} in {all:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod recover_tests {
     use super::*;
 
@@ -37561,6 +39469,72 @@ mod recover_tests {
         );
         // Any other partial (one restored, one gone, no collision) → see log.
         assert_eq!(mac_recover_message("HWU_1", 2, 1, 1, &[]), "Recovered 1/2 file(s) for HWU_1 — see log");
+    }
+
+    /// R10 (CS-47): under Windows' default "Hide extensions for known file types" a bin item's display
+    /// name can drop the extension. The item's own `$R` file keeps it. So the item matches the file we
+    /// sent, and comes back under its whole name, whichever way the name reads. Confirmed in use on the
+    /// owner's laptop, not here: these items are synthetic.
+    ///
+    /// FALSIFIER (L28): `match_recycled_items` reads the items as they come: the first row finds nothing.
+    /// It returns the original items: the restore row. Append whenever `name` has another extension
+    /// or compare the case exactly: the rows after.
+    /// R14: what the bin check reports, from one listing: the files the bin lacks, whatever else is in it.
+    /// An item of the same name deleted before this delete isn't this file (F-P11 rule 3). A name that has
+    /// lost its extension still counts as there (R10).
+    ///
+    /// FALSIFIER (L28): `missing_from_bin` returns what it found (drop the `!`): every row.
+    /// It reads the name alone, or drops the time filter: the older item's row.
+    #[test]
+    fn the_bin_check_names_only_what_the_bin_lacks() {
+        let item = |id: &str, name: &str, deleted: i64| trash::TrashItem {
+            id: std::ffi::OsString::from(format!("C:\\$Recycle.Bin\\S-1-5-21\\{id}")),
+            name: std::ffi::OsString::from(name),
+            original_parent: PathBuf::from("C:\\Shoot"),
+            time_deleted: deleted,
+        };
+        let sent = |name: &str| PathBuf::from(format!("C:\\Shoot\\{name}"));
+        let bin = [item("$R1.CR3", "ANT.CR3", 1000), item("$R2.JPG", "ANT", 1000), item("$R3.JPG", "OTHER.JPG", 1000), item("$R4.JPG", "OLD.JPG", 10)];
+        assert!(missing_from_bin(&bin, &[sent("ANT.CR3"), sent("ANT.JPG")], 1000).is_empty(), "both there, one with a hidden extension");
+        assert_eq!(missing_from_bin(&bin, &[sent("ANT.CR3"), sent("BEE.JPG")], 1000), [sent("BEE.JPG")], "only what it lacks");
+        assert_eq!(missing_from_bin(&bin, &[sent("OLD.JPG")], 1000), [sent("OLD.JPG")], "an older delete of the same name isn't this one");
+        assert_eq!(missing_from_bin(&[], &[sent("ANT.CR3")], 1000), [sent("ANT.CR3")], "an empty bin");
+        assert!(missing_from_bin(&bin, &[], 1000).is_empty(), "nothing asked");
+    }
+
+    // Windows only, like the bin check it serves: the ids and paths here are Windows ones, and on the Mac
+    // a backslash is part of a file name, so the same strings split into different parts there.
+    #[cfg(windows)]
+    #[test]
+    fn a_bin_item_with_a_hidden_extension_matches_and_comes_back_whole() {
+        let bin_item = |id: &str, name: &str| trash::TrashItem {
+            id: std::ffi::OsString::from(format!("C:\\$Recycle.Bin\\S-1-5-21\\{id}")),
+            name: std::ffi::OsString::from(name),
+            original_parent: PathBuf::from("C:\\Shoot"),
+            time_deleted: 1000,
+        };
+        let sent = |name: &str| PathBuf::from(format!("C:\\Shoot\\{name}"));
+        let found = |bin: &[trash::TrashItem], name: &str| -> Vec<std::ffi::OsString> {
+            match_recycled_items(bin, &[sent(name)], 999).into_iter().map(|it| it.name).collect()
+        };
+        // The name has lost its extension: it still matches.
+        assert_eq!(found(&[bin_item("$RABC123.JPG", "IMG_1")], "IMG_1.JPG"), ["IMG_1.JPG"], "matched, and the restore's name is whole");
+        let restored = match_recycled_items(&[bin_item("$RABC123.HEIC", "IMG_2")], &[sent("IMG_2.HEIC")], 999);
+        assert_eq!(restored[0].original_path(), sent("IMG_2.HEIC"), "the restore goes back to the file's own path");
+        // A dot in the name isn't an extension.
+        assert_eq!(found(&[bin_item("$RABC124.JPG", "IMG.1")], "IMG.1.JPG"), ["IMG.1.JPG"]);
+        // A whole name stays as it is, whatever the case of either.
+        assert_eq!(found(&[bin_item("$RABC125.JPG", "IMG_3.jpg")], "IMG_3.jpg"), ["IMG_3.jpg"]);
+        assert_eq!(found(&[bin_item("$RABC126.CR3", "IMG_4.CR3")], "IMG_4.CR3"), ["IMG_4.CR3"]);
+        // A file with no extension has nothing to take.
+        assert_eq!(found(&[bin_item("$RABC127", "README")], "README"), ["README"]);
+        // The confirmation and the restore read one answer: two files of a pair, one with a hidden name.
+        let pair = [bin_item("$RABC128.CR3", "IMG_5.CR3"), bin_item("$RABC129.JPG", "IMG_5")];
+        let both = match_recycled_items(&pair, &[sent("IMG_5.CR3"), sent("IMG_5.JPG")], 999);
+        assert_eq!(both.iter().map(|it| it.original_path()).collect::<Vec<_>>(), [sent("IMG_5.CR3"), sent("IMG_5.JPG")]);
+        // Another folder's photo with the same hidden name is still another photo.
+        let elsewhere = trash::TrashItem { original_parent: PathBuf::from("C:\\Other"), ..bin_item("$RABC130.JPG", "IMG_6") };
+        assert!(found(&[elsewhere], "IMG_6.JPG").is_empty());
     }
 
     #[test]
@@ -38585,9 +40559,10 @@ pub(crate) enum UndoEntry {
     /// so an unmapped entry can never survive. Stated here, at the enum, because this is the only
     /// place a reader of a future change to that is guaranteed to look.
     ///
-    /// HONEST LIMITATION (accepted): a group drops whole if any member left the list, never trimmed:
-    /// rate 12, delete one of them, and that one Ctrl+Z is gone for all 12, while the stars stay. The
-    /// delete's own record still wins Ctrl+Z, because its stamp is newer (`live_undo_arm`).
+    /// A group keeps its other members when one leaves (Delete round, R8): rate 12, delete one of them,
+    /// and Ctrl+Z brings that one back first, because the delete is newer, with its member back in the
+    /// group, so the next press takes back all 12. The sentence counts what the walk restored, so a
+    /// group that has lost a member for good says 11.
     // WAVE 1 SHIPS THE ENTRY, WAVE 2 PRODUCES IT: the pop arms (main.rs on_undo / on_redo) and the
     // unit table exercise it now; `push_undo_bulk`'s callers are the bulk flag / reject / rate
     // operations, which land next round. The allow goes away with them.
@@ -38608,7 +40583,9 @@ pub(crate) enum UndoEntry {
     /// in the applied/cleared set. A half-revertible batch is the L43 class in miniature: a Ctrl+Z
     /// that restores three of five turns leaves a state the user never created and cannot name, and
     /// there is no second press that finishes the job. Stated HERE, at the enum, because this is the
-    /// one place a reader of a future fourth prune is guaranteed to look.
+    /// one place a reader of a future fourth prune is guaranteed to look. A photo LEAVING the list is
+    /// not one of these prunes: its turn hasn't been written anywhere, and the group keeps its other
+    /// members (`photo_open::remap_history`, `park_steps`).
     ///
     /// v1.0.0-rc TAIL (skeptic R2): and HELD, at last, by
     /// [`multiselect_menu_tests::the_three_bulkrot_prunes_drop_the_batch_whole`] — the rule shipped
@@ -38619,8 +40596,8 @@ pub(crate) enum UndoEntry {
 /// v0.8.186 (U1) — **THE SEQUENCE STAMP: one act, one number, one history.**
 ///
 /// Falcon's reversible history is not one stack. It is this stack (cull + rotation + bulk) plus
-/// TWO single-slot records that live outside it — the delete record ([`DeleteRecord`], v0.8.37)
-/// and the move record (`main.rs::last_move`, #11) — because both of those ops end in a re-scan.
+/// the deletes and moves that live outside it ([`FileHistory`]; one slot each until the Delete
+/// round) — because both of those ops end in a re-scan.
 /// v0.8.37's A2 rule ordered the stack against the delete record by a PROXY:
 /// *"an empty stack + a live delete record means the delete is the latest reversible action"* —
 /// true back then because the delete's own re-scan emptied the stack. Keeping prepared work
@@ -40263,17 +42240,17 @@ pub(crate) fn undo_pill_label(arm: Option<UndoArm>) -> &'static str {
 
 /// v0.8.186 (fix wave, review finding 5) — **the Undo control's ENABLEMENT, pre-flight.**
 ///
-/// An armed arm is not always a performable one. The MOVE arm alone runs through `start_op`, which
-/// refuses outright while another file operation holds `sel_busy` — so during a copy, an export or
-/// a rescan the Undo pill was fully lit, labelled "Undo move", and did nothing when clicked. That
-/// is L15/L21 exactly: a visible control whose click can only be refused, and the refusal was
-/// SILENT as well (fixed in the same wave, at the shared body).
+/// An armed arm is not always a performable one. The MOVE arm alone is refused while another file
+/// operation holds `sel_busy` — so during a copy, an export or a move the Undo pill was fully lit,
+/// labelled "Undo move", and did nothing when clicked. That is L15/L21 exactly: a visible control whose
+/// click can only be refused, and the refusal was SILENT as well (fixed in the same wave, at the shared
+/// body).
 ///
-/// The other two arms are deliberately NOT gated: `on_recover_delete` takes no `start_op` (its
-/// restore is synchronous and its rescan goes through `reload_req` like any other), and the stack
-/// arms are pure in-memory edits. Gating them on `sel_busy` would grey a control that would have
-/// worked. THIS ASYMMETRY IS THE POINT — the predicate mirrors which handler can refuse, not a
-/// blanket "is the app busy". Pure → table-tested.
+/// The other two arms are deliberately NOT gated: `on_recover_delete` never checks `sel_busy` (its job
+/// joins the file queue), and the stack arms are pure in-memory edits. Gating them on `sel_busy` would
+/// grey a control that would have worked. THIS ASYMMETRY IS THE POINT — the predicate mirrors which
+/// handler can refuse, not a blanket "is the app busy". A running queue is no term here: a Recover or an
+/// Undo move joins it, and neither is ever refused for that. Pure → table-tested.
 pub(crate) fn undo_control_enabled(arm: Option<UndoArm>, op_busy: bool) -> bool {
     match arm {
         Some(UndoArm::Move(_)) => !op_busy,
@@ -40381,7 +42358,7 @@ pub(crate) fn last_act_sentence(act: &UndoEntry, subject: &str, cur_r: i32, cur_
 /// branches, never re-authored from the model's state view).
 ///
 /// It mirrors `on_undo`'s ACTUAL branches, term for term. v0.8.184 mirrored a handler that read
-/// `undo.is_empty() && delete_record.is_some()`; v0.8.186 (U1) replaced that ordering proxy with
+/// an empty stack and a delete record; v0.8.186 (U1) replaced that ordering proxy with
 /// the stamp race, so this mirrors [`undo_arm`] — LITERALLY, by calling it: armed ⇔ some arm would
 /// fire. The two folder rules it applies first are the same shared predicates the handlers guard
 /// with (`recover_offer_live` for the delete record, [`move_undo_live`] for the move record), so
@@ -40748,7 +42725,7 @@ mod round_b_copy_tests {
             ),
             (
                 "on_recover_delete",
-                span("app.on_recover_delete(move || {", "delete-flag-reject()"),
+                span("app.on_recover_delete(move |seq| {", "delete-flag-reject()"),
             ),
         ] {
             assert!(
@@ -40847,13 +42824,13 @@ mod round_b_copy_tests {
     /// rating undo would go grey during any background copy, which is a control greyed for a
     /// refusal that would never have happened.
     #[test]
-    fn the_undo_control_greys_only_for_the_arm_that_start_op_can_refuse() {
+    fn the_undo_control_greys_only_for_the_arm_another_operation_can_refuse() {
         // (a) the move arm, idle ⇒ clickable.
         assert!(undo_control_enabled(Some(UndoArm::Move(9)), false));
-        // (b) the move arm, an op in flight ⇒ GREY. `start_op` would refuse this click outright.
+        // (b) the move arm, an op in flight ⇒ GREY. `on_undo_move` would refuse this click outright.
         assert!(!undo_control_enabled(Some(UndoArm::Move(9)), true));
-        // (c)+(d) the delete arm is unaffected in both states: `on_recover_delete` takes no
-        //         `start_op`, so greying it would refuse a click that would have worked.
+        // (c)+(d) the delete arm is unaffected in both states: `on_recover_delete` never checks
+        //         `sel_busy`, so greying it would refuse a click that would have worked.
         assert!(undo_control_enabled(Some(UndoArm::Delete(9)), false));
         assert!(undo_control_enabled(Some(UndoArm::Delete(9)), true));
         // (e)+(f) …and the stack arms are pure in-memory edits.
@@ -41337,7 +43314,7 @@ mod keybind_tests {
         let (action, msg) = warn.expect("restoring reject onto “x” duplicates the BASIC delete key");
         assert_eq!(action, "reject", "the warn hangs on the CONTROLS row that was just restored");
         assert!(
-            msg.contains("Delete photo…") && msg.contains("BASIC SHORTCUTS"),
+            msg.contains("Delete photo") && msg.contains("BASIC SHORTCUTS"),
             "the message names the holder AND the recovery that exists; got {msg:?}"
         );
         assert!(msg.starts_with("X "), "the key reads as its keycap (pretty_key); got {msg:?}");
@@ -41747,7 +43724,6 @@ pub(crate) fn build_settings(
         sort_last_used: sort_last_used.to_string(),
         sort_folders: sort_folders.to_vec(),
         panel_folders: panel_folders.to_vec(), // v0.8.89
-        photo_open_edits: app.get_photo_open_edits(),
         sort_cap_tier: app.get_sort_cap_tier(),
         sort_cap_custom: app.get_sort_cap_custom(),
         // v0.8.65 (C3/H5): geometry memory — the toggle straight off its Slint property (the
@@ -52549,7 +54525,9 @@ mod writer_tests {
         // menu grows a counted command over a star row that rates one photograph.
         assert_eq!(ctx_rate_label(true, 3), "Rate 3");
         assert_eq!(ctx_rate_label(false, 3), "Rating");
-        assert_eq!(bulk_delete_label(9), "Delete 9 photos…");
+        assert_eq!(bulk_delete_label(9, true), "Delete 9 photos…");
+        assert_eq!(bulk_delete_label(9, false), "Delete 9 photos", "R27: no dialog, no ellipsis");
+        assert_eq!(bulk_delete_label(1, false), "Delete 1 photo");
         assert_eq!(bulk_rate_ask(12, 3), "Rate all 12 photos 3★?");
         assert_eq!(bulk_rate_ask(1, 0), "Clear rating on 1 photo?");
         assert_ne!(bulk_rate_ask(4, 0), bulk_rate_ask(4, 1), "a clear and a rate are different questions");
@@ -56543,10 +58521,9 @@ mod toasts_and_loading_words_tests {
         );
         assert_eq!(
             m.matches("Duration::from_millis(support::REFUSAL_TOAST_GAP_MS)").count(),
-            5,
-            "main.rs's five refusal limiters — the cull key's gate, compare 1:1, both-halves-pinned \
-             navigation, the close-request deferral and delete-key-in-compare — all read the \
-             shared constant"
+            4,
+            "main.rs's four refusal limiters — the cull key's gate, compare 1:1, both-halves-pinned \
+             navigation and the close-request deferral — all read the shared constant"
         );
         assert!(
             !m.contains("now.duration_since(t) < Duration::from_millis(1500)"),

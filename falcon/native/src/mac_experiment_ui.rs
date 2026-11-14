@@ -1,8 +1,7 @@
 //! Compiled on Mac diagnostics and in automated UI tests; no donor window in shipping Windows.
-slint::slint! {
-    import { MacExperimentBar } from "../ui/mac_experiment.slint";
-    export { MacExperimentBar }
-}
+//! The bar itself is compiled in the interface crate (`falcon_ui::mac_probe`, the `mac-probe`
+//! feature, which `Cargo.toml` turns on for macOS and for tests).
+pub(crate) use falcon_ui::mac_probe::MacExperimentBar;
 
 #[cfg(test)]
 mod tests {
@@ -103,7 +102,7 @@ mod tests {
             let count = calls.clone();
             // Printable shortcuts enter Rust through key-typed; the normal Rust keymap
             // resolves "f" to the fullscreen command (confirmed in the recovered settings).
-            app.on_key_typed(move |token| {
+            app.on_key_typed(move |token, _repeat| {
                 if token == "f" {
                     count.set(count.get() + 1);
                 }

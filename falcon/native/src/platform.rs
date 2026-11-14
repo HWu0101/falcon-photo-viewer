@@ -171,7 +171,6 @@ pub(crate) fn bin_noun() -> &'static str {
     crate::i18n::tr(PLATFORM.trash_noun)
 }
 
-/// Delete-recycle success toast: "Sent N file(s) to the Recycle Bin". Routes `trash_noun`.
 /// v0.8.131 (F-P11 rule 5): a PARTIAL recycle, stated as an OBSERVATION rather than an inference.
 /// The app knows two things after re-statting: how many files left the folder, and how many did
 /// not. It does not know WHY any single one stayed (an `IFileOperationProgressSink` is the only
@@ -187,10 +186,45 @@ pub(crate) fn partial_recycle_toast_text(ok: usize, total: usize, failed: usize)
     )
 }
 
-/// Language packs (round 2): "file(s)" for every count is today's English, so both English forms
-/// are equal; a pack can still give its own forms.
-pub(crate) fn recycle_toast_text(n: usize) -> String {
-    tr_plural!(n, "Sent {n} file(s) to the {bin}", "Sent {n} file(s) to the {bin}", bin = bin_noun())
+// ── Delete round (R29, R47): what a delete says, in photos and never in files. The owner's approved words
+// (`QUESTIONS.md`, second set, question 6). A pair is one photo, named by `support::photo_subject`. Failure
+// sentences are shared with the for-good route below. Routes `trash_noun`. ──
+
+/// One photo, whole: "Sent IMG_1234 [RAW+JPG] to the Recycle Bin".
+pub(crate) fn sent_one_text(photo: &str) -> String {
+    tr_format!("Sent {photo} to the {bin}", photo = photo, bin = bin_noun())
+}
+
+/// A selection, whole. A selection of one is a single delete by name (R25), so this is two or more.
+pub(crate) fn sent_selected_text(n: usize) -> String {
+    tr_plural!(n, "Sent {n} selected photo to the {bin}", "Sent {n} selected photos to the {bin}", bin = bin_noun())
+}
+
+/// R32: a run of deletes one at a time, the bell list's folded row: "Sent 30 photos to the Recycle Bin"
+/// (owner-approved). Its lines name the photos. While the panel is open a run can have one left.
+pub(crate) fn sent_run_text(n: usize) -> String {
+    tr_plural!(n, "Sent {n} photo to the {bin}", "Sent {n} photos to the {bin}", bin = bin_noun())
+}
+
+/// R38: the events panel's pinned row for a delete whose row names none of its deletes, in that row's own
+/// "what — which" grammar, and not "Deleted" for a photo that went to the bin.
+pub(crate) fn pinned_sent_text(photo: &str) -> String {
+    tr_format!("Sent to the {bin} — {photo}", bin = bin_noun(), photo = photo)
+}
+
+/// One file of a pair went, and the other didn't. `gone` and `stayed` are format words, RAW and JPG.
+pub(crate) fn sent_part_text(gone: &str, name: &str, stayed: &str) -> String {
+    tr_format!("Sent the {gone} of {name} to the {bin}. The {stayed} is still in the folder.", gone = gone, name = name, bin = bin_noun(), stayed = stayed)
+}
+
+/// Part of a selection went. [`still_in_folder_text`] says the rest.
+pub(crate) fn sent_some_text(ok: usize, total: usize) -> String {
+    tr_plural!(total, "Sent {ok} of {n} photo to the {bin}.", "Sent {ok} of {n} photos to the {bin}.", ok = ok, bin = bin_noun())
+}
+
+/// Undo move, whole: `photos` is `support::moved_subject`'s. Owner-approved.
+pub(crate) fn brought_back_text(photos: &str) -> String {
+    tr_format!("Brought back {photos}", photos = photos)
 }
 
 /// Empty-./Rejected success toast: "Sent N file(s) from ./Rejected to the Recycle Bin." Routes `trash_noun`.
@@ -201,6 +235,174 @@ pub(crate) fn empty_rejected_toast_text(n: usize) -> String {
         "Sent {n} file(s) from ./Rejected to the {bin}.",
         bin = bin_noun()
     )
+}
+
+// ── Delete round (R22, R23, R24, R28): a photo that can't come back. The owner's rule: "If it can come back,
+// don't stop me. If it can't, tell me before, not after." The single-photo sentences are the owner's approved
+// words (`QUESTIONS.md`, second set, question 6), and so are the plural and partial ones (`PLAN.md`, "Approved
+// after Stage B"). Windows only in practice: the Mac has no for-good route (R26). ──
+
+/// Where a photo went that won't come back, and so how a sentence says it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GoneFrom {
+    /// A drive with no Recycle Bin.
+    #[default]
+    Drive,
+    /// A photo that was only in the cloud.
+    Cloud,
+}
+
+pub(crate) fn no_bin_title_one() -> String {
+    crate::i18n::tr("Delete photo for good?").to_string()
+}
+
+pub(crate) fn no_bin_title_many(n: usize) -> String {
+    tr_plural!(n, "Delete {n} photo for good?", "Delete {n} photos for good?")
+}
+
+pub(crate) fn no_bin_body_one(photo: &str) -> String {
+    tr_format!("{photo}. This drive has no {bin}, so it can't be brought back.", photo = photo, bin = bin_noun())
+}
+
+/// `note` is the side-file tail, as the bin's own dialog words it.
+pub(crate) fn no_bin_body_many(shots: usize, files: usize, note: &str) -> String {
+    let head = if files == 1 {
+        tr_plural!(shots, "{n} selected photo, {files} file", "{n} selected photos, {files} file", files = files)
+    } else {
+        tr_plural!(shots, "{n} selected photo, {files} files", "{n} selected photos, {files} files", files = files)
+    };
+    tr_format!(
+        "{photos_and_files}{sidecar_note}. This drive has no {bin}, so they can't be brought back.",
+        photos_and_files = head,
+        sidecar_note = note,
+        bin = bin_noun()
+    )
+}
+
+pub(crate) fn no_bin_confirm() -> String {
+    crate::i18n::tr("Delete for good").to_string()
+}
+
+pub(crate) fn cloud_only_title_one() -> String {
+    tr_format!("Delete photo from {provider}?", provider = PLATFORM.cloud_hint)
+}
+
+pub(crate) fn cloud_only_title_many(n: usize) -> String {
+    tr_plural!(n, "Delete {n} photo from {provider}?", "Delete {n} photos from {provider}?", provider = PLATFORM.cloud_hint)
+}
+
+pub(crate) fn cloud_only_body_one(photo: &str) -> String {
+    tr_format!(
+        "{photo} is only in {provider}. Deleting it removes it from {provider}, and Falcon can't bring it back. {provider} keeps it in its online recycle bin for a while.",
+        photo = photo,
+        provider = PLATFORM.cloud_hint
+    )
+}
+
+pub(crate) fn cloud_only_body_many(n: usize) -> String {
+    tr_plural!(
+        n,
+        "{n} selected photo is only in {provider}. Deleting it removes it from {provider}, and Falcon can't bring it back. {provider} keeps it in its online recycle bin for a while.",
+        "{n} selected photos are only in {provider}. Deleting them removes them from {provider}, and Falcon can't bring them back. {provider} keeps them in its online recycle bin for a while.",
+        provider = PLATFORM.cloud_hint
+    )
+}
+
+/// R24: some of a selection are only in the cloud, and the others go to the bin.
+pub(crate) fn cloud_only_body_mixed(cloud: usize, shots: usize) -> String {
+    let some = tr_plural!(
+        cloud,
+        "{n} of {total} selected photos is only in {provider}. Deleting it removes it from {provider}, and Falcon can't bring it back. {provider} keeps it in its online recycle bin for a while.",
+        "{n} of {total} selected photos are only in {provider}. Deleting them removes them from {provider}, and Falcon can't bring them back. {provider} keeps them in its online recycle bin for a while.",
+        total = shots,
+        provider = PLATFORM.cloud_hint
+    );
+    let rest = shots.saturating_sub(cloud);
+    let others = tr_plural!(rest, "The other {n} goes to the {bin}.", "The other {n} go to the {bin}.", bin = bin_noun());
+    format!("{some} {others}")
+}
+
+pub(crate) fn cloud_only_confirm() -> String {
+    tr_format!("Delete from {provider}", provider = PLATFORM.cloud_hint)
+}
+
+/// One photo, whole.
+pub(crate) fn deleted_one_text(from: GoneFrom, photo: &str) -> String {
+    match from {
+        GoneFrom::Drive => tr_format!("Deleted {photo} for good", photo = photo),
+        GoneFrom::Cloud => tr_format!("Deleted {photo} from {provider}", photo = photo, provider = PLATFORM.cloud_hint),
+    }
+}
+
+/// One file of a pair went, and the other didn't. `gone` and `stayed` are format words, RAW and JPG.
+pub(crate) fn deleted_part_text(from: GoneFrom, gone: &str, name: &str, stayed: &str) -> String {
+    match from {
+        GoneFrom::Drive => tr_format!("Deleted the {gone} of {name} for good. The {stayed} is still in the folder.", gone = gone, name = name, stayed = stayed),
+        GoneFrom::Cloud => tr_format!("Deleted the {gone} of {name} from {provider}. The {stayed} is still in the folder.", gone = gone, name = name, provider = PLATFORM.cloud_hint, stayed = stayed),
+    }
+}
+
+pub(crate) fn deleted_many_text(from: GoneFrom, n: usize) -> String {
+    match from {
+        GoneFrom::Drive => tr_plural!(n, "Deleted {n} photo for good", "Deleted {n} photos for good"),
+        GoneFrom::Cloud => tr_plural!(n, "Deleted {n} photo from {provider}", "Deleted {n} photos from {provider}", provider = PLATFORM.cloud_hint),
+    }
+}
+
+pub(crate) fn deleted_some_text(from: GoneFrom, ok: usize, total: usize) -> String {
+    match from {
+        GoneFrom::Drive => tr_plural!(total, "Deleted {ok} of {n} photo for good.", "Deleted {ok} of {n} photos for good.", ok = ok),
+        GoneFrom::Cloud => tr_plural!(total, "Deleted {ok} of {n} photo from {provider}.", "Deleted {ok} of {n} photos from {provider}.", ok = ok, provider = PLATFORM.cloud_hint),
+    }
+}
+
+pub(crate) fn still_in_folder_text(n: usize) -> String {
+    tr_plural!(n, "{n} is still in the folder.", "{n} are still in the folder.")
+}
+
+/// Falcon can't know why a file refused, so "may have it open" (owner-approved).
+pub(crate) fn could_not_delete_one_text(photo: &str) -> String {
+    tr_format!("Couldn't delete {photo}, another program may have it open. It's still in the folder.", photo = photo)
+}
+
+pub(crate) fn could_not_delete_many_text(n: usize) -> String {
+    tr_plural!(n, "Couldn't delete {n} photo, another program may have it open. It's still in the folder.", "Couldn't delete {n} photos, another program may have them open. They're still in the folder.")
+}
+
+/// R24: a mixed selection's two halves, in plain words.
+pub(crate) fn sent_photos_text(n: usize) -> String {
+    tr_plural!(n, "Sent {n} photo to the {bin}.", "Sent {n} photos to the {bin}.", bin = bin_noun())
+}
+
+pub(crate) fn deleted_from_cloud_count_text(n: usize) -> String {
+    tr_plural!(n, "Deleted {n} from {provider}.", "Deleted {n} from {provider}.", provider = PLATFORM.cloud_hint)
+}
+
+/// R23: the Empty ./Rejected dialog on a drive with no Recycle Bin.
+pub(crate) fn empty_for_good_confirm_title(n: usize) -> String {
+    if n == 1 {
+        crate::i18n::tr("file in ./Rejected → gone for good").to_string()
+    } else {
+        crate::i18n::tr("files in ./Rejected → gone for good").to_string()
+    }
+}
+
+pub(crate) fn empty_for_good_confirm_body() -> String {
+    tr_format!(
+        "Deletes every file in ./Rejected for good. This drive has no {bin}, so they can't be brought back. Photos NOT yet moved to ./Rejected are untouched.",
+        bin = bin_noun()
+    )
+}
+
+pub(crate) fn empty_for_good_toast_text(n: usize) -> String {
+    tr_plural!(n, "Deleted {n} file from ./Rejected for good.", "Deleted {n} files from ./Rejected for good.")
+}
+
+/// Owner-approved (4 November): "Deleted 2 of 3 files from ./Rejected for good. 1 is still there."
+pub(crate) fn partial_for_good_toast_text(ok: usize, total: usize, failed: usize) -> String {
+    let deleted = tr_plural!(total, "Deleted {ok} of {n} file from ./Rejected for good.", "Deleted {ok} of {n} files from ./Rejected for good.", ok = ok);
+    let stays = tr_plural!(failed, "{n} is still there.", "{n} are still there.");
+    format!("{deleted} {stays}")
 }
 
 /// Recover failure (bin unreadable): "Couldn't recover NAME — the Recycle Bin is unavailable". Routes
@@ -218,9 +420,31 @@ pub(crate) fn recover_missing_text(name: &str) -> String {
     tr_format!("Couldn't recover {name} — it's no longer in the {bin}", name = name, bin = bin_noun())
 }
 
-/// Cross-folder recover-refused toast: "Deleted file was in another folder — recover it from the Recycle Bin". Routes `trash_noun`.
-pub(crate) fn cross_folder_recover_text() -> String {
-    tr_format!("Deleted file was in another folder — recover it from the {bin}", bin = bin_noun())
+/// R14: the amber line when the bin check finds a photo isn't in the Recycle Bin. Owner-approved words
+/// for one photo, with the pair label in `subjects`; `None` when nothing a person would call a photo is
+/// missing. Routes `trash_noun`, though only Windows has a bin check.
+pub(crate) fn not_in_bin_text(subjects: &[String]) -> Option<String> {
+    match subjects {
+        [] => None,
+        [one] => Some(tr_format!("{photo} isn't in the {bin}, so it can't be brought back.", photo = one, bin = bin_noun())),
+        many => Some(tr_plural!(
+            many.len(),
+            "{n} photos aren't in the {bin}, so they can't be brought back.",
+            "{n} photos aren't in the {bin}, so they can't be brought back.",
+            bin = bin_noun()
+        )),
+    }
+}
+
+/// Cross-folder recover refused: Ctrl+Z, or a Recover from another folder. R39: in the words of a fold from
+/// another folder ("These are in another folder. Go back to it to bring them back."), now that coming back to
+/// the folder does bring it back. `photo` is the record's name; `photos` how many, 0 for one by name.
+pub(crate) fn cross_folder_recover_text(photo: &str, photos: usize) -> String {
+    if photos == 0 {
+        tr_format!("{photo} is in another folder. Go back to it to bring it back.", photo = photo)
+    } else {
+        tr_plural!(photos, "{n} photo is in another folder. Go back to it to bring it back.", "{n} photos are in another folder. Go back to it to bring them back.")
+    }
 }
 
 /// Cloud-placeholder decode note: "Cloud file — not downloaded. Falcon will retry; check OneDrive if this persists." Routes `cloud_hint`.

@@ -1,4 +1,32 @@
 {
+  "Recovered": "已恢复",
+  "Sent to the {bin} — {photo}": "已移到{bin} — {photo}",
+  "Sent {n} photo to the {bin}": {
+    "other": "已将 {n} 张照片移到{bin}"
+  },
+  "Show {n} more": {
+    "other": "再显示 {n} 张"
+  },
+  "These are in another folder. Go back to it to bring them back.": "这些照片在另一个文件夹中。回到那个文件夹即可找回。",
+  "{n} photo is in another folder. Go back to it to bring it back.": {
+    "other": "{n} 张照片在另一个文件夹中。回到那个文件夹即可找回。"
+  },
+  "{photo} is in another folder. Go back to it to bring it back.": "{photo} 在另一个文件夹中。回到那个文件夹即可找回。",
+  "Brought back {photos}": "已移回 {photos}",
+  "Deleted {n} file from ./Rejected for good.": {
+    "other": "已从 ./Rejected 永久删除 {n} 个文件。"
+  },
+  "Deleted {ok} of {n} file from ./Rejected for good.": {
+    "other": "已从 ./Rejected 永久删除 {ok}/{n} 个文件。"
+  },
+  "Sent the {gone} of {name} to the {bin}. The {stayed} is still in the folder.": "已将 {name} 的 {gone} 移到{bin}。{stayed} 仍在文件夹中。",
+  "Sent {n} selected photo to the {bin}": {
+    "other": "已将选中的 {n} 张照片移到{bin}"
+  },
+  "Sent {ok} of {n} photo to the {bin}.": {
+    "other": "已将 {n} 张照片中的 {ok} 张移到{bin}。"
+  },
+  "Sent {photo} to the {bin}": "已将 {photo} 移到{bin}",
   "Starting settings from generated test images": "基于生成的测试图像给出的初始设置",
   " (one XMP sidecar goes too)": {
     "other": "（同时移动 {n} 个 XMP 附属文件）"
@@ -102,7 +130,6 @@
   "All {n} photo are already {target}★": {
     "other": "全部 {n} 张照片已为 {target}★"
   },
-  "Allow photo edits": "允许编辑照片",
   "Altitude": "海拔",
   "Always sharp": "始终清晰",
   "Aperture": "光圈",
@@ -111,7 +138,6 @@
   "Applied": "已应用",
   "Applied to all supported formats": "已应用到所有支持的格式",
   "Applies to this screen when the Falcon window is on it.": "Falcon 窗口位于此屏幕时生效。",
-  "Applies when you open a single photo and the rest of its folder is still loading.": "打开单张照片且其所在文件夹仍在加载时生效。",
   "Apply": "应用",
   "Apply rotations": "应用旋转",
   "Apply to all": "应用至全部",
@@ -148,6 +174,7 @@
   "Browsing speed": "浏览速度",
   "Browsing waits until the next photo has something to show — a thumbnail or a preview — instead of landing on an empty frame. Applies to the wheel and the arrow keys, in single view and in compare.": "等待下一张照片具备缩略图或预览后再切换，避免显示空白画面。适用于滚轮和方向键，以及单图和对比模式。",
   "Busy with another file operation — delete cancelled": "正在执行其他文件操作 — 已取消删除",
+  "Busy with another file operation — try again in a moment": "正在执行其他文件操作 — 请稍后再试",
   "Busy with another file operation — undo cancelled": "正在执行其他文件操作 — 已取消撤销",
   "CHOOSE A PRESET": "选择预设",
   "COLOUR": "色彩",
@@ -297,6 +324,10 @@
   "Couldn't decode this HEIC — the file may be corrupt or an unsupported variant": "无法解码此 HEIC — 文件可能已损坏或属于不支持的变体",
   "Couldn't decode this file — it may be corrupt or unreadable": "无法解码此文件，它可能已损坏或无法读取",
   "Couldn't decode — the HEVC/HEIF Image Extension may not be installed": "无法解码 — 可能尚未安装 HEVC/HEIF 图像扩展",
+  "Couldn't delete {n} photo, another program may have it open. It's still in the folder.": {
+    "other": "无法删除 {n} 张照片，可能有其他程序正在打开它们。它们仍在文件夹中。"
+  },
+  "Couldn't delete {photo}, another program may have it open. It's still in the folder.": "无法删除 {photo}，可能有其他程序正在打开它。它仍在文件夹中。",
   "Couldn't detect a monitor colour profile — use Load profile instead": "无法检测显示器色彩配置文件 — 请改用“载入配置文件”",
   "Couldn't empty ./Rejected — the files are still there": "无法清空 ./Rejected，文件仍保留在原处",
   "Couldn't empty ./Rejected — {error}": "无法清空 ./Rejected — {error}",
@@ -329,20 +360,31 @@
   "Default: system default": "默认：系统默认应用",
   "Default: {app}": "默认：{app}",
   "Del": "Delete",
-  "Delete (always confirms)": "删除（始终确认）",
-  "Delete did not complete — the files are still in the folder": "删除未完成，文件仍在文件夹中",
-  "Delete did not complete — {error}": "删除未完成 — {error}",
-  "Delete did not complete — {failed} of {n} file(s) couldn't be moved to the {bin}": {
-    "other": "删除未完成，{n} 个文件中有 {failed} 个无法移至{bin}"
-  },
-  "Delete needs a single photo — exit compare, or use the right-click menu on a thumbnail": "删除需要单张照片 — 请退出对比，或使用缩略图的右键菜单",
+  "Delete": "删除",
+  "Delete for good": "永久删除",
+  "Delete from {provider}": "从 {provider} 删除",
+  "Delete photo": "删除照片",
+  "Delete photo for good?": "要永久删除照片吗？",
+  "Delete photo from {provider}?": "要从 {provider} 删除照片吗？",
   "Delete photo?": "删除照片？",
-  "Delete photo…": "删除照片…",
   "Delete preset": "删除预设",
+  "Delete this photo": "删除此照片",
   "Delete this photo…": "删除此照片…",
   "Delete this preset?": "删除此预设？",
+  "Delete {n} Photo": {
+    "other": "删除 {n} 张照片"
+  },
   "Delete {n} Photo…": {
     "other": "删除 {n} 张照片…"
+  },
+  "Delete {n} photo": {
+    "other": "删除 {n} 张照片"
+  },
+  "Delete {n} photo for good?": {
+    "other": "要永久删除 {n} 张照片吗？"
+  },
+  "Delete {n} photo from {provider}?": {
+    "other": "要从 {provider} 删除 {n} 张照片吗？"
   },
   "Delete {n} photo?": {
     "other": "删除 {n} 张照片？"
@@ -350,8 +392,26 @@
   "Delete {n} photo…": {
     "other": "删除 {n} 张照片…"
   },
-  "Deleted file was in another folder — recover it from the {bin}": "已删除的文件原本位于其他文件夹，请从{bin}恢复",
-  "Deleted — {photo}": "已删除 — {photo}",
+  "Deleted the {gone} of {name} for good. The {stayed} is still in the folder.": "已永久删除 {name} 的 {gone}。{stayed} 仍在文件夹中。",
+  "Deleted the {gone} of {name} from {provider}. The {stayed} is still in the folder.": "已从 {provider} 删除 {name} 的 {gone}。{stayed} 仍在文件夹中。",
+  "Deleted {n} from {provider}.": {
+    "other": "已从 {provider} 删除 {n} 张。"
+  },
+  "Deleted {n} photo for good": {
+    "other": "已永久删除 {n} 张照片"
+  },
+  "Deleted {n} photo from {provider}": {
+    "other": "已从 {provider} 删除 {n} 张照片"
+  },
+  "Deleted {ok} of {n} photo for good.": {
+    "other": "已永久删除 {ok}/{n} 张照片。"
+  },
+  "Deleted {ok} of {n} photo from {provider}.": {
+    "other": "已从 {provider} 删除 {ok}/{n} 张照片。"
+  },
+  "Deleted {photo} for good": "已永久删除 {photo}",
+  "Deleted {photo} from {provider}": "已从 {provider} 删除 {photo}",
+  "Deletes every file in ./Rejected for good. This drive has no {bin}, so they can't be brought back. Photos NOT yet moved to ./Rejected are untouched.": "永久删除 ./Rejected 中的所有文件。此驱动器没有{bin}，因此无法找回。尚未移到 ./Rejected 的照片不受影响。",
   "Delete…": "删除…",
   "Descending": "降序",
   "Deselect": "取消选择",
@@ -800,6 +860,7 @@
   "Recovered {recovered}/{n} file(s) for {name} — see log": {
     "other": "已恢复 {name} 的 {recovered}/{n} 个文件，详情见日志"
   },
+  "Recovering {name}…": "正在恢复 {name}…",
   "Recycle Bin": "回收站",
   "Redo": "重做",
   "Redo last change": "重做上次更改",
@@ -854,6 +915,12 @@
   "Review": "筛选",
   "Review data FAILED to save for {folder} ({err}) — your latest changes may not be on disk": "无法保存 {folder} 的筛选数据（{err}）— 最新更改可能尚未写入磁盘",
   "Couldn't read this folder's review data — it may be only in the cloud while you're offline, open in another program, or blocked by folder permissions. It's left untouched, and changes made here won't be saved. Reopen the folder to try again.": "无法读取此文件夹的筛选数据 — 它可能仅存于云端而你当前离线、正被其他程序打开，或被文件夹权限阻止。文件保持原样，在此所做的更改不会被保存。重新打开该文件夹即可再试。",
+  "Sent {n} photo to the {bin}.": {
+    "other": "已将 {n} 张照片移到{bin}。"
+  },
+  "The other {n} goes to the {bin}.": {
+    "other": "其余 {n} 张移到{bin}。"
+  },
   "This folder's review data looks damaged, and Falcon couldn't set it aside — another program may have it open. It's left untouched, and changes made here won't be saved. Reopen the folder to try again.": "此文件夹的筛选数据似乎已损坏，且 Falcon 无法将其移到一旁 — 可能有其他程序正在打开它。文件保持原样，在此所做的更改不会被保存。重新打开该文件夹即可再试。",
   "This folder's review data is too large to read (over 16 MB), which usually means it's damaged. It's left untouched, and changes made here won't be saved. To start fresh, move falcon_review_data.json out of the folder.": "此文件夹的筛选数据过大，无法读取（超过 16 MB），这通常意味着它已损坏。文件保持原样，在此所做的更改不会被保存。如需重新开始，请将 falcon_review_data.json 移出该文件夹。",
   "Review data was unreadable — kept as {name} and starting fresh": "筛选数据无法读取，已保留为 {name} 并重新开始",
@@ -930,9 +997,6 @@
   "Sends every file currently in ./Rejected to the {bin} — recoverable from there until you empty the {bin}. Photos NOT yet moved to ./Rejected are untouched.": "将 ./Rejected 中的所有文件移至{bin}，清空{bin}前可从中恢复。尚未移至 ./Rejected 的照片不受影响。",
   "Sent {n} file(s) from ./Rejected to the {bin}.": {
     "other": "已将 ./Rejected 中的 {n} 个文件移至{bin}。"
-  },
-  "Sent {n} file(s) to the {bin}": {
-    "other": "已将 {n} 个文件移至{bin}"
   },
   "Sent {ok} of {n} file to the {bin} — {failed} did not go": {
     "other": "已将 {n} 个文件中的 {ok} 个移至{bin}，{failed} 个未能移动"
@@ -1073,7 +1137,6 @@
   "Uses each camera's built-in preview, not a developed RAW. Some cameras embed a small one, and it is never upscaled.": "使用相机内嵌预览，不进行 RAW 显影。有些相机的内嵌预览较小，程序不会放大它。",
   "View": "显示",
   "View EXIF": "查看 EXIF",
-  "View only": "仅查看",
   "Visible and nearby: also the ones just off screen and around the current photo.": "可见及附近：也包括屏幕外紧邻的照片和当前照片周围的照片。",
   "Visible only: thumbnails for the photos on screen.": "仅可见：只为屏幕上的照片准备缩略图。",
   "WATERMARK": "水印",
@@ -1091,7 +1154,6 @@
   "While browsing: {reject} = reject.": "浏览时：{reject} = 弃选。",
   "While comparing, bring them back from this control. Also on a filmstrip thumbnail's right-click menu, and on the View menu.": "比较时可用此控件重新显示面板，也可从缩略图条的右键菜单或“显示”菜单打开。",
   "While comparing, bring them back from this control. Also on a filmstrip thumbnail's right-click menu.": "比较时可用此控件重新显示面板，也可从缩略图条的右键菜单打开。",
-  "While the folder is loading": "文件夹加载期间",
   "White balance": "白平衡",
   "Whole folder": "整个文件夹",
   "Whole folder: then the rest of the folder while Falcon is idle, up to about {} MB. Cloud-only files are skipped.": "整个文件夹：Falcon 空闲时再准备文件夹中的其余照片，最多约 {} MB。跳过仅在云端的文件。",
@@ -1168,7 +1230,9 @@
   "existing sidecar is not valid UTF-8 — not modified": "现有附属文件不是有效的 UTF-8 编码，未作修改",
   "existing sidecar structure unrecognised — not modified": "无法识别现有附属文件的结构，未作修改",
   "fast, social-first": "快速，适合社交分享",
+  "file in ./Rejected → gone for good": "个文件：./Rejected → 永久删除",
   "file in ./Rejected → {bin}": "个文件：./Rejected → {bin}",
+  "files in ./Rejected → gone for good": "个文件：./Rejected → 永久删除",
   "files in ./Rejected → {bin}": "个文件：./Rejected → {bin}",
   "fully opaque logo": "完全不透明的标志",
   "generating test images…": "正在生成测试图像…",
@@ -1295,6 +1359,7 @@
   "{mode} is ON for {display} — Windows manages colour itself, so Falcon will output sRGB on it.": "{display} 已开启 {mode}，Windows 会自行管理色彩，因此 Falcon 将在此显示器上输出 sRGB。",
   "{mode} is ON for {display}.": "{display} 已开启 {mode}。",
   "{modifier}click": "{modifier}点击",
+  "{name} [RAW+{format}]": "{name} [RAW+{format}]",
   "{name} is connected again — set it back to sRGB to clear its saved colour setting": "{name} 已重新连接 — 将其设回 sRGB 可清除已保存的色彩设置",
   "{name} is set to {chip} — adjust in Settings if needed.": "{name} 已设为 {chip} — 可在设置中调整。",
   "{name} isn't connected — plug it in to read its profile": "{name} 未连接 — 请接入后读取配置文件",
@@ -1327,8 +1392,17 @@
   "{n} image": {
     "other": "{n} 个图像"
   },
+  "{n} is still in the folder.": {
+    "other": "{n} 张仍在文件夹中。"
+  },
+  "{n} is still there.": {
+    "other": "{n} 个仍在原处。"
+  },
   "{n} moved photo(s) have unapplied rotations — Apply rotations first if you want them upright elsewhere": {
     "other": "移动的 {n} 张照片有未应用的旋转。若希望在其他应用中保持朝向，请先应用旋转"
+  },
+  "{n} of {total} selected photos is only in {provider}. Deleting it removes it from {provider}, and Falcon can't bring it back. {provider} keeps it in its online recycle bin for a while.": {
+    "other": "所选 {total} 张照片中有 {n} 张仅存于 {provider}。删除后会将其从 {provider} 移除，Falcon 无法找回。{provider} 会在其在线回收站中保留一段时间。"
   },
   "{n} photo copied to clipboard ({files} file)": {
     "other": "已将 {n} 张照片复制到剪贴板（{files} 个文件）"
@@ -1342,14 +1416,26 @@
   "{n} photos": {
     "other": "{n} 张照片"
   },
+  "{n} photos aren't in the {bin}, so they can't be brought back.": {
+    "other": "{n} 张照片不在{bin}中，无法恢复。"
+  },
   "{n} pick(s) have unapplied rotations — Apply rotations first if you want them upright elsewhere": {
     "other": "{n} 张已选照片有未应用的旋转。若希望在其他应用中保持朝向，请先应用旋转"
+  },
+  "{n} selected photo is only in {provider}. Deleting it removes it from {provider}, and Falcon can't bring it back. {provider} keeps it in its online recycle bin for a while.": {
+    "other": "所选的 {n} 张照片仅存于 {provider}。删除后会将其从 {provider} 移除，Falcon 无法找回。{provider} 会在其在线回收站中保留一段时间。"
   },
   "{n} selected photo — {files} file go to the {bin}.": {
     "other": "已选中 {n} 张照片，将 {files} 个文件移至{bin}。"
   },
   "{n} selected photo — {files} files go to the {bin}.": {
     "other": "已选中 {n} 张照片，将 {files} 个文件移至{bin}。"
+  },
+  "{n} selected photo, {files} file": {
+    "other": "所选 {n} 张照片，{files} 个文件"
+  },
+  "{n} selected photo, {files} files": {
+    "other": "所选 {n} 张照片，{files} 个文件"
   },
   "{n}h ago": {
     "other": "{n} 小时前"
@@ -1362,10 +1448,13 @@
   },
   "{path}: {reason}": "{path}：{reason}",
   "{photos_and_files}{sidecar_note} Recoverable from there, and Recover restores the whole batch.": "{photos_and_files}{sidecar_note} 可从中恢复，点击“恢复”可还原整批文件。",
+  "{photos_and_files}{sidecar_note}. This drive has no {bin}, so they can't be brought back.": "{photos_and_files}{sidecar_note}。此驱动器没有{bin}，因此无法找回。",
   "{photo} RAW + {format} copied to clipboard": "已将 {photo} 的 RAW 和 {format} 复制到剪贴板",
   "{photo} RAW copied to clipboard": "已将 {photo} 的 RAW 复制到剪贴板",
+  "{photo} is only in {provider}. Deleting it removes it from {provider}, and Falcon can't bring it back. {provider} keeps it in its online recycle bin for a while.": "{photo} 仅存于 {provider}。删除后会将其从 {provider} 移除，Falcon 无法找回。{provider} 会在其在线回收站中保留一段时间。",
+  "{photo} isn't in the {bin}, so it can't be brought back.": "{photo} 不在{bin}中，无法恢复。",
   "{photo} {format} copied to clipboard": "已将 {photo} 的 {format} 复制到剪贴板",
-  "{result} — folder re-checked": "{result} — 已重新检查文件夹",
+  "{photo}. This drive has no {bin}, so it can't be brought back.": "{photo}。此驱动器没有{bin}，因此无法找回。",
   "{rotated} — {gifs}": "{rotated} — {gifs}",
   "{size} px": "{size} px",
   "{size} · {quality} · {mark}": "{size} · {quality} · {mark}",

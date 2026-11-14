@@ -127,6 +127,32 @@ pub(crate) struct Observation {
 /// photographer can browse Falcon with the wheel while another application keeps focus.
 pub(crate) const INPUT_KEEPS_ACTIVE: Duration = Duration::from_secs(2);
 
+/// Fix round 2 (11 November 2026, `CS-7`) — **WHICH WINDOW EVENTS ARE A PERSON USING FALCON.** The
+/// wheel, a click, a key, touch and the trackpad gestures. NOT bare pointer movement: Windows sends it
+/// to the window under the pointer whether or not that window is active, so with Falcon visible on a
+/// second screen, merely sweeping the pointer across it on the way to the program in use counted as
+/// using Falcon and took back the graphics memory it had freed. And it adds nothing while Falcon IS
+/// active: the platform reading ([`falcon_is_active`]) already says so then. (On a Mac an inactive
+/// window gets no pointer movement at all, so nothing changes there.) A click on an inactive Falcon
+/// activates it and counts; scrolling it without clicking counts, as before.
+///
+/// FALSIFIER (L28): put `CursorMoved` back and
+/// `pointer_movement_alone_is_not_using_falcon` reddens.
+pub(crate) fn window_input_counts_as_use(ev: &i_slint_backend_winit::winit::event::WindowEvent) -> bool {
+    use i_slint_backend_winit::winit::event::WindowEvent;
+    matches!(
+        ev,
+        WindowEvent::MouseWheel { .. }
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::KeyboardInput { .. }
+            | WindowEvent::Touch(_)
+            | WindowEvent::PinchGesture { .. }
+            | WindowEvent::PanGesture { .. }
+            | WindowEvent::RotationGesture { .. }
+            | WindowEvent::DoubleTapGesture { .. }
+    )
+}
+
 /// One tick's observation: the platform's activity reading, overridden by recent input.
 pub(crate) fn observe(foreground: Option<bool>, since_input: Option<Duration>, minimised: bool) -> Observation {
     let recent_input = since_input.is_some_and(|d| d < INPUT_KEEPS_ACTIVE);
@@ -588,6 +614,39 @@ mod tests {
             b.step(t0 + Duration::from_secs(s), obs, &p, 100, 0);
         }
         assert!(!b.holds(), "input every second or two keeps Falcon in use");
+    }
+
+    /// Fix round 2 (`CS-7`): sweeping the pointer across a visible Falcon while another program has
+    /// focus is not using Falcon; scrolling or clicking it is. And with pointer movement as the only
+    /// "input", the release goes ahead exactly as if Falcon had not been touched.
+    #[test]
+    fn pointer_movement_alone_is_not_using_falcon() {
+        use i_slint_backend_winit::winit::dpi::PhysicalPosition;
+        use i_slint_backend_winit::winit::event::{DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+        let device_id = DeviceId::dummy();
+        let moved = WindowEvent::CursorMoved { device_id, position: PhysicalPosition::new(10.0, 10.0) };
+        let wheel = WindowEvent::MouseWheel { device_id, delta: MouseScrollDelta::LineDelta(0.0, 1.0), phase: TouchPhase::Moved };
+        let click = WindowEvent::MouseInput { device_id, state: ElementState::Pressed, button: MouseButton::Left };
+        let pinch = WindowEvent::PinchGesture { device_id, delta: 0.1, phase: TouchPhase::Moved };
+        assert!(!window_input_counts_as_use(&moved), "bare pointer movement");
+        assert!(window_input_counts_as_use(&wheel), "a wheel scroll over an inactive Falcon is use (the existing rule)");
+        assert!(window_input_counts_as_use(&click), "a click is use");
+        assert!(window_input_counts_as_use(&pinch), "a trackpad gesture is use");
+        assert!(!window_input_counts_as_use(&WindowEvent::Focused(false)), "focus changes are the platform reading's");
+        // A minute of pointer sweeps over Falcon while another program has focus: the input clock is
+        // never stamped, so the wait completes and the release starts, as with no sweep at all.
+        let p = Policy::BALANCED;
+        let t0 = Instant::now();
+        let mut b = Background::new();
+        let mut last_input: Option<Instant> = None;
+        for s in 0..60 {
+            let now = t0 + Duration::from_secs(s);
+            if window_input_counts_as_use(&moved) {
+                last_input = Some(now);
+            }
+            b.step(now, observe(Some(false), last_input.map(|at| now - at), false), &p, 100, 0);
+        }
+        assert!(b.holds(), "the release went ahead");
     }
 
     /// Fails if minimising waits like a switch away, or if the release jumps straight to the target

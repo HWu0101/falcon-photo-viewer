@@ -134,6 +134,12 @@ pub(crate) struct Film {
     /// `tick::step_cloud_landed_with` to re-check their notes and scan tag. Drained every tick.
     pub(crate) cloud_landed: RefCell<Vec<usize>>,
     pub(crate) visible_signal: Arc<(Mutex<(u64, usize)>, std::sync::Condvar)>,
+    /// Delete round (R41 to R43): the strip's and the grid's slide at a landing (`tile_slide.rs`). Not in
+    /// `on_folder_swap`: every landing hands it what it saw, or nothing, which ends it (`TileSlide::landed`).
+    pub(crate) slide: RefCell<crate::tile_slide::TileSlide>,
+    /// Delete round (R46): the blue edge on the strip and the grid, for a photo the person brought back off
+    /// what they show (`blue_edge.rs`). Every landing hands it what came back, or nothing, as the slide's does.
+    pub(crate) edge: RefCell<crate::blue_edge::BlueEdge>,
     startup_at: Cell<Option<Instant>>,
     startup_request: Cell<(u64, usize)>,
     models_ready: Cell<bool>,
@@ -159,6 +165,8 @@ impl Film {
             cloud_skipped: Arc::new(Mutex::new(HashSet::new())),
             cloud_landed: RefCell::new(Vec::new()),
             visible_signal: Arc::new((Mutex::new((0, 0)), std::sync::Condvar::new())),
+            slide: RefCell::new(Default::default()),
+            edge: RefCell::new(Default::default()),
             startup_at: Cell::new(None), startup_request: Cell::new((0, 0)),
             models_ready: Cell::new(false), any_thumb: Cell::new(false),
             first_presented: Cell::new(false), visible_presented: Cell::new(false),

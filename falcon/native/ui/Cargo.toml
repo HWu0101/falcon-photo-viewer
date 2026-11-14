@@ -1,0 +1,37 @@
+[package]
+name = "falcon-ui"
+version = "0.0.0"
+description = "Falcon's interface: the .slint files in this folder, compiled once into a library"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The interface is its own crate so it is compiled once and reused by the plain `falcon` bin, its
+# test harness and the Mac diagnostics, instead of being expanded and compiled inside
+# `falcon-native` for each of them (build-time round, 11 November 2026: the interface was about 95%
+# of that crate's generated code, 10 to 19 GB per debug compile). The `.slint` files stay beside
+# this manifest; `lib.rs` holds no markup.
+#
+# The interface's tests live in the app (`tipgeom_tests.rs` and the rest), which drives it headless.
+# This crate has none of its own, so `cargo test` and `clippy --all-targets` must not compile the
+# whole interface a second time as an empty test program or for doc-tests.
+[lib]
+path = "lib.rs"
+test = false
+doctest = false
+
+[features]
+# The Mac title-bar diagnostics bar (`mac_probe::MacExperimentBar`). `falcon-native` turns it on for
+# macOS and for its tests; a Windows release never compiles it.
+mac-probe = []
+
+[dependencies]
+# The generated code needs only Slint's core API. The app picks the backend and renderer
+# (`falcon-native/Cargo.toml`), and Cargo builds one Slint with the union of both feature lists.
+slint = { version = "1.17", default-features = false, features = ["compat-1-2", "std"] }
+
+# Language packs (`../build_translations.rs`): read the pack JSON, and turn on the Slint compiler's
+# bundled translations. Cargo merges this feature into the copy the `slint!` macro already uses.
+[build-dependencies]
+serde_json = "1"
+i-slint-compiler = { version = "=1.17.0", default-features = false, features = ["bundle-translations"] }

@@ -80,12 +80,25 @@ import { FilmItem } from "structs.slint";
         in property <bool> lift: false; // v0.8.27: hover lift, DRIVEN BY THE STRIP (fsinner.hover-k) — the strip-wide
                                         // TouchArea occludes this component's own ta, so has-hover here never fired in
                                         // the strip (the old -2px y-translate hover it drove was dead in practice).
+        // Delete round (R41, R42): where a slide still has this thumb, from its place in the strip's layout
+        // (already scaled and snapped by the host), and how far an arriving photo has faded in. Both move
+        // `slide` only, the wrapper below: `content` and its classes are untouched (L47), and `ta` stays in
+        // the layout's place (the strip's own area takes the clicks anyway).
+        in property <length> slide-x: 0px;
+        in property <float> appear: 1.0;
         callback clicked;
         // v0.8.27: hover LIFTS the thumb — the SelTile drag-affordance grammar (E1 shadow elevation +
         // hover border-strengthen; v0.8.17 constant-geometry idiom: geometry never moves, only colours
         // fade). Blur/offset are REDUCED from SelTile's 20/6: fsinner clips at the 102px strip (femtovg
         // clips shadows at ancestor clips) and the thumb band leaves 11px above/below — 9/2 is the
         // largest lift that fits with ZERO visible cut (top reach 7px, bottom reach 11px exactly).
+        // Delete round (R42): the slide's wrapper. A translation, and an opacity that is 1 on every thumb but
+        // an arriving one mid-fade, so the only layer it can add is that arrival's, for its 0.2 s.
+        slide := Rectangle {
+        x: root.slide-x;
+        width: 100%;
+        height: 100%;
+        opacity: root.appear;
         content := Rectangle {
             width: 100%;
             height: 100%;
@@ -186,6 +199,7 @@ import { FilmItem } from "structs.slint";
                 animate opacity { duration: root.lift ? 0ms : Theme.anim; easing: ease; }
             }
         }
+        } // Delete round (R42): the slide's wrapper
         ta := TouchArea { enabled: root.hit; clicked => { root.clicked(); } }
     }
 

@@ -16,6 +16,10 @@ members = [
     "crates/falcon-gpu",
     "crates/falcon-nvjpeg",
     "native",
+    # The interface (the .slint files), compiled once as a library that `native` links.
+    "native/ui",
+    # The Mac title-bar move test and the Windows Shell icon tests (own process each).
+    "native/platform-tests",
 ]
 exclude = [
     "spikes-decode-bench",
@@ -54,6 +58,14 @@ codegen-units = 1
 # `panic = "abort"` must NOT be set here.
 strip = "symbols"
 
+# Debug info that matches what is used (build-time round, 11 November 2026). Nobody steps through
+# this code in a debugger; what is read is a panic's backtrace, which needs file and line only. So
+# Falcon's own crates carry line tables, and the interface crate and every dependency carry none.
+# Measured on one debug compile of the app before the interface had its own crate: full debug info
+# 159 s and 14.3 GB, line tables 131 s and 11.4 GB, none 113 s and 10.0 GB.
+[profile.dev]
+debug = "line-tables-only"
+
 # Optimized deps, debuggable first-party crates. Media codecs (jpeg-decoder,
 # image, rawler, jxl-oxide) are ~20x slower with debug-assertions/overflow-checks
 # on even at opt-level 3, so disable those for deps — this is what makes `tauri
@@ -63,6 +75,12 @@ strip = "symbols"
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
+debug = false
+
+# The interface crate is generated code (the `.slint` files): its line tables would only point into
+# macro output nobody reads.
+[profile.dev.package.falcon-ui]
+debug = false
 
 # Our own media crates inline heavy generic code from jpeg-decoder /
 # fast_image_resize / jpeg-encoder; that code monomorphizes into the *calling*

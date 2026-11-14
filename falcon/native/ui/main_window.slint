@@ -8,7 +8,7 @@ import { AboutCard } from "about.slint";
 import { Theme, Tip } from "theme.slint";
 import { CacheBar, Star, StarBulkPill, Chip, ChipRole, MiniVBar, JumpLatch, SectionJump, PhotoJump } from "widgets.slint";
 import { AaHairline, MagnifierIcon, MinimizeIcon, CloseGlyph, UnsupportedGlyph, CloudGlyph, ChevronGlyph, EllipsisGlyph, FlagGlyph, LeafGlyph } from "glyphs.slint";
-import { FilmItem, SelTileRow, ExifRow, ExifBrief, KeybindRow, NotifRow, CopyPrefRow, MacAssocRow, WmFontRow, DisplaySection, FloatExifPanel, PresetBrief } from "structs.slint";
+import { FilmItem, SelTileRow, ExifRow, ExifBrief, KeybindRow, NotifRow, NotifLine, CopyPrefRow, MacAssocRow, WmFontRow, DisplaySection, FloatExifPanel, PresetBrief } from "structs.slint";
 import { IconBtn, PillBtn, TextField, ActionBtn, FocusBadge } from "controls.slint";
 import { GlassPanel, SolidPanel, SettingsGroup, SectionLabel, PanelHeader, HRule, PanelBottomFade, PanelRightFade, ExifRowsView, FloatingExif, HoverPreview } from "panels.slint";
 import { MenuItem, MenuSep, MenuHeader } from "menu.slint";
@@ -17,7 +17,7 @@ import { SegPill, Seg, CustomSeg, CountRow } from "segs.slint";
 import { ToggleRow, ToggleTrack, OptionChip, SelectedChip, CopyRankList } from "settings.slint";
 import { FilmThumb, BriefCell, BriefSep, SelTile } from "filmstrip.slint";
 import { GridThumb } from "grid.slint";
-import { EdgePillBottom, EdgePillLeft } from "edges.slint";
+import { EdgePillBottom, EdgePillLeft, BlueEdge } from "edges.slint";
 import { MainToolbar, ToolbarState } from "toolbar.slint";
 import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
 
@@ -370,7 +370,6 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         in-out property <int> opening-wait-dir: 0; // signed photo offset; grid keys retain a full row
         callback grid-boundary-step(int);
         out property <bool> opening-boundary-wait: root.opening-photo && root.opening-wait-dir != 0;
-        in-out property <bool> photo-open-edits: false;
         in-out property <bool> scanning: false; // U1 (v0.3.19): a folder scan is running off-thread → show the indicator
         in-out property <float> zoom: 1.0;
         // v0.8.119 (design-sweep O20/O22): the macOS View menu's `at_fit` (menubar_model: "single-
@@ -492,6 +491,12 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // fps → 0..1 position over the speed CustomSeg's stop centres (5→0.0 · 12→0.25 · 20→0.5 ·
         // 30→0.75 · 120→1.0, piecewise-linear between). Drives BOTH the custom value's blue indicator
         // line AND the benchmarked device-limit veil so they share ONE mapping (v0.7.5). Clamps to 0..1.
+        // Delete round (R42): a tile's slide offset now, `offset` scaled by the clock and snapped to whole
+        // device pixels (L48). Every tile is a rounded-clip layer, so a sliding one keeps the sub-pixel
+        // phase it has at rest and is as sharp moving as still; at the end the clock is 0 and so is this.
+        pure function slid(offset: length) -> length {
+            return Math.round(offset / 1px * root.tile-slide-k * max(root.win-sf, 0.5)) / max(root.win-sf, 0.5) * 1px;
+        }
         pure function fps-frac(f: float) -> float {
             return f <= 5 ? 0.0
                 : f <= 12 ? (f - 5) / 7 * 0.25
@@ -637,6 +642,10 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         in property <string> empty-confirm-body: "Sends every file currently in ./Rejected to the OS Recycle Bin — recoverable from there until you empty the bin. Photos NOT yet moved to ./Rejected are untouched.";
         in property <string> empty-confirm-label: @tr("falcon" => "Empty to Bin");
         in property <string> delete-confirm-label: @tr("falcon" => "Move to Recycle Bin");
+        // R27 (Delete round): does the menu's Delete row open a dialog? Its ellipsis says so, and it goes
+        // on a fixed disk, where a photo goes at once and comes back with Ctrl+Z. `on_ctx_populate` writes
+        // it for the row's own photo. Before that it promises the dialog, the safe side.
+        in property <bool> delete-asks: true;
         // v1.0 MERGE TAIL [B-R3, L26]: the kind-8 Overwrite WARN body. Its two siblings in the same
         // ternary (`delete-body`, `empty-confirm-body`) were already Rust-composed; this one typed
         // "Recycle Bin" and reached macOS for the first time at the merge, three lines above the
@@ -688,7 +697,28 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // v0.8.130 (W2-2, owner ruling Q1): skip the ask-first question when a digit rates a whole
         // selection. DEVELOPER lever, OFF by default; persist-only, read live by the rate path.
         in-out property <bool> direct-bulk-rating: false;
-        in-out property <bool> motion-ui: true;        // v0.8.19 (was motion-toasts; serde alias keeps an old OFF): ONE gate for ALL interface motion — M4 toast slide+fade + M5 panel-open + M6 immersive crossfade + M7 HUD chip fades. OFF = every transition instant (v0.8.18 behavior). Live-flip, pure UI gate.
+        // Delete round (R41 to R43, owner: "#9 do not move but the filmstrip and grid should update with an
+        // animation"): THE MOVEMENT'S ONE CLOCK, written by the tick (`tick::step_tile_slide`): 1 at a
+        // landing's first frame, exactly 0 at its end. Each moving tile's row holds its offset at the start
+        // (`FilmItem.slide-x`, `slide-y`), so a thumbnail landing that rewrites the row moves nothing. Never
+        // `animate`d here: a delayed animate restarts whenever its input is dirtied (`tile_slide.rs`).
+        in property <float> tile-slide-k: 0;
+        in property <float> tile-fade-k: 0;
+        // Delete round (R46, owner: "the edge of the filmstrip (left or right depending on where it is) should
+        // lit up in a blue gradient for a moment and clicking on the gradient should take them to that image
+        // immediately", and "the grid do get the blue edge (top/bottom instead of left/right as that's how it
+        // scrolls)"): THE BLUE EDGE'S FOUR SIDES, written by the tick (`tick::step_blue_edge`) only when one
+        // changes: the photo a click on that side goes to, or -1 when it isn't lit. `blue-edge-hot`: the
+        // pointer is on a lit edge, so its moment waits.
+        in property <int> blue-edge-left: -1;
+        in property <int> blue-edge-right: -1;
+        in property <int> blue-edge-top: -1;
+        in property <int> blue-edge-bottom: -1;
+        in-out property <bool> blue-edge-hot: false;
+        // How deep each lit edge reaches into the strip or the grid, which is its click target too: a third
+        // of a tile's width, a strip's full height, at every window size down to half a 1080p screen.
+        out property <length> blue-edge-depth: 48px;
+        in-out property <bool> motion-ui: true;       // v0.8.19 (was motion-toasts; serde alias keeps an old OFF): ONE gate for ALL interface motion — M4 toast slide+fade + M5 panel-open + M6 immersive crossfade + M7 HUD chip fades. OFF = every transition instant (v0.8.18 behavior). Live-flip, pure UI gate.
         // ── M5 (v0.8.19): panel OPEN transitions — enter-only (opacity + 8px slide-down, the M4 toast
         // grammar, anim-med ease-out). Root owns one animated reveal per panel: a mount-gated panel
         // can't animate its own birth, but a root property is always alive — when the open flag flips
@@ -777,11 +807,12 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         in-out property <bool> cs-hover: false;   // hovering the colour chip → show the full note
         property <length> raw-panel-h: 124px;  // live RAW/zoom panel height (synced below) so the cs-note anchors to its top edge across modes
         in property <bool> detail-failed: false;  // current shot's full-res/RAW decode FAILED (#15) — showing the fast proxy; tap to retry
-        in property <bool> can-undo-move: false;   // a "Move rejected" just ran and is reversible (#11)
+        in property <bool> can-undo-move: false;   // a "Move rejected" in the folder on screen is reversible (#11)
         // v0.8.120 (design-sweep O5): the delete-recovery twin of `can-undo-move` — a delete record
         // exists AND the folder it ran in is still the open one (`on_recover_delete`'s own dir gate,
         // published each tick so the panel row cannot outlive it). The events row's Recover pill
-        // mounts on `row.recover && root.can-recover`, exactly the shape the Undo pill uses.
+        // mounts on `row.recover && root.can-recover`, exactly the shape the Undo pill uses. Which
+        // record it takes is the row's own `seq` (Delete round).
         in property <bool> can-recover: false;
         // v0.8.184 (D1): THE CULL-HISTORY PAIR, published each tick from `support::cull_undo_armed`
         // — one predicate derived from `on_undo`'s own branches (the stack, and the delete record's
@@ -810,6 +841,10 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // root.undo-target-row`; no row carries rim state of its own (L44: one publisher).
         in property <int> undo-target-row: -1;
         in property <int> redo-target-row: -1;
+        // Delete round (R38): a fold of two or more deletes names none of them on its row (its `seq` is −1),
+        // so the pinned row below names what Undo takes back. With the fold open, the rim is on that line:
+        // this is its delete's stamp (−1 = no line shows it), published by the same derivation.
+        in property <int> undo-target-line: -1;
         // ── v0.8.186 (U4, OWNER RULING): THE PINNED LAST-ACTION ROW ──────────────────────────────
         // "I would like to check if it is possible to add a temporary row describing the last action
         // (which is for things that does not trigger a notification - like flagged HWU_1234)" — with
@@ -1215,6 +1250,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         in property <int> toast-kind: 0;
         in property <string> toast-reveal-path: "";      // absolute result-folder path for the toast's "Show" ("" = none)
         in property <bool> toast-undoable: false;
+        in property <int> toast-seq: -1;                 // Delete round: the act the toast's Undo or Recover takes back
         in property <int> toast-jump: -1;                // D2: >= 0 → a "Resume" toast button (-1 = none)
         in property <string> toast-jump-name;            // R6: the photo that button goes to, found by name at the click
         in-out property <bool> toast-recover: false;     // v0.8.37 (FIX A1): the delete toast Recover action (restore from the OS Recycle Bin)
@@ -1227,9 +1263,16 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         in-out property <bool> toast-settings: false;
         in property <bool> toast-show: false;
         in property <int> toast-more: 0;                 // D1: notifications superseded before timeout -> "+N" chip
+        // Delete round (R29, R35): a clean delete's card shows the small picture of the photo it names, a
+        // blank tile if the strip's thumbnail hadn't loaded. `toast-role` is Rust's: what this card is (tick.rs).
+        in property <bool> toast-picture-on: false;
+        in property <image> toast-picture;
+        in property <int> toast-role: 0;
         callback toggle-notif();                         // bell click → open/close the events panel (Rust resets unread)
         callback notif-clear();                          // clear the event log
         callback notif-dismiss(int);                     // × on one event row → remove that entry
+        callback notif-fold(int);                        // R34: a fold's arrow → open or close it, by its id
+        callback notif-fold-more(int);                   // R34: "Show {n} more" under an open fold's lines
         callback dismiss-toast();                        // × on the toast
         callback reveal-path(string);                    // open an absolute folder path in the OS file manager
         in-out property <int> confirm-kind: 0;           // pending file op: 0 none / 1 copy picks / 2 move rejects / 3 empty rejected / 4 discard rot / 5 apply rot / 6 delete photo (v0.8.13)
@@ -1239,9 +1282,9 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         in property <string> copy-cloud-notice: "";     // v0.8.24 (D4): Copy-selected (kind 1) line — N cloud-only files a Copy would download (Rust-composed; empty = hidden)
         in property <string> move-cloud-notice: "";     // v0.8.24 (D4): Move-rejected (kind 2) line — N cloud-only files a Move would download (Rust-composed; empty = hidden)
         in property <string> apply-cloud-notice: "";    // 2026-10-28 (the cloud-only round): Apply rotations (kind 5) — the same line, counted by `apply-rotations-ask` (empty = hidden)
-        callback delete-key();                           // v0.8.13: Delete/Backspace on the stage → Rust gates + opens the popup (confirm-kind 6)
+        callback delete-key();                           // v0.8.13: Delete/Backspace on the stage → Rust gates, then goes at once or opens the popup (confirm-kind 6) (R27)
         callback delete-shot(int);                       // v0.8.28: context-menu Delete… — (shot idx or -1 = current). SAME capture + gate class as delete-key, at the menu's TARGET shot
-        callback delete-recycle();                       // v0.8.13: "Move to Recycle Bin" confirmed → Rust recycles the shot's file(s) + sidecars, then rescans
+        callback delete-recycle();                       // v0.8.13: the popup's danger button confirmed → Rust sends the shot's file(s) + sidecars by the route the popup stated, then rereads (R22)
         callback delete-flag-reject();                   // v0.8.15 (F3): "Mark as rejected" (kind-6 middle button) runs the SAME folder-scoped identity check, then SETS reject on the verified index
         in-out property <bool> rot-reminder-open: false; // v0.8.0 S2: the "N rotations not applied" close reminder
         in-out property <int> copy-content: 0;           // picks copy-content: 0 RAW+JPG / 1 RAW only / 2 JPG only (output triad)
@@ -2504,8 +2547,9 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         callback toggle-xmp-sync();      // v0.8.69 (E/H2): the Selection-panel toggle — Rust gates the flip (OFF→ON may open the kind-7 backfill confirm)
         callback xmp-backfill-confirm(); // v0.8.69 (E/H2): confirm-kind 7 "Write sidecars" — queue the backfill + enable sync
         callback move-rejects();         // move rejected photos → ./Rejected
-        callback undo-move();            // reverse the last "Move rejected" (#11)
-        callback empty-rejected();       // send ./Rejected contents → OS Recycle Bin (#24)
+        callback undo-move(int);         // reverse the "Move rejected" with this stamp (#11)
+        callback empty-rejected();       // send ./Rejected contents → OS Recycle Bin (#24), or for good where the drive has none (R23)
+        callback empty-rejected-ask();   // R23: Rust decides which at the dialog's open, words and call together, and opens it
         callback export-web();           // resize+watermark flagged photos → ./export (social prep)
         callback cancel-export();        // stop a running web export (#18)
         callback choose-watermark();     // pick a PNG logo (native file dialog)
@@ -2829,7 +2873,8 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         callback open-folder();    // open the native folder picker
         callback undo();           // Ctrl+Z — revert the last rating change
         callback redo();           // Ctrl+Shift+Z / Ctrl+Y — re-apply the last undone change
-        callback recover-delete(); // v0.8.37 (FIX A1/A2): restore the just-deleted shot from the OS Recycle Bin (toast Recover button + Ctrl+Z)
+        callback recover-delete(int); // v0.8.37 (FIX A1/A2): restore the delete with this stamp from the OS Recycle Bin (toast and row Recover, Ctrl+Z)
+        callback recover-line(int, string); // R33: a fold line's Recover: that delete, or that one photo of a selection's
         callback retry-detail();   // re-attempt the current shot's failed full-res/EXIF/WB decode (#15)
         callback rebind(string);   // start capturing a new key for this action id
         // Photo menus and keys share one command route, so displayed hints describe
@@ -2924,7 +2969,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
             root.ctx-open = false; root.sel-ctx-open = false;
             return true;
         }
-        callback key-typed(string); // a printable key was pressed (rebind capture / hotkey)
+        callback key-typed(string, bool); // a printable key was pressed (rebind capture / hotkey); the bool is the OS key repeat (fix round 2, F14-input-1: a held mark key marks once)
         callback basics-locked();      // v0.8.65 (C3/H4): BASIC section Save — Rust abandons a live capture + clears warnings
         callback basics-unlocked();    // v0.8.77 (owner): Edit pressed — Rust snapshots the basics' bindings so Cancel can honestly revert
         callback basics-cancelled();   // v0.8.77 (owner): Cancel pressed — Rust restores the Edit-press snapshot + clears capture/warnings
@@ -2954,14 +2999,25 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
         // On Mac, the welcome guide also permits native fullscreen without entering
         // immersive photo mode (on_toggle_fullscreen keeps the toolbar and traffic lights).
         // Windows fullscreen is immersive, so its welcome guide continues to block it.
-        out property <bool> dialog-open: root.about-open || root.settings-open || root.loading-open || root.confirm-kind != 0 || root.export-open || root.rot-reminder-open || root.display-del-confirm || root.assoc-prompt-open || root.update-prompt-open;
-        out property <bool> modal-open-base: root.opening-boundary-wait || (root.opening-photo && !root.photo-open-edits) || root.dialog-open;
+        // Queue entry 6 (the owner's row: "browsing keys work while the browse-speed panel or Settings is
+        // open"): the dialogs other than those two panels, which the browsing keys still wait for. One
+        // list, so a new dialog joins `dialog-open` and the browsing keys' gate by being added here.
+        out property <bool> real-dialog-open: root.about-open || root.confirm-kind != 0 || root.export-open || root.rot-reminder-open || root.display-del-confirm || root.assoc-prompt-open || root.update-prompt-open;
+        out property <bool> dialog-open: root.settings-open || root.loading-open || root.real-dialog-open;
+        // Queue entry 6 (owner, 2 November 2026: "always allow and remove the setting"): a folder still
+        // loading is no longer a term here. Stars, flags, rejects and turns work on the photos already
+        // checked, as the old "Allow photo edits" choice did, and the "While the folder is loading"
+        // setting is gone. What still waits for the whole folder waits at its own gate: sorting (the
+        // sort rows and `sort_pick`), selection gestures (`sel-gesture-kind`, `sel-affordance-live`),
+        // Home and End (their key arms), Compare (`toggle_compare`, `sel_to_compare`), and every file
+        // and whole-folder action (each Rust callback reads `get_opening_photo()`).
+        out property <bool> modal-open-base: root.opening-boundary-wait || root.dialog-open;
         out property <bool> modal-open: root.modal-open-base || root.welcome-open; // v0.8.67 (D): + welcome. v0.9.16: the assoc popup rides the base.
         // Fullscreen only needs the ready photo, including while waiting at a batch edge.
         // Keep real dialogs and the Windows welcome guide in charge of their input.
         out property <bool> modal-open-fs: root.dialog-open
             || (!root.native-window-controls && root.welcome-open)
-            || (!root.photo-ready && (root.opening-boundary-wait || (root.opening-photo && !root.photo-open-edits)));
+            || (!root.photo-ready && root.opening-photo);
         // v0.8.120 (design-sweep O8/O9): the SCRIM-BEARING subset of `modal-open` — the modals that
         // draw a full-window scrim ABOVE every panel the title bar's four panel buttons open. Those
         // panels all mount BEFORE the confirm overlay, so clicking the gear / Browse speed /
@@ -3040,13 +3096,24 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                      || root.notif-open;
         out property <bool> popup-open: root.modal-open || root.menu-open;
         // v1.0.6: inspection (zoom, pan, 1:1, Fit) needs only the current photo, never the complete
-        // collection. `inspection-blocked` is `modal-open` minus View only's opening term: dialogs and
-        // the welcome guide still own input. View only keeps edits on `modal-open`; browsing verified
-        // neighbours uses the same narrower input gate as inspection.
+        // collection. `inspection-blocked` is `modal-open` minus the unfinished-boundary wait: dialogs and
+        // the welcome guide still own input. (Queue entry 6 removed View only's opening term, so edits on
+        // `modal-open` no longer wait for the folder either.) Browsing verified neighbours uses the same
+        // narrower input gate as inspection.
         // The Rust callbacks, the Fit key and the Mac menu rows read it. The photo's own pointer surfaces
         // read `photo-popup-open`, which adds the menus, exactly as they read `popup-open` before.
         out property <bool> inspection-blocked: root.dialog-open || root.welcome-open;
         out property <bool> photo-popup-open: root.inspection-blocked || root.menu-open;
+        // Queue entry 6 (the owner's row: "browsing keys work while the browse-speed panel or Settings is
+        // open"): the browsing keys' gate. `browse-blocked` is `inspection-blocked` minus Settings and the
+        // browse-speed panel, and it is what stops a browsing key's step in Rust (`on_sel_jump`,
+        // `on_grid_boundary_step`). The keys themselves also wait for the menus, as they did, and for
+        // Settings' language list, which is a menu too. Everything else the two panels block (the edits,
+        // the photo and filmstrip wheels, a click on a thumbnail, opening menus, full screen) still reads
+        // the gates above. A text field in either panel that has keyboard focus keeps its own arrows:
+        // the keys reach this scope only while it has focus, and each panel's fields give it back.
+        out property <bool> browse-blocked: root.real-dialog-open || root.welcome-open;
+        out property <bool> browse-keys-blocked: root.browse-blocked || root.menu-open || root.language-menu-open;
         // Modified clicks must not become plain navigation when early multi-selection
         // is unavailable. This is also the real-dialog/menu gate for thumbnail clicks.
         public pure function neighbour-browse-allowed(ctrl: bool, shift: bool) -> bool {
@@ -3345,7 +3412,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 // conflict check, and commits or refuses. Modified combos fall through exactly as
                 // before (a modified key was never capturable); F12/F11/Esc/Enter keep their arms
                 // above, so dev-HUD / cancel behave identically while a capture is armed.
-                else if (root.capture-armed && !e.modifiers.control && !e.modifiers.alt) { root.key-typed(root.key-token(e.text)); accept }
+                else if (root.capture-armed && !e.modifiers.control && !e.modifiers.alt) { root.key-typed(root.key-token(e.text), e.repeat); accept }
                 // ── v0.8.160 (B1/U8): EVERY NAV ARM BELOW READS `popup-open`, NOT `modal-open`. ──
                 // D1a gated the three photo WHEELS on `popup-open` and left these keys on
                 // `modal-open`, which contains NONE of the menu/dropdown surfaces (six then, five
@@ -3364,8 +3431,10 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 //
                 // Browse prev/next — the LIVE bindings (default ← / →; a printable rebind lands here
                 // too, ahead of key-typed, so hold-to-scrub + release semantics ride along).
-                else if (root.key-token(e.text) == root.kb-next) { if (!root.photo-popup-open) { root.navigate(1); } accept }
-                else if (root.key-token(e.text) == root.kb-prev) { if (!root.photo-popup-open) { root.navigate(-1); } accept }
+                // Queue entry 6: the browsing keys read `browse-keys-blocked` (`photo-popup-open` without
+                // Settings and the browse-speed panel), so they work with either panel open.
+                else if (root.key-token(e.text) == root.kb-next) { if (!root.browse-keys-blocked) { root.navigate(1); } accept }
+                else if (root.key-token(e.text) == root.kb-prev) { if (!root.browse-keys-blocked) { root.navigate(-1); } accept }
                 // v0.8.52 (owner fix 3): Up/Down = current shot ± one grid ROW, active ONLY while the
                 // grid dock is mounted (open, not immersive, not empty) — the gate lives in the CONDITION,
                 // so with the dock closed both keys fall through to key-typed exactly as before. NOT
@@ -3373,19 +3442,22 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 // them as an informational row). Row step = the LIVE column count; clamped at the folder
                 // ends; routed through sel-jump (the discontinuous-jump path: primes G3 + recentres).
                 else if (e.text == Key.UpArrow && root.grid-open && !root.immersive && !root.empty-state) {
-                    if (!root.photo-popup-open) {
+                    if (!root.browse-keys-blocked) {
                         if ((root.opening-boundary-wait && root.opening-wait-dir < 0) || (root.opening-before && root.cur-idx < root.grid-cols)) { root.grid-boundary-step(-1); }
                         else { root.sel-jump(max(0, root.cur-idx - root.grid-cols)); }
                     } accept }
                 else if (e.text == Key.DownArrow && root.grid-open && !root.immersive && !root.empty-state) {
-                    if (!root.photo-popup-open) {
+                    if (!root.browse-keys-blocked) {
                         if ((root.opening-boundary-wait && root.opening-wait-dir > 0) || (root.opening-after && root.cur-idx + root.grid-cols >= root.count-all)) { root.grid-boundary-step(1); }
                         else { root.sel-jump(min(root.count-all - 1, root.cur-idx + root.grid-cols)); }
                     } accept }
                 // v0.8.38 (G6): first / last shot through the SAME discontinuous-jump path the
                 // filmstrip / Selection list use (default Home / End — live bindings).
-                else if (root.key-token(e.text) == root.kb-first) { if (!root.popup-open) { root.sel-jump(0); } accept }
-                else if (root.key-token(e.text) == root.kb-last) { if (!root.popup-open) { root.sel-jump(root.count-all - 1); } accept }
+                // Queue entry 6: while a folder is still loading, the list on screen is only the checked
+                // photos around the one opened, so its first and last are not the folder's. Home and End
+                // wait for the whole folder through their own term, now that `modal-open` no longer has it.
+                else if (root.key-token(e.text) == root.kb-first) { if (!root.browse-keys-blocked && !root.opening-photo) { root.sel-jump(0); } accept }
+                else if (root.key-token(e.text) == root.kb-last) { if (!root.browse-keys-blocked && !root.opening-photo) { root.sel-jump(root.count-all - 1); } accept }
                 // Compare-mode keyboard parity (#7): swap the active half / toggle its pin (default
                 // Tab / Space — live bindings). Accepted so Tab doesn't drive Slint focus traversal.
                 // v0.8.120 (design-sweep Y42): a gate at all — these two were the only FocusScope
@@ -3399,12 +3471,15 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 // Ctrl+1 rated the photo, Ctrl+X toggled reject. (Ctrl+C/Z/Y are handled
                 // above; plain unmodified keys flow to key-typed exactly as before.)
                 else if (e.modifiers.control || e.modifiers.alt) { reject }
-                // v0.8.13: an UNMODIFIED delete key opens the "Delete photo?" popup (default Del —
-                // key-token folds Backspace into "Del", today's synonym, so both follow the binding).
-                // Fires ONLY while this scope holds focus, so a TextInput being typed into never
-                // reaches it (same gate as 'r'/'x'); Rust re-checks shot/modal/compare before it opens.
-                else if (root.key-token(e.text) == root.kb-del) { root.delete-key(); accept }
-                else { root.key-typed(e.text); accept }
+                // v0.8.13: an UNMODIFIED delete key deletes, at once or behind the popup, as Rust decides
+                // (default Del — key-token folds Backspace into "Del", today's synonym, so both follow the
+                // binding). Fires ONLY while this scope holds focus, so a TextInput being typed into never
+                // reaches it (same gate as 'r'/'x'); Rust re-checks shot/modal before it acts, and in Compare it takes the active half (R5).
+                // R18: a held key is one press, since a press can now delete with no dialog. R19: it does
+                // nothing with the bell panel open, the same as the arrows. It stays live on a context menu,
+                // whose own row it presses (`delete-key` asks `menu-action` first).
+                else if (root.key-token(e.text) == root.kb-del) { if (!e.repeat && !root.notif-open) { root.delete-key(); } accept }
+                else { root.key-typed(e.text, e.repeat); accept }
             }
             key-released(e) => {
                 root.shift-held = e.modifiers.shift; // v0.8.129: the other half of the mirror
@@ -3558,6 +3633,13 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                     width: root.grid-dock-w;
                     background: Theme.base; // the dock is chrome (the filmstrip's surface), not stage
                     clip: true; // layouts don't clip — the dock must (live rows ride grid-win-y past both edges)
+                    // Delete round (R46): the blue edge's reveal, top and bottom. See the strip's (`fsinner`).
+                    property <float> edge-t-reveal: root.blue-edge-top >= 0 ? 1.0 : 0.0;
+                    animate edge-t-reveal { duration: Theme.anim-med; easing: ease; }
+                    property <float> edge-t: root.motion-ui ? self.edge-t-reveal : (root.blue-edge-top >= 0 ? 1.0 : 0.0);
+                    property <float> edge-b-reveal: root.blue-edge-bottom >= 0 ? 1.0 : 0.0;
+                    animate edge-b-reveal { duration: Theme.anim-med; easing: ease; }
+                    property <float> edge-b: root.motion-ui ? self.edge-b-reveal : (root.blue-edge-bottom >= 0 ? 1.0 : 0.0);
                     // v0.8.129 (W1-5): the dock's BACKGROUND is the grid's genuine empty space — a
                     // click here reached no handler at all before this. Declared BEFORE the Flickable
                     // so every tile (declared after) still wins its own hits; what is left to this
@@ -3577,8 +3659,11 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                             y: root.grid-win-y;
                             x: 0; width: 100%; height: 1px; // a positioning anchor only (children overflow by design; the dock clips)
                             for item[i] in root.grid-items : GridThumb {
-                                x: 8px + Math.mod(i, root.grid-cols) * 128px; // 120px tile + 8px gap — the filmstrip pitch
-                                y: Math.floor(i / root.grid-cols) * 88px;     // 80px tile + 8px row gap
+                                // Delete round (R41, R42): + the slide, a paint offset that ends at exactly 0, so the
+                                // slot itself is where a plain update puts it. An arriving photo fades in.
+                                x: 8px + Math.mod(i, root.grid-cols) * 128px + root.slid(item.slide-x); // 120px tile + 8px gap — the filmstrip pitch
+                                y: Math.floor(i / root.grid-cols) * 88px + root.slid(item.slide-y);     // 80px tile + 8px row gap
+                                opacity: item.arriving ? 1 - root.tile-fade-k : 1;
                                 width: 120px; height: 80px;
                                 item: item; cur-idx: root.cur-idx; edits-enabled: !root.modal-open;
                                 preview: root.sel-preview; // v0.8.129 (W1-3): the Shift range-origin preview
@@ -3659,6 +3744,26 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                     // are never mirrored, so unlike the rules above it was stable — stably wrong.
                     // Vertical = the same hairline rotated a quarter turn (glyphs.slint).
                     dockdiv := AaHairline { x: parent.width - 1px; width: 1px; height: 100%; vertical: true; tint: Theme.divider; }
+                    // Delete round (R46): THE BLUE EDGE on the grid, along its own scroll: the top for a photo the
+                    // person brought back above what it shows, the bottom for one below (`blue_edge.rs`). Declared
+                    // last, over the tiles, the scrollbar's ends and the divider, so while it's lit a click on it
+                    // goes to that photo, the way the photo's own tile click goes (`sel-jump`).
+                    if griddock.edge-t > 0.001 : edgetop := BlueEdge {
+                        y: 0; width: 100%; height: root.blue-edge-depth;
+                        shown: griddock.edge-t;
+                        live: root.blue-edge-top >= 0;
+                        paint: @linear-gradient(180deg, Theme.accent 0%, Theme.accent.with-alpha(0) 100%);
+                        go => { if (root.neighbour-browse-allowed(false, false)) { root.sel-jump(root.blue-edge-top); } }
+                        hot(on) => { root.blue-edge-hot = on; }
+                    }
+                    if griddock.edge-b > 0.001 : edgebottom := BlueEdge {
+                        y: parent.height - root.blue-edge-depth; width: 100%; height: root.blue-edge-depth;
+                        shown: griddock.edge-b;
+                        live: root.blue-edge-bottom >= 0;
+                        paint: @linear-gradient(0deg, Theme.accent 0%, Theme.accent.with-alpha(0) 100%);
+                        go => { if (root.neighbour-browse-allowed(false, false)) { root.sel-jump(root.blue-edge-bottom); } }
+                        hot(on) => { root.blue-edge-hot = on; }
+                    }
                 }
 
             // ── image stage ──
@@ -5199,6 +5304,15 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 opacity: root.chrome-eff; // M6 fade (input dies on the bool via the gates below)
                 background: Theme.base; // strip matches the flat app base
                 clip: true;
+                // Delete round (R46): the blue edge's reveal, left and right: the edge pills' (`bedge`), 0.2 s in
+                // and out from the side the tick names, and with "Interface motion" off it snaps, so the cue still
+                // shows. An `animate` over a plain property the tick writes only when it changes (never delayed).
+                property <float> edge-l-reveal: root.blue-edge-left >= 0 ? 1.0 : 0.0;
+                animate edge-l-reveal { duration: Theme.anim-med; easing: ease; }
+                property <float> edge-l: root.motion-ui ? self.edge-l-reveal : (root.blue-edge-left >= 0 ? 1.0 : 0.0);
+                property <float> edge-r-reveal: root.blue-edge-right >= 0 ? 1.0 : 0.0;
+                animate edge-r-reveal { duration: Theme.anim-med; easing: ease; }
+                property <float> edge-r: root.motion-ui ? self.edge-r-reveal : (root.blue-edge-right >= 0 ? 1.0 : 0.0);
                 // v0.8.27: which thumb the cursor is over — drives the per-thumb hover LIFT through the
                 // strip-wide ta (which occludes the thumbs' own TouchAreas, so FilmThumb can't self-hover).
                 // Grid coordinate = (mouse-x − film-offset-px) / 128 (120px thumb + 8px gap — the same
@@ -5231,6 +5345,9 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                         hit: !root.immersive; // M6 gate (see FilmThumb: exposed-once-ta-disables class)
                         lift: i == fsinner.hover-k && item.badge != ""; // v0.8.27: strip-driven hover lift (VOID edge slots never lift)
                         width: 120px; // 3:2 against the ~80 px inner height
+                        // Delete round (R41, R42): the slide, from the layout's own place, and an arrival's fade.
+                        slide-x: root.slid(item.slide-x);
+                        appear: item.arriving ? 1 - root.tile-fade-k : 1;
                         thumb: item.thumb;
                         number: item.number;
                         badge: item.badge;
@@ -5430,6 +5547,29 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                         opacity: barta.has-hover && !barta.pressed ? 0.55 : 1.0;
                         animate background, opacity { duration: Theme.anim; easing: ease; }
                     }
+                }
+                // Delete round (R46): THE BLUE EDGE on the strip, left and right, for a photo the person brought
+                // back off what it shows (`blue_edge.rs`). Declared last, over the strip-wide area and the seek
+                // bar, so while an edge is lit a click on it goes to that photo, never to the tile beneath: the
+                // way the grid's tile click goes (`sel-jump`), because the photo is off the strip and the strip
+                // has to follow it there, which a strip click on a tile in view never needs. In Compare the
+                // focused half takes it, as either click does. Mounted only while it shows: an unlit edge costs
+                // nothing, and a fading one has let go of the click.
+                if fsinner.edge-l > 0.001 : edgeleft := BlueEdge {
+                    x: 0; width: root.blue-edge-depth; height: 100%;
+                    shown: fsinner.edge-l;
+                    live: root.blue-edge-left >= 0 && !root.immersive;
+                    paint: @linear-gradient(90deg, Theme.accent 0%, Theme.accent.with-alpha(0) 100%);
+                    go => { if (root.neighbour-browse-allowed(false, false)) { root.sel-jump(root.blue-edge-left); } }
+                    hot(on) => { root.blue-edge-hot = on; }
+                }
+                if fsinner.edge-r > 0.001 : edgeright := BlueEdge {
+                    x: parent.width - root.blue-edge-depth; width: root.blue-edge-depth; height: 100%;
+                    shown: fsinner.edge-r;
+                    live: root.blue-edge-right >= 0 && !root.immersive;
+                    paint: @linear-gradient(270deg, Theme.accent 0%, Theme.accent.with-alpha(0) 100%);
+                    go => { if (root.neighbour-browse-allowed(false, false)) { root.sel-jump(root.blue-edge-right); } }
+                    hot(on) => { root.blue-edge-hot = on; }
                 }
                 } // fsinner (M6)
             }
@@ -5838,24 +5978,8 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                 }
                                 Rectangle { height: 4px; }
                                 input-cap := SectionLabel { text: @tr("falcon" => "INPUT"); }
-                                SettingsGroup {
-                                    title: @tr("falcon" => "While the folder is loading");
-                                    HorizontalLayout {
-                                        padding-left: 12px; padding-right: 12px;
-                                        photoopenseg := Seg {
-                                            horizontal-stretch: 1;
-                                            opts: [@tr("falcon" => "View only"), @tr("falcon" => "Allow photo edits")];
-                                            sel: root.photo-open-edits ? 1 : 0;
-                                            bg: Theme.well;
-                                            changed(i) => { root.photo-open-edits = i == 1; keys.focus(); }
-                                        }
-                                    }
-                                    VerticalLayout {
-                                        padding-left: 12px; padding-right: 12px;
-                                        photo-open-caption := Text { text: @tr("falcon" => "Applies when you open a single photo and the rest of its folder is still loading.");
-                                               color: Theme.text-mute; font-size: Theme.font-sm; wrap: word-wrap; }
-                                    }
-                                }
+                                // Queue entry 6 (owner, 2 November 2026: "always allow and remove the
+                                // setting"): the "While the folder is loading" group stood first here.
                                 ToggleRow {
                                     bg: Theme.block;
                                     label: @tr("falcon" => "Mouse wheel changes photo"); on: root.wheel-nav;
@@ -9097,7 +9221,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                 // W3d: red only when ./Rejected actually has files (probed on panel-open / op-finish).
                                 // v0.8.119 (Y45): the probe returns a COUNT now — `> 0` is the same set.
                                 enabled: root.count-bin > 0 && !root.sel-busy;
-                                clicked => { root.confirm-kind = 3; }
+                                clicked => { root.empty-rejected-ask(); }
                             }
                         }
                         VerticalLayout {
@@ -9422,10 +9546,23 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 padding: Theme.space-3; spacing: Theme.space-2;
             toastrow := HorizontalLayout {
                 spacing: Theme.space-2;
-                Rectangle {
+                // The severity dot, or for a clean delete the small picture (R29), since that's no severity:
+                // the owner, "show thumbnail". The picture takes the dot's place, and 36px more of the text's
+                // budget than the dot did, so with [Recover] the text has about 124px. A long name wraps. The
+                // JumpThumb grammar, one size up.
+                if !root.toast-picture-on : Rectangle {
                     width: 8px; height: 8px; border-radius: 4px; y: 5px;
                     background: root.toast-kind == 3 ? Theme.danger : root.toast-kind == 2 ? Theme.warn
                               : root.toast-kind == 1 ? Theme.accent : Theme.text-mute;
+                }
+                if root.toast-picture-on : VerticalLayout {
+                    alignment: start;
+                    toastpicture := Rectangle {
+                        width: 44px; height: 44px; border-radius: 3px;
+                        clip: true;
+                        background: Theme.well;
+                        Image { source: root.toast-picture; image-fit: cover; width: 100%; height: 100%; }
+                    }
                 }
                 VerticalLayout {
                     horizontal-stretch: 1; spacing: 2px;
@@ -9466,7 +9603,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                 // The toast card is a block; its action pills use the standard dark well.
                 if root.toast-undoable && root.can-undo-move && toastcard.hot : VerticalLayout {
                     alignment: center;
-                    PillBtn { text: @tr("falcon" => "Undo"); clicked => { root.undo-move(); root.dismiss-toast(); } }
+                    PillBtn { text: @tr("falcon" => "Undo"); clicked => { root.undo-move(root.toast-seq); root.dismiss-toast(); } }
                 }
                 // D2 (W4): the resume-at-last-shot ASK — jumps via the same path as a Selection-
                 // list click (the user decided: ask, never auto-jump).
@@ -9484,7 +9621,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                     // v0.8.131 (the F-P4 rule-4 class, same defect one pill over): ONE call. This
                     // handler raises an honest refusal toast on a cross-folder recover, and the
                     // paired dismissal killed it in the same event.
-                    PillBtn { text: @tr("falcon" => "Recover"); clicked => { root.recover-delete(); } }
+                    PillBtn { text: @tr("falcon" => "Recover"); clicked => { root.recover-delete(root.toast-seq); } }
                 }
                 // v0.8.129 (W1-5, owner ruling Q12+N2): the clear-recovery pill — a drop-in clone of
                 // Recover above (same PillBtn, same `hot` gate, same dismiss-on-act). Selection
@@ -9787,8 +9924,12 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                         viewport-height: notiflist.preferred-height;
                         notiflist := VerticalLayout {
                             spacing: Theme.space-2; // standard intra-group gap (v0.7.1; was 4px)
-                            for row[i] in root.notif-model : Rectangle {
-                                height: nrow.preferred-height + 12px;
+                            for row[i] in root.notif-model : nrowcard := Rectangle {
+                                // Delete round (R34): the heading is the row as it was, and an open fold's
+                                // lines go under it (the row's height includes them). Open, the heading gives
+                                // up the 12px under it, as the lines carry the card's bottom inset.
+                                property <length> head-h: nrow.preferred-height + (row.open ? 0px : 12px);
+                                height: self.head-h + nlines.preferred-height;
                                 background: Theme.block; border-radius: Theme.radius-sm;
                                 // ── v0.8.186 (U3, OWNER RULING): THE LINKAGE RIM ─────────────────
                                 // The row the Undo button would reverse wears the SAME accent rim
@@ -9800,7 +9941,22 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                 // the pair reads as one system in two colours.
                                 border-width: (i == root.undo-target-row || i == root.redo-target-row) ? 1px : 0px;
                                 border-color: i == root.undo-target-row ? Theme.accent : Theme.border-lift;
+                                // R34: a fold's heading is the disclosure header's grammar (the Settings
+                                // folds): the hover wash on the WHOLE heading, and one full-row hit target
+                                // that opens and closes it. It sits UNDER the heading's controls, so its
+                                // pills and × keep their own clicks. The wash is the opaque flatten of the
+                                // hover over this block card, the events row's own token. Inset by the row's
+                                // live border, so a selection row's rim stays whole under the wash (L37).
+                                if row.fold >= 2 : nhead := Rectangle {
+                                    x: parent.border-width; y: parent.border-width;
+                                    width: parent.width - 2 * parent.border-width; height: parent.head-h - parent.border-width;
+                                    border-radius: Theme.radius-sm;
+                                    background: nheadta.has-hover ? Theme.hover-flat-block : transparent;
+                                    animate background { duration: Theme.anim; easing: ease; }
+                                    nheadta := TouchArea { clicked => { root.notif-fold(row.fold-id); } }
+                                }
                                 nrow := HorizontalLayout {
+                                    y: 0; width: parent.width; height: parent.head-h;
                                     padding: Theme.space-3; spacing: Theme.space-2; // settings-card 12px inset (v0.7.1)
                                     nrowdot := Rectangle {
                                         width: 8px; height: 8px; border-radius: 4px; y: 5px;
@@ -9809,14 +9965,15 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                     }
                                     VerticalLayout {
                                         horizontal-stretch: 1; spacing: 2px;
-                                        Text { text: row.text; color: Theme.text; font-size: Theme.font-body; wrap: word-wrap; }
+                                        // R37: brought back with the panel open, it reads dimmed until the panel closes.
+                                        Text { text: row.text; color: row.recovered ? Theme.text-mute : Theme.text; font-size: Theme.font-body; wrap: word-wrap; }
                                         Text { text: row.when; color: Theme.text-mute; font-size: Theme.font-sm; }
                                     }
                                     // inline Undo for a still-reversible "Move rejected" (brought back per-row)
                                     // Each event ROW is a block card; its pills use the standard dark well.
                                     if row.undoable && root.can-undo-move : VerticalLayout {
                                         alignment: center;
-                                        PillBtn { text: @tr("falcon" => "Undo"); clicked => { root.undo-move(); } }
+                                        PillBtn { text: @tr("falcon" => "Undo"); clicked => { root.undo-move(row.seq); } }
                                     }
                                     // D2: a persisted Resume — the toast is transient, so the resume ask
                                     // must be actionable from the events panel too (the toast's twin).
@@ -9842,7 +9999,13 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                     // rather than firing a refusal.
                                     if row.recover && root.can-recover : VerticalLayout {
                                         alignment: center;
-                                        PillBtn { text: @tr("falcon" => "Recover"); clicked => { root.recover-delete(); } }
+                                        PillBtn { text: @tr("falcon" => "Recover"); clicked => { root.recover-delete(row.seq); } }
+                                    }
+                                    // R37 (Delete round): what it says in the pill's place once it has come back,
+                                    // with the panel open, so nothing moves under the pointer. Not a control.
+                                    if row.recovered : VerticalLayout {
+                                        alignment: center;
+                                        nrowrecovered := Text { text: @tr("falcon" => "Recovered"); color: Theme.text-mute; font-size: Theme.font-sm; }
                                     }
                                     // v0.8.121 (Round-B fix F19 = audit Y16): the colour-profile
                                     // failure's own route, persisted. It was the last toast action
@@ -9860,6 +10023,21 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                             root.notif-open = false;
                                         } }
                                     }
+                                    // R34: the fold's arrow, the app's one expand/collapse `ChevronGlyph` in a 24px
+                                    // box, beside the × and as tall as it so the two share a centre. It is drawn,
+                                    // not a control: the heading's own hit target opens the fold. The owner's rule:
+                                    // the arrow points where the content will move, so down while it's closed.
+                                    if row.fold >= 2 : VerticalLayout {
+                                        alignment: start;
+                                        nfoldbox := Rectangle {
+                                            width: 24px; height: 26px;
+                                            ChevronGlyph {
+                                                x: (parent.width - self.width) / 2;
+                                                y: (parent.height - self.height) / 2;
+                                                points-down: !row.open;
+                                            }
+                                        }
+                                    }
                                     // per-row × dismiss, pinned to the top-right corner — matches the toast's ×
                                     // so a single notification can be cleared without wiping the whole log.
                                     VerticalLayout {
@@ -9871,6 +10049,82 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                             CloseGlyph { width: 11px; height: 11px;
                                                          x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
                                             ndxta := TouchArea { clicked => { root.notif-dismiss(i); } }
+                                        }
+                                    }
+                                }
+                                // ── Delete round (R33 to R39, owner chose version A): THE FOLD'S LINES ─────────
+                                // "A fits the notification panel better as everything there is a vertical list":
+                                // one line per photo, under the heading's text column (the dot's column stays
+                                // clear), each with its small picture, its name with the pair's label, the time
+                                // under it, and its own Recover. Always mounted, and empty with no height while
+                                // the fold is closed: the lines themselves mount only while it's open (Rust gives
+                                // a closed row no lines), and the two `if`s below are mount-gated (L4).
+                                nlines := VerticalLayout {
+                                    y: parent.head-h; width: parent.width; height: self.preferred-height;
+                                    padding-left: Theme.space-3 + 8px + Theme.space-2; // the heading text's column: inset, dot, gap
+                                    padding-right: Theme.space-3;
+                                    padding-bottom: row.open ? Theme.space-3 : 0px;
+                                    spacing: Theme.space-1;
+                                    // R39: in another folder a line can't bring its photo back, and says why once.
+                                    if row.open && row.away : nlinesaway := Text {
+                                        text: @tr("falcon" => "These are in another folder. Go back to it to bring them back.");
+                                        color: Theme.text-mute; font-size: Theme.font-sm; wrap: word-wrap;
+                                    }
+                                    for line in row.lines : nline := Rectangle {
+                                        height: nlrow.preferred-height;
+                                        nlrow := HorizontalLayout {
+                                            padding: Theme.space-1; spacing: Theme.space-2;
+                                            // R35: the small picture, the strip's own thumbnail kept from the
+                                            // press. JumpThumb's grammar: a well tile, so an unloaded one is blank.
+                                            nlpic := Rectangle {
+                                                width: 32px; height: 32px; border-radius: 3px;
+                                                clip: true;
+                                                background: Theme.well;
+                                                Image { source: line.picture; image-fit: cover; width: 100%; height: 100%; }
+                                                // R37: dimmed with the words, by the card's own colour over it
+                                                // (no `opacity`, so no layer).
+                                                if line.recovered : Rectangle { width: 100%; height: 100%; background: Theme.block.with-alpha(0.6); }
+                                            }
+                                            VerticalLayout {
+                                                horizontal-stretch: 1; spacing: 2px; alignment: center;
+                                                // R34: "Keep `[RAW+JPG]` visible and shorten only the name". The eliding
+                                                // name takes all the shrink (measured by the rig), so the label needs no minimum.
+                                                HorizontalLayout {
+                                                    alignment: start; spacing: 4px;
+                                                    nltitle := Text {
+                                                        text: line.title; overflow: elide;
+                                                        color: line.recovered ? Theme.text-mute : Theme.text; font-size: Theme.font-body;
+                                                    }
+                                                    if line.tag != "" : nltag := Text {
+                                                        text: line.tag;
+                                                        color: line.recovered ? Theme.text-mute : Theme.text-dim; font-size: Theme.font-body;
+                                                    }
+                                                }
+                                                Text { text: line.when; color: Theme.text-mute; font-size: Theme.font-sm; }
+                                            }
+                                            if line.recover && !line.recovered && root.can-recover : VerticalLayout {
+                                                alignment: center;
+                                                nlrecover := PillBtn { text: @tr("falcon" => "Recover"); clicked => { root.recover-line(line.seq, line.name); } }
+                                            }
+                                            if line.recovered : VerticalLayout {
+                                                alignment: center;
+                                                Text { text: @tr("falcon" => "Recovered"); color: Theme.text-mute; font-size: Theme.font-sm; }
+                                            }
+                                        }
+                                        // R38: the rim is on the line Undo takes back, the row rim's colour and
+                                        // weight. Its own sibling, mounted only on that line, over the line and
+                                        // taking no clicks: no border bound by a condition (L47).
+                                        if line.seq >= 0 && line.seq == root.undo-target-line : nlrim := Rectangle {
+                                            width: 100%; height: 100%;
+                                            border-radius: Theme.radius-sm; border-width: 1px; border-color: Theme.accent;
+                                        }
+                                    }
+                                    // R34: the newest 50 lines, then 50 more at a time.
+                                    if row.open && row.more > 0 : HorizontalLayout {
+                                        alignment: start;
+                                        nlinesmore := PillBtn {
+                                            text: @tr("falcon" => "Show {n} more" | "Show {n} more" % row.more);
+                                            clicked => { root.notif-fold-more(row.fold-id); }
                                         }
                                     }
                                 }
@@ -11636,7 +11890,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                                     WkRow { label: @tr("falcon" => "Immersive full screen");
                                         KeyHint { text: root.keybinds[14].key; }
                                     }
-                                    wkdelete := WkRow { label: @tr("falcon" => "Delete (always confirms)");
+                                    wkdelete := WkRow { label: @tr("falcon" => "Delete photo");
                                         KeyHint { text: root.key-name(root.kb-del); }
                                     }
                                     // ── v1.0.0-rc (queue item 27, sheet 2.1 B8, OWNER RULING): THE CARD
@@ -12682,7 +12936,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                         //
                         // THE CHIP IS HONEST, on the same two derivations "Flag N" carries: the stage case
                         // (`ctx-target == -1`, because a filmstrip thumb re-targets everything else in this
-                        // menu), not in compare (`delete_key_allowed` hard-refuses there), and
+                        // menu), not in compare (the key takes the active half there, never the selection), and
                         // `bulk-actions-armed` — which IS the Del key's own gate, and the state in which the
                         // key performs exactly THIS row rather than the single one below.
                         if root.ctx-plural : MenuItem { edge-to-edge: true; text: root.ctx-bulk-delete-label;
@@ -13082,10 +13336,8 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                         MenuSep { extra-inset: 3px; }
                         // v0.8.119 (design-sweep O17/O19/O23 + Y41): BOTH conditions must hold for a
                         // chip. Target scope — the Del key deletes the CURRENT shot, so a thumb-scoped
-                        // row must not teach it. Compare — delete_key_allowed() hard-refuses in
-                        // compare (main.rs), while the ITEM still works there by design (a menu acts
-                        // on an explicit shot), so the chip would teach a key that is dead in the very
-                        // mode it was read in.
+                        // row must not teach it. Compare — the key takes the active half (R5), while the
+                        // ITEM acts on its own explicit shot.
                         //
                         // v0.8.137 (W3) — A THIRD CONDITION, AND IT IS A BUG FIX. v0.8.135 sent the
                         // Del key PLURAL whenever a selection exists: `delete-key` checks the same
@@ -13103,7 +13355,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                         // above "Delete 12 photos…" is the one row whose scope the user has to infer.
                         // The chip condition is UNCHANGED — `!bulk-actions-armed`, because while armed the
                         // Del key opens the plural confirm and this row must not wear it.
-                        MenuItem { edge-to-edge: true; text: @tr("falcon" => "Delete this photo…"); shortcut: !root.ctx-plural ? root.sc-delete : ""; clicked => { root.menu-action("delete-one", false); root.ctx-open = false; } }
+                        MenuItem { edge-to-edge: true; text: root.delete-asks ? @tr("falcon" => "Delete this photo…") : @tr("falcon" => "Delete this photo"); shortcut: !root.ctx-plural ? root.sc-delete : ""; clicked => { root.menu-action("delete-one", false); root.ctx-open = false; } }
                     }
                 }
                 // v0.8.122 (M5 = the v0.8.121 verify's S1 finding): the owner's panel-bottom
@@ -13449,7 +13701,7 @@ import { MacExperimentPopup, MacExperimentStatus } from "mac_experiment.slint";
                     // v0.8.131 (J2 / F3 L-5): TILE-SCOPED, and it says so. In a menu that also
                     // carries "Delete 12 photos…" a bare "Delete…" is the one row whose scope the
                     // user has to infer, and the two are one row apart.
-                    MenuItem { edge-to-edge: true; text: @tr("falcon" => "Delete this photo…"); shortcut: !root.ctx-plural ? root.sc-delete : ""; clicked => { root.menu-action("delete-one", false); root.sel-ctx-open = false; } }
+                    MenuItem { edge-to-edge: true; text: root.delete-asks ? @tr("falcon" => "Delete this photo…") : @tr("falcon" => "Delete this photo"); shortcut: !root.ctx-plural ? root.sc-delete : ""; clicked => { root.menu-action("delete-one", false); root.sel-ctx-open = false; } }
                 }
                 }
                 // The clipped-content smudge, off the flick's own edges (the ctxflick site above).

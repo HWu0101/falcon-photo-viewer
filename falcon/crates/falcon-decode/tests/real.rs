@@ -335,3 +335,60 @@ fn passenger_does_not_rotate_the_owners_portrait_raw() {
     assert_eq!(read_orientation(&with, true), read_orientation(&alone, true));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Fix round 2 (11 November 2026, `CS-2`): **A RAW-ONLY CR3 SHOWS THE SAME INFO ROWS AS ITS JPEG.**
+/// For each real CR3+JPEG pair in the approved photo corpus (both files on this device; a cloud-only
+/// file is skipped, never downloaded), the CR3 seen alone gives exactly the JPEG's rows, keys and
+/// values character for character. Only `Files` may differ (it names the files present).
+///
+/// FALSIFIER (L28): drop the `raw_exif_from_bytes` fallback in `exif_rows` and the RAW-only rows are
+/// empty, so every pair fails; drop the CMT2 re-tagging and every exposure row goes missing.
+#[test]
+fn a_raw_only_cr3_shows_the_same_info_rows_as_its_jpeg() {
+    let Some(shots) = shots_or_skip() else { return };
+    let is_cr3 = |p: &Option<std::path::PathBuf>| {
+        p.as_deref().and_then(|p| p.extension()).is_some_and(|e| e.eq_ignore_ascii_case("cr3"))
+    };
+    let pairs: Vec<&Shot> = shots
+        .iter()
+        .filter(|s| s.has_raw && s.has_jpg && is_cr3(&s.raw))
+        .filter(|s| fixture_paths::local_file(s.raw.as_deref().unwrap()) && fixture_paths::local_file(s.jpg.as_deref().unwrap()))
+        .take(12)
+        .collect();
+    if !fixture_paths::require_available(!pairs.is_empty(), "a local CR3+JPEG pair in the photo corpus") {
+        return;
+    }
+    for s in &pairs {
+        let jpeg_rows: Vec<(String, String)> = exif_rows(s, 0).into_iter().filter(|(k, _)| k != "Files").collect();
+        let alone = Shot { has_jpg: false, jpg: None, ..(*s).clone() };
+        let raw_rows: Vec<(String, String)> = exif_rows(&alone, 0).into_iter().filter(|(k, _)| k != "Files").collect();
+        // Keys only: values such as Artist and GPS are personal and stay out of logs.
+        let keys: Vec<&str> = raw_rows.iter().map(|(k, _)| k.as_str()).collect();
+        println!("{}: {} rows from the JPEG, {} from the CR3 alone: {keys:?}", s.name, jpeg_rows.len(), raw_rows.len());
+        assert!(jpeg_rows.len() >= 8, "{}: premise, the JPEG has a full panel", s.name);
+        assert_eq!(raw_rows, jpeg_rows, "{}: the CR3 alone must show the JPEG's rows", s.name);
+        assert!(exif_rows(&alone, 0).iter().any(|(k, _)| k == "Files"), "{}: and its Files row", s.name);
+    }
+    println!("{} CR3 pair(s) compared", pairs.len());
+}
+
+/// Fix round 2 (`CS-2`): a real Fujifilm RAF from the approved other-brands corpus, seen alone,
+/// shows the camera, exposure and date rows, read from the JPEG the RAF carries.
+#[test]
+fn a_raw_only_raf_shows_its_camera_and_exposure_rows() {
+    let path = fixture_paths::other_raw().join("DSCF1276.RAF");
+    if !fixture_paths::require_file(&path) {
+        eprintln!("SKIP real RAF fixture: {} is absent or not on this device", path.display());
+        return;
+    }
+    let shot = Shot { id: 0, name: "DSCF1276".into(), has_raw: true, has_jpg: false, raw: Some(path),
+        jpg: None, kind: SrcKind::Jpeg, cloud_placeholder: false, sniffed: None };
+    let rows = exif_rows(&shot, 0);
+    let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+    println!("RAF rows: {keys:?}"); // keys only: values such as Artist and GPS are personal
+    for key in ["Camera", "Shutter", "Aperture", "ISO", "Date", "Files"] {
+        assert!(rows.iter().any(|(k, v)| k == key && !v.is_empty()), "the RAF's {key} row");
+    }
+    let camera = rows.iter().find(|(k, _)| k == "Camera").map(|(_, v)| v.as_str()).unwrap_or("");
+    assert!(camera.to_ascii_uppercase().contains("FUJIFILM"), "the camera is the Fujifilm's own make: {camera}");
+}

@@ -1,7 +1,7 @@
 //! Current-photo inspection is independent of background collection discovery.
 //! Kept separate so real pointer events can exercise the production handlers in tests.
 //! Every callback here refuses only while `inspection-blocked` holds (a dialog or the welcome
-//! guide). View only's edit gate does not apply, and a menu owns the pointer through its own
+//! guide). The unfinished-boundary wait `modal-open` adds does not apply, and a menu owns the pointer through its own
 //! overlay, so the Fit key and the Mac menu rows keep working while a menu is open, as before.
 use crate::*;
 
@@ -206,8 +206,8 @@ pub(crate) fn wire(
         a.set_zoom(z1);
         a.set_pan_x(px);
         a.set_pan_y(py);
-        if trace { log_event(&format!("inspection: click accepted opening={} edits={} ready={} zoom={z1:.3}",
-            a.get_opening_photo(), a.get_photo_open_edits(), a.get_photo_ready())); }
+        if trace { log_event(&format!("inspection: click accepted opening={} ready={} zoom={z1:.3}",
+            a.get_opening_photo(), a.get_photo_ready())); }
     });
 
 }

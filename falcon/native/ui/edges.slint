@@ -163,3 +163,27 @@ import { GridGlyph, FilmFrameBlock, ChevronGlyph } from "glyphs.slint";
         }
         pta := TouchArea { enabled: root.hit; clicked => { root.clicked(); } }
     }
+
+    // Delete round (R46): THE BLUE EDGE. The owner, verbatim: "if the user already scrolled past the recovered
+    // image and it is off the visible filmstrip, the edge of the filmstrip (left or right depending on where it
+    // is) should lit up in a blue gradient for a moment and clicking on the gradient should take them to that
+    // image immediately"; "the grid do get the blue edge (top/bottom instead of left/right as that's how it
+    // scrolls)". One edge of the strip or the grid: the selected blue (`Theme.accent`, the selected button's)
+    // at the surface's edge, clear at its inner side, in the `paint` the host gives it. Pure paint plus one
+    // TouchArea, which takes the click only while a photo is named (`live`), so a click on it goes to that
+    // photo and never to the tile beneath, and passes through while it fades out. The host mounts it only
+    // while it shows and owns the reveal; the rule for what lights is `blue_edge.rs`.
+    export component BlueEdge inherits Rectangle {
+        in property <brush> paint;
+        in property <float> shown: 1;
+        in property <bool> live: false;
+        callback go;
+        callback hot(bool);
+        opacity: root.shown;
+        Rectangle { background: root.paint; }
+        TouchArea {
+            enabled: root.live;
+            clicked => { root.go(); }
+            changed has-hover => { root.hot(self.has-hover); }
+        }
+    }

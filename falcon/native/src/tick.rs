@@ -274,14 +274,20 @@ pub(crate) fn drain_bench(rx: &Receiver<Option<BenchResult>>, running: &Cell<boo
 }
 
 /// 0b) white-balance Kelvin (off-thread) → cache; rebuild EXIF if it's the on-screen shot.
+///
+/// Fix round 2 (`CS-13`): a [`support::WbAnswer::CloudOnly`] answer caches NOTHING and leaves the
+/// request latch (`wb_requested`) set, so Preview mode never asks again for that RAW; turning RAW mode
+/// on re-arms it (`on_set_raw` drops every latch with no cached reading), because then the view reads
+/// the RAW anyway. The panel meanwhile shows what it shows for a photo with no RAW.
 pub(crate) fn drain_wb(
-    rx: &Receiver<(usize, u64, Option<u32>)>,
+    rx: &Receiver<(usize, u64, support::WbAnswer)>,
     gen_now: u64,
     wb_cache: &RefCell<HashMap<usize, Option<u32>>>,
     cur: &RefCell<usize>,
     exif_built: &Cell<Option<(usize, bool, u32)>>,
 ) {
-    while let Ok((id, gen, k)) = rx.try_recv() {
+    while let Ok((id, gen, answer)) = rx.try_recv() {
+        let support::WbAnswer::Kelvin(k) = answer else { continue };
         if gen == gen_now {
             wb_cache.borrow_mut().insert(id, k);
             if id == *cur.borrow() {
@@ -289,6 +295,14 @@ pub(crate) fn drain_wb(
             }
         }
     }
+}
+
+/// Fix round 2 (`CS-13`): RAW mode turned on — every white-balance latch with no cached reading is
+/// dropped, so a reading Preview skipped (an online-only RAW the view did not read) is asked for again,
+/// now that the view reads the RAW. One still on its way is asked once more, which is harmless.
+pub(crate) fn rearm_wb_for_raw_mode(wb_requested: &RefCell<HashSet<usize>>, wb_cache: &RefCell<HashMap<usize, Option<u32>>>) {
+    let cache = wb_cache.borrow();
+    wb_requested.borrow_mut().retain(|i| cache.contains_key(i));
 }
 
 // ── v0.8.89: bounded EXIF empty-parse RETRY (the "blank panel during import" self-heal) ──────────
@@ -6233,6 +6247,8 @@ pub(crate) fn step_display(
     // `step_prefetch_detail`): the six handlers that bump it are UI-thread callbacks, i.e. THIS
     // thread — the Release/Acquire pair exists for the decode WORKERS, and has nothing to order here.
     det_epoch: &AtomicU64,
+    // R6 (Delete round): the photo a delete's take-out landed on, which doesn't hold for sharp.
+    preview_landing: &RefCell<Option<String>>,
 ) {
     // The animated-GIF path (step_gif_advance) owns the stage + its signals this tick; don't fight it.
     if gif_active {
@@ -6273,10 +6289,14 @@ pub(crate) fn step_display(
     // what changes is that the mode now SAYS so on slow formats (`support::zoom_sharp_slow_note`)
     // and that its rate cap can finally measure such a lane instead of rejecting every landing as a
     // stall (I4, `DETAIL_FPS_MAX_GAP_S`).
+    //
+    // R6 (Delete round; owner chose A): the landing after a delete doesn't hold: the preview shows at
+    // once and sharpens in place. The hold stays for arrows.
     let epoch_now = det_epoch.load(Ordering::Relaxed);
     let zoom_sharp = zoom_sharp_active(app);
     let want_full = (!*scrubbing.borrow() || zoom_sharp) && detail.borrow().contains_key(&c);
-    let hold_sharp = zoom_sharp && !want_full;
+    let on_landing = support::on_preview_landing(preview_landing, shots.get(c).map(|s| s.name.as_str()));
+    let hold_sharp = zoom_sharp && !want_full && !on_landing;
     let key = (c, want_full, epoch_now);
     let main = if want_full {
         // (H3 note, CORRECTED v0.8.183 — W8) DetailCache carries no baked-turns field: its inserts
@@ -7257,6 +7277,10 @@ pub(crate) fn make_film_item(
         // The cloud-only round: a landed picture (Falcon's thumbnail, or the stage's frame standing
         // in) always wins, and a real failure keeps its broken-image mark.
         cloud: cloud && !valid && !failed,
+        // Delete round (R42): no slide here. The strip and the grid put a slide's offsets on after this.
+        slide_x: 0.0,
+        slide_y: 0.0,
+        arriving: false,
     }
 }
 
@@ -7413,6 +7437,9 @@ pub(crate) fn step_filmstrip(
     // art `lookup_thumb` serves while a thumbnail is still out. Same fix, same reason, one tier over.
     let fgen = fast_gen.get();
     let sgv = sel_gen.get();
+    // Delete round (R42): a landing's slide, placed from the place this step has just settled on, which a
+    // plain update has too. Once per landing; the rows below take it at this and every later rebuild.
+    film.slide.borrow_mut().place_strip(pos, base..base + count as i64, len, vis_half);
     // F1: watch the monotonic thumbnail ARRIVAL generation, not the thumb_cache SIZE — the cache pins
     // at THUMB_CACHE_MAX on a big folder (insert+evict), so a size key stopped firing for new thumbs.
     let tgen = thumb_gen.get();
@@ -7450,6 +7477,7 @@ pub(crate) fn step_filmstrip(
                 (i >= 0 && i < len as i64).then_some(i as usize)
             }),
         );
+        let slide = film.slide.borrow();
         let items: Vec<FilmItem> = (0..count)
             .map(|slot| {
                 let idx = base + slot as i64;
@@ -7461,9 +7489,12 @@ pub(crate) fn step_filmstrip(
                 let shot = &shots[idx];
                 let (thumb, valid) = lookup_thumb(&tc, &cache, idx, &mut need_thumb, cm_now);
                 let mk = mv.get(idx).copied().unwrap_or(0);
-                make_film_item(shot, idx, c, thumb, valid, rv.get(idx).copied().unwrap_or(0), mk, rot.delta_of(idx), plan, failed_now.contains(&idx), sel.contains(idx), cloud_now.contains(&idx))
+                let mut item = make_film_item(shot, idx, c, thumb, valid, rv.get(idx).copied().unwrap_or(0), mk, rot.delta_of(idx), plan, failed_now.contains(&idx), sel.contains(idx), cloud_now.contains(&idx));
+                (item.slide_x, item.arriving) = slide.strip_tile(idx); // R42: by photo, at every rebuild
+                item
             })
             .collect();
+        drop(slide);
         drop(cache);
         drop(tc);
         drop(sel);
@@ -9997,7 +10028,7 @@ pub(crate) struct NotifEntry {
     pub(crate) kind: i32,     // severity: 0 info / 1 success / 2 warn / 3 error
     pub(crate) reveal_path: String, // ABSOLUTE result-folder path for a "Show" button ("" = none) — captured at
     // creation so a historical event opens the folder it happened in, not the folder open now
-    pub(crate) undoable: bool, // captured `can_undo_move` at creation → an "Undo" button on the toast
+    pub(crate) undoable: bool, // this result armed a move record → an "Undo" button on the toast and the row
     // D2 (W4): a shot index for a "Resume" button on the toast (-1 = none) — the resume-at-last-
     // shot ask on folder open. It rides the PERSISTED events-panel row too: `rebuild_notif_model`
     // copies it (tick.rs `jump_to: e.jump_to`) and the row mounts its own Resume button
@@ -10017,7 +10048,8 @@ pub(crate) struct NotifEntry {
     pub(crate) open_settings: bool,
     // v0.8.120 (design-sweep O5): a "Recover" pill — the delete result's own action, on the toast
     // AND on the persisted events row (gated there by the live `can-recover`, see below). Set only
-    // by the delete path; every other entry leaves it false, the `open_settings` discipline.
+    // by the delete path; every other entry leaves it false, the `open_settings` discipline. The
+    // pill takes this row's own record, by `seq`, so an older row's works out of order.
     pub(crate) recover: bool,
     // v0.8.120 (design-sweep O6): the folder this event was created in ("" = not folder-scoped).
     // `jump_to` is a raw shot index with no folder identity, and `notif_log` is never cleared on a
@@ -10039,10 +10071,22 @@ pub(crate) struct NotifEntry {
     //
     // WRITERS, exhaustively (the census this comment exists to keep honest): the delete result
     // (`delete_result_entry`), the move result (the op-result drain below, tagged only while
-    // `undoable_now`), and `main.rs::say_edit_result`'s panel-row arm, which carries the stamp of
+    // it armed a record), and `main.rs::say_edit_result`'s panel-row arm, which carries the stamp of
     // the act whose reversal it is announcing. Everything else leaves it `None` — the
     // `open_settings` discipline.
     pub(crate) seq: Option<u64>,
+    // Delete round (R29): this is about a delete, and the stamp of its press, whatever route it went by (a
+    // for-good delete has no `seq`). Its card has no "+N". See `clean_delete`.
+    pub(crate) delete_press: Option<u64>,
+    // Delete round (R29, R35): the small picture of the one photo this names, from the strip's thumbnail at
+    // the press, for its card. Memory only. A row that folds hands it to its line ([`Fold`]).
+    pub(crate) picture: Option<slint::Image>,
+    // Delete round (R32, R33): this row folds, a run of deletes one at a time or a selection's photos.
+    pub(crate) fold: Option<Fold>,
+    // Delete round, R48 (owner, 11 November 2026: "2 B just make sure the notification is still there even
+    // though the bell doesn't light up"): a clean Move rejected or Undo move. Its card and its row are as any
+    // success's; only the bell's light and count leave it out. Set only by `op_result_notification`.
+    pub(crate) clean_move: bool,
     pub(crate) created: Instant,
 }
 
@@ -10062,8 +10106,18 @@ impl NotifEntry {
             recover: false,
             dir: String::new(),
             seq: None,
+            delete_press: None,
+            picture: None,
+            fold: None,
+            clean_move: false,
             created,
         }
+    }
+    /// R29, R30: this is a clean delete's result: the stamp of its press. It asks for no attention: it never
+    /// feeds the bell, its card is short, a newer press overtakes it, and it never takes the card from a
+    /// red or amber line.
+    pub(crate) fn clean_delete(&self) -> Option<u64> {
+        self.delete_press.filter(|_| self.kind < 2)
     }
     /// Info toast/event (kind 0).
     pub(crate) fn info(text: impl Into<String>, created: Instant) -> Self {
@@ -10111,6 +10165,315 @@ impl NotifEntry {
         self.seq = Some(seq);
         self
     }
+    /// R29: this is about the delete of that press. Builder.
+    pub(crate) fn about_delete(mut self, press: u64) -> Self {
+        self.delete_press = Some(press);
+        self
+    }
+    /// R32, R33: the row's words, Recover and stamp, from what of its fold is still gone. A run of one, or a
+    /// selection with one photo left, reads by name as an ordinary row. A run of two or more says how many and
+    /// names none of them: its `seq` is `None`, so the pinned row names what Ctrl+Z takes back (R38). A
+    /// selection says how many, with a Recover for all of them on the row. With nothing left, only while the
+    /// panel is open (R37), the words stand and offer nothing.
+    pub(crate) fn refold(&mut self) {
+        let Some(fold) = &self.fold else { return };
+        let live: Vec<&FoldLine> = fold.lines.iter().filter(|l| !l.recovered).collect();
+        let Some(newest) = live.first() else {
+            self.recover = false;
+            self.seq = None;
+            return;
+        };
+        let folded = fold.lines.len() >= 2;
+        match fold.kind {
+            FoldKind::Run { to_bin } => {
+                self.text = match (folded, to_bin) {
+                    (true, true) => platform::sent_run_text(live.len()),
+                    (true, false) => platform::deleted_many_text(platform::GoneFrom::Drive, live.len()),
+                    (false, true) => platform::sent_one_text(&newest.subject),
+                    (false, false) => platform::deleted_one_text(platform::GoneFrom::Drive, &newest.subject),
+                };
+                self.seq = if folded { None } else { newest.seq };
+                self.recover = !folded && newest.seq.is_some();
+            }
+            FoldKind::Selection { seq } => {
+                self.text = if live.len() >= 2 { platform::sent_selected_text(live.len()) } else { platform::sent_one_text(&newest.subject) };
+                self.seq = Some(seq);
+                self.recover = true;
+            }
+        }
+        self.created = newest.created;
+    }
+}
+
+/// R34: how many of a fold's newest lines show when it opens, and how many more "Show {n} more" adds.
+pub(crate) const FOLD_LINES_SHOWN: usize = 50;
+
+/// R32, R33 (Delete round). The owner: "ignored delete messages should not keep counting up (consider folding
+/// into an expandable notification card like deleted n photos [expand]-> show each one)", and of the layout,
+/// "A fits the notification panel better as everything there is a vertical list". A row that lists its
+/// photos under an arrow: a run, the top row of the list while clean deletes one at a time keep landing on it,
+/// or a selection deleted together ("2 can use the foldable notification"). Still one row per log entry,
+/// because `notif-dismiss(i)` and the rims index the log, and the lines are the fold's own.
+pub(crate) struct Fold {
+    pub(crate) kind: FoldKind,
+    /// Newest first: a run's deletes, or a selection's photos in its order.
+    pub(crate) lines: Vec<FoldLine>,
+    /// R34: what the panel opens it by, its first press's stamp. Never a row index: a row above it can go.
+    pub(crate) id: u64,
+    pub(crate) open: bool,
+    /// How many of the newest lines the open fold shows.
+    pub(crate) shown: usize,
+    /// The open fold's lines as the panel has them. Changed only by insert, remove and `set_row_data`, so the
+    /// times change in place and a hovered Recover doesn't bounce (R34, for FIX-A's reason). A closed fold
+    /// gets a new, empty one.
+    pub(crate) model: Rc<slint::VecModel<NotifLine>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FoldKind {
+    /// Clean deletes one at a time, in the row's folder. `to_bin`: each went to the bin, with a record. It's
+    /// in the run key, so a "Deleted … for good" never joins a "Sent …" (R32).
+    Run { to_bin: bool },
+    /// A selection that went to the bin together: one record, with this stamp. A line brings back its own
+    /// photo, and Ctrl+Z all that's left of it in one press (R33).
+    Selection { seq: u64 },
+}
+
+/// One photo in a fold.
+pub(crate) struct FoldLine {
+    /// The record its Recover takes: a run line's own, or the selection's. `None`: it went for good (R39).
+    pub(crate) seq: Option<u64>,
+    /// Which line it is in its fold: a run's press stamps, a selection's places.
+    pub(crate) key: u64,
+    pub(crate) name: String,
+    /// How a message names it, with the pair's label when both files went.
+    pub(crate) subject: String,
+    /// R35: the strip's thumbnail, cloned at the press, a blank tile if it hadn't loaded. Memory only, and
+    /// dropped with the line.
+    pub(crate) picture: slint::Image,
+    pub(crate) created: Instant,
+    /// R37: brought back with the panel open. Nothing counts it, and it shows, dimmed, until the panel closes,
+    /// so the next line can't slide under the pointer.
+    pub(crate) recovered: bool,
+}
+
+impl Fold {
+    /// What a clean result folds into, from its job's report, with the pictures its press held, by photo.
+    pub(crate) fn from_seed(seed: crate::file_queue::FoldSeed, seq: u64, pictures: &mut Vec<(String, slint::Image)>, now: Instant) -> Self {
+        let mut picture = |name: &str| pictures.iter().position(|(n, _)| n == name).map_or_else(slint::Image::default, |at| pictures.remove(at).1);
+        let line = |seq: Option<u64>, key: u64, name: String, subject: String, picture: slint::Image| FoldLine { seq, key, name, subject, picture, created: now, recovered: false };
+        let (kind, lines) = match seed {
+            crate::file_queue::FoldSeed::One { name, subject, to_bin } => {
+                let pic = picture(&name);
+                (FoldKind::Run { to_bin }, vec![line(to_bin.then_some(seq), seq, name, subject, pic)])
+            }
+            crate::file_queue::FoldSeed::Selection(photos) => (
+                FoldKind::Selection { seq },
+                photos.into_iter().enumerate().map(|(at, (name, subject))| {
+                    let pic = picture(&name);
+                    line(Some(seq), at as u64, name, subject, pic)
+                }).collect(),
+            ),
+        };
+        Self { kind, lines, id: seq, open: false, shown: FOLD_LINES_SHOWN, model: Default::default() }
+    }
+
+    /// R34: the arrow shows from two lines; a row of one is an ordinary row.
+    fn folds(&self) -> bool {
+        self.lines.len() >= 2
+    }
+
+    /// The fold has changed: at one line or none it isn't open any more ("cleared when 2 becomes 1"), and a
+    /// closed fold keeps no lines for the panel.
+    fn settle(&mut self) {
+        if !self.folds() {
+            self.close();
+        }
+    }
+
+    fn close(&mut self) {
+        self.open = false;
+        self.shown = FOLD_LINES_SHOWN;
+        self.model = Default::default();
+    }
+
+    /// R34: the open fold's lines as the panel shows them, newest first, by insert, remove and `set_row_data`.
+    /// The two lists agree in order, so dropping what's gone leaves what stays in place, and what's new goes in
+    /// where it belongs. A line is rewritten only when it has changed: its picture never does, and two empty
+    /// images are never equal, so it isn't compared.
+    fn sync_lines(&self, now: Instant, here: bool) {
+        use slint::Model;
+        let want: Vec<NotifLine> = self.lines.iter().take(self.shown).map(|l| {
+            let (title, tag) = support::label_parts(&l.subject, &l.name);
+            NotifLine {
+                key: l.key as i32,
+                seq: l.seq.map_or(-1, |s| s as i32),
+                name: l.name.as_str().into(),
+                title: title.into(),
+                tag: tag.into(),
+                when: rel_time(l.created, now).into(),
+                picture: l.picture.clone(),
+                recover: here && l.seq.is_some(), // R39: `line.recover = e.dir == live_dir`
+                recovered: l.recovered,
+            }
+        }).collect();
+        let keys: HashSet<i32> = want.iter().map(|l| l.key).collect();
+        let mut at = 0;
+        while at < self.model.row_count() {
+            if self.model.row_data(at).is_some_and(|have| keys.contains(&have.key)) {
+                at += 1;
+            } else {
+                self.model.remove(at);
+            }
+        }
+        let same = |a: &NotifLine, b: &NotifLine| {
+            (a.key, a.seq, &a.name, &a.title, &a.tag, &a.when, a.recover, a.recovered) == (b.key, b.seq, &b.name, &b.title, &b.tag, &b.when, b.recover, b.recovered)
+        };
+        for (at, line) in want.into_iter().enumerate() {
+            match self.model.row_data(at) {
+                Some(have) if have.key == line.key => {
+                    if !same(&have, &line) {
+                        self.model.set_row_data(at, line);
+                    }
+                }
+                _ => self.model.insert(at, line),
+            }
+        }
+    }
+}
+
+/// R32: a clean delete of one photo joins the run on top of the list: the same folder, the same kind, to the
+/// bin or for good, and nothing else has landed on top since. Anything else is a row of its own, which ends
+/// the run: stars and arrows raise no row, so they never do, and time doesn't. A row that folds hands its
+/// picture to its line, as the card has had it.
+pub(crate) fn join_or_push(log: &mut VecDeque<NotifEntry>, mut e: NotifEntry) {
+    if e.fold.is_some() {
+        e.picture = None;
+    }
+    let joins = match (&e.fold, log.front()) {
+        (Some(Fold { kind: kind @ FoldKind::Run { .. }, lines, .. }), Some(top)) => {
+            lines.len() == 1 && top.dir == e.dir && top.fold.as_ref().is_some_and(|f| f.kind == *kind)
+        }
+        _ => false,
+    };
+    let Some(line) = joins.then(|| e.fold.take().and_then(|mut f| f.lines.pop())).flatten() else {
+        log.push_front(e);
+        return;
+    };
+    let Some(top) = log.front_mut() else { return };
+    if let Some(fold) = &mut top.fold {
+        fold.lines.insert(0, line);
+        fold.lines.truncate(support::FILE_HISTORY_CAP); // R39: lines with no record have a cap of their own
+    }
+    top.refold();
+}
+
+/// Lines leave their folds, and a fold with none left goes. `ghost`: they stay, dimmed, until the panel
+/// closes (R37). A row that doesn't fold is left to `rest`.
+fn lines_leave(log: &mut VecDeque<NotifEntry>, gone: impl Fn(&FoldLine) -> bool, ghost: bool, rest: impl Fn(&mut NotifEntry)) {
+    for e in log.iter_mut() {
+        let Some(fold) = &mut e.fold else {
+            rest(e);
+            continue;
+        };
+        let before = fold.lines.len();
+        let changed = if ghost {
+            fold.lines.iter_mut().filter(|l| !l.recovered && gone(l)).map(|l| l.recovered = true).count() > 0
+        } else {
+            fold.lines.retain(|l| !gone(l));
+            fold.lines.len() != before
+        };
+        if changed {
+            fold.settle();
+            e.refold();
+        }
+    }
+    log.retain(|e| e.fold.as_ref().is_none_or(|f| !f.lines.is_empty()));
+}
+
+/// R33, R36, R37: a delete has been taken back, by a Recover, a line's own or Ctrl+Z. The bell list is what's
+/// still gone, so its line leaves its fold and the count drops, and a row with no line left goes. With the
+/// panel open the line stays, dimmed, reading "Recovered", until the panel closes ([`purge_recovered`]).
+/// `photo` is the one photo of a selection a line brought back. A row that doesn't fold stops offering it,
+/// as ever ([`retire_row_offer`]).
+pub(crate) fn taken_back(log: &mut VecDeque<NotifEntry>, seq: u64, photo: Option<&str>, panel_open: bool) {
+    lines_leave(log, |l| l.seq == Some(seq) && photo.is_none_or(|p| l.name == p), panel_open, |e| {
+        if e.seq == Some(seq) {
+            e.recover = false;
+            e.undoable = false;
+        }
+    });
+}
+
+/// R37: the panel has closed, so the lines brought back while it was open go now. `true`: something went.
+pub(crate) fn purge_recovered(log: &mut VecDeque<NotifEntry>) -> bool {
+    if !log.iter().any(|e| e.fold.as_ref().is_some_and(|f| f.lines.iter().any(|l| l.recovered))) {
+        return false;
+    }
+    lines_leave(log, |l| l.recovered, false, |_| {});
+    true
+}
+
+/// R34: "all collapse on a panel open".
+pub(crate) fn collapse_folds(log: &mut VecDeque<NotifEntry>) {
+    for fold in log.iter_mut().filter_map(|e| e.fold.as_mut()) {
+        if fold.open {
+            fold.close();
+        }
+    }
+}
+
+/// R34: a fold's arrow, by its id: open it with its newest lines, or close it. Several can be open. `false`:
+/// no such fold, or one with nothing to open.
+pub(crate) fn toggle_fold(log: &mut VecDeque<NotifEntry>, id: u64) -> bool {
+    let Some(fold) = log.iter_mut().filter_map(|e| e.fold.as_mut()).find(|f| f.id == id && f.folds()) else { return false };
+    if fold.open {
+        fold.close();
+    } else {
+        fold.open = true;
+    }
+    true
+}
+
+/// R34: "Show 50 more" under an open fold.
+pub(crate) fn show_more_lines(log: &mut VecDeque<NotifEntry>, id: u64) -> bool {
+    let Some(fold) = log.iter_mut().filter_map(|e| e.fold.as_mut()).find(|f| f.id == id && f.open) else { return false };
+    fold.shown += FOLD_LINES_SHOWN;
+    true
+}
+
+/// R33: what a fold line's Recover takes back. A run's line is its own delete, and so is a selection's line when
+/// its photo is all that's left of it. Otherwise that one photo is split off into a record of its own, under a
+/// new `stamp`, and the second value is the photo, so its line leaves the selection's fold. `None`: no such
+/// record, a photo it doesn't hold, or another folder, where a line offers nothing (R39).
+pub(crate) fn line_recover_target(history: &RefCell<support::FileHistory>, seq: u64, photo: &str, live_dir: &str, stamp: impl FnOnce() -> u64) -> Option<(u64, Option<String>)> {
+    let split = {
+        let hist = history.borrow();
+        let record = hist.delete_by_seq(seq).filter(|r| support::recover_offer_live(&r.dir, live_dir))?;
+        let left: Vec<&str> = record.outcome.get().map_or_else(Vec::new, |o| o.left.iter().map(|p| p.name.as_str()).collect());
+        match &left[..] {
+            _ if record.photos == 0 => false,
+            [only] if *only == photo => false,
+            many if many.contains(&photo) => true,
+            _ => return None,
+        }
+    };
+    if !split {
+        return Some((seq, None));
+    }
+    let stamp = stamp();
+    history.borrow_mut().split_photo(seq, photo, stamp).then(|| (stamp, Some(photo.to_string())))
+}
+
+/// R38: the line that wears Undo's rim, by its delete's stamp: in an open run, where its row names none of
+/// its deletes. −1: no open line shows it, and then the pinned row names it. A fold stays open behind a closed
+/// panel until the next open collapses it, so `panel_open` keeps the pinned row's words ready for that open.
+pub(crate) fn line_rim(log: &VecDeque<NotifEntry>, target: Option<u64>, panel_open: bool) -> i32 {
+    let Some(target) = target.filter(|_| panel_open) else { return -1 };
+    let shows = log.iter().filter_map(|e| e.fold.as_ref()).any(|f| {
+        matches!(f.kind, FoldKind::Run { .. }) && f.open && f.lines.iter().take(f.shown).any(|l| !l.recovered && l.seq == Some(target))
+    });
+    if shows { target as i32 } else { -1 }
 }
 
 /// v0.8.121 (Round-B fix F23a = audit A15): the delete result's events-centre ENTRY, as a pure fn.
@@ -10130,24 +10493,133 @@ impl NotifEntry {
 ///
 /// v0.8.186 (U3): `seq` is the delete record's own act stamp, and it rides the entry for exactly
 /// the same reason the Recover pill does — it is the row that DESCRIBES the reversible act, so it
-/// is the row the undo rim belongs on. `None` when nothing was recorded (`can_recover` false):
+/// is the row the undo rim belongs on. Not when nothing was recorded (`can_recover` false):
 /// there is no act to point at, and a rim on a row whose recovery is gone would be a lie.
+///
+/// R29, R30: `fail` is how many photos are still in the folder, so nothing failed is a clean delete,
+/// whatever route it went by. It remembers its press (`NotifEntry::clean_delete`), the stamp this takes.
 pub(crate) fn delete_result_entry(
     msg: impl Into<String>,
     fail: usize,
     dir: &str,
     can_recover: bool,
-    seq: Option<u64>,
+    seq: u64,
     created: Instant,
 ) -> NotifEntry {
-    let mut ev = NotifEntry::new(msg, if fail > 0 { 3 } else { 1 }, created).in_dir(dir);
+    let mut ev = NotifEntry::new(msg, if fail > 0 { 3 } else { 1 }, created).in_dir(dir).about_delete(seq);
     if can_recover {
-        ev = ev.with_recover();
-        if let Some(s) = seq {
-            ev = ev.with_seq(s);
-        }
+        ev = ev.with_recover().with_seq(seq);
     }
     ev
+}
+
+/// What the card is, for what's said over it. `toast-role` on the window. R29, R30: a clean delete's card
+/// isn't a superseded notification, and R36: any Del clears a "Recovered" card.
+pub(crate) const CARD_CLEAN_DELETE: i32 = 1;
+pub(crate) const CARD_RECOVERED: i32 = 2;
+
+/// R36: a clean Recover's say, when its landing is over. Nothing if the photo is there to be seen. If the
+/// person has moved on, a short card names it, as the strip alone doesn't. It's no row: the bell list is
+/// what's still gone. With the panel open a card couldn't be read, and a red or amber line holds its seconds.
+pub(crate) fn say_recovered(app: &MainWindow, words: &str, on_screen: bool, toast_counts_unread: &Cell<bool>, toast_left: &Cell<i32>) {
+    if on_screen || app.get_notif_open() || (app.get_toast_show() && app.get_toast_kind() >= 2) {
+        return;
+    }
+    crate::show_transient_toast(app, toast_counts_unread, toast_left, words, support::RECOVERED_CARD_MS);
+    app.set_toast_role(CARD_RECOVERED);
+}
+
+/// R17, R36: a clean Recover's landing is over, whether its photo landed or not (`named` is what the
+/// landing took, or what nothing landed on). The working message goes only now, as the person has been
+/// waiting for the photo and not for the file, and then the Recover says so if the photo isn't there to be
+/// seen. `at` is the list on screen, the photo on screen and Compare's two halves if it's open.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recover_over(
+    app: &MainWindow,
+    named: Option<crate::support::Named>,
+    at: (&[Shot], usize, Option<(usize, usize)>),
+    working_said: &RefCell<Option<(u64, String)>>,
+    log: &RefCell<VecDeque<NotifEntry>>,
+    model: &slint::VecModel<NotifRow>,
+    now: Instant,
+    live_dir: &str,
+    toast_left: &Cell<i32>,
+    toast_counts_unread: &Cell<bool>,
+) {
+    let Some(crate::support::Named { files, clean: Some(clean), .. }) = named else { return };
+    let said = working_said.borrow_mut().take();
+    if let Some((_, text)) = said {
+        retire_working_message(app, &text, log, model, now, live_dir, toast_left, toast_counts_unread);
+    }
+    let on_screen = support::recovered_on_screen(&files, at.0, at.1, at.2);
+    say_recovered(app, &clean.words, on_screen, toast_counts_unread, toast_left);
+}
+
+/// R6, R45: the photo on screen changed at a delete's or a Recover's landing, so it shows its preview at once
+/// and sharpens in place, even zoomed on Always sharp (`support::on_preview_landing`). The hold stays for
+/// arrows. `was_on` and `now_on` are the photo on screen either side of the landing.
+pub(crate) fn note_preview_landing(landing: &RefCell<Option<String>>, was_on: Option<String>, now_on: Option<String>) {
+    if now_on != was_on {
+        *landing.borrow_mut() = now_on;
+    }
+}
+
+/// R36: any Del clears a "Recovered" card, at the press: that photo may be the one going.
+pub(crate) fn clear_recovered_card(app: &MainWindow, toast_left: &Cell<i32>) {
+    if app.get_toast_show() && app.get_toast_role() == CARD_RECOVERED {
+        toast_left.set(0);
+        app.set_toast_show(false);
+    }
+}
+
+/// Delete round (R9): a delete's result, folded with what history knows by then. A Ctrl+Z can take the
+/// record before its result is folded, and then a lit Recover would do nothing. The clean "Sent" goes
+/// with it, so the person reads only that the photo came back. A failure still speaks, with no pill.
+/// `false` drops the entry.
+pub(crate) fn delete_result_still_true(entry: &mut NotifEntry, history: &crate::support::FileHistory) -> bool {
+    if !entry.recover || entry.seq.is_some_and(|s| history.has_delete(s)) {
+        return true;
+    }
+    entry.recover = false;
+    entry.kind >= 2
+}
+
+/// Delete round: this act has been taken back, or can't be any more, so its own row stops offering it.
+/// Every other row keeps its own. A line about it in a fold leaves at once (R32: a line's life is its
+/// record's), as the bin check's amber line now says it can't come back.
+pub(crate) fn retire_row_offer(log: &mut VecDeque<NotifEntry>, seq: u64) {
+    lines_leave(log, |l| l.seq == Some(seq), false, |e| {
+        if e.seq == Some(seq) {
+            e.recover = false;
+            e.undoable = false;
+        }
+    });
+}
+
+/// R17: a job's working message goes when the job has reported, or for a clean Recover when its photo has
+/// landed ([`recover_over`]). A result raises its own card or row the same tick, and a Recover that says
+/// nothing must not leave "Recovering…" standing. It may be a row (the panel was open, `say_edit_result`) or
+/// the card, and only the card still showing these words goes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn retire_working_message(
+    app: &MainWindow,
+    text: &str,
+    log: &RefCell<VecDeque<NotifEntry>>,
+    model: &slint::VecModel<NotifRow>,
+    now: Instant,
+    live_dir: &str,
+    toast_left: &Cell<i32>,
+    toast_counts_unread: &Cell<bool>,
+) {
+    let was = log.borrow().len();
+    log.borrow_mut().retain(|e| !(e.kind == 0 && e.seq.is_none() && e.text == text));
+    if log.borrow().len() != was {
+        rebuild_notif_model(model, &log.borrow(), now, live_dir);
+    }
+    if app.get_toast_show() && !toast_counts_unread.get() && app.get_toast_text() == text {
+        toast_left.set(0);
+        app.set_toast_show(false);
+    }
 }
 
 /// v0.8.120 (design-sweep O6): the ONE folder-identity rule both Resume surfaces resolve through —
@@ -10197,7 +10669,8 @@ pub(crate) fn op_result_notification(
     NotifEntry {
         text, kind: severity.notif_kind(), reveal_path: result_reveal_path(kind, &dir),
         undoable, jump_to: -1, jump_name: String::new(), open_settings: false, recover: false, dir,
-        seq: if undoable { move_seq } else { None }, created: now,
+        seq: if undoable { move_seq } else { None }, delete_press: None, picture: None, fold: None,
+        clean_move: severity == crate::support::OpSeverity::Clean, created: now, // R48
     }
 }
 
@@ -10745,22 +11218,41 @@ pub(crate) fn rebuild_notif_model(
 ) {
     let rows: Vec<NotifRow> = log
         .iter()
-        .map(|e| NotifRow {
-            text: e.text.as_str().into(),
-            kind: e.kind,
-            when: rel_time(e.created, now).into(),
-            reveal_path: e.reveal_path.as_str().into(),
-            undoable: e.undoable,
-            jump_to: resume_target(&e.dir, live_dir, e.jump_to), // D2 + O6: a persisted-row Resume, scoped to its own folder
-            jump_name: e.jump_name.as_str().into(),
-            recover: e.recover, // v0.8.120 (O5): ANDed with the live `can-recover` at the mount
-            // v0.8.121 (Round-B fix F19 = audit Y16): the colour-profile failure's "Open Settings"
-            // pill was the ONLY toast action with no persisted twin — Undo, Resume and Recover all
-            // had one. A background thumbnail warning or a finished copy inside the dwell window
-            // replaced the toast and the route to the fix went with it, leaving a logged row that
-            // states the problem and offers nothing. No live gate is needed: Settings is always
-            // openable, so unlike Recover/Resume this pill cannot go stale.
-            open_settings: e.open_settings,
+        .map(|e| {
+            // Delete round (R34): an open fold's lines, brought up to date in place. A closed fold, or a row that
+            // doesn't fold, has none (the same empty model each time, so the row isn't changed by it).
+            let fold = e.fold.as_ref();
+            let open = fold.is_some_and(|f| f.open && f.folds());
+            if let Some(f) = fold.filter(|_| open) {
+                f.sync_lines(now, e.dir == live_dir);
+            }
+            NotifRow {
+                text: e.text.as_str().into(),
+                kind: e.kind,
+                when: rel_time(e.created, now).into(),
+                reveal_path: e.reveal_path.as_str().into(),
+                // Delete round: both offers are the row's own, in its own folder. Another folder keeps
+                // the row and its record, and the offer comes back with the folder.
+                undoable: e.undoable && e.dir == live_dir,
+                seq: e.seq.map_or(-1, |s| s as i32),
+                jump_to: resume_target(&e.dir, live_dir, e.jump_to), // D2 + O6: a persisted-row Resume, scoped to its own folder
+                jump_name: e.jump_name.as_str().into(),
+                recover: e.recover && e.dir == live_dir, // v0.8.120 (O5): ANDed with the live `can-recover` at the mount
+                // v0.8.121 (Round-B fix F19 = audit Y16): the colour-profile failure's "Open Settings"
+                // pill was the ONLY toast action with no persisted twin — Undo, Resume and Recover all
+                // had one. A background thumbnail warning or a finished copy inside the dwell window
+                // replaced the toast and the route to the fix went with it, leaving a logged row that
+                // states the problem and offers nothing. No live gate is needed: Settings is always
+                // openable, so unlike Recover/Resume this pill cannot go stale.
+                open_settings: e.open_settings,
+                fold: fold.map_or(0, |f| f.lines.len() as i32),
+                fold_id: fold.map_or(-1, |f| f.id as i32),
+                open,
+                lines: fold.filter(|_| open).map_or_else(slint::ModelRc::default, |f| f.model.clone().into()),
+                more: fold.filter(|_| open).map_or(0, |f| f.lines.len().saturating_sub(f.shown).min(FOLD_LINES_SHOWN) as i32),
+                away: fold.is_some() && e.dir != live_dir, // R39
+                recovered: fold.is_some_and(|f| f.lines.iter().all(|l| l.recovered)), // R37
+            }
         })
         .collect();
     // FIX-A: set_vec is a full MODEL RESET (destroys + recreates every row subtree). step_notifs calls
@@ -10803,7 +11295,9 @@ pub(crate) fn rebuild_notif_model(
 /// to prevent. (The events-centre row and the Settings/welcome card survived; the toast did not.)
 ///
 /// The ladder, highest first:
-///   1. **undoable** — a time-limited Undo must stay reachable; burying it loses data, not attention.
+///   1. **undoable** — a time-limited Undo must stay reachable; burying it loses data, not attention. The
+///      caller passes a delete's Recover here only if that delete went wrong: a clean delete's stays on
+///      Ctrl+Z and its row, and a red in the same tick has the card (R31).
 ///   2. **error**, then **warn** — a problem outranks a routine info in the same tick.
 ///   3. everything else, where NEWEST-WINS is preserved exactly (ties break to the last push).
 /// Nothing is lost either way: every entry still lands in the events centre in push order, and the
@@ -10892,11 +11386,16 @@ pub(crate) fn step_notifs(
     // real elapsed milliseconds instead of one unit per tick. `None` on the first tick of the
     // process (nothing has elapsed yet), which is why the delta below defaults to 0.
     toast_prev: &Cell<Option<Instant>>,
-    // v0.8.186 (U3): the act stamp of the LIVE move record (`None` = no record), read from
-    // `last_move` AFTER the move-fold (step #11) has run this tick — the same ordering the
-    // `can_undo_move` this fn reads already relies on. It tags the move's own op-result row so the
-    // undo rim can find it; see `NotifEntry::seq`.
-    move_seq: Option<u64>,
+    // Delete round: the deletes and moves. A delete's result reads it (R9), and so does the toast's
+    // Undo, which goes when its own move has.
+    history: &RefCell<crate::support::FileHistory>,
+    // v0.8.186 (U3): asked when a Move rejected's result arrives: the stamp of the record that move
+    // armed (`None` = it armed none, such as a re-move with nothing to do). It tags the move's own
+    // op-result row, so the row's Undo takes that move and the undo rim can find it; see
+    // `NotifEntry::seq`. A question rather than a value, because the worker posts its pairs just before
+    // its result, so a result seen here always finds its pairs, even when they came too late for this
+    // tick's fold (step #11).
+    move_armed: &dyn Fn() -> Option<u64>,
 ) {
     // v0.8.120 (O7): the busy flag, re-derived. Cheap (an atomic load + a Slint property compare)
     // and total — it runs before anything below can write it.
@@ -10927,51 +11426,42 @@ pub(crate) fn step_notifs(
     // the slot, because "error red, else success" had no third answer and the conversion-refusal
     // notice — nothing lost, nothing converted — rendered green. The "Show" folder is
     // captured with a web worker's result; legacy immediate results use the current folder. An event opens
-    // the folder it happened in — never whatever folder is open later. `undoable` reads the
-    // can_undo_move the move-fold (step #11) already set THIS tick.
+    // the folder it happened in — never whatever folder is open later.
     if let Some(result) = sel_status_slot.try_lock().ok().and_then(|mut g| g.take()) {
         // v0.8.120 (O7): the `app.set_sel_busy(false)` that used to sit here is GONE — the flag is
         // re-derived from the atomic at the top of this fn, so a drained entry can no longer assert
         // "the op finished" on the UI's behalf. (OpGuard writes the slot and THEN clears the atomic,
         // so at worst the dimmed state survives one extra tick, which is the honest direction.)
-        let event = op_result_notification(result, &cur_dir.borrow(), app.get_can_undo_move(), move_seq, now);
-        // v0.7.3 GF6: only the NEWEST move may offer Undo — undo_move() restores `last_move`
-        // (always the LATEST move's pairs), so an Undo button on any OLDER row would move the
-        // WRONG files. Demote every existing row first; the push below sets `newest`, so
-        // rebuild_notif_model re-renders the demoted rows this same tick.
-        let undoable_now = event.undoable;
-        if undoable_now {
-            for e in log.borrow_mut().iter_mut() {
-                e.undoable = false;
-            }
-        }
+        let move_seq = if result.2 == 1 { move_armed() } else { None };
+        let event = op_result_notification(result, &cur_dir.borrow(), move_seq.is_some(), move_seq, now);
         pending.borrow_mut().push(event);
     }
     // Fold pending → log (newest first, bounded), and choose which entry the toast raises.
     // v0.8.104 (Round-A C7): the choice is `toast_pick`, not "the last one drained" — see its doc.
-    let mut newest: Option<(String, i32, String, bool, (i32, String), bool, bool, String)> = None;
-    let added = {
+    let mut newest: Option<(String, i32, String, bool, (i32, String), bool, bool, String, Option<u64>, (bool, bool, Option<slint::Image>, bool))> = None;
+    let (added, counted, lit) = {
         let mut p = pending.borrow_mut();
+        p.retain_mut(|e| delete_result_still_true(e, &history.borrow())); // R9
         let n = p.len();
+        // R30: clean deletes never feed the bell, or the "+N". Everything else is as it was.
+        let counted = p.iter().filter(|e| e.clean_delete().is_none()).count();
+        // R48: nor does a clean Move rejected or Undo move. It still counts for the "+N", as a card it replaces.
+        let lit = p.iter().filter(|e| e.clean_delete().is_none() && !e.clean_move).count();
         if n > 0 {
             let mut lg = log.borrow_mut();
+            // R29: a clean delete joins the list quietly when a newer press has overtaken it, or when a red
+            // or amber line is on the card, which holds its full 8 or 10 s.
+            let (newest_press, problem_up) = (history.borrow().newest_press, app.get_toast_show() && app.get_toast_kind() >= 2);
+            let may_raise: Vec<usize> = (0..n).filter(|&i| !p[i].clean_delete().is_some_and(|press| problem_up || press < newest_press)).collect();
             // v0.8.120 (design-sweep O5): a delete's Recover is a time-limited reversal exactly like
             // a move's Undo, so it rides the SAME top band of the ladder — burying it under a
             // same-tick info would lose the user a recovery, not an announcement.
+            // R31: a clean delete's doesn't. It's on Ctrl+Z and on its row, and a red in the same tick
+            // takes the card. So only a Recover that goes with a problem rides that band.
             let pick = toast_pick(
-                &p.iter().map(|e| (e.kind, e.undoable || e.recover)).collect::<Vec<_>>(),
-            );
+                &may_raise.iter().map(|&i| &p[i]).map(|e| (e.kind, e.undoable || (e.recover && e.clean_delete().is_none()))).collect::<Vec<_>>(),
+            ).map(|at| may_raise[at]);
             for (i, e) in p.drain(..).enumerate() {
-                // v0.8.121 (Round-B fix F1 = audit A1/A5/A9): the GF6 newest-only rule for Recover,
-                // at the fold as well as at the push site — `delete_record` is a single slot and
-                // `recover-delete()` carries no row index, so two live pills mean the older row
-                // restores the newer delete's files. Here it also covers the case the push-site
-                // demote cannot see: two recover-bearing entries drained in the SAME tick.
-                if e.recover {
-                    for old in lg.iter_mut() {
-                        old.recover = false;
-                    }
-                }
                 if Some(i) == pick {
                     newest = Some((
                         e.text.clone(),
@@ -10982,20 +11472,26 @@ pub(crate) fn step_notifs(
                         e.open_settings,
                         e.recover,
                         e.dir.clone(),
+                        e.seq,
+                        (e.clean_delete().is_some(), e.delete_press.is_some(), e.picture.clone(), e.clean_move),
                     ));
                 }
-                lg.push_front(e);
+                join_or_push(&mut lg, e); // R32
             }
             while lg.len() > 50 {
                 lg.pop_back();
             }
         }
-        n
+        (n, counted, lit)
     };
-    if let Some((text, kind, reveal_path, undoable, (jump_to, jump_name), open_settings, recover, entry_dir)) =
+    // R37: the lines brought back while the panel was open go once it has closed, however it closed.
+    let purged = !app.get_notif_open() && purge_recovered(&mut log.borrow_mut());
+    if added > 0 || purged {
+        rebuild_notif_model(model, &log.borrow(), now, &live_dir.borrow());
+    }
+    if let Some((text, kind, reveal_path, undoable, (jump_to, jump_name), open_settings, recover, entry_dir, seq, (clean, about_delete, picture, clean_move))) =
         newest
     {
-        rebuild_notif_model(model, &log.borrow(), now, &live_dir.borrow());
         // v0.8.120 (O6): the toast's Resume is resolved through the SAME helper the row uses, and
         // the folder it belongs to is remembered for the countdown's re-check below.
         let jump_to = resume_target(&entry_dir, &live_dir.borrow(), jump_to);
@@ -11005,9 +11501,14 @@ pub(crate) fn step_notifs(
             // D1: a new toast REPLACES the visible one at once; tally how many were superseded before
             // their timeout for the "+N" chip. `was_live` (a toast currently up) MUST be read here,
             // before set_toast_show(true) below flips it. Reset to 0 on chain-end (see the countdown).
-            let more = toast_supersede_count(app.get_toast_more(), app.get_toast_show(), added);
+            // R29, R30: a delete's card has no "+N", and a clean delete's isn't a notification superseded.
+            let more = if about_delete {
+                0
+            } else {
+                toast_supersede_count(app.get_toast_more(), app.get_toast_show() && app.get_toast_role() != CARD_CLEAN_DELETE, counted)
+            };
             app.set_toast_more(more);
-            unread.set((unread.get() + added as i32).min(999));
+            unread.set((unread.get() + lit as i32).min(999));
             app.set_notif_unread(unread.get());
             // v1.0.0-rc (queue item 30, §1.C): THE TEARDOWN RUNS BEFORE THE TEXT WRITE. This is
             // the second of the two DISPLACEMENT raisers — a scan landing is exactly the event
@@ -11022,6 +11523,7 @@ pub(crate) fn step_notifs(
             app.set_toast_kind(kind);
             app.set_toast_reveal_path(reveal_path.as_str().into());
             app.set_toast_undoable(undoable);
+            app.set_toast_seq(seq.map_or(-1, |s| s as i32)); // Delete round: what its Undo or Recover takes back
             app.set_toast_jump(jump_to); // D2: -1 = no Resume button
             app.set_toast_jump_name(jump_name.as_str().into());
             // v0.8.120 (design-sweep O5): the delete result is a NotifEntry now, so its Recover
@@ -11039,6 +11541,11 @@ pub(crate) fn step_notifs(
             // v0.8.104 (Round-A C12): the "Open Settings" pill. Set from the entry (never sticky —
             // same reset discipline as `toast_recover`, so it cannot leak onto the next toast).
             app.set_toast_settings(open_settings);
+            // R29: a clean delete's card, and the picture if it names one photo. A blank tile if its
+            // thumbnail hadn't loaded (R35). Set from the entry, as the pills are.
+            app.set_toast_role(if clean { CARD_CLEAN_DELETE } else { 0 });
+            app.set_toast_picture_on(picture.is_some());
+            app.set_toast_picture(picture.unwrap_or_default());
             app.set_toast_show(true);
             // Undoable moves linger (the button must stay reachable while the op is reversible,
             // capped at 30 s); warnings/errors longer than info. v0.8.45 (Fix 5): the RESUME ask no
@@ -11056,7 +11563,10 @@ pub(crate) fn step_notifs(
             // to change with the ruling's other half: this wave takes the toast off the ACTIVE tick
             // set, and a frame counter would have made every one of these 8x longer at the 125 ms
             // idle cadence — the linger would have become a function of how busy the app is.
-            toast_left.set(if undoable || recover {
+            // R29: a clean delete's card is the exception to the Recover rung: about 3 s.
+            toast_left.set(if clean {
+                support::CLEAN_DELETE_CARD_MS
+            } else if undoable || recover {
                 support::TOAST_MS_MAX
             } else if jump_to >= 0 {
                 6_000
@@ -11066,7 +11576,8 @@ pub(crate) fn step_notifs(
                 5_000
             });
             // v0.8.120 (Y43): this toast IS a logged event — dismissing it may decrement the badge.
-            toast_counts_unread.set(true);
+            // R30: a clean delete fed no badge, so its × has nothing to take off. R48: nor did a clean move.
+            toast_counts_unread.set(!clean && !clean_move);
         }
     } else if app.get_notif_open() {
         // Panel open with no new event: refresh ~1×/s so relative times ("2m ago") don't freeze.
@@ -11119,7 +11630,10 @@ pub(crate) fn step_notifs(
     if app.get_toast_show() {
         let n = toast_spend(toast_left.get(), elapsed_ms, app.get_toast_blocked());
         toast_left.set(n);
-        if n <= 0 || (app.get_toast_undoable() && !app.get_can_undo_move()) {
+        // R36: a card whose act has been taken back clears at once, by every route.
+        let act_taken = (app.get_toast_undoable() && !history.borrow().move_live(app.get_toast_seq() as u64, &live_dir.borrow()))
+            || (app.get_toast_recover() && !history.borrow().has_delete(app.get_toast_seq() as u64));
+        if n <= 0 || act_taken {
             app.set_toast_show(false);
             app.set_toast_more(0); // D1: the toast chain ended → clear the "+N" superseded counter
             toast_counts_unread.set(false); // v0.8.120 (Y43): a TIMED-OUT toast stays unread, so nothing to decrement
@@ -11814,11 +12328,9 @@ pub(crate) fn unapplied_rotation_in(order: &[usize], delta_of: impl Fn(usize) ->
     order.iter().filter(|&&i| delta_of(i) != 0).count()
 }
 
-/// The cloud twin, over the same index slice (the MOVE path keeps the mark-based form below — its
-/// target really is MARK_REJECT, folder-wide).
-pub(crate) fn cloud_placeholders_in(order: &[usize], is_cloud: impl Fn(usize) -> bool) -> usize {
-    order.iter().filter(|&&i| is_cloud(i)).count()
-}
+// (Fix round 2, `CS-27`: the photo-counting cloud twin that stood here is gone. The copy's download
+// count is `support::copy_cloud_files`, over the same index slice, counting FILES. The MOVE path keeps
+// the mark-based form below — its target really is MARK_REJECT, folder-wide.)
 
 /// Compose the Copy-selected confirm-dialog notice for `n` picks carrying an unapplied rotation. Empty
 /// when `n == 0` (the dialog hides the line). Singular/plural — RIDER wording.
@@ -12305,7 +12817,7 @@ pub(crate) fn step_settle_exif(
     dims_req_tx: &Sender<(usize, u64)>,
     wb_cache: &RefCell<HashMap<usize, Option<u32>>>,
     wb_requested: &RefCell<HashSet<usize>>,
-    wb_req_tx: &Sender<(usize, u64, PathBuf)>,
+    wb_req_tx: &Sender<(usize, u64, PathBuf, bool)>, // fix round 2 (CS-13): + "the view reads the RAW"
     exif_model: &slint::VecModel<ExifRow>,
     output_gamut: &AtomicU32,
     shot_gamut: &RefCell<HashMap<usize, Gamut>>,
@@ -12460,11 +12972,15 @@ pub(crate) fn step_settle_exif(
         }
         let wb_k = wb_cache.borrow().get(&c).copied().flatten();
         // White-balance Kelvin (off-thread from the RAW). Request once per shot while MOUNTED.
+        // Fix round 2 (`CS-13`): the request says whether the view reads the RAW (RAW mode, or no
+        // finished picture), so the worker never opens an online-only RAW that only Preview shows
+        // the JPEG of (`support::wb_read_refused`).
         if wb_k.is_none() {
             if let Some(shot) = shots.get(c) {
                 if shot.has_raw && wb_requested.borrow_mut().insert(c) {
                     if let Some(p) = shot.raw.clone() {
-                        let _ = wb_req_tx.send((c, gen_now, p));
+                        let raw_viewed = app.get_raw_mode() || !shot.has_jpg;
+                        let _ = wb_req_tx.send((c, gen_now, p, raw_viewed));
                     }
                 }
             }
@@ -13142,16 +13658,78 @@ pub(crate) fn sel_recenter_vp_y(row: usize, view_h: f32, row_count: usize) -> f3
     if row_count == 0 {
         return 0.0;
     }
+    let target = (SEL_GRID_PAD_TOP + row as f32 * SEL_ROW_PITCH - (view_h - SEL_TILE_H) / 2.0)
+        .clamp(0.0, sel_max_scroll(view_h, row_count));
+    -target
+}
+
+/// How far the Review panel can scroll with `row_count > 0` rows.
+fn sel_max_scroll(view_h: f32, row_count: usize) -> f32 {
     // Spelled out from the four `gridcol` values rather than as `rows × pitch`, so the identity the
     // pin test asserts is a CHECK on this function rather than an assumption inside it.
     let virtual_h = SEL_GRID_PAD_TOP
         + row_count as f32 * SEL_TILE_H
         + (row_count - 1) as f32 * SEL_ROW_GAP
         + SEL_GRID_PAD_BOT;
-    let max_scroll = (virtual_h - view_h).max(0.0);
-    let target = (SEL_GRID_PAD_TOP + row as f32 * SEL_ROW_PITCH - (view_h - SEL_TILE_H) / 2.0)
-        .clamp(0.0, max_scroll);
-    -target
+    (virtual_h - view_h).max(0.0)
+}
+
+/// R3: the Review panel holds its tile through a landing that keeps the photo on screen and the order.
+/// Runs just before `step_selection`, while the rows still address the list the scroll belongs to, and
+/// answers the panel's row at the top of the view and the first row's tile from there that stayed. Marking
+/// this generation settled takes the place of `step_selection`'s recentre. `None` leaves that recentre:
+/// a new photo, a panel opening this tick, a landing before this one, or a drag holding the refill.
+pub(crate) fn sel_hold_start(
+    app: &MainWindow,
+    kept: &photo_open::KeptScroll,
+    gen_now: u64,
+    last_sel_view: &Cell<(bool, u64)>,
+    sel_model: &slint::VecModel<SelTileRow>,
+) -> Option<(usize, Option<usize>)> {
+    let (was_open, was_gen) = last_sel_view.get();
+    if !kept.same_photo
+        || !was_open
+        || was_gen != kept.gen_before
+        || !app.get_sel_open()
+        || app.get_immersive()
+        || app.get_sel_dragging()
+    {
+        return None;
+    }
+    last_sel_view.set((true, gen_now));
+    let scroll = (-app.get_sel_vp_y()).max(0.0);
+    let top = ((scroll - SEL_GRID_PAD_TOP) / SEL_ROW_PITCH).floor().max(0.0) as usize;
+    let tile = (top..sel_model.row_count()).find_map(|r| kept.stayed(sel_model.row_data(r)?.a.idx as usize));
+    Some((top, tile))
+}
+
+/// R3: after `step_selection` has rebuilt the rows, the scroll moves by as many rows as the tile did
+/// (clamped), and writes nothing if it didn't. Written the way the panel's recenter writes it: the
+/// value, the nonce and the memo (see the recenter's notes in `step_selection`).
+pub(crate) fn sel_hold_finish(
+    app: &MainWindow,
+    (top, tile): (usize, Option<usize>),
+    sel_model: &slint::VecModel<SelTileRow>,
+    sel_vp_prog: &Cell<Option<support::PanelMemo>>,
+) {
+    let rows = sel_model.row_count();
+    let row = tile
+        .and_then(|t| {
+            (0..rows).find(|&r| {
+                sel_model.row_data(r).is_some_and(|rw| {
+                    rw.a.idx as usize == t || (rw.has_b && rw.b.idx as usize == t)
+                })
+            })
+        })
+        .unwrap_or(top);
+    let max_scroll = if rows == 0 { 0.0 } else { sel_max_scroll(app.get_sel_vp_h(), rows) };
+    let scroll = (-app.get_sel_vp_y()).max(0.0);
+    let target = (scroll + (row as f32 - top as f32) * SEL_ROW_PITCH).clamp(0.0, max_scroll);
+    if (target - scroll).abs() > 0.01 {
+        app.set_sel_scroll_y(-target);
+        app.set_sel_scroll_seq(app.get_sel_scroll_seq().wrapping_add(1));
+        sel_vp_prog.set(Some(support::PanelMemo::new(-target)));
+    }
 }
 
 /// v1.0.0-rc (queue item 31) — **THE HOVER PREVIEW'S OWN STATE**, in one struct rather than seven
@@ -13792,6 +14370,10 @@ pub(crate) fn step_selection(
     rot: &RotState, // v0.8.0: the delta each thumb request carries
     cloud_tagged: &RefCell<HashSet<usize>>, // v0.8.24 (D4): live cloud-placeholder set → the download advisory
     sel_cache: &RefCell<SelCache>, // 2026-10-29 (owner, testing rc.2): the rows' and the jump list's memory
+    // Fix round 2 (`CS-27`): the copy confirm's download count reads the folder and ./Picks ONCE, as
+    // listings (`support::CopyCountListing::read` in production), only while that confirm is open
+    // and only when a cloud-tagged photo is among the targets. Tests hand in a made-up listing.
+    copy_listing: &dyn Fn(&std::path::Path, &HashSet<std::ffi::OsString>) -> support::CopyCountListing,
 ) {
     // v0.8.32 (§64): rebind the Film field this fn's rebuild reads to the local its body already
     // references (pure state-move extraction). v0.8.42: the `pending`/`failed` aliases left with the
@@ -13984,7 +14566,10 @@ pub(crate) fn step_selection(
             gen_now,
             select_gen.get(),
             filt_o + (ratingf_o + 2) * 16,
-            content_o,
+            // Fix round 2 (`CS-27`): + whether the copy confirm is open, packed beside the content
+            // choice (0..=2): the download count is taken fresh at the open (and on every change of
+            // the set while it is open), never while it is closed.
+            content_o + 4 * (app.get_confirm_kind() == 1) as i32,
             // v0.8.132 (OQ1): + `inc_o`, packed into the same slot (the established idiom in this
             // key). A flip of the toggle re-composes the WHOLE column — the counts, the confirm's
             // two strings, the sheet's three and the two copy advisories — off the EFFECTIVE set,
@@ -14083,9 +14668,23 @@ pub(crate) fn step_selection(
                 app.set_copy_rot_notice(
                     unapplied_rotation_notice(unapplied_rotation_in(&order, |i| rot.delta_of(i))).into(),
                 );
-                app.set_copy_cloud_notice(
-                    cloud_download_notice(cloud_placeholders_in(&order, |i| ct.contains(&i))).into(),
-                );
+                // Fix round 2 (`CS-27`): FILES, not photos — the ones this copy will read under the
+                // "what to copy" choice that are online-only now and not already in ./Picks. Read
+                // fresh while the confirm is open (the line is drawn only there), from ONE listing of
+                // the folder and one of ./Picks, and only when a cloud-tagged photo is among the
+                // targets: a local folder lists nothing.
+                let n_cloud = if app.get_confirm_kind() == 1 {
+                    support::copy_download_count(
+                        &order,
+                        shots,
+                        support::CopyContent::from_i32(content_o),
+                        |i| ct.contains(&i),
+                        copy_listing,
+                    )
+                } else {
+                    0
+                };
+                app.set_copy_cloud_notice(cloud_download_notice(n_cloud).into());
             } else {
                 app.set_copy_rot_notice("".into());
                 app.set_copy_cloud_notice("".into());
@@ -14355,6 +14954,8 @@ pub(crate) fn step_selection(
     // the dock's `else if last_grid_c != c` arm chases the current shot while the dock is already
     // open, and this panel has no such behaviour today and is not being given one (a Review panel
     // that scrolled itself while you were reading it is the THINKING-FLOW lens's own complaint).
+    // Delete round, R3: nor does a landing that keeps the photo on screen and the order recentre it:
+    // `sel_hold_start` has marked that generation settled, and the panel holds its tile.
     //
     // IMMERSIVE COUNTS AS CLOSED, deliberately, and here that is the opposite of the dock's rule for
     // a reason that is in the code rather than in the ruling: the dock preserves its scroll across
@@ -14603,6 +15204,53 @@ pub(crate) fn grid_window(scroll: f32, view_h: f32, vrows: i64, margin: i64) -> 
     (base, live)
 }
 
+/// R3: the grid keeps its scroll through a landing that keeps the order, by the same tile (clamped).
+/// Runs just before `step_folder_grid`. Marking this generation settled takes the place of that step's
+/// recentre. The tile is the photo on screen's if its row is in view, because that tile keeps its row
+/// and may step sideways (columns come from `index mod cols`), and otherwise the first tile in view.
+/// A new photo then goes through the step's existing follow, which recentres only if it's off screen:
+/// `last_grid_c` is cleared for it, since the next photo often takes the deleted one's number.
+/// Nothing to do on an opening edge, or after a landing earlier in this tick: those recentre.
+pub(crate) fn hold_grid_on_landing(
+    app: &MainWindow,
+    kept: &photo_open::KeptScroll,
+    gen_now: u64,
+    len: usize,
+    last_grid_view: &Cell<(bool, u64)>,
+    last_grid_c: &Cell<usize>,
+    grid_vp_prog: &Cell<Option<support::PanelMemo>>,
+) {
+    let (was_open, was_gen) = last_grid_view.get();
+    let view_h = app.get_grid_vp_h();
+    if !was_open || was_gen != kept.gen_before || !app.get_grid_open() || len == 0 || view_h <= 0.0 {
+        return;
+    }
+    last_grid_view.set((true, gen_now));
+    last_grid_c.set(if kept.same_photo && last_grid_c.get() == kept.anchor { kept.landing } else { usize::MAX });
+    let cols = sync_grid_width(app);
+    let edges = photo_open::pending_edges(app);
+    let before = if kept.leading_before { cols } else { 0 };
+    let after = if edges.0 { cols } else { 0 };
+    let scroll = (-app.get_grid_vp_y()).max(0.0);
+    let row_at = |y: f32| ((y - GRID_PAD) / GRID_ROW_PITCH).floor().max(0.0) as usize;
+    let in_view = row_at(scroll)..=row_at(scroll + view_h);
+    let held = if in_view.contains(&((kept.anchor + before) / cols)) {
+        kept.anchor
+    } else {
+        (*in_view.start() * cols).saturating_sub(before)
+    };
+    let row_was = (held + before) / cols;
+    let row_now = (kept.nearest_stayed(held) + after) / cols;
+    let vrows = len.div_ceil(cols) + usize::from(edges.0) + usize::from(edges.1);
+    let max_scroll = (GRID_PAD + vrows as f32 * GRID_ROW_PITCH - view_h).max(0.0);
+    let target = (scroll + (row_now as f32 - row_was as f32) * GRID_ROW_PITCH).clamp(0.0, max_scroll);
+    if (target - scroll).abs() > 0.01 {
+        app.set_grid_vp_y(-target);
+        // OURS, not the user's: see `step_folder_grid`'s `grid_vp_prog`.
+        grid_vp_prog.set(Some(support::PanelMemo::new(-target)));
+    }
+}
+
 /// Whether `step_folder_grid` reaches its key-gated refill: its three early returns, in order —
 /// immersive mode (the dock is unmounted but keeps its open setting), closed or empty, and the
 /// mount tick before the dock's layout solves. A grid that does not refill keeps whatever images
@@ -14700,6 +15348,8 @@ pub(crate) fn step_folder_grid(
     // v0.8.62 (owner ruling): this open-edge recenter IS the ruled re-open behaviour — pinned by
     // the rig (grid_dock_reopen_recenters_on_current_shot); manual scrolls keep never recentring
     // (the else-if below fires only on a CURRENT-SHOT change whose row is offscreen).
+    // Delete round, R3: a landing that keeps the order has already marked this generation settled
+    // (`hold_grid_on_landing`), so only an open edge, a re-sort or a folder change reach this.
     let (was_open, was_gen) = last_grid_view.get();
     if !was_open || was_gen != gen_now {
         last_grid_view.set((true, gen_now));
@@ -14733,6 +15383,9 @@ pub(crate) fn step_folder_grid(
     let (base, live) = grid_window(scroll, view_h, vrows, GRID_MARGIN_ROWS);
     let count = live as usize * cols;
     app.set_grid_win_y(GRID_PAD + base as f32 * GRID_ROW_PITCH);
+    // Delete round (R42): a landing's slide, placed from the scroll this step has just settled on (R3's
+    // hold has run before it), once per landing.
+    film.slide.borrow_mut().place_grid(scroll, cols, leading, base as usize * cols..base as usize * cols + count, len, view_h);
     // The eviction anchor for the rows the user is looking at (see `Film::grid_anchor`).
     let mid_row = (((scroll + view_h / 2.0 - GRID_PAD) / GRID_ROW_PITCH).floor() as i64).clamp(0, vrows - 1) as usize;
     film.grid_anchor.set(Some((mid_row * cols + cols / 2).saturating_sub(leading).min(len - 1)));
@@ -14796,6 +15449,7 @@ pub(crate) fn step_folder_grid(
             support::ReadTier::Thumb,
             (0..count).filter_map(|slot| (base as usize * cols + slot).checked_sub(leading)).filter(|i| *i < len),
         );
+        let slide = film.slide.borrow();
         let items: Vec<FilmItem> = (0..count)
             .map(|slot| {
                 let row_index = base as usize * cols + slot;
@@ -14807,9 +15461,12 @@ pub(crate) fn step_folder_grid(
                 let shot = &shots[idx];
                 let (thumb, valid) = lookup_thumb(&tc, &cache, idx, &mut need_thumb, cm_now);
                 let mk = mv.get(idx).copied().unwrap_or(0);
-                make_film_item(shot, idx, c, thumb, valid, rv.get(idx).copied().unwrap_or(0), mk, rot.delta_of(idx), plan, failed_now.contains(&idx), sel.contains(idx), cloud_now.contains(&idx))
+                let mut item = make_film_item(shot, idx, c, thumb, valid, rv.get(idx).copied().unwrap_or(0), mk, rot.delta_of(idx), plan, failed_now.contains(&idx), sel.contains(idx), cloud_now.contains(&idx));
+                (item.slide_x, item.slide_y, item.arriving) = slide.grid_tile(idx); // R42: by photo, at every rebuild
+                item
             })
             .collect();
+        drop(slide);
         drop(cache);
         drop(tc);
         drop(sel);
@@ -14848,6 +15505,52 @@ pub(crate) fn step_folder_grid(
     }
 }
 
+/// Delete round (R41 to R43): the movement's clock, once a tick, after the strip and the grid have placed a
+/// landing's slide (`tile_slide.rs`). `gestures`: a held arrow, a scrub, a strip drag or banked wheel notches,
+/// which keep the snap at a landing and end a slide at once; so do a drag from the grid and "Interface
+/// motion" off, read here. `watch`: what the person could have moved since it began. Writes both clocks when
+/// they change, so the last write is exactly 0 (L48). Whether a slide is running, for the posture.
+pub(crate) fn step_tile_slide(app: &MainWindow, film: &Film, now: Instant, gestures: bool, watch: crate::tile_slide::Watch) -> bool {
+    let hold = gestures || app.get_sel_dragging() || !app.get_motion_ui();
+    let mut slide = film.slide.borrow_mut();
+    if let Some(k) = slide.step(now, hold, watch) {
+        // One clock today, so the fade ends with the slide. Two properties, so one can be tuned alone.
+        app.set_tile_slide_k(k);
+        app.set_tile_fade_k(k);
+    }
+    slide.live()
+}
+
+/// Delete round (R46): the blue edge, once a tick, after the strip's and the grid's steps have settled their
+/// place and scroll for this frame (`blue_edge.rs`). Nothing to do, and nothing read, unless a photo the person
+/// brought back is waiting or an edge is lit. The strip counts when it's on screen (as `tile_slide::seen`
+/// reads it), the grid when its step refills (`grid_refills`). The events panel and a sheet cover both, with a
+/// click-away over the strip, so the edge waits for them. The sides go to the window only when one changes;
+/// when the last goes, so does the pointer's hold, as an unmounted edge can't say it's been left.
+pub(crate) fn step_blue_edge(app: &MainWindow, film: &Film, now: Instant, stage: crate::blue_edge::Stage, film_pos: f32, len: usize) {
+    let mut edge = film.edge.borrow_mut();
+    if !edge.live() {
+        return;
+    }
+    let strip = (!app.get_immersive() && !app.get_empty_state() && app.get_film_visible())
+        .then(|| crate::blue_edge::StripView { pos: film_pos, half: app.get_strip_w() / (2.0 * crate::tile_slide::STRIP_PITCH) });
+    let grid = grid_refills(app, len).then(|| {
+        let cols = app.get_grid_cols().max(1) as usize;
+        let leading = if photo_open::pending_edges(app).0 { cols } else { 0 };
+        crate::blue_edge::GridView { scroll: (-app.get_grid_vp_y()).max(0.0), view_h: app.get_grid_vp_h(), cols, leading }
+    });
+    let covered = app.get_notif_open() || app.get_modal_open();
+    if let Some([left, right, top, bottom]) = edge.step(now, stage, strip, grid, app.get_blue_edge_hot(), covered) {
+        app.set_blue_edge_left(left);
+        app.set_blue_edge_right(right);
+        app.set_blue_edge_top(top);
+        app.set_blue_edge_bottom(bottom);
+        if [left, right, top, bottom] == crate::blue_edge::OFF {
+            app.set_blue_edge_hot(false);
+        }
+    }
+}
+
 /// ROI crop floor: even a tiny selection resolves to at least this long side, so the hi-res tile is
 /// always usable. Was a bare `256` literal duplicated in both ROI steppers (v0.8.22 named it).
 const ROI_MIN_LONG: u32 = 256;
@@ -14856,6 +15559,147 @@ const ROI_MIN_LONG: u32 = 256;
 /// the tier's `roi_max`, floored at [`ROI_MIN_LONG`]. Shared verbatim by step_roi_single + step_roi_compare.
 fn roi_out_long(region_long: f32, ss: f32, roi_max: u32) -> u32 {
     ((region_long * ss) as u32).min(roi_max).max(ROI_MIN_LONG)
+}
+
+/// Fix round 2 (11 November 2026, `CS-77`) — **ON A SLOW DECODER, A ZOOM-PIECE DECODE STARTS ONLY FOR A
+/// PHOTO YOU HAVE STOPPED ON.** A zoom piece needs the whole source decoded (0.5-1.5 s on a laptop CPU,
+/// seconds in RAW mode; tens of ms with nvJPEG), one at a time, with no way to stop one. The view's own
+/// settle (`roi_settle`, 70 ms after a zoom or pan) never moved when the PHOTO changed, so a wheel step
+/// or an arrow tap while zoomed met a view "settled" long ago and started that whole decode for the
+/// photo being passed, and the photo stopped on waited behind it. Now, on a slow decoder, the decode
+/// also waits for stillness since the last move to another photo (`last_motion`, stamped by
+/// `step_bookkeeping` on every change of photo and by the held key and both wheels; panning and
+/// zooming never stamp it, so re-cropping a photo already stopped on keeps its 70 ms). Single view and
+/// Compare (`step_roi_compare`) ask the same question, each with its own last decode time.
+///
+/// HOW LONG ([`zoom_stillness`], the main session's rule of 11 November, final): `clamp((D - 300 ms) / 2,
+/// 0, 150 ms)` for the view's most recent completed zoom decode D, and no wait before one has completed
+/// this session. A wait W costs every single step after a pause W (the decode would have started at
+/// once), and it only pays when it outlasts the gap between steps (wheel notches and arrow taps are
+/// roughly 80-300 ms apart) AND the decode it then skips is slow: a shorter wait just starts each
+/// passed photo's decode later. So up to a 300 ms decode there is no wait at all (exactly the
+/// behaviour before this round), from 600 ms the full 150 ms (the full-detail decode's wait,
+/// `SETTLE_MS`), a ramp between with no cliff; a single step costs at most 150 ms and a quarter of D.
+/// The 16 ms tick needs no correction here: below 300 ms the wait is zero, and above it the tick
+/// rounds a wait up by less than one tick, inside the quarter-of-D bound (the simulation's asserts).
+///
+/// FALSIFIER (L28): drop the `last_motion` term and the slow quick-run rows of
+/// `a_zoom_decode_starts_only_for_the_photo_stopped_on` decode the photo passed; wait on a fast decoder
+/// (a fixed 150 ms, or half of D) and its at-most-300-ms rows stop equalling before.
+pub(crate) fn zoom_decode_due(now: Instant, view_settled_at: Instant, last_motion: Instant, last_decode_ms: u32) -> bool {
+    now.duration_since(view_settled_at) >= Duration::from_millis(ROI_SETTLE_MS)
+        && now.duration_since(last_motion) >= zoom_stillness(last_decode_ms)
+}
+
+/// The stillness a zoom decode waits for after a move to another photo: `clamp((D - 300 ms) / 2, 0,
+/// 150 ms)` for the view's most recent completed zoom decode D; none while no zoom decode has completed
+/// this session (`0`): the first decode starts at once, as it always did, and tells us D.
+pub(crate) fn zoom_stillness(last_decode_ms: u32) -> Duration {
+    Duration::from_millis((u64::from(last_decode_ms).saturating_sub(300) / 2).min(SETTLE_MS))
+}
+
+#[cfg(test)]
+mod zoom_decode_tests {
+    use super::*;
+
+    /// One zoomed browse, simulated tick by tick (16 ms) the way `roi_single_request` behaves: zoomed
+    /// on photo 0 long ago (its piece is there, so a decode of `decode_ms` has completed this
+    /// session), then `steps` photos `step_ms` apart, stopping on the last. A photo's source size
+    /// arrives one tick after it becomes current (the dims worker); one decode runs at a time
+    /// (`roi_busy`) and takes `decode_ms`; a photo with its piece needs nothing. Returns the photos
+    /// whose whole-source decode was started, in order, and how long the photo stopped on waited from
+    /// the moment it was stepped onto until its piece landed.
+    fn simulate(due: &dyn Fn(Instant, Instant, Instant, u32) -> bool, steps: usize, step_ms: u64, decode_ms: u64) -> (Vec<usize>, u64) {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let start = 10_000u64; // the zoom settled at t0, ten seconds before the first step
+        let plan: Vec<(u64, usize)> = (1..=steps).map(|p| (start + (p as u64 - 1) * step_ms, p)).collect();
+        let (mut current, mut last_motion, mut last_decode) = (0usize, at(0), decode_ms as u32);
+        let (mut dims, mut covered): (HashSet<usize>, HashSet<usize>) = ([0].into(), [0].into());
+        let (mut busy, mut started, mut landed_at) = (None::<(usize, u64)>, Vec::new(), None::<u64>);
+        let mut t = start;
+        while t < start + 20_000 {
+            if let Some(&(_, p)) = plan.iter().rev().find(|(ms, _)| *ms <= t) {
+                if p != current {
+                    current = p;
+                    last_motion = at(t); // step_bookkeeping stamps a change of photo
+                    if p == steps {
+                        landed_at = Some(t);
+                    }
+                }
+            }
+            if let Some((p, end)) = busy {
+                if t >= end {
+                    covered.insert(p);
+                    busy = None;
+                    last_decode = decode_ms as u32;
+                    if p == steps {
+                        return (started, end - landed_at.unwrap());
+                    }
+                }
+            }
+            if !covered.contains(&current) && dims.contains(&current) && busy.is_none() && due(at(t), at(0), last_motion, last_decode) {
+                busy = Some((current, t + decode_ms));
+                started.push(current);
+            }
+            dims.insert(current); // known by the next tick
+            t += 16;
+        }
+        panic!("the photo stopped on never sharpened");
+    }
+
+    /// Fix round 2 (`CS-77`, final rule): stepping while zoomed with zoom pieces in use, before (the
+    /// view's settle only) and after (`zoom_decode_due`), for the three kinds of stepping — a quick run
+    /// (three steps 50 ms apart), one step after a pause, and slow taps (three steps 250 ms apart) —
+    /// printed as the table the commit and RECORD.md carry. Asserted: at 300 ms and below, after equals
+    /// before on every kind; at 600 ms and above the quick run decodes only the photo stopped on and
+    /// is faster; a single step costs at most 150 ms more than before and at most a quarter of D.
+    /// Also: a pan on a photo already stopped on re-crops after the view's own 70 ms, and there is no
+    /// wait before a decode has completed.
+    #[test]
+    fn a_zoom_decode_starts_only_for_the_photo_stopped_on() {
+        let before = |now: Instant, settle: Instant, _lm: Instant, _d: u32| {
+            now.duration_since(settle) >= Duration::from_millis(ROI_SETTLE_MS)
+        };
+        // 40 ms ≈ an nvJPEG decode; 205 ms = a 45 MP JPEG on this PC's CPU (release build, measured
+        // 11 November); 450-1500 ms = slower CPUs (the scan's laptop range is 0.5-1.5 s).
+        let rows: [(&str, usize, u64, u64); 12] = [
+            ("quick run", 3, 50, 40), ("quick run", 3, 50, 205), ("quick run", 3, 50, 300), ("quick run", 3, 50, 450),
+            ("quick run", 3, 50, 600), ("quick run", 3, 50, 1000), ("quick run", 3, 50, 1500),
+            ("one step", 1, 0, 205), ("one step", 1, 0, 450), ("one step", 1, 0, 600), ("one step", 1, 0, 1000),
+            ("slow taps", 3, 250, 1000),
+        ];
+        println!("| stepping | decode | wait | before: decoded · photo stopped on | after: decoded · photo stopped on |");
+        for (kind, steps, step, d) in rows {
+            let (old_started, old_wait) = simulate(&before, steps, step, d);
+            let (new_started, new_wait) = simulate(&zoom_decode_due, steps, step, d);
+            println!(
+                "| {kind} | {d} ms | {} ms | photos {old_started:?} · {old_wait} ms | photos {new_started:?} · {new_wait} ms |",
+                zoom_stillness(d as u32).as_millis()
+            );
+            assert_eq!(new_started.last(), Some(&steps), "{kind} {d}: the photo stopped on is decoded");
+            if d <= 300 {
+                assert_eq!((&new_started, new_wait), (&old_started, old_wait), "{kind} {d}: exactly as before");
+            }
+            if kind == "quick run" && d >= 600 {
+                assert_eq!(new_started, vec![steps], "{kind} {d}: only the photo stopped on");
+                assert!(new_wait < old_wait, "{kind} {d}: sooner ({new_wait} < {old_wait} ms)");
+            }
+            if kind == "one step" {
+                let extra = new_wait.saturating_sub(old_wait);
+                assert!(extra <= 150 && extra <= d / 4, "{kind} {d}: costs {extra} ms more (at most 150 and D/4)");
+            }
+        }
+        let t0 = Instant::now();
+        let ms = |m: u64| t0 + Duration::from_millis(m);
+        assert!(zoom_decode_due(ms(10_070), ms(10_000), ms(0), 1000), "a pan on a photo stopped on long ago: 70 ms, as before");
+        assert!(!zoom_decode_due(ms(10_060), ms(10_000), ms(0), 1000), "…not sooner");
+        assert_eq!(zoom_stillness(0), Duration::ZERO, "no decode completed yet: no wait");
+        assert_eq!(zoom_stillness(300), Duration::ZERO, "up to 300 ms: no wait");
+        assert_eq!(zoom_stillness(450), Duration::from_millis(75), "a ramp, no cliff");
+        assert_eq!(zoom_stillness(600), Duration::from_millis(150));
+        assert_eq!(zoom_stillness(5000), Duration::from_millis(150));
+    }
 }
 
 /// 6c) adaptive hi-res (zoomed region) for the SINGLE view, with a neighbour-tile cache. When zoomed
@@ -14872,6 +15716,8 @@ pub(crate) fn step_roi_single(
     compare: &Cell<bool>,
     last_view: &Cell<(f32, f32, f32)>,
     roi_settle: &RefCell<Instant>,
+    last_motion: &RefCell<Instant>, // fix round 2 (CS-77): the photo-change stillness clock
+    last_decode_ms: u32, // …and this view's most recent completed zoom decode, ms (0 = none yet)
     // v0.8.31 (§64): the ROI/zoom-tier subsystem — this fn threads `roi.src` (source-dim memo), `roi.tiles`
     // (the tile cache), `roi.region` (the overlay descriptor), and `roi.failed` (the (gen,idx) latch) into
     // its scan-helper. Was four separate &-params (roi_src, roi_tiles, roi_region, roi_failed).
@@ -14895,7 +15741,7 @@ pub(crate) fn step_roi_single(
     // v0.8.31 (§64): the scan-helper keeps its individual &-params (a mixed consumer, FastTier/DetailTier
     // parity); pass `&roi.<field>` (the (gen,idx) latch `&roi.failed` Deref-coerces &Arc<Mutex> → &Mutex).
     let keep = roi_single_scan(
-        app, c, len, now, gen_now, scrubbing, compare, last_view, roi_settle, &roi.src,
+        app, c, len, now, gen_now, scrubbing, compare, last_view, roi_settle, last_motion, last_decode_ms, &roi.src,
         dims_requested, dims_req_tx, &roi.tiles, &roi.region, roi_busy, &roi.failed, roi_req_tx, detail_cap,
         roi_max, roi_ss, raw_mode, animated, rot,
     );
@@ -14922,6 +15768,8 @@ fn roi_single_scan(
     compare: &Cell<bool>,
     last_view: &Cell<(f32, f32, f32)>,
     roi_settle: &RefCell<Instant>,
+    last_motion: &RefCell<Instant>, // fix round 2 (CS-77)
+    last_decode_ms: u32,
     roi_src: &RefCell<HashMap<usize, (u32, u32)>>,
     dims_requested: &RefCell<HashSet<usize>>,
     dims_req_tx: &Sender<(usize, u64)>,
@@ -15050,7 +15898,7 @@ fn roi_single_scan(
     let nv1 = ((vb - iy) / img_h).clamp(0.0, 1.0);
     roi_single_select(app, c, eff, roi_tiles, roi_region, nu0, nu1, nv0, nv1);
     roi_single_request(
-        c, eff, now, gen_now, roi_tiles, roi_settle, roi_busy, roi_failed, roi_req_tx, roi_max, roi_ss,
+        c, eff, now, gen_now, roi_tiles, roi_settle, last_motion, last_decode_ms, roi_busy, roi_failed, roi_req_tx, roi_max, roi_ss,
         raw_mode, nu0, nu1, nv0, nv1, img_w, img_h, sf, full_src_long,
     );
     true
@@ -15123,6 +15971,8 @@ fn roi_single_request(
     gen_now: u64,
     roi_tiles: &RefCell<Vec<RoiTile>>,
     roi_settle: &RefCell<Instant>,
+    last_motion: &RefCell<Instant>, // fix round 2 (CS-77)
+    last_decode_ms: u32,
     roi_busy: &AtomicBool,
     roi_failed: &Mutex<HashSet<(u64, usize)>>, // F9: skip a shot whose full decode already failed
     roi_req_tx: &Sender<RoiReq>,
@@ -15151,8 +16001,8 @@ fn roi_single_request(
         let tiles = roi_tiles.borrow();
         tiles.iter().any(|t| covers(t) && t.src_long >= full_src_long)
     };
-    let settled = now.duration_since(*roi_settle.borrow())
-        >= Duration::from_millis(ROI_SETTLE_MS);
+    // Fix round 2 (`CS-77`): the view settled AND the photo stopped on (see `zoom_decode_due`).
+    let settled = zoom_decode_due(now, *roi_settle.borrow(), *last_motion.borrow(), last_decode_ms);
     // F9 (§5 defect #2 / #83): a shot whose full decode already failed this folder stops being
     // requested — no whole-file re-read + re-fail every settle tick. Mirrors the fast/thumb/detail
     // dispatch-side failed-set checks; cleared on folder swap.
@@ -15227,7 +16077,7 @@ fn roi_single_request(
             // for the session. Same rollback shape as the detail and thumb lanes.
             send_or_rollback(
                 roi_req_tx,
-                RoiReq { ids: vec![c], turns: vec![eff], gen: gen_now, rects, raw: raw_mode },
+                RoiReq { ids: vec![c], turns: vec![eff], gen: gen_now, rects, raw: raw_mode, compare: false },
                 ReqLane::Roi,
                 || roi_busy.store(false, Ordering::Relaxed),
             );
@@ -15248,6 +16098,8 @@ pub(crate) fn step_roi_compare(
     compare: &Cell<bool>,
     last_view: &Cell<(f32, f32, f32)>,
     roi_settle: &RefCell<Instant>,
+    last_motion: &RefCell<Instant>, // fix round 2 (CS-77): the same stillness as the single view
+    last_decode_ms: u32, // …from Compare's own most recent completed zoom decode (0 = none yet)
     cmp_a_idx: &Cell<usize>,
     cmp_b_idx: &Cell<usize>,
     // v0.8.31 (§64): the ROI/zoom-tier subsystem — compare uses only `roi.src` (per-half source-dim memo)
@@ -15408,8 +16260,9 @@ pub(crate) fn step_roi_compare(
         // has a covering tile. has_full checks coverage (tile ⊇ rect) so once stored it never re-asks.
         let a_needs = recta.map_or(false, |r| !has_full(a, effa, a_long, r));
         let b_needs = rectb.map_or(false, |r| !has_full(b, effb, b_long, r));
-        let settled =
-            now.duration_since(*roi_settle.borrow()) >= Duration::from_millis(ROI_SETTLE_MS);
+        // Fix round 2 (`CS-77`): wheel-browsing a zoomed Compare moves a half to another photo; the
+        // whole-source decode waits until that half has stopped, as in the single view.
+        let settled = zoom_decode_due(now, *roi_settle.borrow(), *last_motion.borrow(), last_decode_ms);
         if (a_needs || b_needs) && settled && !roi_busy.load(Ordering::Relaxed) {
             let mut need: Vec<(f32, f32, f32, f32)> = Vec::new();
             if a_needs {
@@ -15459,7 +16312,7 @@ pub(crate) fn step_roi_compare(
             // v0.8.183 (W5): as the single-view site — latch, send, roll back if the lane is dead.
             send_or_rollback(
                 roi_req_tx,
-                RoiReq { ids, turns, gen: gen_now, rects, raw: raw_mode },
+                RoiReq { ids, turns, gen: gen_now, rects, raw: raw_mode, compare: true },
                 ReqLane::Roi,
                 || roi_busy.store(false, Ordering::Relaxed),
             );
@@ -20320,10 +21173,11 @@ mod unapplied_rotation_tests {
         let cloud = [true, false, true, false];
         let order = vec![0usize, 2]; // …but these two are SELECTED, and they are what gets copied
         assert_eq!(unapplied_rotation_in(&order, |i| deltas[i]), 2);
-        assert_eq!(cloud_placeholders_in(&order, |i| cloud[i]), 2);
+        assert_eq!(order.iter().filter(|&&i| cloud[i]).count(), 2, "both targets are cloud-tagged");
+        // (Fix round 2: what the copy's line then counts is FILES — `support::copy_cloud_files`.)
         // …and the FOLDER-WIDE mark scan those two replaced, for the differential: same folder,
         // same photographs, zero advisories. (The rotation scan is written out because its function
-        // is gone with its last production caller; its cloud twin survives for the MOVE path.)
+        // is gone with its last production caller; the mark-based cloud form survives for the MOVE path.)
         let old_rot_scan = marks.iter().enumerate().filter(|(i, m)| **m & MARK_FLAG != 0 && deltas[*i] != 0).count();
         assert_eq!(old_rot_scan, 0, "the shipped scan saw nothing to warn about");
         assert_eq!(cloud_placeholder_picks(&marks, MARK_FLAG, |i| cloud[i]), 0);

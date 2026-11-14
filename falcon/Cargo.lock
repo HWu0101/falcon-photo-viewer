@@ -1218,10 +1218,10 @@ dependencies = [
  "falcon-gpu",
  "falcon-hwdec",
  "falcon-nvjpeg",
+ "falcon-ui",
  "fontdb",
  "i-slint-backend-testing",
  "i-slint-backend-winit",
- "i-slint-compiler",
  "i-slint-core",
  "libc",
  "libloading",
@@ -1251,6 +1251,29 @@ dependencies = [
  "image",
  "jpeg-decoder",
  "libloading",
+]
+
+[[package]]
+name = "falcon-platform-tests"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "libloading",
+ "objc2 0.5.2",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
+ "windows 0.62.2",
+ "winit",
+ "winreg",
+]
+
+[[package]]
+name = "falcon-ui"
+version = "0.0.0"
+dependencies = [
+ "i-slint-compiler",
+ "serde_json",
+ "slint",
 ]
 
 [[package]]

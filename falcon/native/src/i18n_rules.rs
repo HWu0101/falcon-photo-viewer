@@ -1,4 +1,5 @@
-//! Plural rules for language packs, shared by `build.rs` (which writes Slint's `.po` headers) and
+//! Plural rules for language packs, shared by `build_translations.rs` (which writes Slint's `.po`
+//! headers for the interface crate and the pack list for the app) and
 //! `i18n.rs` (which picks a Rust message's plural form). `scripts/check-translations.py` keeps a
 //! copy of the ids and categories; `languages.json` names a rule by its `id`.
 //!

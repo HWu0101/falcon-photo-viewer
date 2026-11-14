@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import shutil
 import tempfile
+import tomllib
 import os
 import subprocess
 import unittest
@@ -92,7 +93,10 @@ class ReleaseMaterials(unittest.TestCase):
             for folder in ('falcon/vendor', 'falcon/crates')
             for p in (ROOT / folder).glob('*/Cargo.toml')
         ]
-        names += ['falcon/native/Cargo.toml']
+        # The workspace members' manifests come from the same list the validator reads, so a new
+        # member (the interface and platform-test packages of November) cannot leave it stale.
+        members = tomllib.loads((ROOT / 'falcon/Cargo.toml').read_text(encoding='utf-8'))['workspace']['members']
+        names += sorted({'falcon/' + member + '/Cargo.toml' for member in members} | {'falcon/native/Cargo.toml'})
         names += ['falcon/native/src/main.rs']
         names += list(materials.SUPPLEMENTS) + list(materials.FONTS)
         names += [str(materials.build_guide(ROOT).relative_to(ROOT))]

@@ -762,6 +762,100 @@ pub fn parse_heif_grid(bytes: &[u8]) -> Result<HeifGridPlan, HeifParseError> {
     })
 }
 
+/// Where a HEIF file's `Exif` item lies, as [`heif_exif_item`] answers it from the file's first bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HeifExifLookup {
+    /// The item's bytes as ABSOLUTE file extents, in order, each non-empty and inside the file. An
+    /// item stored in `idat` (construction method 1) resolves to the `idat` bytes' own file offsets,
+    /// which lie inside the prefix the caller already holds.
+    Found(Vec<HeifExtent>),
+    /// The top-level `meta` box starts in the prefix and ends at this file offset, past it: the
+    /// caller may read up to it and ask again.
+    MetaEndsAt(u64),
+    /// No `meta` in the prefix, no `Exif` item, or an index this module's readers decline.
+    NotFound,
+}
+
+/// 14 November 2026 (the date-read fix): where the `Exif` item of a HEIF file is, from its first
+/// bytes alone. `prefix` must be the file's bytes from offset 0 (so a prefix index IS a file offset,
+/// the same identity [`parse_heif_grid`] relies on for a whole file); `file_len` is the file's
+/// length, against which every extent is checked.
+///
+/// The date read needs this because an iPhone writes the Exif item wherever its `iloc` says, measured
+/// at 3.5 to 94.6 KiB from the start while the index (`meta`) itself ends by 36.2 KiB: a fixed-size
+/// head misses a third of a real library's dates. Nothing new is parsed here: `meta` is
+/// [`read_meta`] (so `iinf`/`infe`, `iref` and `iloc` are this module's own readers, with their field
+/// widths, versions and construction methods), and the extents are [`resolve_extents`] (the
+/// `data_reference_index` refusal, the overflow-free bounds, the `idat` containment). The one extra
+/// is [`top_box`], a single top-level box HEADER, because [`bmff_children`] stops at a box that runs
+/// past the bytes in hand, and "where does `meta` end" is exactly the question then.
+///
+/// Which item: the `Exif` item that describes (`cdsc`) the primary picture; else the last one by
+/// item ID, the one kamadak-exif (the details panel's reader) takes, as every file seen declares
+/// items in ID order. Every file measured has exactly one.
+pub(crate) fn heif_exif_item(prefix: &[u8], file_len: u64) -> HeifExifLookup {
+    let mut at = 0usize;
+    loop {
+        let Some((typ, hdr, end)) = top_box(prefix, at, file_len) else { return HeifExifLookup::NotFound };
+        if end > prefix.len() as u64 {
+            // Only `meta` is worth reading on for; a box before it that runs past the prefix (an
+            // `mdat` first) means the index is not near the start, and the caller keeps its old path.
+            return if &typ == b"meta" { HeifExifLookup::MetaEndsAt(end) } else { HeifExifLookup::NotFound };
+        }
+        let end = end as usize; // <= prefix.len(), so it fits
+        if &typ == b"meta" {
+            // A FullBox: its children start 4 bytes in, exactly as `parse_heif_grid` reads it.
+            let body = at + hdr;
+            if end.saturating_sub(body) < 4 {
+                return HeifExifLookup::NotFound;
+            }
+            return exif_extents(&read_meta(prefix, body + 4, end), file_len);
+        }
+        at = end;
+    }
+}
+
+/// One top-level box header at `at`: `(type, header length, the box's END as a file offset)`. The
+/// sizes follow [`bmff_children`]'s rules (`1` = a 64-bit `largesize`, a size below the header is
+/// refused), except that `0` ("to the end") means the end of the FILE, which is what it says at the
+/// top level and which the prefix alone cannot know. Every sum is checked; an end past the file is
+/// `None`.
+fn top_box(buf: &[u8], at: usize, file_len: u64) -> Option<([u8; 4], usize, u64)> {
+    let mut c = Cur::new(buf, at, buf.len());
+    let size = c.u32()?;
+    let typ = c.fourcc()?;
+    let (hdr, size) = match size {
+        0 => (8usize, file_len.checked_sub(at as u64)?),
+        1 => (16, c.uint(8)?),
+        n => (8, u64::from(n)),
+    };
+    if size < hdr as u64 {
+        return None;
+    }
+    let end = (at as u64).checked_add(size)?;
+    (end <= file_len).then_some((typ, hdr, end))
+}
+
+/// The `Exif` item of `meta`, resolved (see [`heif_exif_item`] for which one).
+fn exif_extents(meta: &Meta, file_len: u64) -> HeifExifLookup {
+    let ids: Vec<u32> =
+        meta.items.iter().filter(|(_, info)| &info.item_type == b"Exif").map(|(id, _)| *id).collect();
+    let describes_primary = |id: &u32| {
+        meta.primary.is_some_and(|p| {
+            meta.refs.iter().any(|(t, from, to)| t == b"cdsc" && from == id && to.contains(&p))
+        })
+    };
+    let Some(id) = ids.iter().copied().find(describes_primary).or_else(|| ids.last().copied()) else {
+        return HeifExifLookup::NotFound;
+    };
+    match resolve_extents(meta, id, file_len) {
+        // A zero length means "to the end of the data" in ISO-BMFF; no Exif item is written that
+        // way, and following it would read a whole file, so it is declined.
+        Ok((extents, _)) if extents.iter().all(|e| e.len > 0) => HeifExifLookup::Found(extents),
+        _ => HeifExifLookup::NotFound,
+    }
+}
+
 /// The path door: [`parse_heif_grid`] plus the colour answer from the EXISTING oracle.
 ///
 /// The colour half is one delegation and nothing else — `heic_color_tag` is the v0.8.141 two-pass
@@ -995,6 +1089,14 @@ fn read_iloc(buf: &[u8], s: usize, e: usize) -> BTreeMap<u32, ItemLoc> {
         let Some(data_reference_index) = c.u16() else { break };
         let Some(base_offset) = c.uint(base_offset_size) else { break };
         let Some(extent_count) = c.u16() else { break };
+        // An extent record of ZERO bytes (index, offset and length all 0 wide) says "the whole of the
+        // base": one is legal, more are no information. They cost nothing in the box and 16 bytes
+        // each here, 65,535 per 6-byte item: gigabytes from a `meta` that fits the first 64 KiB, in
+        // a read the Date taken sort now makes for every HEIC of a folder (14 November 2026, found
+        // by the date-read review). Declined like a truncated list: keep what was read whole.
+        if index_size + offset_size + length_size == 0 && extent_count > 1 {
+            break;
+        }
         let mut extents = Vec::new();
         let mut short = false;
         for _ in 0..extent_count {
@@ -1785,5 +1887,36 @@ mod tests {
         // A crop bigger than the image is outside it.
         let huge = HeifClap { width_n: 500, ..centred };
         assert!(apply_clap((100, 80), Some(&huge)).is_err());
+    }
+
+    /// A crafted `iloc` whose extent records are zero bytes wide may not buy memory: 65,535 extents
+    /// per 6-byte item would be a megabyte each, gigabytes from an index that fits the date read's
+    /// 64 KiB head (and the Date taken sort reads every HEIC of a folder). One zero-width extent,
+    /// "the whole of the base", stays legal.
+    ///
+    /// FALSIFIER (L28): drop the `record == 0 && extent_count > 1` refusal in `read_iloc` and the
+    /// eight items hold 524,280 extents (seen failing so on the code before 14 November 2026).
+    #[test]
+    fn zero_width_iloc_extents_buy_no_memory() {
+        // Version 0 with every field width 0: an item is its id, data reference and extent count.
+        let iloc = |items: &[(u16, u16)]| {
+            let mut b = vec![0u8; 4]; // version 0, flags 0
+            b.extend_from_slice(&0u16.to_be_bytes()); // offset, length and base offset sizes: 0
+            b.extend_from_slice(&(items.len() as u16).to_be_bytes());
+            for &(id, extent_count) in items {
+                for v in [id, 0, extent_count] {
+                    b.extend_from_slice(&v.to_be_bytes());
+                }
+            }
+            b
+        };
+        let crafted = iloc(&(1..=8).map(|id| (id, u16::MAX)).collect::<Vec<_>>());
+        let held: usize = read_iloc(&crafted, 0, crafted.len()).values().map(|l| l.extents.len()).sum();
+        assert!(held <= 8, "a {}-byte iloc held {held} extents", crafted.len());
+        // The legal form is still read: one zero-width extent per item.
+        let legal = iloc(&[(1, 1), (2, 1)]);
+        let locs = read_iloc(&legal, 0, legal.len());
+        assert_eq!(locs.len(), 2);
+        assert!(locs.values().all(|l| l.extents == [(0, 0)]));
     }
 }

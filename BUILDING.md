@@ -23,7 +23,7 @@ reproducible build.
 On macOS, run the native toolbar tests before a release build:
 
 ```text
-cargo test --locked --workspace --features falcon-native/mac-native-tests
+cargo test --locked --workspace --features falcon-platform-tests/mac-native-tests
 ```
 
 Packaging requires macOS tools. From the source root, run:

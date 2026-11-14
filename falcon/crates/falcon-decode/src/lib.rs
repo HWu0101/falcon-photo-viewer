@@ -4739,6 +4739,30 @@ pub fn read_exif(shot: &Shot) -> Exif {
 /// 2026-10-28 (the cloud-only round, owner answer 12): the sort layer checks the PRIMARY file's
 /// metadata it already has; the RAW this falls back to is checked here, before it is opened, so a
 /// re-sort never downloads a RAW freed up during the session.
+///
+/// 14 November 2026 (the date-read fix; owner: "fix it now"). The 64 KiB head alone missed two
+/// kinds of date, measured on the approved samples and on a real phone library (counts only):
+///   * **HEIC / HEIF.** The Exif data is an ITEM the file's index (`meta`: `iinf` + `iloc`) points
+///     at, measured anywhere from 3.5 to 94.6 KiB in (14 of 40 sampled past 64 KiB; all 12 approved
+///     samples at 91 to 94 KiB), while `meta` itself ends by 36.2 KiB. So a third of that library's
+///     iPhone photos, and every approved sample, got no date and sorted by file time. The head is
+///     now decided by its BYTES (a HEIC named `.jpg` included), and for a HEIF the index is followed
+///     ([`heif_grid::heif_exif_item`]): the item is cut from the head when it lies there, else read
+///     with ONE positioned read of exactly its extent (at most [`DATE_EXIF_ITEM_CAP`]); a `meta` that
+///     ends past the head costs one more read to its end (at most [`DATE_HEIF_META_CAP`]).
+///   * **JPEG.** The Exif segment (APP1) can be 64 KiB on its own and need not come first; 1 of 32
+///     dated JPEGs in that library needed 65.0 KiB. When the segment STARTS in the head and ends past
+///     it, the read goes on to exactly its end (at most [`DATE_JPEG_CAP`]); no Exif segment starting
+///     in the head means no date, as before. The head is not raised for every JPEG.
+///   * **The head** is one pre-sized read (one read call for a local file) instead of the ~12 calls
+///     `take(..).read_to_end` made growing its buffer.
+///
+/// Everything else is unchanged: TIFF, the TIFF-based RAWs, PNG and WebP parse the head as before,
+/// a CR3 still falls back to rawler, a passenger's date is still not the shot's, and the RAW is still
+/// asked about before it is opened. Every offset and length that steers a read comes from the file
+/// and is checked against its length and the caps first; a malformed file is `None`, never a panic
+/// or a large allocation. Measured cost: a HEIC with the item past the head is 2 read calls and
+/// 64 KiB + the item (~3 KiB); a cut JPEG is 2 calls and the segment's end.
 pub fn read_date_taken(shot: &Shot) -> Option<String> {
     read_date_taken_with(shot, file_is_cloud_placeholder)
 }
@@ -4746,13 +4770,10 @@ pub fn read_date_taken(shot: &Shot) -> Option<String> {
 /// [`read_date_taken`] with the cloud probe passed in (no test can make a real placeholder).
 pub fn read_date_taken_with(shot: &Shot, is_cloud: impl Fn(&Path) -> bool) -> Option<String> {
     use exif::{In, Tag};
-    const DATE_READ_CAP: u64 = 64 * 1024;
     let read_capped = |path: &Path| -> Option<exif::Exif> {
-        use std::io::Read;
-        let file = std::fs::File::open(path).ok()?;
-        let mut buf = Vec::new();
-        file.take(DATE_READ_CAP).read_to_end(&mut buf).ok()?;
-        exif_from_bytes(&buf)
+        let mut file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        date_exif_from(&mut file, len)
     };
     let date_of = |path: &Path| -> Option<String> {
         read_capped(path)?
@@ -4776,6 +4797,586 @@ pub fn read_date_taken_with(shot: &Shot, is_cloud: impl Fn(&Path) -> bool) -> Op
     let decoder = rawler::get_decoder(&src).ok()?;
     let md = decoder.raw_metadata(&src, &RawDecodeParams::default()).ok()?;
     md.exif.date_time_original.clone().filter(|s| !s.trim().is_empty())
+}
+
+/// The date read's head: every file costs this one read, and most need nothing more.
+const DATE_HEAD_CAP: u64 = 64 * 1024;
+/// A HEIF `meta` that ends past the head is read to its end only up to here (measured: 36.2 KiB at
+/// most). A larger one keeps the head-only answer.
+const DATE_HEIF_META_CAP: u64 = 1024 * 1024;
+/// The HEIF `Exif` item's own bytes, at most (measured: 2.0 to 3.0 KiB).
+const DATE_EXIF_ITEM_CAP: u64 = 256 * 1024;
+/// A JPEG's whole date read, at most. An APP1 is at most 65,537 bytes and must start in the head,
+/// so a real file never reaches this; it is the belt.
+const DATE_JPEG_CAP: u64 = 256 * 1024;
+
+/// [`read_date_taken`]'s reading rule on any reader (a file in the app; an injected counting
+/// reader in the tests). `file_len` is the file's length from its metadata; every read below is
+/// bounded by it and by the caps above. See [`read_date_taken`]'s doc for the why.
+fn date_exif_from<R: std::io::Read + std::io::Seek>(r: &mut R, file_len: u64) -> Option<exif::Exif> {
+    let mut buf = read_up_to(r, file_len.min(DATE_HEAD_CAP) as usize)?;
+    match sniff_kind(&buf) {
+        Some(SrcKind::Heic) => {
+            if let Some(exif) = heif_exif_by_index(r, &mut buf, file_len) {
+                return Some(exif);
+            }
+        }
+        Some(SrcKind::Jpeg) => {
+            if let Some((tiff_at, end)) = jpeg_exif_segment(&buf).filter(|&(_, end)| end > buf.len()) {
+                // Cut by the head: read on to exactly its end, then parse the segment's TIFF block.
+                if end as u64 > file_len.min(DATE_JPEG_CAP) {
+                    return None;
+                }
+                extend_to(r, &mut buf, end)?;
+                return exif::Reader::new().read_raw(buf.get(tiff_at..end)?.to_vec()).ok();
+            }
+        }
+        _ => {}
+    }
+    // Today's path: the head as a container (a whole JPEG APP1, TIFF, PNG, WebP, a HEIF whose index
+    // the walk above declined).
+    exif_from_bytes(&buf)
+}
+
+/// Up to `n` bytes from the reader's current position, into one buffer sized once: one read call
+/// for a local file. Short only at the end of the file.
+fn read_up_to<R: std::io::Read>(r: &mut R, n: usize) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    let mut got = 0;
+    while got < n {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    buf.truncate(got);
+    Some(buf)
+}
+
+/// Grow `buf` (the file's bytes from offset 0) to the file's first `end` bytes with one positioned
+/// read. The caller has checked `end` against the file's length and its cap.
+fn extend_to<R: std::io::Read + std::io::Seek>(r: &mut R, buf: &mut Vec<u8>, end: usize) -> Option<()> {
+    let start = buf.len();
+    if end <= start {
+        return Some(());
+    }
+    r.seek(std::io::SeekFrom::Start(start as u64)).ok()?;
+    buf.resize(end, 0);
+    if r.read_exact(&mut buf[start..]).is_err() {
+        buf.truncate(start);
+        return None;
+    }
+    Some(())
+}
+
+/// A HEIF's Exif, found through the file's own index (see [`heif_grid::heif_exif_item`]). `buf` holds
+/// the file's first bytes and may grow to the end of `meta`. `None` sends the caller back to the head.
+fn heif_exif_by_index<R: std::io::Read + std::io::Seek>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+    file_len: u64,
+) -> Option<exif::Exif> {
+    use heif_grid::HeifExifLookup;
+    let mut lookup = heif_grid::heif_exif_item(buf, file_len);
+    if let HeifExifLookup::MetaEndsAt(end) = lookup {
+        // `heif_exif_item` only answers an end inside the file; the cap keeps the read sane.
+        if end > DATE_HEIF_META_CAP.min(file_len) {
+            return None;
+        }
+        extend_to(r, buf, usize::try_from(end).ok()?)?;
+        lookup = heif_grid::heif_exif_item(buf, file_len);
+    }
+    let HeifExifLookup::Found(extents) = lookup else { return None };
+    let total = extents.iter().try_fold(0u64, |t, e| t.checked_add(e.len))?;
+    if total > DATE_EXIF_ITEM_CAP {
+        return None;
+    }
+    let mut item = Vec::with_capacity(total as usize);
+    for e in &extents {
+        // Every extent is inside the file (checked by `resolve_extents`) and the sum is capped.
+        let (start, end) = (usize::try_from(e.offset).ok()?, usize::try_from(e.end()).ok()?);
+        match buf.get(start..end) {
+            Some(bytes) => item.extend_from_slice(bytes),
+            None => {
+                // ONE positioned read of exactly this extent.
+                r.seek(std::io::SeekFrom::Start(e.offset)).ok()?;
+                let at = item.len();
+                item.resize(at + (end - start), 0);
+                r.read_exact(&mut item[at..]).ok()?;
+            }
+        }
+    }
+    exif_from_heif_item(item)
+}
+
+/// An `Exif` item's payload: a big-endian 4-byte offset to the TIFF header (`exif_tiff_header_offset`,
+/// 6 in an iPhone file, skipping `Exif\0\0`), then the TIFF block. kamadak-exif's own HEIF reader
+/// strips it the same way before the same `read_raw`.
+fn exif_from_heif_item(mut item: Vec<u8>) -> Option<exif::Exif> {
+    let offset = u32::from_be_bytes(item.get(..4)?.try_into().ok()?);
+    let tiff_at = usize::try_from(offset).ok()?.checked_add(4)?;
+    if tiff_at > item.len() {
+        return None;
+    }
+    item.drain(..tiff_at);
+    exif::Reader::new().read_raw(item).ok()
+}
+
+/// The first JPEG Exif segment (APP1 `Exif\0\0`) that starts in `head`: `(where its TIFF block
+/// starts, where the segment ends)`, both as file offsets, the end possibly past `head`. Walks the
+/// marker segments from SOI by their own lengths and stops at the image data (SOS) or EOI, or at any
+/// byte that is not a marker: no Exif segment before the image is "none" (kamadak-exif's JPEG reader
+/// reads the same first segment).
+fn jpeg_exif_segment(head: &[u8]) -> Option<(usize, usize)> {
+    if !head.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut at = 2usize;
+    loop {
+        if *head.get(at)? != 0xFF {
+            return None;
+        }
+        while *head.get(at)? == 0xFF {
+            at += 1; // fill bytes before the marker code
+        }
+        let code = *head.get(at)?;
+        at += 1;
+        match code {
+            0x01 | 0xD0..=0xD7 => continue, // standalone markers: no length
+            0xD8..=0xDA => return None, // a second SOI, EOI, or the image data: no Exif before it
+            _ => {}
+        }
+        let len = usize::from(u16::from_be_bytes([*head.get(at)?, *head.get(at + 1)?]));
+        if len < 2 {
+            return None;
+        }
+        let end = at.checked_add(len)?; // the length counts its own two bytes
+        if code == 0xE1 && head.get(at + 2..at + 8) == Some(&b"Exif\0\0"[..]) {
+            return Some((at + 8, end));
+        }
+        at = end;
+    }
+}
+
+/// 14 November 2026 (the date-read fix): the date read's own rows. Synthetic files built here; the
+/// approved samples only through `fixture_paths`, by count, never by name.
+#[cfg(test)]
+mod date_read_tests {
+    use super::*;
+
+    const WANT: &str = "2023:04:05 06:07:08";
+
+    /// A little-endian TIFF block: IFD0 holding the Exif-IFD pointer, the Exif IFD holding
+    /// `DateTimeOriginal`, then `pad` bytes (a real block carries maker notes after it).
+    fn tiff_with_date(pad: usize) -> Vec<u8> {
+        let mut t = b"II*\0".to_vec();
+        t.extend_from_slice(&8u32.to_le_bytes());
+        for (tag, ty, count, value) in [(0x8769u16, 4u16, 1u32, 26u32), (0x9003, 2, 20, 44)] {
+            t.extend_from_slice(&1u16.to_le_bytes());
+            t.extend_from_slice(&tag.to_le_bytes());
+            t.extend_from_slice(&ty.to_le_bytes());
+            t.extend_from_slice(&count.to_le_bytes());
+            t.extend_from_slice(&value.to_le_bytes());
+            t.extend_from_slice(&0u32.to_le_bytes());
+        }
+        assert_eq!(t.len(), 44, "premise: the string sits where the entry points");
+        t.extend_from_slice(WANT.as_bytes());
+        t.push(0);
+        t.resize(t.len() + pad, 0);
+        t
+    }
+
+    fn bx(t: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut v = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(t);
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn full(t: &[u8; 4], ver: u8, body: &[u8]) -> Vec<u8> {
+        let mut b = vec![ver, 0, 0, 0];
+        b.extend_from_slice(body);
+        bx(t, &b)
+    }
+
+    /// One HEIF file: `ftyp`, `meta` (pitm, iinf, iref `cdsc`, iloc v1, then an optional `free` and
+    /// `idat`), `mdat` holding a one-byte picture and the Exif item. Each field is one thing a row
+    /// varies; the rest stays an ordinary, valid file.
+    #[derive(Clone, Copy)]
+    struct Heif {
+        /// The Exif item (in `mdat`) starts at this file offset, or right after the picture byte.
+        item_from: usize,
+        /// A `free` box of this many bytes inside `meta`, before `idat`: moves `meta`'s end out.
+        meta_pad: usize,
+        /// The item lives in `idat` (construction method 1) rather than in `mdat`.
+        in_idat: bool,
+        /// Bytes of `mdat` after the item.
+        tail: usize,
+        /// Damage: the item's `(offset, length)` as `iloc` writes it, replacing the true one.
+        extent: Option<(u32, u32)>,
+        /// Damage: `iloc`'s `offset_size` nibble (4 is the true width written).
+        offset_size: u8,
+        /// Damage: the `infe` version (2 is the one Exif items use).
+        infe_version: u8,
+    }
+
+    impl Default for Heif {
+        fn default() -> Self {
+            Heif { item_from: 0, meta_pad: 0, in_idat: false, tail: 0, extent: None, offset_size: 4, infe_version: 2 }
+        }
+    }
+
+    /// The Exif item the way an iPhone writes it: a 4-byte offset (6), `Exif\0\0`, then the TIFF
+    /// block, about 2.7 KiB in all.
+    fn exif_item() -> Vec<u8> {
+        let mut v = 6u32.to_be_bytes().to_vec();
+        v.extend_from_slice(b"Exif\0\0");
+        v.extend_from_slice(&tiff_with_date(2_600));
+        v
+    }
+
+    fn heif(o: Heif) -> Vec<u8> {
+        let item = exif_item();
+        let ftyp = bx(b"ftyp", b"heic\0\0\0\0mif1heic");
+        let infe = |id: u16, typ: &[u8; 4]| {
+            let mut b = id.to_be_bytes().to_vec();
+            b.extend_from_slice(&0u16.to_be_bytes());
+            b.extend_from_slice(typ);
+            b.push(0);
+            full(b"infe", o.infe_version, &b)
+        };
+        let mut iinf = 2u16.to_be_bytes().to_vec();
+        iinf.extend_from_slice(&infe(1, b"hvc1"));
+        iinf.extend_from_slice(&infe(2, b"Exif"));
+        let mut cdsc = Vec::new(); // the Exif item (2) describes the picture (1)
+        for v in [2u16, 1, 1] {
+            cdsc.extend_from_slice(&v.to_be_bytes());
+        }
+        let head = [
+            full(b"pitm", 0, &1u16.to_be_bytes()),
+            full(b"iinf", 0, &iinf),
+            full(b"iref", 0, &bx(b"cdsc", &cdsc)),
+        ]
+        .concat();
+        let tail = [
+            if o.meta_pad > 0 { bx(b"free", &vec![0; o.meta_pad]) } else { Vec::new() },
+            if o.in_idat { bx(b"idat", &item) } else { Vec::new() },
+        ]
+        .concat();
+        let iloc = |pic: u32, (off, len): (u32, u32)| {
+            // offset_size, length_size 4, base_offset_size 0, index_size 0.
+            let mut b = ((u16::from(o.offset_size) << 12) | 0x0400).to_be_bytes().to_vec();
+            b.extend_from_slice(&2u16.to_be_bytes());
+            for (id, method, off, len) in [(1u16, 0u16, pic, 1u32), (2, u16::from(o.in_idat), off, len)] {
+                for v in [id, method, 0, 1] {
+                    b.extend_from_slice(&v.to_be_bytes()); // item, construction, data ref, extent count
+                }
+                b.extend_from_slice(&off.to_be_bytes());
+                b.extend_from_slice(&len.to_be_bytes());
+            }
+            full(b"iloc", 1, &b)
+        };
+        let meta = |pic: u32, ext: (u32, u32)| full(b"meta", 0, &[head.clone(), iloc(pic, ext), tail.clone()].concat());
+        // `iloc` is the same length whatever offsets it holds, so one measuring pass places everything.
+        let pic = ftyp.len() + meta(0, (0, 0)).len() + 8;
+        let item_at = if o.in_idat { 0 } else { o.item_from.max(pic + 1) };
+        let ext = o.extent.unwrap_or((item_at as u32, item.len() as u32));
+        let mut out = [ftyp.clone(), meta(pic as u32, ext)].concat();
+        let mut mdat = vec![0xAA];
+        if !o.in_idat {
+            mdat.resize(item_at - pic, 0);
+            mdat.extend_from_slice(&item);
+        }
+        mdat.resize(mdat.len() + o.tail, 0);
+        out.extend_from_slice(&bx(b"mdat", &mdat));
+        assert!(out.get(pic) == Some(&0xAA), "premise: the picture byte is where iloc says");
+        out
+    }
+
+    /// A JPEG segment of `code` with a `len`-byte payload.
+    fn segment(code: u8, len: usize) -> Vec<u8> {
+        let mut s = vec![0xFF, code];
+        s.extend_from_slice(&((len + 2) as u16).to_be_bytes());
+        s.resize(len + 4, 0);
+        s
+    }
+
+    /// SOI, then the `before` segments, then the Exif APP1 (its TIFF block padded by `pad`), then a
+    /// real little encoded image without its own SOI.
+    fn jpeg(before: &[Vec<u8>], pad: usize) -> Vec<u8> {
+        let mut img = Vec::new();
+        jpeg_encoder::Encoder::new(&mut img, 90).encode(&[90; 18], 2, 3, jpeg_encoder::ColorType::Rgb).unwrap();
+        let tiff = tiff_with_date(pad);
+        let mut out = vec![0xFF, 0xD8];
+        for s in before {
+            out.extend_from_slice(s);
+        }
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&u16::try_from(tiff.len() + 8).expect("an APP1 fits its length field").to_be_bytes());
+        out.extend_from_slice(b"Exif\0\0");
+        out.extend_from_slice(&tiff);
+        out.extend_from_slice(&img[2..]);
+        out
+    }
+
+    /// Where the Exif APP1 segment ends in `bytes` (the first one).
+    fn app1_end(bytes: &[u8]) -> usize {
+        let at = bytes.windows(10).position(|w| w[..2] == [0xFF, 0xE1] && &w[4..] == b"Exif\0\0").unwrap();
+        at + 2 + usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]))
+    }
+
+    /// The production door, on a real file: `read_date_taken_with` with the picture at `ext`.
+    fn date_of_file(tag: &str, ext: &str, kind: SrcKind, bytes: &[u8]) -> Option<String> {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!("falcon_date_read_{tag}_{}_{nanos}.{ext}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let shot = Shot { id: 0, name: tag.into(), has_raw: false, has_jpg: true, raw: None, jpg: Some(path.clone()),
+            kind, cloud_placeholder: false, sniffed: None };
+        let got = read_date_taken_with(&shot, |_| false);
+        let _ = std::fs::remove_file(&path);
+        got
+    }
+
+    /// THE iPHONE CASE: the Exif item at 94 KiB, past the 64 KiB head, as in every approved sample
+    /// and about a third of a real phone library.
+    ///
+    /// FALSIFIER (L28): drop the HEIF arm of `date_exif_from` (the `heif_exif_by_index` call) and
+    /// this reads `None`, which is what the 64 KiB head alone gave before 14 November 2026.
+    #[test]
+    fn a_heif_exif_item_past_the_head_is_dated() {
+        let bytes = heif(Heif { item_from: 94 * 1024, tail: 4096, ..Default::default() });
+        assert!(bytes.len() > 96 * 1024, "premise: the item lies past 64 KiB");
+        assert_eq!(date_of_file("heif_far", "HEIC", SrcKind::Heic, &bytes).as_deref(), Some(WANT));
+        // By the bytes, not the name: the same file named `.jpg` is a HEIC all the same.
+        assert_eq!(date_of_file("heif_far_jpg", "jpg", SrcKind::Jpeg, &bytes).as_deref(), Some(WANT));
+    }
+
+    /// The other two thirds: the item inside the head. Dated before the fix and after it (a
+    /// control row: it shows the index walk did not lose what the head already held).
+    #[test]
+    fn a_heif_exif_item_inside_the_head_is_dated() {
+        let bytes = heif(Heif { item_from: 4 * 1024, tail: 200 * 1024, ..Default::default() });
+        assert_eq!(date_of_file("heif_near", "HEIC", SrcKind::Heic, &bytes).as_deref(), Some(WANT));
+    }
+
+    /// `meta` itself ends past the head (seen up to 36 KiB in real files; a larger one is legal):
+    /// one more bounded read to its end, then the item.
+    ///
+    /// FALSIFIER (L28): drop the `MetaEndsAt` arm in `heif_exif_by_index` and this reads `None`.
+    #[test]
+    fn a_heif_meta_ending_past_the_head_is_dated() {
+        let bytes = heif(Heif { meta_pad: 70 * 1024, tail: 1024, ..Default::default() });
+        assert_eq!(date_of_file("heif_meta", "HEIC", SrcKind::Heic, &bytes).as_deref(), Some(WANT));
+    }
+
+    /// An Exif item stored in `idat` (construction method 1, which `heif_grid` resolves for the
+    /// grid payloads), inside a `meta` that ends past the head.
+    ///
+    /// FALSIFIER (L28): drop the `Idat` arm of `heif_grid::resolve_extents` (make it decline) and
+    /// this reads `None`; drop the `MetaEndsAt` arm and it reads `None` too.
+    #[test]
+    fn a_heif_exif_item_in_idat_is_dated() {
+        let bytes = heif(Heif { meta_pad: 70 * 1024, in_idat: true, ..Default::default() });
+        assert_eq!(date_of_file("heif_idat", "HEIC", SrcKind::Heic, &bytes).as_deref(), Some(WANT));
+    }
+
+    /// A JPEG whose Exif segment ends past 64 KiB: the largest legal APP1 straight after SOI (it ends
+    /// at 65,539 bytes, the owner's 65.0 KiB case), and an APP1 behind APP0 and an ICC-sized APP2.
+    ///
+    /// FALSIFIER (L28): drop the JPEG arm of `date_exif_from` (the read-on to the segment's end)
+    /// and both read `None`.
+    #[test]
+    fn a_jpeg_exif_segment_ending_past_the_head_is_dated() {
+        let first = jpeg(&[], 65_535 - 8 - 64);
+        assert_eq!(app1_end(&first), 65_539, "premise: the biggest APP1 there is, cut by 3 bytes");
+        assert_eq!(date_of_file("jpeg_first", "jpg", SrcKind::Jpeg, &first).as_deref(), Some(WANT));
+        let behind = jpeg(&[segment(0xE0, 14), segment(0xE2, 20_000)], 50_000);
+        assert!(app1_end(&behind) > 64 * 1024, "premise: the segment is cut by the head");
+        assert_eq!(date_of_file("jpeg_behind", "jpg", SrcKind::Jpeg, &behind).as_deref(), Some(WANT));
+        // A control: the same shape, whole inside the head, is dated (as it was before the fix).
+        let whole = jpeg(&[segment(0xE0, 14), segment(0xE2, 20_000)], 2_000);
+        assert_eq!(date_of_file("jpeg_whole", "jpg", SrcKind::Jpeg, &whole).as_deref(), Some(WANT));
+    }
+
+    /// A reader that counts its read calls and the bytes asked of it (the sizes of the buffers handed
+    /// in, which is what the date read allocates).
+    struct Counting<R> {
+        inner: R,
+        calls: usize,
+        asked: u64,
+    }
+
+    impl<R: std::io::Read> std::io::Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            self.asked += buf.len() as u64;
+            self.inner.read(buf)
+        }
+    }
+
+    impl<R: std::io::Seek> std::io::Seek for Counting<R> {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// The date read over `bytes` through a counting reader: `(date, read calls, bytes asked)`.
+    fn counted(bytes: &[u8]) -> (Option<String>, usize, u64) {
+        let mut r = Counting { inner: std::io::Cursor::new(bytes), calls: 0, asked: 0 };
+        let date = date_exif_from(&mut r, bytes.len() as u64)
+            .and_then(|e| e.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY).and_then(exif_string));
+        (date, r.calls, r.asked)
+    }
+
+    /// Where the top-level `meta` box of a [`heif`] file ends (it follows the 24-byte `ftyp`).
+    fn meta_end(bytes: &[u8]) -> u64 {
+        assert_eq!(&bytes[28..32], b"meta", "premise: meta follows ftyp");
+        24 + u64::from(u32::from_be_bytes(bytes[24..28].try_into().unwrap()))
+    }
+
+    const HEAD: u64 = 64 * 1024;
+
+    /// WHAT A DATE COSTS NOW, through an injected reader: the head is ONE read call (it was about 12);
+    /// a HEIF item past the head is one more call of exactly the item; a `meta` past the head one more
+    /// call to its end; a cut JPEG segment one more call to the segment's end.
+    ///
+    /// FALSIFIER (L28): read the head with `take(..).read_to_end` again (calls rise past 2), or read
+    /// the whole `meta`-to-item span instead of the extent (bytes asked rise).
+    #[test]
+    fn a_date_costs_one_head_read_and_at_most_one_more_per_step() {
+        let item = exif_item().len() as u64;
+        let far = heif(Heif { item_from: 94 * 1024, tail: 4096, ..Default::default() });
+        assert_eq!(counted(&far), (Some(WANT.into()), 2, HEAD + item), "HEIF item past the head");
+        let near = heif(Heif { item_from: 4 * 1024, tail: 200 * 1024, ..Default::default() });
+        assert_eq!(counted(&near), (Some(WANT.into()), 1, HEAD), "HEIF item inside the head");
+        let meta = heif(Heif { meta_pad: 70 * 1024, tail: 1024, ..Default::default() });
+        assert_eq!(counted(&meta), (Some(WANT.into()), 3, meta_end(&meta) + item), "meta past the head");
+        let idat = heif(Heif { meta_pad: 70 * 1024, in_idat: true, ..Default::default() });
+        assert_eq!(counted(&idat), (Some(WANT.into()), 2, meta_end(&idat)), "idat item: the meta read holds it");
+        let cut = jpeg(&[segment(0xE0, 14), segment(0xE2, 20_000)], 50_000);
+        assert_eq!(counted(&cut), (Some(WANT.into()), 2, app1_end(&cut) as u64), "JPEG cut by the head");
+        let whole = jpeg(&[segment(0xE0, 14)], 2_000);
+        assert_eq!(counted(&whole), (Some(WANT.into()), 1, whole.len() as u64), "a small JPEG: one read");
+        // Through a real file, as the app reads it: the head is at most two read calls.
+        let path = std::env::temp_dir().join(format!("falcon_date_read_calls_{}.HEIC", std::process::id()));
+        std::fs::write(&path, &near).unwrap();
+        let mut file = Counting { inner: std::fs::File::open(&path).unwrap(), calls: 0, asked: 0 };
+        let date = date_exif_from(&mut file, near.len() as u64)
+            .and_then(|e| e.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY).and_then(exif_string));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(date.as_deref(), Some(WANT));
+        assert!(file.calls <= 2 && file.asked <= 2 * HEAD, "a file's head read: {} calls, {} bytes", file.calls, file.asked);
+    }
+
+    /// A JPEG whose Exif segment does not START in the head is no date, as before the fix, and costs
+    /// the head and nothing more; so does a JPEG with no Exif at all.
+    ///
+    /// FALSIFIER (L28): raise the head for every JPEG, or read on when no Exif segment starts in it.
+    #[test]
+    fn a_jpeg_without_an_exif_segment_in_the_head_costs_only_the_head() {
+        let late = jpeg(&[segment(0xE2, 65_533), segment(0xE2, 100)], 0);
+        assert!(app1_end(&late) - 74 > 64 * 1024, "premise: the APP1 starts past the head");
+        assert_eq!(counted(&late), (None, 1, HEAD));
+        let mut plain = Vec::new();
+        jpeg_encoder::Encoder::new(&mut plain, 90).encode(&[90; 18], 2, 3, jpeg_encoder::ColorType::Rgb).unwrap();
+        assert_eq!(counted(&plain), (None, 1, plain.len() as u64));
+    }
+
+    /// A MALFORMED INDEX IS NO DATE: never a panic, and never a read or an allocation past the head
+    /// when the index's own numbers are wrong. Each row is the far-item file (whose date the head
+    /// alone cannot give) damaged in one place.
+    ///
+    /// FALSIFIER (L28): drop the `total > DATE_EXIF_ITEM_CAP` test (the over-cap row reads 300 KiB),
+    /// drop the `DATE_HEIF_META_CAP` test (the 2 MiB `meta` row reads 2 MiB), or accept a zero-length
+    /// extent in `exif_extents` (that row reads to the end of the file).
+    #[test]
+    fn a_malformed_heif_index_is_no_date_and_no_read_past_the_caps() {
+        let far = Heif { item_from: 94 * 1024, tail: 4096, ..Default::default() };
+        let at = 94 * 1024u32;
+        let patched = |o: Heif, f: fn(&mut Vec<u8>)| {
+            let mut b = heif(o);
+            f(&mut b);
+            b
+        };
+        let rows: Vec<(&str, Vec<u8>)> = vec![
+            ("an extent past the end of the file", heif(Heif { extent: Some((at + 8 * 1024, 2_700)), ..far })),
+            ("an offset near u32::MAX", heif(Heif { extent: Some((u32::MAX - 10, 2_700)), ..far })),
+            ("a huge length", heif(Heif { extent: Some((at, u32::MAX)), ..far })),
+            ("a length inside the file but over the item cap",
+                heif(Heif { extent: Some((at, 300 * 1024)), tail: 400 * 1024, ..far })),
+            ("a zero-length extent (\"to the end\")", heif(Heif { extent: Some((at, 0)), ..far })),
+            ("an iloc field width of 9 bytes", heif(Heif { offset_size: 9, ..far })),
+            ("an infe version that names no type", heif(Heif { infe_version: 1, ..far })),
+            ("a meta past the meta cap", heif(Heif { meta_pad: 2 * 1024 * 1024, tail: 4096, ..far })),
+            ("a meta claiming more than the file", patched(far, |b| b[24..28].copy_from_slice(&u32::MAX.to_be_bytes()))),
+            ("a meta smaller than its own header", patched(far, |b| b[24..28].copy_from_slice(&3u32.to_be_bytes()))),
+            ("a zero-length iinf box (\"to the end\" of meta)", patched(far, |b| {
+                let i = b.windows(4).position(|w| w == b"iinf").unwrap() - 4;
+                b[i..i + 4].copy_from_slice(&0u32.to_be_bytes());
+            })),
+        ];
+        for (what, bytes) in rows {
+            let (date, calls, asked) = counted(&bytes);
+            assert_eq!(date, None, "{what}: no date");
+            assert_eq!((calls, asked), (1, HEAD), "{what}: the head and nothing more");
+        }
+        // And a good file cut short anywhere: no panic, and never more than the head and the item
+        // (the item is read only once the cut leaves it whole).
+        let good = heif(far);
+        let item_end = 94 * 1024 + exif_item().len();
+        for cut in (0..good.len()).step_by(97) {
+            let (date, _, asked) = counted(&good[..cut]);
+            let whole_item = cut >= item_end;
+            assert_eq!(date.is_some(), whole_item, "cut at {cut}");
+            assert!(asked <= HEAD + if whole_item { exif_item().len() as u64 } else { 0 }, "cut at {cut}: asked {asked}");
+        }
+    }
+
+    /// The approved HEIC test kit: every HEIC that carries a date (by a whole-file read) gets that
+    /// date from the production date read. COUNTS ONLY in the output: no name, no path, no EXIF text.
+    ///
+    /// FALSIFIER (L28): drop the HEIF arm of `date_exif_from` and "dated" falls to 0 (run on the
+    /// code before 14 November 2026: 0 of 5).
+    #[test]
+    fn every_dated_heic_in_the_approved_kit_gets_its_date() {
+        use exif::{In, Tag};
+        let (mut heics, mut carrying, mut dated) = (0usize, 0usize, 0usize);
+        let entries: Vec<std::fs::DirEntry> =
+            std::fs::read_dir(crate::fixture_paths::heic()).map(|d| d.flatten().collect()).unwrap_or_default();
+        for entry in entries {
+            let path = entry.path();
+            // Metadata first: a sample that is only in the cloud is never opened.
+            if !crate::fixture_paths::local_file(&path) {
+                continue;
+            }
+            let mut head = [0u8; 32];
+            let n = std::fs::File::open(&path).and_then(|mut f| std::io::Read::read(&mut f, &mut head)).unwrap_or(0);
+            if sniff_kind(&head[..n]) != Some(SrcKind::Heic) {
+                continue;
+            }
+            heics += 1;
+            let whole = std::fs::read(&path).unwrap();
+            let truth = exif_from_bytes(&whole)
+                .and_then(|e| e.get_field(Tag::DateTimeOriginal, In::PRIMARY).and_then(exif_string))
+                .filter(|s| !s.is_empty());
+            let Some(truth) = truth else { continue };
+            carrying += 1;
+            let shot = Shot { id: 0, name: String::new(), has_raw: false, has_jpg: true, raw: None,
+                jpg: Some(path.clone()), kind: SrcKind::Heic, cloud_placeholder: false, sniffed: None };
+            if read_date_taken_with(&shot, |_| false).as_deref() == Some(truth.as_str()) {
+                dated += 1;
+            }
+        }
+        if !crate::fixture_paths::require_available(heics > 0, "approved HEIC samples") {
+            eprintln!("approved HEIC samples absent here — row skipped");
+            return;
+        }
+        eprintln!("approved HEIC samples: {heics}; carrying a date: {carrying}; dated by the date read: {dated}");
+        assert!(carrying > 0, "the samples must carry dates, or this row proves nothing");
+        assert_eq!(dated, carrying, "every HEIC that carries a date gets it");
+    }
 }
 
 // ─────────────────── orientation (EXIF / rawler) + upright rotation (v0.8.0) ───────────────────
@@ -4993,12 +5594,177 @@ fn exif_from_bytes(buf: &[u8]) -> Option<exif::Exif> {
 /// Read at most [`EXIF_READ_CAP`] bytes of `path` into memory and parse EXIF from them — the bounded
 /// replacement for a raw `read_from_container` on a `BufReader<File>` (see [`EXIF_READ_CAP`]).
 fn read_exif_bounded(path: &Path) -> Option<exif::Exif> {
+    exif_from_bytes(&read_exif_prefix(path)?)
+}
+
+/// The first [`EXIF_READ_CAP`] bytes of `path` — the one read every EXIF parse here works from.
+fn read_exif_prefix(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read;
     let file = std::fs::File::open(path).ok()?;
     let mut buf = Vec::new();
     // `take` caps the alloc: `read_to_end` on the capped reader can grow `buf` to at most the cap.
     file.take(EXIF_READ_CAP).read_to_end(&mut buf).ok()?;
-    exif_from_bytes(&buf)
+    Some(buf)
+}
+
+/// The EXIF fields one photo's info rows are built from.
+///
+/// Fix round 2 (11 November 2026, `CS-2`): `Container` is what kamadak-exif reads straight from a
+/// JPEG, TIFF (and the TIFF-based RAWs: CR2, NEF, ARW, DNG…), HEIF, PNG or WebP — every photo that
+/// had rows before. `Fields` is a Canon CR3's EXIF, which sits in three separate TIFF blocks inside
+/// the file ([`cr3_exif_fields`]); kamadak parses each block, and the fields are put back under the
+/// IFD each one came from, so the rows are built by exactly the same code with exactly the same
+/// formatting as the JPEG beside it.
+enum ExifSource {
+    Container(exif::Exif),
+    Fields(Vec<exif::Field>),
+}
+
+impl ExifSource {
+    fn get(&self, tag: exif::Tag) -> Option<&exif::Field> {
+        match self {
+            ExifSource::Container(r) => r.get_field(tag, exif::In::PRIMARY),
+            ExifSource::Fields(v) => v.iter().find(|f| f.tag == tag && f.ifd_num == exif::In::PRIMARY),
+        }
+    }
+
+    /// A field's value with its unit, as kamadak writes it. The `Container` arm is byte-identical to
+    /// what the rows always used (`with_unit(&reader)`). The `Fields` arm hands kamadak the one other
+    /// field a unit can name among the rows' tags (GPS altitude's reference), which is what
+    /// `with_unit(&reader)` would have looked up.
+    fn unit(&self, tag: exif::Tag) -> Option<String> {
+        let f = self.get(tag)?;
+        Some(match self {
+            ExifSource::Container(r) => f.display_value().with_unit(r).to_string(),
+            ExifSource::Fields(_) => match self.get(exif::Tag::GPSAltitudeRef) {
+                Some(r) if tag == exif::Tag::GPSAltitude => f.display_value().with_unit(r).to_string(),
+                _ => f.display_value().with_unit(f).to_string(),
+            },
+        })
+    }
+}
+
+/// Fix round 2 (`CS-2`): **THE EXIF OF A RAW THAT KAMADAK CANNOT OPEN AS A CONTAINER**, from the same
+/// bytes ([`read_exif_prefix`]) — asked only for a RAW-only photo (or a passenger), after the plain
+/// parse failed, so no JPEG, pair or TIFF-based RAW reads or parses anything new.
+/// * Canon CR3 (ISO-BMFF `crx `): the `CMT1`/`CMT2`/`CMT4` TIFF blocks ([`cr3_exif_fields`]).
+/// * Fujifilm RAF: the header names the embedded JPEG (offset and length, big-endian, at bytes 84 and
+///   88), and that JPEG carries the camera's full EXIF.
+/// * Panasonic RW2 and Olympus ORF: TIFF files with their own magic number (`IIU\0`, `IIRO`/`IIRS`,
+///   `MMOR`) in place of 42; with the magic put back, kamadak reads them as the TIFF they are. Tried
+///   on made-up files only, never on a real one.
+fn raw_exif_from_bytes(buf: &[u8]) -> Option<ExifSource> {
+    if buf.len() >= 12 && &buf[4..8] == b"ftyp" && &buf[8..12] == b"crx " {
+        return cr3_exif_fields(buf).map(ExifSource::Fields);
+    }
+    if buf.len() >= 92 && buf.starts_with(b"FUJIFILMCCD-RAW") {
+        let off = u32::from_be_bytes([buf[84], buf[85], buf[86], buf[87]]) as usize;
+        let len = u32::from_be_bytes([buf[88], buf[89], buf[90], buf[91]]) as usize;
+        let end = off.saturating_add(len).min(buf.len());
+        return (off < end).then(|| exif_from_bytes(&buf[off..end])).flatten().map(ExifSource::Container);
+    }
+    let fixed: Option<[u8; 2]> = match buf.get(0..4) {
+        Some(b"IIU\0") | Some(b"IIRO") | Some(b"IIRS") => Some([0x2A, 0x00]),
+        Some(b"MMOR") => Some([0x00, 0x2A]),
+        _ => None,
+    };
+    let magic = fixed?;
+    let mut tiff = buf.to_vec();
+    tiff[2..4].copy_from_slice(&magic);
+    exif_from_bytes(&tiff).map(ExifSource::Container)
+}
+
+/// Canon's CR3 metadata box (`moov` → `uuid` 85c0b687-820f-11e0-8111-f4ce462b6a48): `CMT1` is IFD0,
+/// `CMT2` the Exif IFD, `CMT4` the GPS IFD, each a complete little TIFF. kamadak parses each as a
+/// TIFF's IFD0, so the `CMT2`/`CMT4` fields come back tagged as IFD0 tags; they are re-tagged into
+/// the Exif and GPS contexts their numbers belong to. `None` when the boxes are not there.
+fn cr3_exif_fields(buf: &[u8]) -> Option<Vec<exif::Field>> {
+    const CANON_UUID: [u8; 16] =
+        [0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a, 0x48];
+    let (_, ms, me) = bmff_children(buf, 0, buf.len()).into_iter().find(|(t, _, _)| t == b"moov")?;
+    let (_, us, ue) = bmff_children(buf, ms, me)
+        .into_iter()
+        .find(|(t, s, e)| t == b"uuid" && e.saturating_sub(*s) >= 16 && buf[*s..*s + 16] == CANON_UUID)?;
+    let mut fields = Vec::new();
+    for (t, s, e) in bmff_children(buf, us + 16, ue) {
+        let ctx = match &t {
+            b"CMT1" => exif::Context::Tiff,
+            b"CMT2" => exif::Context::Exif,
+            b"CMT4" => exif::Context::Gps,
+            _ => continue,
+        };
+        let Ok(r) = exif::Reader::new().read_raw(buf[s..e].to_vec()) else { continue };
+        // Only a field parsed AS an IFD0 field moves; one kamadak found through a pointer already
+        // carries its own context.
+        fields.extend(r.fields().filter(|f| f.ifd_num == exif::In::PRIMARY).map(|f| exif::Field {
+            tag: if f.tag.context() == exif::Context::Tiff { exif::Tag(ctx, f.tag.number()) } else { f.tag },
+            ifd_num: exif::In::PRIMARY,
+            value: f.value.clone(),
+        }));
+    }
+    (!fields.is_empty()).then_some(fields)
+}
+
+#[cfg(test)]
+mod raw_exif_tests {
+    use super::*;
+
+    /// A little-endian TIFF: IFD0 (Make, Model, Exif pointer) → Exif IFD (ExposureTime 1/250,
+    /// ISO 200).
+    fn tiff_with_exposure() -> Vec<u8> {
+        let entry = |t: &mut Vec<u8>, tag: u16, ty: u16, count: u32, value: [u8; 4]| {
+            t.extend_from_slice(&tag.to_le_bytes());
+            t.extend_from_slice(&ty.to_le_bytes());
+            t.extend_from_slice(&count.to_le_bytes());
+            t.extend_from_slice(&value);
+        };
+        let exif_at = 8 + 2 + 3 * 12 + 4u32; // 50
+        let rational_at = exif_at + 2 + 2 * 12 + 4; // 80
+        let mut t = b"II*\0".to_vec();
+        t.extend_from_slice(&8u32.to_le_bytes());
+        t.extend_from_slice(&3u16.to_le_bytes());
+        entry(&mut t, 0x010F, 2, 4, *b"Pan\0");
+        entry(&mut t, 0x0110, 2, 4, *b"GH6\0");
+        entry(&mut t, 0x8769, 4, 1, exif_at.to_le_bytes());
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.extend_from_slice(&2u16.to_le_bytes());
+        entry(&mut t, 0x829A, 5, 1, rational_at.to_le_bytes());
+        entry(&mut t, 0x8827, 3, 1, [200, 0, 0, 0]);
+        t.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(t.len() as u32, rational_at, "premise: the rational sits where the entry points");
+        t.extend_from_slice(&1u32.to_le_bytes());
+        t.extend_from_slice(&250u32.to_le_bytes());
+        t
+    }
+
+    /// Fix round 2 (`CS-2`): Panasonic RW2 and Olympus ORF are TIFF with their own magic number; with
+    /// it put back the same reader gives the same rows. MADE-UP FILES ONLY: no real RW2 or ORF is in
+    /// the approved corpora, so this proves the route, not any camera's file.
+    ///
+    /// FALSIFIER (L28): drop the magic arm of `raw_exif_from_bytes` and every row here is empty.
+    #[test]
+    fn rw2_and_orf_made_up_files_read_through_the_tiff_reader() {
+        let dir = std::env::temp_dir().join(format!("falcon_raw_exif_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        for (name, magic) in [("made_up.RW2", *b"IIU\0"), ("made_up.ORF", *b"IIRO"), ("made_up_s.ORF", *b"IIRS")] {
+            let mut bytes = tiff_with_exposure();
+            bytes[0..4].copy_from_slice(&magic);
+            let path = dir.join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            let shot = Shot { id: 0, name: name.into(), has_raw: true, has_jpg: false, raw: Some(path),
+                jpg: None, kind: SrcKind::Jpeg, cloud_placeholder: false, sniffed: None };
+            let rows = exif_rows(&shot, 0);
+            println!("{name}: {rows:?}");
+            let get = |k: &str| rows.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+            assert_eq!(get("Camera"), Some("Pan GH6"), "{name}");
+            assert_eq!(get("Shutter"), Some("1/250 s"), "{name}");
+            assert_eq!(get("ISO"), Some("200"), "{name}");
+        }
+        // A plain TIFF needs none of this (kamadak reads it directly), and a stray magic is not taken
+        // for one of these: nothing comes back.
+        assert!(raw_exif_from_bytes(b"XXXX\0\0\0\0").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 pub(crate) fn exif_orientation(path: &Path) -> Option<u32> {
@@ -5426,11 +6192,16 @@ mod orient_tests {
     }
 }
 
-/// Extract the embedded ICC colour profile from a JPEG (the bytes of the `APP2`
-/// `ICC_PROFILE` segment(s), concatenated in chunk order). The profile sits in the file
-/// header before the image scan, so a bounded prefix read covers it. `None` if the file
-/// isn't a JPEG or carries no profile (e.g. a Canon sRGB JPG, which tags sRGB in EXIF only).
-fn extract_icc_from_jpeg(path: &std::path::Path) -> Option<Vec<u8>> {
+/// What a JPEG's header says about its colour, read in ONE bounded prefix read: the embedded ICC
+/// profile (the bytes of the `APP2` `ICC_PROFILE` segment(s), concatenated in chunk order), and the
+/// TIFF body of its first `APP1` `Exif` segment. Both sit in the file header before the image scan,
+/// so the prefix covers them. `None` if the file isn't a JPEG.
+struct JpegColourSegments {
+    icc: Option<Vec<u8>>,
+    exif_tiff: Option<Vec<u8>>,
+}
+
+fn jpeg_colour_segments(path: &std::path::Path) -> Option<JpegColourSegments> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
     // 512 KB covers every realistic ICC profile (sRGB ~3 KB, Adobe RGB / Display P3 < 1 KB) even
@@ -5438,11 +6209,16 @@ fn extract_icc_from_jpeg(path: &std::path::Path) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; 512 * 1024];
     let n = f.read(&mut buf).ok()?;
     buf.truncate(n);
-    let b = &buf;
+    jpeg_colour_segments_in(&buf)
+}
+
+/// [`jpeg_colour_segments`] over bytes already in hand (the marker walk, split out for tests).
+fn jpeg_colour_segments_in(b: &[u8]) -> Option<JpegColourSegments> {
     if b.len() < 4 || b[0] != 0xFF || b[1] != 0xD8 {
         return None; // not a JPEG (SOI = FFD8)
     }
     let mut i = 2usize;
+    let mut exif_tiff: Option<Vec<u8>> = None;
     let mut chunks: Vec<(u8, Vec<u8>)> = Vec::new(); // (sequence number, chunk bytes)
     while i + 4 <= b.len() {
         if b[i] != 0xFF {
@@ -5469,13 +6245,201 @@ fn extract_icc_from_jpeg(path: &std::path::Path) -> Option<Vec<u8>> {
         if marker == 0xE2 && data.len() > 14 && &data[0..12] == b"ICC_PROFILE\0" {
             chunks.push((data[12], data[14..].to_vec()));
         }
+        // APP1 "Exif\0\0" + a TIFF body. Only the first one is the camera's EXIF (an XMP APP1 has
+        // a different signature and is skipped by the test).
+        if marker == 0xE1 && exif_tiff.is_none() && data.len() > 6 && &data[0..6] == b"Exif\0\0" {
+            exif_tiff = Some(data[6..].to_vec());
+        }
         i += seg_len;
     }
-    if chunks.is_empty() {
-        return None;
+    let icc = (!chunks.is_empty()).then(|| {
+        chunks.sort_by_key(|(s, _)| *s);
+        chunks.into_iter().flat_map(|(_, d)| d).collect()
+    });
+    Some(JpegColourSegments { icc, exif_tiff })
+}
+
+/// The embedded ICC profile of a JPEG, `None` if the file isn't a JPEG or carries none.
+fn extract_icc_from_jpeg(path: &std::path::Path) -> Option<Vec<u8>> {
+    jpeg_colour_segments(path)?.icc
+}
+
+/// Fix round 2 (11 November 2026, `F6-colour-2`) — **THE ONE PLACE A JPEG'S COLOUR IS DECIDED.**
+/// An embedded profile wins. Without one, the camera's EXIF marker for in-camera Adobe RGB decides:
+/// Canon, Sony and Fujifilm write no profile in that mode, only `ColorSpace = 2` or `ColorSpace =
+/// 0xFFFF` ("Uncalibrated") with the Interop index `R03` (the DCF option-file rule). Anything else is
+/// silent, so the sRGB floor answers as before. The picture (every tier and export, through
+/// [`shot_source_gamut`]) and the info panel's label ([`color_space_label`]) both ask here.
+///
+/// It adds no read: the EXIF body comes out of the same prefix read the profile walk already does,
+/// and is parsed only for a JPEG that carries no profile.
+///
+/// FALSIFIER (L28): drop the EXIF arm and `an_in_camera_adobe_rgb_jpeg_is_adobe_rgb_on_every_route`
+/// reddens on both marker rows.
+fn jpeg_color_tag(path: &Path) -> ColorTag {
+    jpeg_colour_segments(path).map(|s| jpeg_color_tag_from(&s)).unwrap_or_default()
+}
+
+fn jpeg_color_tag_from(s: &JpegColourSegments) -> ColorTag {
+    if let Some(icc) = &s.icc {
+        return ColorTag::from_icc(icc.clone());
     }
-    chunks.sort_by_key(|(s, _)| *s);
-    Some(chunks.into_iter().flat_map(|(_, d)| d).collect())
+    if s.exif_tiff.as_deref().is_some_and(exif_marks_adobe_rgb) {
+        return ColorTag::named("Adobe RGB");
+    }
+    ColorTag::default()
+}
+
+/// The DCF rule over an EXIF TIFF body: `ColorSpace == 2`, or `ColorSpace == 0xFFFF` with the
+/// Interop index `R03`. `ColorSpace == 1` (sRGB) is sRGB whatever the Interop index says.
+fn exif_marks_adobe_rgb(tiff: &[u8]) -> bool {
+    use exif::{In, Tag, Value};
+    let Ok(reader) = exif::Reader::new().read_raw(tiff.to_vec()) else { return false };
+    let cs = reader.get_field(Tag::ColorSpace, In::PRIMARY).and_then(|f| match &f.value {
+        Value::Short(v) => v.first().copied(),
+        _ => None,
+    });
+    match cs {
+        Some(2) => true,
+        Some(0xFFFF) => reader
+            .get_field(Tag::InteroperabilityIndex, In::PRIMARY)
+            .is_some_and(|f| matches!(&f.value, Value::Ascii(v) if v.first().is_some_and(|s| s.as_slice() == b"R03"))),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod in_camera_adobe_rgb_tests {
+    use super::*;
+    use falcon_color::Gamut;
+
+    /// A little-endian EXIF TIFF body: IFD0 → Exif IFD (`ColorSpace = cs`) → optional Interop IFD
+    /// (`InteroperabilityIndex = interop`, a 3-letter code stored inline).
+    fn exif_tiff(cs: u16, interop: Option<&[u8; 3]>) -> Vec<u8> {
+        let entry = |t: &mut Vec<u8>, tag: u16, ty: u16, count: u32, value: [u8; 4]| {
+            t.extend_from_slice(&tag.to_le_bytes());
+            t.extend_from_slice(&ty.to_le_bytes());
+            t.extend_from_slice(&count.to_le_bytes());
+            t.extend_from_slice(&value);
+        };
+        let exif_at = 8 + 18u32;
+        let exif_n: u16 = if interop.is_some() { 2 } else { 1 };
+        let interop_at = exif_at + 2 + 12 * exif_n as u32 + 4;
+        let mut t = b"II*\0".to_vec();
+        t.extend_from_slice(&8u32.to_le_bytes());
+        t.extend_from_slice(&1u16.to_le_bytes());
+        entry(&mut t, 0x8769, 4, 1, exif_at.to_le_bytes());
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.extend_from_slice(&exif_n.to_le_bytes());
+        let mut v = [0u8; 4];
+        v[..2].copy_from_slice(&cs.to_le_bytes());
+        entry(&mut t, 0xA001, 3, 1, v);
+        if interop.is_some() {
+            entry(&mut t, 0xA005, 4, 1, interop_at.to_le_bytes());
+        }
+        t.extend_from_slice(&0u32.to_le_bytes());
+        if let Some(code) = interop {
+            t.extend_from_slice(&1u16.to_le_bytes());
+            entry(&mut t, 0x0001, 2, 4, [code[0], code[1], code[2], 0]);
+            t.extend_from_slice(&0u32.to_le_bytes());
+        }
+        t
+    }
+
+    /// A small real JPEG, optionally with an APP2 profile and an APP1 EXIF body.
+    fn jpeg(icc: Option<&[u8]>, exif: Option<Vec<u8>>) -> Vec<u8> {
+        let rgb = vec![120u8; 8 * 8 * 3];
+        let mut j = encode_jpeg(&rgb, 8, 8, 90, icc).expect("encode");
+        if let Some(tiff) = exif {
+            let mut app1 = b"\xff\xe1".to_vec();
+            app1.extend_from_slice(&((tiff.len() + 8) as u16).to_be_bytes());
+            app1.extend_from_slice(b"Exif\0\0");
+            app1.extend_from_slice(&tiff);
+            j.splice(2..2, app1);
+        }
+        j
+    }
+
+    /// Fix round 2 (`F6-colour-2`): an in-camera Adobe RGB JPEG with no embedded profile is Adobe RGB
+    /// on every route that decides a JPEG's colour — the source gamut every tier and export asks,
+    /// both frame sources, the info panel's label and the web export's action — and an embedded
+    /// profile still wins over the marker. Generated files only.
+    ///
+    /// FALSIFIER (L28): drop the EXIF arm of `jpeg_color_tag_from` and both marker rows read sRGB /
+    /// TagSrgbOnly; let the marker beat the profile and the third row reads Adobe RGB.
+    #[test]
+    fn an_in_camera_adobe_rgb_jpeg_is_adobe_rgb_on_every_route() {
+        let srgb_icc = falcon_color::icc_bytes_for_gamut(Gamut::Srgb).expect("an sRGB profile");
+        let rows: [(&str, Vec<u8>, Gamut, &str); 5] = [
+            ("uncalibrated-r03", jpeg(None, Some(exif_tiff(0xFFFF, Some(b"R03")))), Gamut::AdobeRgb, "Adobe RGB"),
+            ("colorspace-2", jpeg(None, Some(exif_tiff(2, None))), Gamut::AdobeRgb, "Adobe RGB"),
+            ("marker-and-srgb-profile", jpeg(Some(&srgb_icc), Some(exif_tiff(0xFFFF, Some(b"R03")))), Gamut::Srgb, "sRGB"),
+            ("srgb-tag-r03", jpeg(None, Some(exif_tiff(1, Some(b"R03")))), Gamut::Srgb, "sRGB"),
+            ("neither", jpeg(None, None), Gamut::Srgb, ""),
+        ];
+        let dir = std::env::temp_dir().join(format!("falcon_adobe_marker_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        for (name, bytes, want, label) in rows {
+            let path = dir.join(format!("{name}.jpg"));
+            std::fs::write(&path, &bytes).unwrap();
+            let shot = Shot { id: 0, name: name.into(), has_raw: false, has_jpg: true, raw: None,
+                jpg: Some(path.clone()), kind: SrcKind::Jpeg, cloud_placeholder: false, sniffed: None };
+            let g = shot_source_gamut(&shot);
+            let main = frame_source_gamut(&shot, FrameSource::MainImage);
+            let preview = frame_source_gamut(&shot, FrameSource::EmbeddedPreview);
+            let row = exif_rows(&shot, 0).into_iter().find(|(k, _)| k == "Color space").map(|(_, v)| v);
+            let action = export_color_action(ExportTarget::Web, g);
+            println!("{name}: gamut={g:?} main={main:?} preview={preview:?} label={row:?} web={action:?}");
+            assert_eq!(g, want, "{name}: the source gamut");
+            assert_eq!(main, want, "{name}: the main-image frame");
+            assert_eq!(preview, want, "{name}: the embedded-preview frame");
+            assert_eq!(row.as_deref().unwrap_or(""), label, "{name}: the panel's label");
+            let want_action = if want == Gamut::Srgb { ExportColorAction::TagSrgbOnly } else { ExportColorAction::ConvertToSrgb };
+            assert_eq!(action, want_action, "{name}: the web export converts, never relabels");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A RAW-only photo's label keeps today's reading: the marker rule is the finished JPEG's, because
+    /// a RAW's embedded preview is drawn as sRGB. (The file here is a JPEG container under a RAW name,
+    /// which is what lets the old reading see a profile at all.)
+    #[test]
+    fn the_marker_rule_never_reaches_a_raw_paths_label() {
+        let tiff = exif_tiff(0xFFFF, Some(b"R03"));
+        let reader = ExifSource::Container(exif::Reader::new().read_raw(tiff.clone()).unwrap());
+        let path = std::env::temp_dir().join(format!("falcon_adobe_marker_raw_{}.CR2", std::process::id()));
+        std::fs::write(&path, jpeg(None, Some(tiff))).unwrap();
+        assert_eq!(color_space_label(&path, true, &reader).as_deref(), Some("Adobe RGB"), "premise: the finished door reads it");
+        assert_eq!(color_space_label(&path, false, &reader), None, "a RAW path's label is unchanged (Uncalibrated → none)");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The cost of the marker read, measured: `shot_source_gamut` on a profile-less marker JPEG (the
+    /// path that now parses EXIF) and on a profile-less JPEG with no EXIF (the old cost, one prefix
+    /// read and a marker walk). Printed everywhere; no clock bound (the plan's rule).
+    #[test]
+    fn the_marker_read_cost_is_printed() {
+        let dir = std::env::temp_dir().join(format!("falcon_adobe_marker_cost_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let shot_for = |name: &str, bytes: Vec<u8>| {
+            let path = dir.join(format!("{name}.jpg"));
+            std::fs::write(&path, bytes).unwrap();
+            Shot { id: 0, name: name.into(), has_raw: false, has_jpg: true, raw: None,
+                jpg: Some(path), kind: SrcKind::Jpeg, cloud_placeholder: false, sniffed: None }
+        };
+        let marker = shot_for("marker", jpeg(None, Some(exif_tiff(0xFFFF, Some(b"R03")))));
+        let plain = shot_for("plain", jpeg(None, None));
+        let time = |s: &Shot| {
+            for _ in 0..50 { std::hint::black_box(shot_source_gamut(s)); }
+            let n = 2000u32;
+            let t = std::time::Instant::now();
+            for _ in 0..n { std::hint::black_box(shot_source_gamut(s)); }
+            t.elapsed().as_secs_f64() * 1e6 / n as f64
+        };
+        let (m, p) = (time(&marker), time(&plain));
+        println!("shot_source_gamut per call: marker JPEG {m:.1} µs, plain JPEG {p:.1} µs, difference {:.1} µs", m - p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// What a file DECLARES about its colour space: the raw ICC profile when it embeds one, and the
@@ -5740,16 +6704,26 @@ fn quoted_profile_name(desc: &str) -> String {
 /// The shot's REAL colour space: the embedded ICC profile's description first (authoritative —
 /// names Adobe RGB / Display P3 / sRGB variants), falling back to the EXIF `ColorSpace` tag when
 /// there's no profile (Canon sRGB JPGs). `None` = unknown (the UI then assumes its sRGB default).
-fn color_space_label(path: &std::path::Path, reader: &exif::Exif) -> Option<String> {
-    let tag = extract_icc_from_jpeg(path).map(ColorTag::from_icc).unwrap_or_default();
+///
+/// Fix round 2 (`F6-colour-2`): for the shot's FINISHED file (`finished`) the tag is
+/// [`jpeg_color_tag`]'s, the same answer the picture is drawn with, so an in-camera Adobe RGB JPEG
+/// with no profile says "Adobe RGB" here too (the R03 case said nothing before). A RAW path keeps
+/// the old reading (a profile only, then the EXIF `ColorSpace` tag): its embedded preview is drawn
+/// as sRGB (`shot_source_gamut`), and widening its label would make the label disagree with it.
+fn color_space_label(path: &std::path::Path, finished: bool, reader: &ExifSource) -> Option<String> {
+    let tag = if finished {
+        jpeg_color_tag(path)
+    } else {
+        extract_icc_from_jpeg(path).map(ColorTag::from_icc).unwrap_or_default()
+    };
     if let Some(desc) = tag.desc.as_deref().filter(|d| !d.is_empty()) {
         // v0.8.141 (R8): resolve ONCE and hand the answer to the label, which used to re-parse the
         // same profile to ask a question this call already answers.
         let r = falcon_color::resolve_source_gamut(tag.icc.as_deref(), tag.desc.as_deref());
         return Some(color_space_label_for(&tag, desc, &r));
     }
-    use exif::{In, Tag, Value};
-    let cs = reader.get_field(Tag::ColorSpace, In::PRIMARY).and_then(|f| match &f.value {
+    use exif::{Tag, Value};
+    let cs = reader.get(Tag::ColorSpace).and_then(|f| match &f.value {
         Value::Short(v) => v.first().copied(),
         _ => None,
     });
@@ -5873,7 +6847,7 @@ pub fn shot_source_gamut(shot: &Shot) -> falcon_color::Gamut {
 /// BYTES where the format has any, and a name where the format only carries an enumerated code.
 fn file_color_tag(path: &Path, kind: SrcKind) -> ColorTag {
     match kind {
-        SrcKind::Jpeg => extract_icc_from_jpeg(path).map(ColorTag::from_icc).unwrap_or_default(),
+        SrcKind::Jpeg => jpeg_color_tag(path),
         SrcKind::Png => png_color_tag(path),
         SrcKind::Tiff => tiff_color_tag(path),
         SrcKind::Webp => webp_color_tag(path),
@@ -6069,7 +7043,7 @@ fn note_profile_missed_tolerance(tag: &ColorTag, r: &falcon_color::GamutResoluti
 /// resolved by the caller): the Dimensions row shows the ORIENTED W × H (user gate: "Oriented"),
 /// so odd turns swap the two values. 0 leaves the file's stored order untouched.
 pub fn exif_rows(shot: &Shot, turns: u8) -> Vec<(String, String)> {
-    use exif::{In, Tag};
+    use exif::Tag;
 
     // Open-time check (2 November): the panel names the real format and a passenger's RAW from its
     // first build. The size lookups below use `source_dimensions_checked` on this same answer.
@@ -6091,7 +7065,15 @@ pub fn exif_rows(shot: &Shot, turns: u8) -> Vec<(String, String)> {
     // A1/F2 (defect #1): bounded read — the info-panel parse fires off-thread on the EXIF worker when
     // the user settles on a shot, so an unbounded `read_from_container` here would OOM-abort on a
     // crafted multi-GB TIFF exactly like the per-decode orientation read. Same 4 MB cap.
-    let reader = match read_exif_bounded(path) {
+    // Fix round 2 (`CS-2`): ONE read; when the plain parse fails on a RAW (a RAW-only photo or a
+    // passenger), the same bytes are asked for the RAW's own EXIF blocks (`raw_exif_from_bytes`).
+    let prefix = read_exif_prefix(path);
+    let parsed = prefix.as_deref().and_then(|b| {
+        exif_from_bytes(b)
+            .map(ExifSource::Container)
+            .or_else(|| (!shot.has_jpg).then(|| raw_exif_from_bytes(b)).flatten())
+    });
+    let reader = match parsed {
         Some(r) => r,
         None => {
             // v0.8.90: the EXIF container is absent or unparseable (a PNG/WebP with no EXIF chunk, a
@@ -6101,7 +7083,9 @@ pub fn exif_rows(shot: &Shot, turns: u8) -> Vec<(String, String)> {
             // locked file still returns EMPTY, so the v0.8.89 bounded retry keeps self-healing
             // exactly those, while a readable EXIF-less file gets its honest panel IMMEDIATELY
             // instead of 5 blank retries (~11 s) first. (A RAW-only shot has no finished path →
-            // `source_dimensions` is None → empty → retry, unchanged — real raws carry EXIF.)
+            // `source_dimensions` is None → empty → retry. Since fix round 2 (`CS-2`) a RAW reaches
+            // here only when neither the plain parse nor `raw_exif_from_bytes` found its EXIF: a
+            // mid-copy file, or a RAW format with neither route.)
             if let Some((w, h)) = source_dimensions_checked(shot) {
                 // Same oriented-swap rule as the EXIF-present Dimensions fallback below.
                 let (w, h) = if turns & 1 == 1 { (h, w) } else { (w, h) };
@@ -6115,13 +7099,11 @@ pub fn exif_rows(shot: &Shot, turns: u8) -> Vec<(String, String)> {
         }
     };
 
-    let plain = |tag| reader.get_field(tag, In::PRIMARY).map(|f| f.display_value().to_string());
-    let unit = |tag| {
-        reader.get_field(tag, In::PRIMARY).map(|f| f.display_value().with_unit(&reader).to_string())
-    };
+    let plain = |tag| reader.get(tag).map(|f| f.display_value().to_string());
+    let unit = |tag| reader.unit(tag);
     // String tags (make/model/lens/artist/software/date) → first non-empty ASCII
     // component, so NUL-padding / empty fields don't leak `", "", "", …` (see exif_string).
-    let str_tag = |tag| reader.get_field(tag, In::PRIMARY).and_then(exif_string);
+    let str_tag = |tag| reader.get(tag).and_then(exif_string);
     let add = |rows: &mut Vec<(String, String)>, k: &str, v: Option<String>| {
         if let Some(v) = v {
             let v = trim_quotes(&v);
@@ -6156,7 +7138,7 @@ pub fn exif_rows(shot: &Shot, turns: u8) -> Vec<(String, String)> {
     // Exposure bias: cameras use 1/3-EV steps, so the raw rational is e.g. -0.33333…;
     // round to 2 decimals (trim trailing zeros) instead of dumping a dozen 3s.
     let ev = reader
-        .get_field(Tag::ExposureBiasValue, In::PRIMARY)
+        .get(Tag::ExposureBiasValue)
         .and_then(|f| match &f.value {
             exif::Value::SRational(v) => v.first().map(|r| r.to_f64()),
             _ => None,
@@ -6180,7 +7162,7 @@ pub fn exif_rows(shot: &Shot, turns: u8) -> Vec<(String, String)> {
     // Adobe RGB from Display P3 — the EXIF ColorSpace tag reports both as "Uncalibrated"), falling back
     // to the EXIF tag for profile-less sRGB JPGs. The render pipeline is sRGB-assumed, so the always-
     // visible RAW/JPG panel turns this into a dim "sRGB" or a yellow warning for a non-sRGB file.
-    add(&mut rows, "Color space", color_space_label(path, &reader));
+    add(&mut rows, "Color space", color_space_label(path, shot.has_jpg, &reader));
     // v0.8.0: ORIENTED dimensions — swap W×H when the display turns are odd (90°/270°).
     let swap = turns & 1 == 1;
     // v0.8.101 (S4): HEIC reads its size from the DECODED frame, never from EXIF
@@ -6223,8 +7205,8 @@ pub fn exif_rows(shot: &Shot, turns: u8) -> Vec<(String, String)> {
 }
 
 /// Decimal lat/long from EXIF GPS rationals, e.g. `33.85920°S 151.21500°E`.
-fn format_gps(reader: &exif::Exif) -> Option<String> {
-    use exif::{In, Tag, Value};
+fn format_gps(reader: &ExifSource) -> Option<String> {
+    use exif::{Tag, Value};
     let dms = |v: &Value| -> Option<f64> {
         if let Value::Rational(r) = v {
             if r.len() >= 3 {
@@ -6233,10 +7215,10 @@ fn format_gps(reader: &exif::Exif) -> Option<String> {
         }
         None
     };
-    let lat = dms(&reader.get_field(Tag::GPSLatitude, In::PRIMARY)?.value)?;
-    let lon = dms(&reader.get_field(Tag::GPSLongitude, In::PRIMARY)?.value)?;
-    let lr = reader.get_field(Tag::GPSLatitudeRef, In::PRIMARY).map(|f| f.display_value().to_string()).unwrap_or_default();
-    let or = reader.get_field(Tag::GPSLongitudeRef, In::PRIMARY).map(|f| f.display_value().to_string()).unwrap_or_default();
+    let lat = dms(&reader.get(Tag::GPSLatitude)?.value)?;
+    let lon = dms(&reader.get(Tag::GPSLongitude)?.value)?;
+    let lr = reader.get(Tag::GPSLatitudeRef).map(|f| f.display_value().to_string()).unwrap_or_default();
+    let or = reader.get(Tag::GPSLongitudeRef).map(|f| f.display_value().to_string()).unwrap_or_default();
     Some(format!("{:.5}°{} {:.5}°{}", lat, trim_quotes(&lr), lon, trim_quotes(&or)))
 }
 
@@ -12203,7 +13185,7 @@ mod tests {
             let f = std::fs::File::open(&p).ok()?;
             let mut br = std::io::BufReader::new(f);
             let reader = exif::Reader::new().read_from_container(&mut br).ok()?;
-            color_space_label(&p, &reader)
+            color_space_label(&p, true, &crate::ExifSource::Container(reader))
         };
         for (file, expect) in [
             ("AdobeRGB_test.jpg", "Adobe RGB"),

@@ -1,0 +1,47 @@
+[package]
+name = "falcon-platform-tests"
+version = "0.0.0"
+description = "Falcon's checks that need a process of their own: the Mac title-bar move test and the Windows Shell icon tests"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# These two tests lived in `falcon-native/tests/`. A package's integration tests make Cargo build
+# its programs too, so every `cargo test` compiled a plain debug copy of the whole app that nothing
+# ran, beside the app's test program (build-time round, 11 November 2026). Here they need only
+# what they use: winit and AppKit on the Mac, the icon helper DLLs and the registry on Windows.
+
+# AppKit must run on the process main thread. The usual parallel test harness cannot exercise view
+# adoption; this native event-loop test runs before the Mac release build.
+[[test]]
+name = "mac_hosted_view"
+path = "mac_hosted_view.rs"
+harness = false
+required-features = ["mac-native-tests"]
+
+# Native DLL/COM checks in a separate process (they redirect the process-wide registry).
+[[test]]
+name = "windows_shell_icons"
+path = "windows_shell_icons.rs"
+
+[features]
+# Test-only entry point: ordinary Windows checks must not build a Mac launcher.
+mac-native-tests = []
+
+# The same winit, objc2 and objc2-* versions and features the app resolves (see
+# `falcon-native/Cargo.toml`), so `cargo test` builds each of them once.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+winit = { version = "=0.30.13", default-features = false, features = ["falcon-macos-hosted-view"] }
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSGeometry", "NSRange"] }
+objc2-app-kit = { version = "0.2", features = ["NSResponder", "NSView", "NSWindow"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
+winreg = "0.55"
+libloading = "0.8"
+
+# The icon helper (`../shell-icons/handler.cpp`), built by the same code as the app's copy
+# (`../build_shell_icons.rs`), plus its test-only variant with a different identity.
+[target.'cfg(windows)'.build-dependencies]
+cc = "1"

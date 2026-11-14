@@ -10,19 +10,14 @@ publish = false
 name = "falcon"
 path = "src/main.rs"
 
-# AppKit must run on the process main thread. The usual parallel test harness
-# cannot exercise view adoption; this native event-loop test runs before release.
-[[test]]
-name = "mac_hosted_view"
-path = "tests/mac_hosted_view.rs"
-harness = false
-required-features = ["mac-native-tests"]
+# No integration tests here on purpose: they would make every `cargo test` compile a second,
+# plain copy of the app beside its test program. The Mac title-bar move test and the Windows
+# Shell icon tests, which need a process of their own, are in `platform-tests/` (its
+# `mac-native-tests` feature turns the Mac one on).
 
 [features]
 # Isolated diagnostic identity/profile. Ordinary Mac builds use the same native toolbar.
-mac-chrome-experiment = ["mac-native-tests"]
-# Test-only entry point: ordinary Windows checks must not build a Mac launcher.
-mac-native-tests = []
+mac-chrome-experiment = []
 
 [dependencies]
 # Native GUI, FemtoVG-on-wgpu renderer (the only Slint renderer that supports the
@@ -42,6 +37,8 @@ slint = { version = "1.17", default-features = false, features = [
     "unstable-winit-030",
 ] }
 i-slint-backend-winit = { version = "1.17", default-features = false }
+# The interface: the `.slint` files in `ui/`, compiled once in their own crate (`crate::ui`).
+falcon-ui = { path = "ui" }
 falcon-decode = { path = "../crates/falcon-decode" }
 # Optional GPU JPEG decode (NVIDIA nvJPEG, CUDA dlopen'd at runtime). Builds + runs
 # CUDA-free — NvjpegContext::new() returns None and the full-res path uses the CPU.
@@ -123,6 +120,10 @@ windows = { version = "0.62", features = [
     # …and the rendering device's adapter LUID (`ID3D12Device::GetAdapterLuid`, a COM vtable call
     # on wgpu's own device: no new import).
     "Win32_Graphics_Direct3D12",
+    # Delete round, R21: GetDriveTypeW, the one question that tells a card or a stick from a fixed disk.
+    # It links kernel32.dll, so an ordinary static import, and the only NEW import this feature may add
+    # is kernel32!GetDriveTypeW.
+    "Win32_Storage_FileSystem",
 ] }
 # 2026-10-25 (graphics-memory sharing, round 1): Vulkan's PhysicalDeviceIDProperties, to read the
 # rendering device's LUID through wgpu's own Vulkan device. The SAME ash 0.38 wgpu-hal already
@@ -148,11 +149,10 @@ winreg = "0.55"
 winresource = "0.1"
 cc = "1"
 
-# Language packs (build_translations.rs): read the pack JSON, and turn on the Slint compiler's
-# bundled translations. Cargo merges this feature into the copy the `slint!` macro already uses.
+# Language packs (build_translations.rs): read the language list for `packs.rs`. The Slint side of
+# the packs (and the compiler's bundled-translations feature) is the interface crate's, `ui/`.
 [build-dependencies]
 serde_json = "1"
-i-slint-compiler = { version = "=1.17.0", default-features = false, features = ["bundle-translations"] }
 
 # macOS (v0.9.7, Phase 6): the Mac arms of the capability/OS seams. `flock` (LOCK_EX|LOCK_NB) for the
 # single-instance advisory lock (support::claim_primary_instance) — the Mac analogue of the Windows
@@ -176,6 +176,8 @@ objc2 = "0.5"
 # on the already-resolved objc2-foundation 0.2 — NO new crate in the graph.
 objc2-foundation = { version = "0.2", features = ["NSArray", "NSString", "NSURL", "NSFileManager", "NSError"] }
 objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSWorkspace"] }
+# The Mac title-bar diagnostics bar (`mac_experiment.rs` `probe_ui`) is part of every Mac build.
+falcon-ui = { path = "ui", features = ["mac-probe"] }
 
 # v0.8.45 (Fix 2): headless UI-geometry tests — the testing platform (no event loop, no GPU)
 # plus i-slint-core for synthetic pointer dispatch (process_mouse_input) and change-handler
@@ -183,6 +185,10 @@ objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSWorkspace"] }
 [dev-dependencies]
 i-slint-backend-testing = "=1.17.0"
 i-slint-core = "=1.17.0"
+# The diagnostics bar's own input test (`mac_experiment_ui.rs`) runs on Windows too. Every target of
+# a `cargo test` or `cargo clippy --all-targets` run shares this one feature set, so the interface
+# crate is still compiled once for the bin and its tests.
+falcon-ui = { path = "ui", features = ["mac-probe"] }
 # v0.8.167: block on wgpu's adapter/device futures in the live-GPU publish rows
 # (`support::publish_tests`). Test-only, and the same version falcon-gpu's own suites use.
 pollster = "0.4"

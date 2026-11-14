@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::rc::Rc;
 
 use rgb::bytemuck;
@@ -62,6 +63,10 @@ use super::Params;
 use super::Vertex;
 
 const UNIFORMARRAY_SIZE: usize = 14;
+
+/// Bytes of one fragment-uniform record (`UniformArray`). Falcon patch (M1B): all records of a flush
+/// live in one buffer, bound with a dynamic offset.
+const UNIFORM_BYTES: u64 = (UNIFORMARRAY_SIZE * 4 * std::mem::size_of::<f32>()) as u64;
 
 #[derive(Clone, PartialEq)]
 pub struct UniformArray([f32; UNIFORMARRAY_SIZE * 4]);
@@ -176,36 +181,136 @@ impl From<&Params> for UniformArray {
     }
 }
 
-enum OwnedBindingResource {
-    TextureView(wgpu::TextureView),
-    ExternalTexture(wgpu::ExternalTexture),
-}
-
-impl OwnedBindingResource {
-    fn is_external(&self) -> bool {
-        matches!(self, Self::ExternalTexture(_))
-    }
-}
-
-impl<'a> From<&'a OwnedBindingResource> for wgpu::BindingResource<'a> {
-    fn from(owned: &'a OwnedBindingResource) -> Self {
-        match owned {
-            OwnedBindingResource::TextureView(texture_view) => Self::TextureView(texture_view),
-            OwnedBindingResource::ExternalTexture(texture_view) => Self::ExternalTexture(texture_view),
-        }
-    }
-}
-
 #[derive(Debug)]
 enum Texture {
     Internal(wgpu::Texture),
+    // Imported, but not bindable yet (as in 0.25.1, binding one panics).
+    #[allow(dead_code)]
     External(wgpu::ExternalTexture),
 }
 
 #[derive(Debug)]
 pub struct Image {
     texture: Texture,
+    /// Falcon patch (M1B): the default view of an internal texture, made once with it.
+    view: Option<wgpu::TextureView>,
+    /// Falcon patch (M1B): unique per texture allocation (never reused); keys the bind-group cache.
+    uid: u64,
     info: ImageInfo,
+    retired: Rc<RefCell<Vec<u64>>>,
+}
+
+impl Drop for Image {
+    fn drop(&mut self) {
+        // Its cached bind groups go in `delete_image` (the path Slint uses) or, for an image replaced
+        // by `ImageStore::realloc`, at the next deletion or flush.
+        self.retired.borrow_mut().push(self.uid);
+    }
+}
+
+/// Falcon patch (M1B): GPU binding objects that live longer than one draw call. FemtoVG 0.25.1 made a
+/// uniform buffer, two samplers, two texture views and a bind group for almost every draw call.
+/// Now: samplers per filter/repeat combination for the renderer's life; one bind group per pair
+/// (main image, glyph image), kept until either image is deleted or reallocated; every fragment
+/// uniform record of a flush in one buffer, bound with a dynamic offset.
+#[derive(Debug)]
+struct BindingCache {
+    samplers: [Option<wgpu::Sampler>; 8],
+    bind_groups: PairCache<wgpu::BindGroup>,
+    uniform_buffer: Option<wgpu::Buffer>,
+    uniform_slots: u64,
+    uniform_stride: u64,
+    retired_images: Rc<RefCell<Vec<u64>>>,
+    next_image_uid: u64,
+}
+
+impl BindingCache {
+    fn new(device: &wgpu::Device) -> Self {
+        Self {
+            samplers: Default::default(),
+            bind_groups: PairCache::default(),
+            uniform_buffer: None,
+            uniform_slots: 0,
+            uniform_stride: uniform_stride(UNIFORM_BYTES, device.limits().min_uniform_buffer_offset_alignment),
+            retired_images: Rc::new(RefCell::new(Vec::new())),
+            // 0 stands for "no image" (the empty texture).
+            next_image_uid: 1,
+        }
+    }
+
+    fn sampler(&mut self, device: &wgpu::Device, flags: crate::ImageFlags) -> wgpu::Sampler {
+        let nearest = flags.contains(crate::ImageFlags::NEAREST);
+        let repeat_x = flags.contains(crate::ImageFlags::REPEAT_X);
+        let repeat_y = flags.contains(crate::ImageFlags::REPEAT_Y);
+        self.samplers[sampler_slot(nearest, repeat_x, repeat_y)]
+            .get_or_insert_with(|| {
+                let filter_mode = if nearest {
+                    wgpu::FilterMode::Nearest
+                } else {
+                    wgpu::FilterMode::Linear
+                };
+                let address_mode = |repeat| {
+                    if repeat {
+                        wgpu::AddressMode::Repeat
+                    } else {
+                        wgpu::AddressMode::ClampToEdge
+                    }
+                };
+                device.create_sampler(&wgpu::SamplerDescriptor {
+                    address_mode_u: address_mode(repeat_x),
+                    address_mode_v: address_mode(repeat_y),
+                    address_mode_w: wgpu::AddressMode::ClampToEdge,
+                    mag_filter: filter_mode,
+                    min_filter: filter_mode,
+                    ..Default::default()
+                })
+            })
+            .clone()
+    }
+
+    /// Drops the bind groups of images deleted or reallocated since the last call. (A bind group
+    /// that a recorded command buffer still uses stays alive inside wgpu until that buffer has run.)
+    fn evict_retired(&mut self) {
+        loop {
+            let Some(uid) = self.retired_images.borrow_mut().pop() else {
+                break;
+            };
+            self.bind_groups.evict(uid);
+        }
+    }
+
+    /// Makes room for `slots` uniform records. A new buffer invalidates every cached bind group.
+    fn ensure_uniform_capacity(&mut self, device: &wgpu::Device, slots: u64) {
+        if self.uniform_buffer.is_some() && slots <= self.uniform_slots {
+            return;
+        }
+        let new_slots = slots.max(self.uniform_slots * 2).max(256);
+        self.uniform_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fragment Uniform Buffer"),
+            size: new_slots * self.uniform_stride,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        self.uniform_slots = new_slots;
+        self.bind_groups.clear();
+    }
+}
+
+/// Upper bound of `update_renderpass` calls (each takes at most one uniform record) for `commands`.
+fn max_uniform_slots(commands: &[super::Command]) -> u64 {
+    commands
+        .iter()
+        .map(|command| match command.cmd_type {
+            super::CommandType::SetRenderTarget(_) => 0,
+            super::CommandType::ClearRect { .. } => 1,
+            super::CommandType::ConvexFill { .. } => 2 * command.drawables.len(),
+            super::CommandType::ConcaveFill { .. } => 2 + command.drawables.len(),
+            super::CommandType::Stroke { .. } => command.drawables.len(),
+            super::CommandType::StencilStroke { .. } => 3,
+            super::CommandType::Triangles { .. } => 1,
+            super::CommandType::RenderFilteredImage { .. } => 2,
+        } as u64)
+        .sum()
 }
 
 #[derive(Debug)]
@@ -215,6 +320,9 @@ struct CachedPipeline {
 }
 
 mod pipeline_cache;
+
+mod binding_cache;
+use binding_cache::{sampler_slot, uniform_stride, PairCache, UniformRecords};
 
 /// WGPU renderer.
 #[derive(Debug)]
@@ -226,9 +334,12 @@ pub struct WGPURenderer {
 
     screen_view: [f32; 2],
 
-    empty_texture: wgpu::Texture,
-    stencil_buffer: Option<wgpu::Texture>,
-    stencil_buffer_for_textures: HashMap<wgpu::Texture, wgpu::Texture>,
+    /// The 1x1 texture bound where a draw has no image (its view keeps it alive).
+    empty_view: wgpu::TextureView,
+    stencil_buffer: Option<(wgpu::Texture, wgpu::TextureView)>,
+    stencil_buffer_for_textures: HashMap<wgpu::Texture, (wgpu::Texture, wgpu::TextureView)>,
+    viewport_bind_groups: HashMap<(u32, u32), wgpu::BindGroup>,
+    bindings: BindingCache,
 
     bind_group_layout: wgpu::BindGroupLayout,
     viewport_bind_group_layout: wgpu::BindGroupLayout,
@@ -291,8 +402,8 @@ impl WGPURenderer {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: NonZeroU64::new(UNIFORM_BYTES),
                     },
                     count: None,
                 },
@@ -337,6 +448,9 @@ impl WGPURenderer {
             immediate_size: 0,
         });
 
+        let empty_view = empty_texture.create_view(&Default::default());
+        let bindings = BindingCache::new(&device);
+
         Self {
             device,
             queue,
@@ -345,13 +459,33 @@ impl WGPURenderer {
 
             screen_view: [0.0, 0.0],
 
-            empty_texture,
+            empty_view,
             stencil_buffer: None,
             stencil_buffer_for_textures: HashMap::new(),
+            viewport_bind_groups: HashMap::new(),
+            bindings,
             bind_group_layout,
             viewport_bind_group_layout,
             pipeline_layout,
             pipeline_cache: Default::default(),
+        }
+    }
+
+    fn new_image(&mut self, texture: Texture, info: ImageInfo) -> Image {
+        let view = match &texture {
+            Texture::Internal(texture) => {
+                Some(texture.create_view(&Default::default()))
+            }
+            Texture::External(_) => None,
+        };
+        let uid = self.bindings.next_image_uid;
+        self.bindings.next_image_uid += 1;
+        Image {
+            texture,
+            view,
+            uid,
+            info,
+            retired: self.bindings.retired_images.clone(),
         }
     }
 }
@@ -372,6 +506,8 @@ impl Renderer for WGPURenderer {
         verts: &[super::Vertex],
         commands: Vec<super::Command>,
     ) -> Self::CommandBuffer {
+        self.bindings.evict_retired();
+
         if commands.is_empty() {
             return None;
         }
@@ -381,6 +517,9 @@ impl Renderer for WGPURenderer {
         // on every frame. Execute the clear as usual, and age the cache only on draws.
         let clear_only = commands.iter().all(|command| matches!(command.cmd_type,
             super::CommandType::ClearRect { .. } | super::CommandType::SetRenderTarget(_)));
+
+        let uniform_slots = max_uniform_slots(&commands);
+        self.bindings.ensure_uniform_capacity(&self.device, uniform_slots);
 
         let output = output.into();
 
@@ -395,16 +534,16 @@ impl Renderer for WGPURenderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
-        if let Some(stencil_buffer) = &self.stencil_buffer {
+        if let Some((stencil_buffer, _)) = &self.stencil_buffer {
             if stencil_buffer.width() != output.width || stencil_buffer.height() != output.height {
                 self.stencil_buffer = None;
             }
         }
 
-        let stencil_buffer = self
+        let screen_stencil_view = self
             .stencil_buffer
             .get_or_insert_with(|| {
-                self.device.create_texture(&wgpu::TextureDescriptor {
+                let stencil_buffer = self.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("Stencil buffer"),
                     size: wgpu::Extent3d {
                         width: output.width,
@@ -417,13 +556,37 @@ impl Renderer for WGPURenderer {
                     format: wgpu::TextureFormat::Stencil8,
                     view_formats: &[],
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                })
+                });
+                let stencil_view = stencil_buffer.create_view(&Default::default());
+                (stencil_buffer, stencil_view)
             })
+            .1
             .clone();
 
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+        // The flush's uniform records are written into a staging buffer while the passes are recorded,
+        // and copied into the uniform buffer ahead of them in this same command buffer, so a command
+        // buffer that is submitted later than the next flush still reads its own records.
+        let uniform_bytes_max = uniform_slots * self.bindings.uniform_stride;
+        let uniform_staging = (uniform_bytes_max > 0).then(|| {
+            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Fragment Uniform Staging"),
+                size: uniform_bytes_max,
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            });
+            encoder.copy_buffer_to_buffer(
+                &staging,
+                0,
+                self.bindings.uniform_buffer.as_ref().unwrap(),
+                0,
+                uniform_bytes_max,
+            );
+            staging
+        });
 
         let mut render_pass_builder = RenderPassBuilder::new(
             self.device.clone(),
@@ -432,8 +595,9 @@ impl Renderer for WGPURenderer {
             self.screen_view,
             self.viewport_bind_group_layout.clone(),
             &mut self.stencil_buffer_for_textures,
+            &mut self.viewport_bind_groups,
             texture_view,
-            stencil_buffer.clone(),
+            screen_stencil_view,
             vertex_buffer,
         );
         // Ensure that we have one initial render pass, in case the first command is not SetRenderTarget
@@ -441,11 +605,13 @@ impl Renderer for WGPURenderer {
 
         let mut pipeline_and_bindgroup_mapper = CommandToPipelineAndBindGroupMapper::new(
             self.device.clone(),
-            self.empty_texture.clone(),
+            self.empty_view.clone(),
             self.shader_module.clone(),
             self.bind_group_layout.clone(),
             self.pipeline_layout.clone(),
             self.pipeline_cache.clone(),
+            &mut self.bindings,
+            uniform_slots,
         );
 
         let mut current_render_target = RenderTarget::Screen;
@@ -539,6 +705,17 @@ impl Renderer for WGPURenderer {
             }
         }
 
+        if let Some(staging) = uniform_staging {
+            let uniform_bytes = pipeline_and_bindgroup_mapper.uniforms.bytes();
+            if !uniform_bytes.is_empty() {
+                staging
+                    .get_mapped_range_mut(0..uniform_bytes.len() as u64)
+                    .copy_from_slice(uniform_bytes);
+            }
+            staging.unmap();
+        }
+        drop(pipeline_and_bindgroup_mapper);
+
         drop(render_pass_builder);
 
         let command_buffer = encoder.finish();
@@ -551,8 +728,7 @@ impl Renderer for WGPURenderer {
     }
 
     fn alloc_image(&mut self, info: crate::ImageInfo) -> Result<Self::Image, crate::ErrorKind> {
-        Ok(Image {
-            texture: Texture::Internal(self.device.create_texture(&wgpu::TextureDescriptor {
+        let texture = Texture::Internal(self.device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
                 size: wgpu::Extent3d {
                     width: info.width() as u32,
@@ -571,9 +747,8 @@ impl Renderer for WGPURenderer {
                     | wgpu::TextureUsages::COPY_DST
                     | wgpu::TextureUsages::RENDER_ATTACHMENT,
                 view_formats: &[],
-            })),
-            info,
-        })
+            }));
+        Ok(self.new_image(texture, info))
     }
 
     fn create_image_from_native_texture(
@@ -581,10 +756,7 @@ impl Renderer for WGPURenderer {
         native_texture: Self::NativeTexture,
         info: crate::ImageInfo,
     ) -> Result<Self::Image, crate::ErrorKind> {
-        Ok(Image {
-            texture: Texture::Internal(native_texture),
-            info,
-        })
+        Ok(self.new_image(Texture::Internal(native_texture), info))
     }
 
     fn create_image_from_external_texture(
@@ -592,10 +764,7 @@ impl Renderer for WGPURenderer {
         external_texture: Self::ExternalTexture,
         info: crate::ImageInfo,
     ) -> Result<Self::Image, crate::ErrorKind> {
-        Ok(Image {
-            texture: Texture::External(external_texture),
-            info,
-        })
+        Ok(self.new_image(Texture::External(external_texture), info))
     }
 
     fn update_image(
@@ -689,6 +858,9 @@ impl Renderer for WGPURenderer {
             self.stencil_buffer_for_textures.remove(texture);
         }
         drop(image);
+        // Its bind groups go now, not at the next flush: a window that draws nothing more for a
+        // while (minimised) would otherwise keep the deleted texture's memory until it draws again.
+        self.bindings.evict_retired();
     }
 
     fn screenshot(&mut self) -> Result<imgref::ImgVec<rgb::RGBA8>, crate::ErrorKind> {
@@ -1355,86 +1527,26 @@ enum ImageOrTexture {
     Texture(wgpu::Texture),
 }
 
-#[derive(Clone, PartialEq)]
-struct BindGroupState {
-    image: Option<ImageOrTexture>,
-    glyph_texture: GlyphTexture,
-    uniforms: UniformArray,
-}
-
-impl BindGroupState {
-    fn materialize(
-        &self,
-        device: &wgpu::Device,
-        images: &ImageStore<Image>,
-        bind_group_layout: &wgpu::BindGroupLayout,
-        empty_texture: &wgpu::Texture,
-    ) -> wgpu::BindGroup {
-        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Fragment Uniform Buffer"),
-            contents: bytemuck::cast_slice(self.uniforms.as_slice()),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let (main_texture_view, main_sampler) =
-            RenderPassBuilder::create_binding_resource_and_sampler(device, images, self.image.as_ref(), empty_texture);
-        let (glyph_texture_view, glyph_sampler) = RenderPassBuilder::create_binding_resource_and_sampler(
-            device,
-            images,
-            self.glyph_texture.image_id().map(ImageOrTexture::Image).as_ref(),
-            empty_texture,
-        );
-
-        if main_texture_view.is_external() || glyph_texture_view.is_external() {
-            unimplemented!("External texture shaders and bind groups are not implemented yet");
-        }
-
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: (&main_texture_view).into(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&main_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: (&glyph_texture_view).into(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&glyph_sampler),
-                },
-            ],
-            label: None,
-        })
-    }
-}
-
 struct RenderPassBuilder<'a> {
     device: wgpu::Device,
     encoder: &'a mut wgpu::CommandEncoder,
     surface_view: wgpu::TextureView,
     surface_format: wgpu::TextureFormat,
     texture_view: wgpu::TextureView,
-    stencil_buffer: Option<wgpu::Texture>,
+    stencil_view: Option<wgpu::TextureView>,
     viewport: [f32; 2],
     vertex_buffer: wgpu::Buffer,
     rendering_to_texture: bool,
     viewport_bind_group_layout: wgpu::BindGroupLayout,
-    current_bind_group_state: Option<BindGroupState>,
+    /// The (bind-group key, dynamic offset) bound at group 1 in the current pass; `None` after a
+    /// pass starts or after an uncached bind group.
+    bound_group1: Option<((u64, u64), u32)>,
     rpass: Option<wgpu::RenderPass<'a>>,
-    screen_stencil_buffer: wgpu::Texture,
+    screen_stencil_view: wgpu::TextureView,
     screen_view: [f32; 2],
     screen_surface_format: wgpu::TextureFormat,
-    stencil_buffer_for_textures: &'a mut HashMap<wgpu::Texture, wgpu::Texture>,
+    stencil_buffer_for_textures: &'a mut HashMap<wgpu::Texture, (wgpu::Texture, wgpu::TextureView)>,
+    viewport_bind_groups: &'a mut HashMap<(u32, u32), wgpu::BindGroup>,
     viewport_bind_group: wgpu::BindGroup,
 }
 
@@ -1445,29 +1557,32 @@ impl<'a> RenderPassBuilder<'a> {
         screen_surface_format: wgpu::TextureFormat,
         screen_view: [f32; 2],
         viewport_bind_group_layout: wgpu::BindGroupLayout,
-        stencil_buffer_for_textures: &'a mut HashMap<wgpu::Texture, wgpu::Texture>,
+        stencil_buffer_for_textures: &'a mut HashMap<wgpu::Texture, (wgpu::Texture, wgpu::TextureView)>,
+        viewport_bind_groups: &'a mut HashMap<(u32, u32), wgpu::BindGroup>,
         texture_view: wgpu::TextureView,
-        stencil_buffer: wgpu::Texture,
+        screen_stencil_view: wgpu::TextureView,
         vertex_buffer: wgpu::Buffer,
     ) -> Self {
-        let viewport_bind_group = Self::create_viewport_bind_group(&device, &screen_view, &viewport_bind_group_layout);
+        let viewport_bind_group =
+            Self::viewport_bind_group(viewport_bind_groups, &device, &screen_view, &viewport_bind_group_layout);
         Self {
             device: device.clone(),
             encoder,
             surface_view: texture_view.clone(),
             surface_format: screen_surface_format,
             texture_view,
-            stencil_buffer: Some(stencil_buffer.clone()),
+            stencil_view: Some(screen_stencil_view.clone()),
             viewport: screen_view,
             vertex_buffer,
             rendering_to_texture: false,
             viewport_bind_group_layout,
-            current_bind_group_state: None,
+            bound_group1: None,
             rpass: None,
-            screen_stencil_buffer: stencil_buffer,
+            screen_stencil_view,
             screen_view,
             screen_surface_format,
             stencil_buffer_for_textures,
+            viewport_bind_groups,
             viewport_bind_group,
         }
     }
@@ -1477,8 +1592,32 @@ impl<'a> RenderPassBuilder<'a> {
             return;
         }
         self.viewport = viewport;
-        self.viewport_bind_group =
-            Self::create_viewport_bind_group(&self.device, &self.viewport, &self.viewport_bind_group_layout);
+        self.viewport_bind_group = Self::viewport_bind_group(
+            self.viewport_bind_groups,
+            &self.device,
+            &self.viewport,
+            &self.viewport_bind_group_layout,
+        );
+    }
+
+    /// Falcon patch (M1B): one viewport uniform and bind group per target size, kept (a handful of
+    /// sizes: the window and the layer sizes), instead of a new pair at every target switch.
+    fn viewport_bind_group(
+        cache: &mut HashMap<(u32, u32), wgpu::BindGroup>,
+        device: &wgpu::Device,
+        viewport: &[f32; 2],
+        viewport_bind_group_layout: &wgpu::BindGroupLayout,
+    ) -> wgpu::BindGroup {
+        let key = (viewport[0].to_bits(), viewport[1].to_bits());
+        if let Some(bind_group) = cache.get(&key) {
+            return bind_group.clone();
+        }
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        let bind_group = Self::create_viewport_bind_group(device, viewport, viewport_bind_group_layout);
+        cache.insert(key, bind_group.clone());
+        bind_group
     }
 
     fn create_viewport_bind_group(
@@ -1507,68 +1646,29 @@ impl<'a> RenderPassBuilder<'a> {
         viewport_bind_group
     }
 
-    fn create_binding_resource_and_sampler(
-        device: &wgpu::Device,
-        images: &ImageStore<Image>,
-        image: Option<&ImageOrTexture>,
-        empty_texture: &wgpu::Texture,
-    ) -> (OwnedBindingResource, wgpu::Sampler) {
-        let flags = image
-            .and_then(|image_or_texture| match image_or_texture {
-                ImageOrTexture::Image(image_id) => images.get(*image_id).map(|img| img.info.flags()),
-                _ => None,
-            })
-            .unwrap_or_else(crate::ImageFlags::empty);
-
-        let filter_mode = if flags.contains(crate::ImageFlags::NEAREST) {
-            wgpu::FilterMode::Nearest
-        } else {
-            wgpu::FilterMode::Linear
-        };
-
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: if flags.contains(crate::ImageFlags::REPEAT_X) {
-                wgpu::AddressMode::Repeat
-            } else {
-                wgpu::AddressMode::ClampToEdge
-            },
-            address_mode_v: if flags.contains(crate::ImageFlags::REPEAT_Y) {
-                wgpu::AddressMode::Repeat
-            } else {
-                wgpu::AddressMode::ClampToEdge
-            },
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: filter_mode,
-            min_filter: filter_mode,
-            ..Default::default()
-        });
-
-        let binding_resource = image
-            .and_then(|image_or_texture| match image_or_texture {
-                ImageOrTexture::Image(image_id) => images.get(*image_id).map(|img| match &img.texture {
-                    Texture::Internal(texture) => {
-                        OwnedBindingResource::TextureView(texture.create_view(&Default::default()))
-                    }
-                    Texture::External(texture) => OwnedBindingResource::ExternalTexture(texture.clone()),
-                }),
-                ImageOrTexture::Texture(texture) => Some(OwnedBindingResource::TextureView(
-                    texture.create_view(&Default::default()),
-                )),
-            })
-            .unwrap_or_else(|| OwnedBindingResource::TextureView(empty_texture.create_view(&Default::default())));
-
-        (binding_resource, sampler)
-    }
-
     fn set_render_target_texture(
         &mut self,
         texture: &wgpu::Texture,
         stencil_buffer: Option<wgpu::Texture>,
         load: wgpu::LoadOp<wgpu::Color>,
     ) {
-        self.texture_view = texture.create_view(&Default::default());
+        let view = texture.create_view(&Default::default());
+        let stencil_view = stencil_buffer.map(|stencil_buffer| {
+            stencil_buffer.create_view(&Default::default())
+        });
+        self.set_render_target_view(view, texture, stencil_view, load);
+    }
+
+    fn set_render_target_view(
+        &mut self,
+        view: wgpu::TextureView,
+        texture: &wgpu::Texture,
+        stencil_view: Option<wgpu::TextureView>,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) {
+        self.texture_view = view;
         self.set_viewport([texture.width() as f32, texture.height() as f32]);
-        self.stencil_buffer = stencil_buffer;
+        self.stencil_view = stencil_view;
         self.surface_format = texture.format();
         self.rendering_to_texture = true;
 
@@ -1583,12 +1683,12 @@ impl<'a> RenderPassBuilder<'a> {
     ) {
         let image = images.get(image_id).unwrap();
 
-        if let Texture::Internal(texture) = &image.texture {
-            let stencil_buffer = self
+        if let (Texture::Internal(texture), Some(view)) = (&image.texture, &image.view) {
+            let stencil_view = self
                 .stencil_buffer_for_textures
                 .entry(texture.clone())
                 .or_insert_with(|| {
-                    self.device.create_texture(&wgpu::TextureDescriptor {
+                    let stencil_buffer = self.device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("Stencil buffer"),
                         size: wgpu::Extent3d {
                             width: texture.width(),
@@ -1601,17 +1701,20 @@ impl<'a> RenderPassBuilder<'a> {
                         format: wgpu::TextureFormat::Stencil8,
                         view_formats: &[],
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    })
+                    });
+                    let stencil_view = stencil_buffer.create_view(&Default::default());
+                    (stencil_buffer, stencil_view)
                 })
+                .1
                 .clone();
 
-            self.set_render_target_texture(&texture.clone(), Some(stencil_buffer), load);
+            self.set_render_target_view(view.clone(), &texture.clone(), Some(stencil_view), load);
         }
     }
 
     fn set_render_target_screen(&mut self) {
         self.texture_view = self.surface_view.clone();
-        self.stencil_buffer = Some(self.screen_stencil_buffer.clone());
+        self.stencil_view = Some(self.screen_stencil_view.clone());
         self.set_viewport(self.screen_view);
         self.surface_format = self.screen_surface_format;
         self.rendering_to_texture = false;
@@ -1621,10 +1724,7 @@ impl<'a> RenderPassBuilder<'a> {
 
     fn recreate_render_pass(&mut self, load: wgpu::LoadOp<wgpu::Color>) {
         drop(self.rpass.take());
-        let stencil_view = self
-            .stencil_buffer
-            .as_ref()
-            .map(|buffer| buffer.create_view(&Default::default()));
+        let stencil_view = self.stencil_view.clone();
 
         let mut rpass = self.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
@@ -1656,7 +1756,7 @@ impl<'a> RenderPassBuilder<'a> {
             rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         }
         rpass.set_viewport(0., 0., self.viewport[0], self.viewport[1], 0., 0.);
-        self.current_bind_group_state.take();
+        self.bound_group1 = None;
         rpass.set_bind_group(0, &self.viewport_bind_group, &[]);
         self.rpass = Some(rpass.forget_lifetime());
     }
@@ -1666,37 +1766,97 @@ impl<'a> RenderPassBuilder<'a> {
     }
 }
 
-struct CommandToPipelineAndBindGroupMapper {
+struct CommandToPipelineAndBindGroupMapper<'c> {
     device: wgpu::Device,
-    empty_texture: wgpu::Texture,
+    empty_view: wgpu::TextureView,
     shader_module: Rc<wgpu::ShaderModule>,
 
-    current_bind_group_state: Option<BindGroupState>,
-    current_bind_group: Option<wgpu::BindGroup>,
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline_cache: Rc<RefCell<HashMap<PipelineState, CachedPipeline>>>,
     pipeline_layout: wgpu::PipelineLayout,
+
+    bindings: &'c mut BindingCache,
+    /// This flush's uniform records, one per `uniform_stride` bytes (copied to the GPU after recording).
+    uniforms: UniformRecords,
 }
 
-impl CommandToPipelineAndBindGroupMapper {
+impl<'c> CommandToPipelineAndBindGroupMapper<'c> {
     fn new(
         device: wgpu::Device,
-        empty_texture: wgpu::Texture,
+        empty_view: wgpu::TextureView,
         shader_module: Rc<wgpu::ShaderModule>,
         bind_group_layout: wgpu::BindGroupLayout,
         pipeline_layout: wgpu::PipelineLayout,
         pipeline_cache: Rc<RefCell<HashMap<PipelineState, CachedPipeline>>>,
+        bindings: &'c mut BindingCache,
+        uniform_slot_capacity: u64,
     ) -> Self {
+        let uniforms = UniformRecords::new(UNIFORM_BYTES, bindings.uniform_stride, uniform_slot_capacity);
         Self {
-            device: device.clone(),
-            empty_texture,
+            device,
+            empty_view,
             shader_module,
-            current_bind_group_state: None,
-            current_bind_group: None,
             bind_group_layout,
             pipeline_cache,
             pipeline_layout,
+            bindings,
+            uniforms,
         }
+    }
+
+    /// The view, sampler flags and cache-key part of an image (0 and the empty texture for none or a
+    /// missing id, as before).
+    fn resolve<'i>(
+        images: &'i ImageStore<Image>,
+        image_id: Option<ImageId>,
+        empty_view: &'i wgpu::TextureView,
+    ) -> (u64, &'i wgpu::TextureView, crate::ImageFlags) {
+        match image_id.and_then(|image_id| images.get(image_id)) {
+            Some(image) => match &image.view {
+                Some(view) => (image.uid, view, image.info.flags()),
+                None => unimplemented!("External texture shaders and bind groups are not implemented yet"),
+            },
+            None => (0, empty_view, crate::ImageFlags::empty()),
+        }
+    }
+
+    fn create_bind_group(
+        &mut self,
+        main: (&wgpu::TextureView, crate::ImageFlags),
+        glyph: (&wgpu::TextureView, crate::ImageFlags),
+    ) -> wgpu::BindGroup {
+        let main_sampler = self.bindings.sampler(&self.device, main.1);
+        let glyph_sampler = self.bindings.sampler(&self.device, glyph.1);
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: self.bindings.uniform_buffer.as_ref().unwrap(),
+                        offset: 0,
+                        size: NonZeroU64::new(UNIFORM_BYTES),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(main.0),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&main_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(glyph.0),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&glyph_sampler),
+                },
+            ],
+            label: None,
+        })
     }
 
     fn update_renderpass<'a>(
@@ -1719,19 +1879,36 @@ impl CommandToPipelineAndBindGroupMapper {
             render_pass.set_stencil_reference(0);
         }
 
-        let bind_group_state = BindGroupState {
-            image,
-            glyph_texture,
-            uniforms: UniformArray::from(params),
-        };
+        let offset = self.uniforms.push(UniformArray::from(params).as_slice());
+        let empty_view = self.empty_view.clone();
+        let glyph = Self::resolve(images, glyph_texture.image_id(), &empty_view);
 
-        if self.current_bind_group_state != Some(bind_group_state.clone()) {
-            self.current_bind_group = bind_group_state
-                .materialize(&self.device, images, &self.bind_group_layout, &self.empty_texture)
-                .into();
-            self.current_bind_group_state = Some(bind_group_state);
+        match image {
+            Some(ImageOrTexture::Texture(texture)) => {
+                // A transient texture (the blur filter's intermediate): bound once, not cached.
+                let view = texture.create_view(&Default::default());
+                let bind_group = self.create_bind_group((&view, crate::ImageFlags::empty()), (glyph.1, glyph.2));
+                render_pass.set_bind_group(1, &bind_group, &[offset]);
+                render_pass_builder.bound_group1 = None;
+            }
+            image => {
+                let image_id = match image {
+                    Some(ImageOrTexture::Image(image_id)) => Some(image_id),
+                    _ => None,
+                };
+                let main = Self::resolve(images, image_id, &empty_view);
+                let key = (main.0, glyph.0);
+                if render_pass_builder.bound_group1 != Some((key, offset)) {
+                    if self.bindings.bind_groups.get(key.0, key.1).is_none() {
+                        let bind_group = self.create_bind_group((main.1, main.2), (glyph.1, glyph.2));
+                        self.bindings.bind_groups.insert(key.0, key.1, bind_group);
+                    }
+                    let bind_group = self.bindings.bind_groups.get(key.0, key.1).expect("inserted above");
+                    render_pass.set_bind_group(1, bind_group, &[offset]);
+                    render_pass_builder.bound_group1 = Some((key, offset));
+                }
+            }
         }
-        render_pass.set_bind_group(1, self.current_bind_group.as_ref().unwrap(), &[]);
 
         let pipeline_state = PipelineState::new(
             color_blend,
@@ -1742,7 +1919,7 @@ impl CommandToPipelineAndBindGroupMapper {
             render_pass_builder.rendering_to_texture,
             primitive_topology,
             cull_mode,
-            render_pass_builder.stencil_buffer.is_some(),
+            render_pass_builder.stencil_view.is_some(),
         );
 
         let mut pipeline_cache = self.pipeline_cache.borrow_mut();
@@ -1789,3 +1966,4 @@ fn blend_factor(factor: BlendFactor) -> wgpu::BlendFactor {
         BlendFactor::SrcAlphaSaturate => wgpu::BlendFactor::SrcAlphaSaturated,
     }
 }
+

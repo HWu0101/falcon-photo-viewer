@@ -125,6 +125,41 @@ impl ViewReset {
         film_dragging.set(false);
         *scrubbing.borrow_mut() = false;
     }
+
+    /// R3: the strip's free-scroll place `(film_pos, film_target)`, while the person has one.
+    pub(crate) fn free_scroll(&self) -> Option<(f32, f32)> {
+        (!self.film_follow.get()).then(|| (self.film_pos.get(), self.film_target.get()))
+    }
+
+    /// R3: puts it back after `reset_for_swap`, on a landing that keeps the photo on screen and the
+    /// order. The strip's step clamps it to the new list on its next pass.
+    pub(crate) fn restore_free_scroll(&self, (pos, target): (f32, f32)) {
+        self.film_follow.set(false);
+        self.film_pos.set(pos);
+        self.film_target.set(target);
+    }
+}
+
+#[cfg(test)]
+impl ViewReset {
+    /// Fresh, independent handles, for a rig that lands a list the way `apply_scan` does.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            compare: Rc::new(Cell::new(false)),
+            pan_carry: Rc::new(Cell::new(None)),
+            shown: Rc::new(RefCell::new(None)),
+            last_seen: Rc::new(RefCell::new(usize::MAX)),
+            blur_key: Rc::new(RefCell::new(tick::BackdropKey { shown: None, pending: None })),
+            last_film_key: Rc::new(RefCell::new((0, 0, 0, 0, 0, 0, 0))),
+            film_pos: Rc::new(Cell::new(0.0)),
+            film_base: Rc::new(Cell::new(0)),
+            film_follow: Rc::new(Cell::new(true)),
+            film_target: Rc::new(Cell::new(0.0)),
+            film_dragging: Rc::new(Cell::new(false)),
+            scrubbing: Rc::new(RefCell::new(false)),
+            nav_dir: Rc::new(Cell::new(1)),
+        }
+    }
 }
 
 #[cfg(test)]

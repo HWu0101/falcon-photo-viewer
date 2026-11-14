@@ -34,19 +34,42 @@ jobs:
         run: |
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup default 1.96.0
+          # Only the pinned toolchain stays installed. The cache key below lists every installed
+          # toolchain, and the runner image's own stable Rust changes with image updates, so
+          # keeping it made the key change and the 1.1.1 run found no cache.
+          for toolchain in $(rustup toolchain list --quiet); do
+            case "$toolchain" in
+              1.96.0-*) ;;
+              *) rustup toolchain uninstall "$toolchain" ;;
+            esac
+          done
+          rustup toolchain list
           test "$(uname -m)" = arm64
           rustc -vV
           rustc -vV | grep -q '^host: aarch64-apple-darwin$'
           git rev-parse HEAD
+          # The machine this run got (chip, cores, bytes of memory). The same unchanged libraries
+          # compiled about three times slower on 3 November than on 3 October, so a step's duration
+          # can only be compared with an earlier run's once the log says what each ran on.
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize || true
+      # Restores the compiled dependencies (debug and release) when the last run on this branch saved
+      # them within GitHub's 7-day window; the falcon crates are always rebuilt from source.
       - name: Reuse the established Mac dependency cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: "falcon -> target"
           shared-key: falcon-arm64
+      # `/usr/bin/time -l` prints the largest compiler process's peak memory after each heavy step,
+      # and `vm.swapusage` says whether the machine had to swap: the two numbers that explain a slow
+      # step on this 7 GB machine (the interface crate alone needs about 9 GB while it compiles).
       - name: Workspace and native title-bar move tests
-        run: cargo test --locked --workspace --features falcon-native/mac-native-tests
+        run: |
+          /usr/bin/time -l cargo test --locked --workspace --features falcon-platform-tests/mac-native-tests
+          sysctl vm.swapusage || true
       - name: Build normal Falcon
-        run: cargo build --locked --release --bin falcon
+        run: |
+          /usr/bin/time -l cargo build --locked --release --bin falcon
+          sysctl vm.swapusage || true
       - name: Verify packaging and backend scope
         working-directory: ${{ github.workspace }}
         run: |

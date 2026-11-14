@@ -1123,8 +1123,8 @@ struct ExifPanelRig {
     _dims_rx: std::sync::mpsc::Receiver<(usize, u64)>,
     wb_cache: std::cell::RefCell<std::collections::HashMap<usize, Option<u32>>>,
     wb_requested: std::cell::RefCell<std::collections::HashSet<usize>>,
-    wb_tx: std::sync::mpsc::Sender<(usize, u64, std::path::PathBuf)>,
-    _wb_rx: std::sync::mpsc::Receiver<(usize, u64, std::path::PathBuf)>,
+    wb_tx: std::sync::mpsc::Sender<(usize, u64, std::path::PathBuf, bool)>,
+    _wb_rx: std::sync::mpsc::Receiver<(usize, u64, std::path::PathBuf, bool)>,
     exif_model: std::rc::Rc<slint::VecModel<ui::ExifRow>>,
     output_gamut: std::sync::atomic::AtomicU32,
     shot_gamut: std::cell::RefCell<std::collections::HashMap<usize, falcon_color::Gamut>>,
@@ -1188,6 +1188,64 @@ impl ExifPanelRig {
 
 fn exif_pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+/// Fix round 2 (11 November 2026, `CS-13`): **THE WHITE-BALANCE REQUEST SAYS WHETHER THE VIEW READS
+/// THE RAW**, and a skip is never cached. In Preview a pair's request says "not viewed" (so the worker
+/// leaves an online-only RAW alone) and is sent once; a RAW-only photo's says "viewed". A `CloudOnly`
+/// answer caches nothing and keeps the latch, so Preview does not ask again; turning RAW mode on
+/// re-arms it and the new request says "viewed". A real reading is cached as before.
+///
+/// FALSIFIER (L28): send `true` (or no flag) for the pair and the first assert reddens; cache the
+/// skip in `drain_wb` and the cache assert reddens; drop `rearm_wb_for_raw_mode` and RAW mode never
+/// asks again.
+#[test]
+fn the_white_balance_request_says_whether_the_view_reads_the_raw() {
+    use std::path::PathBuf;
+    let app = boot();
+    app.set_info_open(true);
+    app.set_info_min(false);
+    let rig = ExifPanelRig::new(&app);
+    let pair = crate::Shot { id: 0, name: "P".into(), has_raw: true, has_jpg: true, raw: Some(PathBuf::from("P.CR3")),
+        jpg: Some(PathBuf::from("P.JPG")), kind: falcon_decode::SrcKind::Jpeg, cloud_placeholder: true, sniffed: None };
+    let alone = crate::Shot { id: 1, name: "A".into(), has_jpg: false, jpg: None, raw: Some(PathBuf::from("A.CR3")), ..pair.clone() };
+    let shots = [pair, alone];
+    let settle = |c: usize| {
+        rig.exif_built.set(None);
+        crate::tick::step_settle_exif(
+            &app, c, rig.now, true, 1, &shots, &rig.last_motion, &rig.last_mounted, &rig.exif_built,
+            &rig.cs_built, &rig.exif_cache, &rig.exif_requested, &rig.exif_retry, &rig.exif_tx,
+            &rig.roi_src, &rig.dims_requested, &rig.dims_tx, &rig.wb_cache, &rig.wb_requested,
+            &rig.wb_tx, &rig.exif_model, &rig.output_gamut, &rig.shot_gamut, &rig.rot,
+            &rig.file_gamuts,
+        );
+    };
+    app.set_raw_mode(false);
+    settle(0);
+    assert_eq!(rig._wb_rx.try_recv().ok(), Some((0, 1, PathBuf::from("P.CR3"), false)), "Preview: the pair's RAW is not viewed");
+    settle(0);
+    assert!(rig._wb_rx.try_recv().is_err(), "asked once per photo");
+    settle(1);
+    assert_eq!(rig._wb_rx.try_recv().ok(), Some((1, 1, PathBuf::from("A.CR3"), true)), "a RAW-only photo's RAW is what the view reads");
+
+    // The worker's answers: a skip caches nothing, a reading is cached.
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send((0, 1, crate::support::WbAnswer::CloudOnly)).unwrap();
+    tx.send((1, 1, crate::support::WbAnswer::Kelvin(Some(5200)))).unwrap();
+    let cur = std::cell::RefCell::new(0usize);
+    crate::tick::drain_wb(&rx, 1, &rig.wb_cache, &cur, &rig.exif_built);
+    assert!(!rig.wb_cache.borrow().contains_key(&0), "the skip is not cached");
+    assert_eq!(rig.wb_cache.borrow().get(&1), Some(&Some(5200)), "a reading is");
+    settle(0);
+    assert!(rig._wb_rx.try_recv().is_err(), "Preview never asks again for the skipped RAW");
+
+    // RAW mode on: the skipped photo is asked for again, now as viewed; the cached one is not.
+    crate::tick::rearm_wb_for_raw_mode(&rig.wb_requested, &rig.wb_cache);
+    app.set_raw_mode(true);
+    settle(0);
+    assert_eq!(rig._wb_rx.try_recv().ok(), Some((0, 1, PathBuf::from("P.CR3"), true)), "RAW mode: asked again, as viewed");
+    settle(1);
+    assert!(rig._wb_rx.try_recv().is_err(), "a cached reading is not asked for again");
 }
 
 /// Language packs (round 2, PLAN §4, batch 5): EXIF rows are found and filtered by the English KEY
@@ -1373,12 +1431,11 @@ fn photo_first_modes_and_promotion_keep_the_view_and_undo_identity() {
     let app = boot();
     app.set_welcome_open(false);
     app.set_opening_photo(true);
-    assert!(!app.get_photo_open_edits());
-    assert!(app.get_modal_open(), "view-only still blocks edits/navigation");
-    app.set_photo_open_edits(true);
-    assert!(!app.get_modal_open(), "interactive permits photo inputs");
+    // Queue entry 6 (changed on purpose): there is no View only any more, so a folder still loading
+    // holds no star, flag, reject or turn; real dialogs still do.
+    assert!(!app.get_modal_open(), "a folder still loading permits photo inputs");
     app.set_settings_open(true);
-    assert!(app.get_modal_open(), "the test mode cannot bypass real dialogs");
+    assert!(app.get_modal_open(), "a loading folder cannot bypass real dialogs");
     app.set_settings_open(false);
     let shot = Shot { id: 0, name: "B".into(), raw: None, jpg: Some(PathBuf::from("B.png")),
         kind: SrcKind::Png, has_raw: false, has_jpg: true, cloud_placeholder: false, sniffed: None };
@@ -1387,8 +1444,8 @@ fn photo_first_modes_and_promotion_keep_the_view_and_undo_identity() {
     let old = vec![shot.clone()];
     let mut done = ScanDone { changed_sources: HashSet::new(), stamps: None, partial: true, pending_edges: (true, true), source_order: Vec::new(), id: 1, dir: PathBuf::from("folder"),
         shots: vec![neighbor, shot], ratings: vec![0, 5], marks: vec![0, MARK_FLAG], start: 0,
-        land: None, extra: BTreeMap::new(), rotations: BTreeMap::new(), attrs: FolderAttrs::default(),
-        had_file: true, from_ledger: false, identity: None, manifest: None, sort: (SortMethod::Name, false), scan_err: false, scan_denied: false, unlisted_target: None, review_load: crate::support::ReviewLoad::Loaded, taken_pass: None };
+        land: None, land_by_photo: None, extra: BTreeMap::new(), rotations: BTreeMap::new(), attrs: FolderAttrs::default(),
+        had_file: true, from_ledger: false, identity: None, manifest: None, sort: (SortMethod::Name, false), scan_err: false, scan_denied: false, unlisted_target: None, review_load: crate::support::ReviewLoad::Loaded, taken_pass: None, delete_asks: None };
     let fast = FastTier::new(); let detail = DetailTier::new(); let rot = RotState::new(true);
     let film = Film::new(); let roi = RoiZoom::new();
     let meta=crate::meta::PerShotMeta::new(2);
@@ -1455,6 +1512,141 @@ fn photo_first_modes_and_promotion_keep_the_view_and_undo_identity() {
     done.id = 0;
     assert!(photo_open::Promotion::take(&app, &mut done, (&old, 0), (&fast, &detail, &film, &roi), &rot, &undo, (&meta,gen)).is_none(),
         "a new same-folder file open must land its requested file, not the earlier preview");
+}
+
+/// Queue entry 6 (owner, 2 November 2026: "why wait at all a star rating writes to the json by default
+/// so it does not require the photos to load at all, same for the other review actions", then "always
+/// allow and remove the setting"). A star, a flag, a reject and a turn made while the folder is still
+/// loading land on the photo on screen, are in what the next save writes (with every review record of
+/// the photos not listed yet), and are still on the same photos, by file, when the whole list lands,
+/// including DOG, a RAW listed alone in the batch that the whole list shows as a RAW+JPEG pair. The
+/// whole list was read from the review file as it was before the edits, as the folder's own scan reads
+/// it. Twice, with other photos and other values, the second time on DOG itself.
+///
+/// The pieces are the ones `apply_scan` and the tick run, in their order: the batch's landing
+/// (`apply_selection`, `selection_leftover`, `RotState::on_folder_swap`), each edit as its handler makes
+/// it (the index on screen, `push_undo`, `RotState::rotate`), the tick's save (`selection_map`, then
+/// `merge_selection_extra`, `rotations_snapshot`), and the whole list's landing
+/// (`carry_live_review_on_rescan`, `photo_open::Promotion::take` and `restore`). The handlers themselves
+/// are closures in `main`; `review_actions_never_wait_for_the_folder_and_folder_actions_still_do` pins
+/// that none of them waits for the folder, and this window's `modal-open` is what the keys read.
+///
+/// FALSIFIER (L28): put the opening term back into `modal-open-base`; the carry keeps the disk's
+/// ratings (`(scan.ratings, scan.marks)` left alone); the save leaves out `merge_selection_extra`; the
+/// carry keys by position instead of name; `Promotion::take` lands by index.
+#[test]
+fn stars_flags_rejects_and_turns_made_while_a_folder_loads_stay_on_their_photos() {
+    use crate::*;
+    let app = boot();
+    app.set_welcome_open(false);
+    app.set_opening_photo(true);
+    app.set_photo_ready(true);
+    assert!(!app.get_modal_open(), "premise: the keys' gate is open while the folder loads");
+    let png = |name: &str| Shot { id: 0, name: name.into(), raw: None, jpg: Some(PathBuf::from(format!("{name}.png"))),
+        kind: SrcKind::Png, has_raw: false, has_jpg: true, cloud_placeholder: false, sniffed: None };
+    let pair = |name: &str| Shot { raw: Some(PathBuf::from(format!("{name}.CR3"))), has_raw: true, ..png(name) };
+    let raw_alone = |name: &str| Shot { jpg: None, has_jpg: false, ..pair(name) };
+    let scan = |shots: Vec<Shot>, journal: &BTreeMap<String, Sel>, rotations: &BTreeMap<String, u8>, partial: bool, start: usize| {
+        let (ratings, marks) = support::apply_selection(journal, &shots);
+        let extra = support::selection_leftover(journal.clone(), &shots);
+        ScanDone { changed_sources: HashSet::new(), stamps: None, partial, pending_edges: (partial, partial), source_order: Vec::new(),
+            id: 1, dir: PathBuf::from("folder"), shots, ratings, marks, start, land: partial.then_some(start), land_by_photo: None,
+            extra, rotations: rotations.clone(), attrs: FolderAttrs::default(), had_file: true, from_ledger: false, identity: None,
+            manifest: None, sort: (SortMethod::Name, false), scan_err: false, scan_denied: false, unlisted_target: None,
+            review_load: crate::support::ReviewLoad::Loaded, taken_pass: None, delete_asks: None }
+    };
+    let at = |shots: &[Shot], name: &str| shots.iter().position(|s| s.name == name).unwrap_or_else(|| panic!("{name} is listed"));
+    // (opened, star (photo, stars), flag, reject, turn, the photo on screen when the whole list lands)
+    for (opened, (starred, stars), flagged, rejected, turned, on_at_landing) in
+        [("CAT", ("CAT", 3), "BEE", "DOG", "CAT", "CAT"), ("BEE", ("DOG", 5), "CAT", "BEE", "DOG", "DOG")]
+    {
+        // The review file before the folder opened: photos outside the batch have records too.
+        let journal = BTreeMap::from([
+            ("ANT".to_string(), Sel { rating: 2, ..Sel::default() }),
+            ("ZEBRA".to_string(), Sel { rating: 4, flag: true, ..Sel::default() }),
+        ]);
+        let disk_rotations = BTreeMap::from([("EEL".to_string(), 2u8)]);
+        // The nearby batch lands: three photos, DOG's JPEG not in it.
+        let batch = scan(vec![png("BEE"), png("CAT"), raw_alone("DOG")], &journal, &disk_rotations, true, 0);
+        let rot = RotState::new(true);
+        assert!(rot.on_folder_swap(&batch.rotations, &batch.shots).is_none());
+        let shots = batch.shots.clone();
+        let (mut ratings, mut marks, extra) = (batch.ratings.clone(), batch.marks.clone(), batch.extra.clone());
+        let undo = RefCell::new(UndoRedo::default());
+        let mut current = at(&shots, opened);
+        let mut seq = 0;
+        let mut edit = |on: &str, current: &mut usize, what: &dyn Fn(&mut i32, &mut u8)| {
+            // The person browses to the photo (arrows work while the folder loads), and the key acts
+            // on the index on screen, as `cull_target` gives it.
+            *current = at(&shots, on);
+            let c = *current;
+            seq += 1;
+            support::push_undo(&undo, seq, c, ratings[c], marks[c]);
+            what(&mut ratings[c], &mut marks[c]);
+        };
+        edit(starred, &mut current, &|r, _| *r = stars);
+        edit(flagged, &mut current, &|_, m| *m = MARK_FLAG);
+        edit(rejected, &mut current, &|_, m| *m = MARK_REJECT);
+        current = at(&shots, turned);
+        let (was, now) = rot.rotate(turned, current, 1);
+        undo.borrow_mut().undo.push(Act { seq: 9, entry: UndoEntry::Rot { name: turned.into(), idx: current, delta: was } });
+        assert_eq!(now, 1);
+        // Each landed on the photo it names, on screen, in the batch.
+        assert_eq!(ratings[at(&shots, starred)], stars, "{starred}: the star is on it");
+        assert_eq!(marks[at(&shots, flagged)], MARK_FLAG, "{flagged}: flagged");
+        assert_eq!(marks[at(&shots, rejected)], MARK_REJECT, "{rejected}: rejected");
+        // What the tick's next save writes: the edits and every record of the photos not listed yet.
+        let mut saved = support::selection_map(&shots, &ratings, &marks);
+        support::merge_selection_extra(&mut saved, &extra);
+        assert_eq!(i32::from(saved[starred].rating), stars, "{starred}: saved");
+        assert!(saved[flagged].flag && saved[rejected].reject, "{flagged}, {rejected}: saved");
+        assert_eq!((saved["ANT"].rating, saved["ZEBRA"].rating, saved["ZEBRA"].flag), (2, 4, true), "the records of photos not listed yet stay");
+        assert_eq!(rot.rotations_snapshot(), BTreeMap::from([(turned.to_string(), 1), ("EEL".to_string(), 2)]), "{turned}: the turn is saved");
+        // The whole list lands, read from the file as it was before the edits.
+        current = at(&shots, on_at_landing);
+        let mut full = scan(vec![png("ANT"), png("BEE"), png("CAT"), pair("DOG"), png("EEL"), png("ZEBRA")],
+            &journal, &disk_rotations, false, at(&[png("ANT"), png("BEE"), png("CAT")], "CAT"));
+        support::carry_live_review_on_rescan(&mut full, &shots, &ratings, &marks, &extra, rot.rotations_snapshot());
+        let fast = FastTier::new(); let detail = DetailTier::new(); let film = Film::new(); let roi = RoiZoom::new();
+        let meta = crate::meta::PerShotMeta::new(2);
+        meta.on_folder_swap(1, shots.len(), &shots);
+        let promotion = photo_open::Promotion::take(&app, &mut full, (&shots, current), (&fast, &detail, &film, &roi), &rot, &undo, (&meta, 1));
+        assert!(rot.on_folder_swap(&full.rotations, &full.shots).is_none());
+        let names: Vec<&str> = full.shots.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["ANT", "BEE", "CAT", "DOG", "EEL", "ZEBRA"]);
+        let by_file = |name: &str| {
+            let i = at(&full.shots, name);
+            (full.ratings[i], full.marks[i], rot.delta_of(i))
+        };
+        assert_eq!(by_file(starred).0, stars, "{starred}: still starred");
+        assert_eq!(by_file(flagged).1, MARK_FLAG, "{flagged}: still flagged");
+        assert_eq!(by_file(rejected).1, MARK_REJECT, "{rejected}: still rejected");
+        assert_eq!(by_file(turned).2, 1, "{turned}: still turned");
+        let dog = &full.shots[at(&full.shots, "DOG")];
+        assert!(dog.raw.is_some() && dog.jpg.is_some(), "premise: DOG is a RAW+JPEG pair in the whole list");
+        assert_eq!((by_file("ANT").0, by_file("ZEBRA").0, by_file("ZEBRA").1, by_file("EEL").2), (2, 4, MARK_FLAG, 2),
+            "the photos the batch didn't list keep theirs");
+        let mut written = support::selection_map(&full.shots, &full.ratings, &full.marks);
+        support::merge_selection_extra(&mut written, &full.extra);
+        assert_eq!(written, saved, "the next save writes the same records");
+        match promotion {
+            // The photo on screen is the same file in the whole list: the person stays on it, and the
+            // undo steps of the photos that are the same files follow them.
+            Some(carry) => {
+                carry.restore(&app, &fast, &detail, &film, &rot, &undo, &roi, (&meta, 2));
+                assert_eq!(full.shots[full.start].name, on_at_landing, "the person stays on {on_at_landing}");
+                let steps: Vec<usize> = undo.borrow().undo.iter().map(|a| match &a.entry {
+                    UndoEntry::Cull { idx, .. } | UndoEntry::Rot { idx, .. } => *idx, _ => usize::MAX }).collect();
+                for step in steps {
+                    assert_ne!(full.shots[step].name, "DOG", "a step of DOG, now another file, drops (stars stay)");
+                    assert!([starred, flagged, rejected, turned].contains(&full.shots[step].name.as_str()), "each step names its photo");
+                }
+            }
+            // DOG on screen as a RAW alone is not the same file as the pair: what it was given stays on
+            // it by name (above); `Promotion` lands nothing (the scan's start stands).
+            None => assert_eq!(on_at_landing, "DOG", "only DOG on screen changes file"),
+        }
+    }
 }
 
 /// Keeping prepared work (2 November): the heart of the round. Real tier stores with a distinct
@@ -1641,7 +1833,7 @@ fn a_landing_waits_for_anything_it_would_close() {
     assert!(!clear.any());
     for (what, held) in [
         ("Move rejected, Undo move or Empty running", LandingHolds { position_op: true, ..clear }),
-        ("a file operation's reread posted", LandingHolds { reload_pending: true, ..clear }),
+        ("a file operation's reread wanted or running", LandingHolds { reload_pending: true, ..clear }),
         ("Apply rotations", LandingHolds { applying_rotations: true, ..clear }),
         ("a filmstrip drag", LandingHolds { film_dragging: true, ..clear }),
         ("a filmstrip scrub", LandingHolds { scrubbing: true, ..clear }),
@@ -1719,14 +1911,16 @@ fn the_reading_card_fits_and_keeps_out_of_the_way() {
     assert_eq!(count_cards(&app), 1);
 }
 
-/// Keeping the view on a sort change: the view stays only when the photo on screen and both Compare
-/// photos are the same photos after the reread, followed by identity, never by position. A file saved
-/// elsewhere keeps the zoom and loses only its own tiles.
+/// The view rule's two forms: the landing is the photo on screen, or Compare keeps both its photos, and
+/// the tiles stay too, followed by identity, never by position. The landing is another photo, and only
+/// the zoom and the spot stay. A file saved elsewhere keeps the zoom and loses only its own tiles. Only
+/// a Compare with fewer than two photos left and an emptied folder still reset.
 ///
-/// FALSIFIER (L28): remove the `follow(current)? != self.start` line, the `?` on a Compare half, or the
-/// `unchanged` lookup in `RescanCarry::keep_view`.
+/// FALSIFIER (L28): remove the second form's early return (or make it `None`), let `Closes` go on as if it
+/// stayed, read `Stays` as no Compare, or drop the `self.emptied` line or the `unchanged` lookup in
+/// `RescanCarry::keep_view`.
 #[test]
-fn keep_view_refuses_three_ways_and_keeps_otherwise() {
+fn keep_view_has_two_forms_and_resets_only_where_it_must() {
     use crate::*;
     use std::time::{Duration, UNIX_EPOCH};
     let shot = |name: &str| Shot { id: 0, name: name.into(), raw: None, jpg: Some(PathBuf::from(format!("{name}.png"))),
@@ -1756,23 +1950,42 @@ fn keep_view_refuses_three_ways_and_keeps_otherwise() {
 
     // A sort change on C's list: B stays B, at its new position, in Compare with A.
     let sorted = carry(&old, &resorted, (&all, &all), 1);
-    let kept = sorted.keep_view(2.0, (3.0, 4.0), 1, Some((0, 1)), &[tile(0), tile(1), tile(2)]).expect("the same photos");
+    let pair = |a: usize, b: usize| Some(support::ComparePair { a, b, focus: 0 });
+    let kept = sorted.keep_view(2.0, (3.0, 4.0), 1, photo_open::compare_landing(&old, &resorted, pair(0, 1), &[]), &[tile(0), tile(1), tile(2)]).expect("the same photos");
     assert_eq!(kept.view_for_test(), (2.0, (3.0, 4.0), Some((2, 1))), "zoom, pan, and Compare's two photos by identity");
     assert_eq!(tile_ids(kept), [2, 1, 0], "every tile follows its file");
 
-    // Refused: the photo on screen isn't the landing photo.
-    assert!(sorted.keep_view(2.0, (0.0, 0.0), 0, None, &[]).is_none(), "A now sits at 2, the landing is 1");
-    // Refused: the photo on screen left.
+    // The second form: the photo on screen isn't the landing photo.
+    let off = photo_open::CompareLanding::Off;
+    let other = sorted.keep_view(2.0, (3.0, 4.0), 0, off, &[tile(0), tile(1), tile(2)]).expect("A now sits at 2, the landing is 1");
+    assert_eq!(other.view_for_test(), (2.0, (3.0, 4.0), None), "the zoom and the spot");
+    assert!(tile_ids(other).is_empty(), "and no tiles");
+    // The second form: the photo on screen left.
     let gone = carry(&old, &[a.clone(), c.clone()], (&all, &stamps(&[&a, &c])), 1);
-    assert!(gone.keep_view(2.0, (0.0, 0.0), 1, None, &[]).is_none(), "B left");
-    // Refused: a Compare photo left, though the photo on screen stayed.
-    assert!(gone.keep_view(2.0, (0.0, 0.0), 2, Some((1, 2)), &[]).is_none(), "B was one of the Compare pair");
+    let next = gone.keep_view(2.0, (3.0, 4.0), 1, off, &[tile(0), tile(1), tile(2)]).expect("B left: C at the same zoom and spot");
+    assert_eq!(next.view_for_test(), (2.0, (3.0, 4.0), None));
+    assert!(tile_ids(next).is_empty(), "no tile of A, B or C rides along");
+    // R5: a Compare photo left, though the photo on screen stayed. Compare keeps its view, and the half
+    // that stayed keeps its tile, by the photo it shows now.
+    let (after_b, a_c) = (photo_open::compare_landing(&old, &[a.clone(), c.clone()], pair(1, 2), &[]), [a.clone(), c.clone()]);
+    let kept = gone.keep_view(2.0, (0.0, 0.0), 2, after_b, &[tile(1), tile(2)]).expect("B was in the pair: A takes its half, as C is in the other");
+    assert_eq!(kept.view_for_test(), (2.0, (0.0, 0.0), Some((0, 1))));
+    assert_eq!(a_c[1].name, "C");
+    assert_eq!(tile_ids(kept), [1], "C's tile, and B's has gone");
+    // Reset: fewer than two photos, so Compare closes on the survivor, at fit.
+    let one_left = carry(&old, std::slice::from_ref(&a), (&all, &stamps(&[&a])), 0);
+    let closes = photo_open::compare_landing(&old, std::slice::from_ref(&a), pair(0, 1), &[]);
+    assert_eq!(closes, photo_open::CompareLanding::Closes);
+    assert!(one_left.keep_view(2.0, (0.0, 0.0), 0, closes, &[]).is_none(), "one photo left");
+    // Reset: nothing left to keep a view on.
+    let emptied = carry(&old, &[], (&all, &stamps(&[])), 0);
+    assert!(emptied.keep_view(2.0, (3.0, 4.0), 1, off, &[]).is_none(), "the empty state is at fit");
 
     // A file another program saved keeps the zoom, and only its own tiles go.
     let mut saved = all.clone();
     saved.insert(c.jpg.clone().unwrap(), (4, t0 + Duration::from_secs(60)));
     let changed = carry(&old, &resorted, (&all, &saved), 1);
-    let kept = changed.keep_view(2.0, (0.0, 0.0), 1, None, &[tile(0), tile(1), tile(2)]).expect("B itself didn't change");
+    let kept = changed.keep_view(2.0, (0.0, 0.0), 1, off, &[tile(0), tile(1), tile(2)]).expect("B itself didn't change");
     assert_eq!(tile_ids(kept), [2, 1], "C's tile is gone with its pixels");
     // Two landings can share a tick. A kept tile's id is a position in the list before the second one.
     roi.kept_tiles.borrow_mut().push(tile(0));
@@ -1780,10 +1993,1122 @@ fn keep_view_refuses_three_ways_and_keeps_otherwise() {
     assert!(roi.kept_tiles.borrow().is_empty(), "the swap drops them");
 }
 
+/// The parts of `apply_scan` a kept view and a kept scroll pass through, in its order, around a real
+/// list change. `kept_tiles_return_after_the_clear` and `a_landings_scroll_is_read_first_and_held_beside_its_steps`
+/// pin that order in the app, whose closures no rig can reach.
+struct LandingRig {
+    fast: crate::FastTier,
+    detail: crate::DetailTier,
+    film: crate::Film,
+    roi: crate::RoiZoom,
+    rot: crate::RotState,
+    meta: crate::meta::PerShotMeta,
+    l2: std::cell::RefCell<crate::L2Store>,
+    undo: std::cell::RefCell<crate::UndoRedo>,
+    view: crate::view::ViewReset,
+    del_pending: std::cell::RefCell<crate::DelPending>,
+    halves: (std::cell::Cell<usize>, std::cell::Cell<usize>),
+    current: std::cell::RefCell<usize>,
+    folder_gen: std::cell::Cell<u64>,
+    /// R46: the file half of the history, for what the person brought back (`brought_back`).
+    history: std::cell::RefCell<crate::support::FileHistory>,
+}
+
+impl LandingRig {
+    fn new(current: usize) -> Self {
+        use std::cell::{Cell, RefCell};
+        Self {
+            fast: crate::FastTier::new(),
+            detail: crate::DetailTier::new(),
+            film: crate::Film::new(),
+            roi: crate::RoiZoom::new(),
+            rot: crate::RotState::new(true),
+            meta: crate::meta::PerShotMeta::new(200),
+            l2: RefCell::new(crate::L2Store::new(1 << 30, 16 << 30)),
+            undo: RefCell::new(crate::UndoRedo::default()),
+            view: crate::view::ViewReset::for_test(),
+            del_pending: RefCell::new(None),
+            halves: (Cell::new(0), Cell::new(0)),
+            current: RefCell::new(current),
+            folder_gen: Cell::new(1),
+            history: RefCell::new(Default::default()),
+        }
+    }
+
+    /// Compare as `apply_scan` reads it.
+    fn pair(&self, app: &ui::MainWindow) -> Option<crate::support::ComparePair> {
+        self.view.compare.get().then(|| crate::support::ComparePair { a: self.halves.0.get(), b: self.halves.1.get(), focus: app.get_cmp_focus() })
+    }
+
+    /// One landing from `old` to `new`, on `start`. The tiles are what's in `roi.tiles` then.
+    fn land(&self, app: &ui::MainWindow, old: &[crate::Shot], new: &[crate::Shot], start: usize, tiles: &[crate::RoiTile]) -> Option<crate::photo_open::KeptScroll> {
+        self.land_settled(app, old, new, start, crate::photo_open::compare_landing(old, new, self.pair(app), &[]), tiles)
+    }
+
+    /// The same, with what the landing has already worked out for Compare.
+    fn land_settled(&self, app: &ui::MainWindow, old: &[crate::Shot], new: &[crate::Shot], start: usize, compare: crate::photo_open::CompareLanding, tiles: &[crate::RoiTile]) -> Option<crate::photo_open::KeptScroll> {
+        let t0 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let stamps = |list: &[crate::Shot]| -> crate::support::ListingStamps {
+            list.iter().map(|s| (s.jpg.clone().unwrap(), (4u64, t0))).collect()
+        };
+        self.land_listed(app, (old, &stamps(old)), (new, &stamps(new)), start, compare, tiles)
+    }
+
+    /// The same, with each list's stamps as a real listing read them: the refresh on coming back.
+    fn land_listed(&self, app: &ui::MainWindow, old: (&[crate::Shot], &crate::support::ListingStamps), new: (&[crate::Shot], &crate::support::ListingStamps), start: usize, compare: crate::photo_open::CompareLanding, tiles: &[crate::RoiTile]) -> Option<crate::photo_open::KeptScroll> {
+        let ((old, old_stamps), (new, new_stamps)) = (old, new);
+        let before = self.folder_gen.get();
+        let caches = (&self.fast, &self.detail, &self.film, &self.roi);
+        let carry = crate::photo_open::RescanCarry::take((old, new), (old_stamps, new_stamps), start, caches, &self.l2, &self.rot, &self.undo, (&self.meta, before));
+        let kept_view = carry.keep_view(app.get_zoom(), (app.get_pan_x(), app.get_pan_y()), *self.current.borrow(), compare, tiles);
+        let kept_scroll = carry.keep_scroll(*self.current.borrow(), before, crate::photo_open::pending_edges(app).0, self.view.free_scroll());
+        // Commit 11: where the tiles are on screen, read as `apply_scan` reads it, beside the scroll.
+        let slide_from = kept_scroll.as_ref().map(|kept| {
+            let (strip, grid) = crate::tile_slide::seen(app, old.len(), self.view.film_pos.get());
+            crate::tile_slide::SlideFrom::read(kept.identity(), new.len(), strip, grid, &self.film.slide.borrow())
+        });
+        self.folder_gen.set(before + 1);
+        self.roi.on_folder_swap();
+        *self.current.borrow_mut() = start;
+        self.view.reset_for_swap(start);
+        crate::reset_transient_ui(app, &self.del_pending, false);
+        carry.restore(caches, &self.l2, &self.rot, &self.undo, (&self.meta, before + 1));
+        if let Some(kept) = kept_view {
+            kept.restore(app, &self.view.compare, (&self.halves.0, &self.halves.1), &self.roi);
+        }
+        if let Some(strip) = kept_scroll.as_ref().and_then(|kept| kept.strip) {
+            self.view.restore_free_scroll(strip);
+        }
+        // R46: the blue edge, as `apply_scan` hands it what the person brought back, on the settled stage.
+        let brought = std::mem::take(&mut self.history.borrow_mut().brought_back);
+        let stage = crate::blue_edge::Stage { current: *self.current.borrow(), halves: self.view.compare.get().then(|| (self.halves.0.get(), self.halves.1.get())) };
+        self.film.edge.borrow_mut().landed(kept_scroll.as_ref().map(|kept| kept.identity()), &brought, new, stage);
+        self.film.slide.borrow_mut().landed(slide_from);
+        kept_scroll
+    }
+
+    /// The next tick's first step, as an arrow's step runs it.
+    fn bookkeeping(&self, app: &ui::MainWindow, shots: &[crate::Shot]) -> usize {
+        use std::cell::RefCell;
+        let c = crate::tick::step_bookkeeping(
+            app, std::time::Instant::now(), &self.current, &self.view.last_seen, &RefCell::new(std::time::Instant::now()),
+            &self.roi.region, &self.roi.tiles, shots, &RefCell::new(vec![0; shots.len()]), &RefCell::new(vec![0; shots.len()]),
+            &self.view.compare, &self.view.pan_carry,
+        );
+        self.roi.tiles.borrow_mut().append(&mut self.roi.kept_tiles.borrow_mut());
+        c
+    }
+}
+
+fn landing_photos(names: &[&str]) -> Vec<crate::Shot> {
+    names.iter().map(|n| landing_photo(n)).collect()
+}
+
+fn landing_photo(name: &str) -> crate::Shot {
+    crate::Shot { id: 0, name: name.into(), raw: None, jpg: Some(std::path::PathBuf::from(format!("{name}.jpg"))),
+        kind: crate::SrcKind::Jpeg, has_raw: false, has_jpg: true, cloud_placeholder: false, sniffed: None }
+}
+
+/// HWU_0000 to HWU_{n-1}, as a folder is named.
+fn numbered_photos(n: usize) -> Vec<crate::Shot> {
+    (0..n).map(|i| landing_photo(&format!("HWU_{i:04}"))).collect()
+}
+
+fn without(list: &[crate::Shot], gone: &[&str]) -> Vec<crate::Shot> {
+    list.iter().filter(|s| !gone.contains(&s.name.as_str())).cloned().collect()
+}
+
+fn landing_tile(id: usize) -> crate::RoiTile {
+    crate::RoiTile { id, u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0, src_long: 8192, img: slint::Image::default(), bytes: 4, turns: 0 }
+}
+
+/// Decision 8, "Delete while zoomed moves to the next photo at the same zoom and spot, as the arrow keys
+/// do" ("Yes to both"). Culling repeats, so three presses (L53), naming photos (L52). No tile of the
+/// photos that left or of the next one rides along: the arrow's path gets them. At fit stays at fit.
+///
+/// FALSIFIER (L28): make the second form of `RescanCarry::keep_view` return `None`: the zoom goes back to
+/// fit on the first press. Remove its early return: BEE's tile is carried. Restore the view before
+/// `reset_transient_ui` in the rig's order, or gate it in `apply_scan`: `kept_tiles_return_after_the_clear`.
+#[test]
+fn view_zoomed_delete_keeps_zoom_three_times() {
+    let app = boot();
+    let rig = LandingRig::new(0);
+    let mut list = landing_photos(&["ANT", "BEE", "CAT", "DOG"]);
+    app.set_img_aspect(1.5);
+    app.set_zoom(4.0);
+    let spot = (60.0, -30.0);
+    app.set_pan_x(spot.0);
+    app.set_pan_y(spot.1);
+    for (deleted, next) in [("ANT", "BEE"), ("BEE", "CAT"), ("CAT", "DOG")] {
+        let on = *rig.current.borrow();
+        assert_eq!(list[on].name, deleted);
+        let new = without(&list, &[deleted]);
+        let start = crate::support::land_by_photo(&list, on, &new, &[]);
+        rig.land(&app, &list, &new, start, &[landing_tile(on), landing_tile(on + 1)]);
+        assert!(rig.roi.kept_tiles.borrow().is_empty(), "{deleted}: no tiles carried");
+        let c = rig.bookkeeping(&app, &new);
+        assert_eq!(new[c].name, next, "the next photo");
+        assert_eq!(app.get_zoom(), 4.0, "{next} shows at the same zoom");
+        assert!(rig.roi.tiles.borrow().is_empty(), "{next} asks for its own tiles");
+        // `step_display`'s half of the arrow's path, at the first present.
+        let carry = rig.view.pan_carry.get().expect("the arrow's own carry");
+        let (iw, ih) = (app.get_img_w(), app.get_img_h());
+        let (mut x, mut y) = crate::support::carry_pan(carry, 1.5, iw, ih);
+        crate::support::clamp_pan(&mut x, &mut y, iw, ih, app.get_stage_w(), app.get_stage_h());
+        assert_eq!((x, y), spot, "{next} shows at the same spot");
+        app.set_pan_x(x);
+        app.set_pan_y(y);
+        rig.view.pan_carry.set(None);
+        list = new;
+    }
+    // At fit: DOG deleted from a list of EEL and DOG, the zoom never comes from anywhere.
+    let list = landing_photos(&["DOG", "EEL"]);
+    *rig.current.borrow_mut() = 0;
+    app.set_zoom(1.0);
+    app.set_pan_x(0.0);
+    app.set_pan_y(0.0);
+    let new = without(&list, &["DOG"]);
+    rig.land(&app, &list, &new, 0, &[]);
+    rig.bookkeeping(&app, &new);
+    assert_eq!((app.get_zoom(), app.get_pan_x(), app.get_pan_y()), (1.0, 0.0, 0.0), "at fit stays at fit");
+    assert!(rig.view.pan_carry.get().is_none());
+    // The last photo: the empty state is at fit, as today.
+    app.set_zoom(4.0);
+    rig.land(&app, &new, &[], 0, &[]);
+    assert_eq!(app.get_zoom(), 1.0, "an emptied folder returns to fit");
+}
+
+/// Decision 7, "Keep", "Both": Compare stays on a Move rejected, whichever side of the pair the photos
+/// left from, and the pair keeps its pins and its tiles. Stars go to the photo the half shows, because
+/// the indexes followed. Named, and repeated (L52, L53). A photo of the pair leaving (R5): its half takes
+/// the next that stayed, and with fewer than two left Compare closes.
+///
+/// FALSIFIER (L28): in `KeptView::restore`, drop the `compare.set(true)`: Compare closes. Follow nothing in
+/// `support::halves_after` (`Some((a, b))`): stars go to the wrong photo after ACE leaves. Read a half that
+/// left as closing: the last rows.
+#[test]
+fn view_move_keeps_compare_on_the_same_two_photos() {
+    use crate::tick::{compare_cull_target, step_compare_retarget};
+    let app = boot();
+    let mut list = landing_photos(&["ACE", "ANT", "BEE", "CAT", "DOG", "ELK", "FOX"]);
+    let rig = LandingRig::new(1);
+    let nav_kind = std::cell::Cell::new(crate::NavKind::Absolute);
+    let idx = |list: &[crate::Shot], name: &str| list.iter().position(|s| s.name == name).unwrap();
+    rig.view.compare.set(true);
+    app.set_compare(true);
+    rig.halves.0.set(1);
+    rig.halves.1.set(2);
+    app.set_cmp_focus(0);
+    app.set_pin_b(true);
+    app.set_zoom(2.5);
+    app.set_pan_x(12.0);
+    app.set_pan_y(-8.0);
+    for moved in [&["CAT"][..], &["ACE"], &["DOG", "ELK"]] {
+        let new = without(&list, moved);
+        let start = crate::support::land_by_photo(&list, *rig.current.borrow(), &new, &[]);
+        let tiles = [landing_tile(idx(&list, "ANT")), landing_tile(idx(&list, "BEE")), landing_tile(idx(&list, moved[0]))];
+        rig.land(&app, &list, &new, start, &tiles);
+        assert!(rig.view.compare.get() && app.get_compare(), "{moved:?}: Compare stays");
+        assert_eq!((app.get_zoom(), app.get_pan_x(), app.get_pan_y()), (2.5, 12.0, -8.0), "{moved:?}: the zoom and the spot");
+        assert!(app.get_pin_b(), "{moved:?}: the pin");
+        assert_eq!(new[rig.halves.0.get()].name, "ANT", "{moved:?}");
+        assert_eq!(new[rig.halves.1.get()].name, "BEE", "{moved:?}");
+        // The tick's first steps leave the pair alone, and a star goes to the photo the half shows.
+        assert!(!step_compare_retarget(&app, &rig.current, &rig.view.compare, &rig.halves.0, &rig.halves.1, &nav_kind, new.len()));
+        assert_eq!((new[rig.halves.0.get()].name.as_str(), new[rig.halves.1.get()].name.as_str()), ("ANT", "BEE"), "{moved:?}");
+        for (focus, photo) in [(0, "ANT"), (1, "BEE")] {
+            assert_eq!(new[compare_cull_target(focus, rig.halves.0.get(), rig.halves.1.get())].name, photo, "{moved:?}: a star");
+        }
+        let held: Vec<&str> = rig.roi.kept_tiles.borrow().iter().map(|t| if t.id == idx(&new, "ANT") { "ANT" } else if t.id == idx(&new, "BEE") { "BEE" } else { "other" }).collect();
+        assert_eq!(held, ["ANT", "BEE"], "{moved:?}: the pair's tiles follow them, and the moved photo's go");
+        rig.bookkeeping(&app, &new);
+        list = new;
+    }
+    // BEE itself moved: its half takes the next that stayed, at the same zoom and spot, with its pin.
+    let new = without(&list, &["BEE"]);
+    let start = crate::support::land_by_photo(&list, *rig.current.borrow(), &new, &[]);
+    rig.land(&app, &list, &new, start, &[]);
+    assert!(rig.view.compare.get() && app.get_compare(), "BEE left, and FOX takes its half");
+    assert_eq!((new[rig.halves.0.get()].name.as_str(), new[rig.halves.1.get()].name.as_str()), ("ANT", "FOX"));
+    assert_eq!((app.get_zoom(), app.get_pan_x(), app.get_pan_y()), (2.5, 12.0, -8.0));
+    assert!(app.get_pin_b());
+    assert!(!step_compare_retarget(&app, &rig.current, &rig.view.compare, &rig.halves.0, &rig.halves.1, &nav_kind, new.len()));
+    assert_eq!((new[rig.halves.0.get()].name.as_str(), new[rig.halves.1.get()].name.as_str()), ("ANT", "FOX"), "the tick's first steps leave them");
+    // And FOX: one photo left. Compare closes on it, and the view returns to fit.
+    let list = new;
+    let new = without(&list, &["FOX"]);
+    let start = crate::support::land_by_photo(&list, *rig.current.borrow(), &new, &[]);
+    rig.land(&app, &list, &new, start, &[]);
+    assert!(!rig.view.compare.get() && !app.get_compare(), "one photo left");
+    assert_eq!(new[*rig.current.borrow()].name, "ANT");
+    assert_eq!(app.get_zoom(), 1.0);
+}
+
+/// R5 (owner chose B), and R6's refusal the way X asks: Del on the active half, three times, on the real
+/// window. Its photo leaves the real take-out's list, the half takes the next photo, the zoom, spot, focus
+/// and pins stay, and the tick's first steps leave the pair alone. Until the half shows what it names, a
+/// second Del is refused, and when it does the labels name that photo. With both halves pinned too, whose
+/// pins refuse a navigation: this isn't one.
+///
+/// FALSIFIER (L28): in `settle_by_photo`, land by the anchor alone: `current` isn't the focused half, so
+/// `step_compare_retarget` moves or refuses. In `KeptView::restore`, don't set the halves: the labels stay on
+/// the photo that left. Have `compare_cull_blocked` ignore the generation: the gate passes before the half is
+/// shown.
+#[test]
+fn del_in_compare_keeps_zoom_spot_focus_and_pins_three_times() {
+    use crate::tick::{compare_cull_blocked, compare_cull_target, step_compare_feed, step_compare_retarget};
+    let app = boot();
+    for (focus, pins, names) in [
+        (0, (true, false), [("ANT", "CAT"), ("CAT", "DOG"), ("DOG", "EEL")]),
+        (1, (true, false), [("BEE", "CAT"), ("CAT", "DOG"), ("DOG", "EEL")]),
+        (0, (true, true), [("ANT", "CAT"), ("CAT", "DOG"), ("DOG", "EEL")]),
+    ] {
+        let case = format!("focus {focus}, pins {pins:?}");
+        let mut list = landing_photos(&["ANT", "BEE", "CAT", "DOG", "EEL", "FOX"]);
+        let rig = LandingRig::new(focus as usize);
+        let nav_kind = std::cell::Cell::new(crate::NavKind::Absolute);
+        let caches = cmp_rig(list.len());
+        rig.view.compare.set(true);
+        app.set_compare(true);
+        rig.halves.0.set(0);
+        rig.halves.1.set(1);
+        app.set_cmp_focus(focus);
+        app.set_pin_a(pins.0);
+        app.set_pin_b(pins.1);
+        app.set_zoom(2.5);
+        app.set_pan_x(12.0);
+        app.set_pan_y(-8.0);
+        app.set_cmp_pan_fx(0.25);
+        app.set_cmp_pan_fy(-0.125);
+        let feed = |list: &[crate::Shot]| step_compare_feed(
+            &app, list.len(), rig.folder_gen.get(), list, &rig.view.compare, &rig.halves.0, &rig.halves.1, &caches.detail, &caches.fast,
+            &caches.det_failed, &caches.fast_failed, &caches.ratings, &caches.marks, &caches.half_a, &caches.half_b);
+        let refused = || compare_cull_blocked(app.get_cmp_focus(), rig.halves.0.get(), rig.halves.1.get(), caches.half_a.get(), caches.half_b.get(), rig.folder_gen.get());
+        let kept_half = if focus == 0 { "BEE" } else { "ANT" };
+        for i in 0..list.len() {
+            caches.detail.borrow_mut().insert(i, frame(400, 300));
+        }
+        feed(&list);
+        for (gone, next) in names {
+            assert!(!refused(), "{case}: {gone} is showing, so Del goes");
+            let target = compare_cull_target(app.get_cmp_focus(), rig.halves.0.get(), rig.halves.1.get());
+            assert_eq!(list[target].name, gone, "{case}: the active half");
+            let mut done = crate::support::take_out_scan(&list, &[(target, list[target].clone())], std::path::PathBuf::from("folder"), None, crate::FolderAttrs::default(), true, None,
+                crate::support::AppliedScan { sort: (crate::SortMethod::Name, false), review_load: crate::support::ReviewLoad::Loaded });
+            let landing = crate::photo_open::settle_by_photo(&mut done, &list, *rig.current.borrow(), 0, rig.pair(&app));
+            rig.land_settled(&app, &list, &done.shots, done.start, landing, &[]);
+            let new = done.shots;
+            assert!(rig.view.compare.get() && app.get_compare(), "{case}, {gone}: Compare stays");
+            assert_eq!((app.get_zoom(), app.get_pan_x(), app.get_pan_y()), (2.5, 12.0, -8.0), "{case}, {gone}: the zoom and the spot");
+            assert_eq!((app.get_cmp_pan_fx(), app.get_cmp_pan_fy()), (0.25, -0.125), "{case}, {gone}: Compare's own spot");
+            assert_eq!((app.get_cmp_focus(), app.get_pin_a(), app.get_pin_b()), (focus, pins.0, pins.1), "{case}, {gone}: the focus and the pins");
+            // The tick's first step: this was no navigation, so nothing moves and nothing is refused.
+            assert!(!step_compare_retarget(&app, &rig.current, &rig.view.compare, &rig.halves.0, &rig.halves.1, &nav_kind, new.len()), "{case}, {gone}: no refusal");
+            let shown = |i: usize| new[i].name.as_str();
+            let (now_active, now_other) = if focus == 0 { (rig.halves.0.get(), rig.halves.1.get()) } else { (rig.halves.1.get(), rig.halves.0.get()) };
+            assert_eq!((shown(now_active), shown(now_other)), (next, kept_half), "{case}: {gone} goes, {next} takes its half");
+            assert_eq!(shown(*rig.current.borrow()), next, "{case}: `current` mirrors the active half");
+            // Nothing of it to show yet: a second Del is refused, by the half, not by any list.
+            assert!(refused(), "{case}, {next}: the landing's new generation means it isn't shown yet");
+            caches.detail.borrow_mut().clear();
+            caches.detail.borrow_mut().insert(now_other, frame(400, 300));
+            feed(&new);
+            assert!(refused(), "{case}, {next}: no frame, so a second Del is refused");
+            assert!(if focus == 0 { app.get_cmp_loading_a() } else { app.get_cmp_loading_b() }, "{case}, {next}: and the half says it's loading");
+            // Its frame arrives.
+            for i in 0..new.len() {
+                caches.detail.borrow_mut().insert(i, frame(400, 300));
+            }
+            feed(&new);
+            assert!(!refused(), "{case}, {next}: now it can go");
+            let (label_a, label_b) = (app.get_name_a().to_string(), app.get_name_b().to_string());
+            assert_eq!(if focus == 0 { label_a } else { label_b }, next, "{case}: the half's label names it");
+            rig.bookkeeping(&app, &new);
+            list = new;
+        }
+    }
+}
+
+/// R5: the real key reaches the handler in Compare, as X does, and `delete-key` decides from there.
+///
+/// FALSIFIER (L28): add `&& !root.compare` to the key's arm.
+#[test]
+fn del_reaches_its_handler_in_compare() {
+    use slint::platform::Key;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let app = boot();
+    let dels = Rc::new(Cell::new(0));
+    {
+        let dels = dels.clone();
+        app.on_delete_key(move || dels.set(dels.get() + 1));
+    }
+    app.set_compare(true);
+    key(&app, Key::Delete);
+    assert_eq!(dels.get(), 1, "Del, in Compare");
+    key(&app, Key::Backspace);
+    assert_eq!(dels.get(), 2, "and its twin");
+}
+
+/// The shape of `background_memory::GRID_KEY_UNBUILT`.
+type GridKey = (i64, usize, usize, u64, u64, u64, u64, u64, (i64, i64));
+
+/// `step_folder_grid` and everything it reads, for rows that land a changing list on a real grid.
+struct GridRig {
+    cache: std::cell::RefCell<crate::tick::FastCache>,
+    film: crate::Film,
+    thumb_gen: std::cell::Cell<u64>,
+    thumb_req: std::sync::mpsc::Sender<crate::support::ThumbReq>,
+    _thumb_rx: std::sync::mpsc::Receiver<crate::support::ThumbReq>,
+    fast_gen: std::cell::Cell<u64>,
+    ratings: std::cell::RefCell<Vec<i32>>,
+    marks: std::cell::RefCell<Vec<u8>>,
+    sel_gen: std::cell::Cell<u64>,
+    select: std::cell::RefCell<crate::support::SelectSet>,
+    select_gen: std::cell::Cell<u64>,
+    last_grid_key: std::cell::Cell<GridKey>,
+    last_grid_view: std::cell::Cell<(bool, u64)>,
+    last_grid_c: std::cell::Cell<usize>,
+    grid_vp_prog: std::cell::Cell<Option<crate::support::PanelMemo>>,
+    grid_model: slint::VecModel<ui::FilmItem>,
+    rot: crate::RotState,
+}
+
+impl GridRig {
+    /// The dock open and laid out, its first tick run.
+    fn open(app: &ui::MainWindow, list: &[crate::Shot], c: usize, generation: u64) -> Self {
+        use std::cell::{Cell, RefCell};
+        let (thumb_req, _thumb_rx) = std::sync::mpsc::channel();
+        let rig = Self {
+            cache: RefCell::new(crate::tick::FastCache::new()),
+            film: crate::Film::new(),
+            thumb_gen: Cell::new(0),
+            thumb_req,
+            _thumb_rx,
+            fast_gen: Cell::new(0),
+            ratings: RefCell::new(vec![0; 200]),
+            marks: RefCell::new(vec![0; 200]),
+            sel_gen: Cell::new(0),
+            select: RefCell::new(crate::support::SelectSet::default()),
+            select_gen: Cell::new(0),
+            last_grid_key: Cell::new(crate::background_memory::GRID_KEY_UNBUILT),
+            last_grid_view: Cell::new((false, u64::MAX)),
+            last_grid_c: Cell::new(usize::MAX),
+            grid_vp_prog: Cell::new(None),
+            grid_model: slint::VecModel::default(),
+            rot: crate::RotState::new(false),
+        };
+        app.set_grid_open(true);
+        hover(app, 600.0, 300.0);
+        if app.get_grid_vp_h() <= 0.0 {
+            app.set_grid_vp_h(654.0);
+        }
+        rig.step(app, list, c, generation);
+        assert_eq!(app.get_grid_cols(), 3, "the rows below count three columns");
+        rig
+    }
+
+    fn step(&self, app: &ui::MainWindow, list: &[crate::Shot], c: usize, generation: u64) {
+        let plan = crate::support::plan_from_shots(list);
+        crate::tick::step_folder_grid(
+            app, c, list.len(), generation, list, &plan, &self.cache, &self.film, &self.thumb_gen, &self.thumb_req,
+            &self.fast_gen, &self.ratings, &self.marks, &self.sel_gen, &self.select, &self.select_gen, &self.last_grid_key,
+            &self.last_grid_view, &self.last_grid_c, &self.grid_vp_prog, &self.grid_model, &self.rot, crate::support::ThumbScope::Nearby,
+        );
+    }
+
+    /// The tick after a landing, in the tick's order.
+    fn landed(&self, app: &ui::MainWindow, kept: Option<&crate::photo_open::KeptScroll>, list: &[crate::Shot], c: usize, generation: u64) {
+        self.grid_vp_prog.set(None);
+        if let Some(kept) = kept {
+            crate::tick::hold_grid_on_landing(app, kept, generation, list.len(), &self.last_grid_view, &self.last_grid_c, &self.grid_vp_prog);
+        }
+        self.step(app, list, c, generation);
+    }
+
+    /// Where a named tile is on screen, from the rows the grid really built.
+    fn tile_y(&self, app: &ui::MainWindow, name: &str) -> Option<f32> {
+        use slint::Model;
+        let slot = (0..self.grid_model.row_count()).find(|&i| self.grid_model.row_data(i).is_some_and(|t| t.name == name))?;
+        Some(app.get_grid_win_y() + (slot / app.get_grid_cols() as usize) as f32 * crate::tick::GRID_ROW_PITCH + app.get_grid_vp_y())
+    }
+
+    /// The same tile's column.
+    fn tile_col(&self, app: &ui::MainWindow, name: &str) -> Option<usize> {
+        use slint::Model;
+        let slot = (0..self.grid_model.row_count()).find(|&i| self.grid_model.row_data(i).is_some_and(|t| t.name == name))?;
+        Some(slot % app.get_grid_cols() as usize)
+    }
+}
+
+/// R3, from the challenge: "scrolled grid, delete five, viewport still shows the same neighbouring tile".
+/// On a photo in the first row, scrolled far down, tidying tiles there. Five right-click deletes, then
+/// tiles leaving above the view, the first tile in view itself, and the end of the list (clamped). The
+/// current photo never moves and the grid never goes back to it.
+///
+/// FALSIFIER (L28): in `hold_grid_on_landing`, drop `last_grid_view.set((true, gen_now));`: the first
+/// delete recentres on HWU_0001. Drop the row shift: HWU_0036 leaves its place when photos above it go.
+/// Drop the `grid_vp_prog` write: the app reads its own write as a scroll. Drop the `.clamp`: the end of
+/// the list scrolls past its last row.
+#[test]
+fn scrolled_grid_keeps_the_same_tile_through_five_deletes() {
+    use crate::tick::{GRID_PAD, GRID_ROW_PITCH};
+    let app = boot();
+    let mut list = numbered_photos(120);
+    let rig = LandingRig::new(1);
+    let grid = GridRig::open(&app, &list, 1, rig.folder_gen.get());
+    // Five pixels into row 12, so the first row in view is cut a little, as a real scroll leaves it.
+    let scrolled = -(GRID_PAD + 12.0 * GRID_ROW_PITCH + 5.0);
+    app.set_grid_vp_y(scrolled);
+    grid.step(&app, &list, 1, rig.folder_gen.get());
+    let place = grid.tile_y(&app, "HWU_0036").expect("the first tile in view");
+    let at_place = |name: &str| grid.tile_y(&app, name).is_some_and(|y| (y - place).abs() < 0.01);
+    let land = |list: &[crate::Shot], gone: &[&str]| {
+        let new = without(list, gone);
+        let start = crate::support::land_by_photo(list, *rig.current.borrow(), &new, &[]);
+        let kept = rig.land(&app, list, &new, start, &[]);
+        assert!(kept.as_ref().is_some_and(|k| k.same_photo), "{gone:?}: the order held, on the same photo");
+        grid.landed(&app, kept.as_ref(), &new, start, rig.folder_gen.get());
+        assert_eq!(new[start].name, "HWU_0001", "{gone:?}: still on the person's photo");
+        new
+    };
+    for deleted in ["HWU_0038", "HWU_0043", "HWU_0037", "HWU_0040", "HWU_0041"] {
+        list = land(&list, &[deleted]);
+        assert_eq!(app.get_grid_vp_y(), scrolled, "{deleted}: the grid stays where it was scrolled");
+        assert!(at_place("HWU_0036"), "{deleted}: the same neighbouring tile");
+        assert_eq!(grid.grid_vp_prog.get(), None, "{deleted}: nothing written");
+        // A tick on its own doesn't take it back either.
+        grid.step(&app, &list, 1, rig.folder_gen.get());
+        assert_eq!(app.get_grid_vp_y(), scrolled, "{deleted}: a steady tick");
+    }
+    // Two tiles above the view leave, in one selection: HWU_0036 goes up a row, so the scroll follows it.
+    list = land(&list, &["HWU_0010", "HWU_0011"]);
+    let moved = scrolled + GRID_ROW_PITCH;
+    assert_eq!(app.get_grid_vp_y(), moved, "by the tile, not by the number");
+    assert!(at_place("HWU_0036"), "the tile holds its place");
+    let memo = grid.grid_vp_prog.get().map(|m| m.target);
+    assert_eq!(memo, Some(moved), "the step declares the row-hold write");
+    assert!(!crate::support::panel_scroll_stamped(scrolled, moved, memo), "it isn't the person's scroll");
+    // The first tile in view is the one that goes: the one after it takes its place, nothing scrolls.
+    assert!(grid.tile_col(&app, "HWU_0036") == Some(1), "HWU_0035 is the first tile in view now");
+    list = land(&list, &["HWU_0035"]);
+    assert_eq!(app.get_grid_vp_y(), moved, "the first tile in view left");
+    assert!(at_place("HWU_0036"));
+    assert_eq!(grid.tile_col(&app, "HWU_0036"), Some(0));
+    // At the end of the list, a row going away clamps the scroll to the new last row.
+    let cols = 3;
+    let bottom = |len: usize, view_h: f32| (GRID_PAD + len.div_ceil(cols) as f32 * GRID_ROW_PITCH - view_h).max(0.0);
+    app.set_grid_vp_y(-bottom(list.len(), app.get_grid_vp_h()));
+    grid.step(&app, &list, 1, rig.folder_gen.get());
+    while list.len() % cols != 1 {
+        let last = list.last().unwrap().name.clone();
+        list = land(&list, &[last.as_str()]);
+    }
+    let last = list.last().unwrap().name.clone();
+    list = land(&list, &[last.as_str()]);
+    assert_eq!(-app.get_grid_vp_y(), bottom(list.len(), app.get_grid_vp_h()), "clamped to the new last row");
+    assert_eq!(grid.grid_vp_prog.get().map(|m| m.target), Some(app.get_grid_vp_y()));
+    app.set_grid_open(false);
+}
+
+/// The grid's half of R41: "the current tile holds; in the grid it keeps its row and may step sideways".
+/// With the person's own photo in view, and photos before it moved out by Move rejected, it stays at the
+/// same height through each one, whether they left from above the view or from inside it.
+///
+/// FALSIFIER (L28): in `hold_grid_on_landing`, always hold the first tile in view: HWU_0030 leaves its
+/// row when HWU_0004 leaves. Drop the row shift: it goes up a row when HWU_0003 leaves.
+#[test]
+fn the_photo_on_screens_tile_keeps_its_row_when_photos_before_it_leave() {
+    let app = boot();
+    let mut list = numbered_photos(60);
+    let rig = LandingRig::new(30);
+    let grid = GridRig::open(&app, &list, 30, rig.folder_gen.get());
+    let place = grid.tile_y(&app, "HWU_0030").expect("recentred on it when the dock opened");
+    assert_eq!(grid.tile_col(&app, "HWU_0030"), Some(0));
+    for (moved, column) in [("HWU_0003", 2), ("HWU_0004", 1), ("HWU_0005", 0), ("HWU_0029", 2)] {
+        let new = without(&list, &[moved]);
+        let start = crate::support::land_by_photo(&list, *rig.current.borrow(), &new, &[]);
+        let kept = rig.land(&app, &list, &new, start, &[]);
+        grid.landed(&app, kept.as_ref(), &new, start, rig.folder_gen.get());
+        assert_eq!(new[start].name, "HWU_0030", "{moved}: on the same photo");
+        assert!(grid.tile_y(&app, "HWU_0030").is_some_and(|y| (y - place).abs() < 0.01), "{moved}: its row stays");
+        assert_eq!(grid.tile_col(&app, "HWU_0030"), Some(column), "{moved}: it may step sideways");
+        list = new;
+    }
+    app.set_grid_open(false);
+}
+
+/// R3: "when the photo changes, the existing recentre only if off-screen branch applies". A Del on the
+/// photo on screen, whose next photo takes its number: in view, nothing scrolls, three times. Scrolled away, the grid
+/// goes to it, as an arrow does.
+///
+/// FALSIFIER (L28): in `hold_grid_on_landing`, set `last_grid_c` to the landing whatever the photo: the
+/// number didn't change, so the follow doesn't run and the grid stays away from the photo on screen.
+#[test]
+fn a_landing_on_another_photo_recentres_the_grid_only_if_it_is_off_screen() {
+    use crate::tick::{GRID_CELL_H, GRID_PAD, GRID_ROW_PITCH};
+    let app = boot();
+    let mut list = numbered_photos(60);
+    let rig = LandingRig::new(30);
+    let grid = GridRig::open(&app, &list, 30, rig.folder_gen.get());
+    let opened_at = app.get_grid_vp_y();
+    for (deleted, next) in [("HWU_0030", "HWU_0031"), ("HWU_0031", "HWU_0032"), ("HWU_0032", "HWU_0033")] {
+        let new = without(&list, &[deleted]);
+        let start = crate::support::land_by_photo(&list, *rig.current.borrow(), &new, &[]);
+        let kept = rig.land(&app, &list, &new, start, &[]);
+        assert!(!kept.as_ref().unwrap().same_photo);
+        grid.landed(&app, kept.as_ref(), &new, start, rig.folder_gen.get());
+        assert_eq!(new[start].name, next);
+        assert_eq!(app.get_grid_vp_y(), opened_at, "{deleted}: {next} is in view, so nothing scrolls");
+        list = new;
+    }
+    // The person scrolled to the top, then Del on the photo on screen, far below.
+    app.set_grid_vp_y(0.0);
+    grid.step(&app, &list, 30, rig.folder_gen.get());
+    let new = without(&list, &["HWU_0033"]);
+    let start = crate::support::land_by_photo(&list, *rig.current.borrow(), &new, &[]);
+    let kept = rig.land(&app, &list, &new, start, &[]);
+    grid.landed(&app, kept.as_ref(), &new, start, rig.folder_gen.get());
+    assert_eq!(new[start].name, "HWU_0034");
+    let view_h = app.get_grid_vp_h();
+    let max_scroll = (GRID_PAD + new.len().div_ceil(3) as f32 * GRID_ROW_PITCH - view_h).max(0.0);
+    let centred = (GRID_PAD + 10.0 * GRID_ROW_PITCH - (view_h - GRID_CELL_H) / 2.0).clamp(0.0, max_scroll);
+    assert_eq!(app.get_grid_vp_y(), -centred, "off screen, so the follow recentres on it");
+    assert_eq!(grid.grid_vp_prog.get().map(|m| m.target), Some(-centred));
+    app.set_grid_open(false);
+}
+
+/// R3: "a re-sort keeps its recentre", with a free-scrolled grid. A landing after a re-sort in the same
+/// tick also takes today's recentre, finding the grid not settled on its generation: rare, and it loses
+/// nothing. (Two landings that both keep the order read as one: the row below.)
+///
+/// FALSIFIER (L28): remove the `is_sorted` line in `RescanCarry::keep_scroll`: the reversed list keeps
+/// the scroll. Remove `was_gen != kept.gen_before` from `hold_grid_on_landing`: the second landing holds.
+#[test]
+fn a_re_sort_keeps_its_recentre() {
+    use crate::tick::{GRID_CELL_H, GRID_PAD, GRID_ROW_PITCH};
+    let app = boot();
+    let list = numbered_photos(60);
+    let rig = LandingRig::new(30);
+    let grid = GridRig::open(&app, &list, 30, rig.folder_gen.get());
+    let view_h = app.get_grid_vp_h();
+    let centre_on = |row: usize| -(GRID_PAD + row as f32 * GRID_ROW_PITCH - (view_h - GRID_CELL_H) / 2.0).clamp(0.0, (GRID_PAD + 20.0 * GRID_ROW_PITCH - view_h).max(0.0));
+    app.set_grid_vp_y(0.0);
+    grid.step(&app, &list, 30, rig.folder_gen.get());
+    // Newest first: the photo on screen stays HWU_0030, in another place.
+    let reversed: Vec<crate::Shot> = list.iter().rev().cloned().collect();
+    let start = reversed.iter().position(|s| s.name == "HWU_0030").unwrap();
+    let kept = rig.land(&app, &list, &reversed, start, &[]);
+    assert!(kept.is_none(), "the order changed");
+    grid.landed(&app, kept.as_ref(), &reversed, start, rig.folder_gen.get());
+    assert_eq!(app.get_grid_vp_y(), centre_on(start / 3), "recentred on the photo on screen");
+    // A re-sort, and a landing behind it in the one tick: the second finds the grid not settled on its
+    // generation, as the first kept no scroll. The person's tile is in view, near the top, so nothing but
+    // the recentre would move the grid to the middle.
+    app.set_grid_vp_y(-(GRID_PAD + 9.0 * GRID_ROW_PITCH));
+    grid.step(&app, &reversed, start, rig.folder_gen.get());
+    let forwards: Vec<crate::Shot> = reversed.iter().rev().cloned().collect();
+    let on = forwards.iter().position(|s| s.name == "HWU_0030").unwrap();
+    let first = rig.land(&app, &reversed, &forwards, on, &[]);
+    assert!(first.is_none(), "the order changed");
+    let twice = without(&forwards, &["HWU_0001"]);
+    let on = twice.iter().position(|s| s.name == "HWU_0030").unwrap();
+    let second = rig.land(&app, &forwards, &twice, on, &[]);
+    assert!(second.is_some(), "the order held");
+    let kept = crate::photo_open::KeptScroll::after(first, second);
+    grid.landed(&app, kept.as_ref(), &twice, on, rig.folder_gen.get());
+    assert_eq!(app.get_grid_vp_y(), centre_on(on / 3), "today's recentre");
+    app.set_grid_open(false);
+}
+
+/// A delete's take-out and a job's reread landing in one tick: the grid holds its tile, at the same
+/// height, as it would through either alone, also when photos leave above the view and one arrives. The
+/// Review panel the same. This used to be left to the recentre, while the two couldn't land together.
+///
+/// FALSIFIER (L28): in `apply_scan`, set the slot from the second landing alone, or in
+/// `KeptScroll::after` keep the second's `gen_before`: the first row recentres. Keep the second's map: the
+/// tile that holds is the wrong one. (`two_landings_in_one_tick_read_as_one_for_the_scroll` has the rest.)
+#[test]
+fn a_take_out_and_a_reread_in_one_tick_keep_the_scroll() {
+    use crate::tick::{GRID_PAD, GRID_ROW_PITCH};
+    let app = boot();
+    let list = numbered_photos(120);
+    let rig = LandingRig::new(1);
+    let grid = GridRig::open(&app, &list, 1, rig.folder_gen.get());
+    let scrolled = -(GRID_PAD + 12.0 * GRID_ROW_PITCH + 5.0);
+    app.set_grid_vp_y(scrolled);
+    grid.step(&app, &list, 1, rig.folder_gen.get());
+    let place = grid.tile_y(&app, "HWU_0036").expect("the first tile in view");
+    // Two landings, and the tick after them. `first_gone` is the take-out, `second_gone` the reread's.
+    let two = |list: &[crate::Shot], first_gone: &[&str], second_gone: &[&str]| {
+        let after_first = without(list, first_gone);
+        let start = crate::support::land_by_photo(list, *rig.current.borrow(), &after_first, &[]);
+        let first = rig.land(&app, list, &after_first, start, &[]);
+        let after_second = without(&after_first, second_gone);
+        let start = crate::support::land_by_photo(&after_first, *rig.current.borrow(), &after_second, &[]);
+        let second = rig.land(&app, &after_first, &after_second, start, &[]);
+        let kept = crate::photo_open::KeptScroll::after(first, second);
+        assert!(kept.as_ref().is_some_and(|k| k.same_photo), "{first_gone:?}: the order held, on the same photo");
+        grid.landed(&app, kept.as_ref(), &after_second, start, rig.folder_gen.get());
+        assert_eq!(after_second[start].name, "HWU_0001", "{first_gone:?}: still on the person's photo");
+        after_second
+    };
+    // A tile in view, then a tile in view: nothing scrolls, and the same tile stays.
+    let list = two(&list, &["HWU_0038"], &["HWU_0043"]);
+    assert_eq!(app.get_grid_vp_y(), scrolled, "the grid stays where it was scrolled");
+    assert!(grid.tile_y(&app, "HWU_0036").is_some_and(|y| (y - place).abs() < 0.01), "the same tile");
+    // Six above the view, a row's worth in each landing, so the scroll follows the tile by two rows.
+    let list = two(&list, &["HWU_0010", "HWU_0011", "HWU_0012"], &["HWU_0013", "HWU_0014", "HWU_0015"]);
+    let moved = scrolled + 2.0 * GRID_ROW_PITCH;
+    assert_eq!(app.get_grid_vp_y(), moved, "by the tile, through both maps");
+    assert!(grid.tile_y(&app, "HWU_0036").is_some_and(|y| (y - place).abs() < 0.01), "the same tile");
+    assert_eq!(grid.grid_vp_prog.get().map(|m| m.target), Some(moved), "and it declares the write");
+    // Twice over: the next tick on its own, then another pair.
+    grid.step(&app, &list, 1, rig.folder_gen.get());
+    let _list = two(&list, &["HWU_0039"], &["HWU_0041"]);
+    assert_eq!(app.get_grid_vp_y(), moved);
+    assert!(grid.tile_y(&app, "HWU_0036").is_some_and(|y| (y - place).abs() < 0.01), "the same tile");
+    app.set_grid_open(false);
+}
+
+/// R6's landing half (owner chose A): zoomed with "When zoomed: Always sharp", the landing after a delete
+/// shows the preview at once, on the real display step, and sharpens in place. An arrow still holds, also an
+/// arrow back to that photo. The previous frame stays dim-free while an arrow holds, and a landing with
+/// no preview yet shows the dim, as Speed mode does, because it isn't a hold.
+///
+/// FALSIFIER (L28): `hold_sharp` ignores `on_landing`: the first row holds the deleted photo's frame. The
+/// drain doesn't name the photo: `the_handler_stashes_and_the_tick_takes_it_out`. `on_preview_landing`
+/// never forgets: the arrow back shows the preview. `note_preview_landing` writes nothing: the Ctrl+Z row.
+/// It writes when the photo stayed: the row after it. The reread's Land arm doesn't ask:
+/// `a_returned_photos_landing_is_wired`.
+#[test]
+fn a_deletes_landing_shows_the_preview_and_an_arrow_still_holds() {
+    use crate::tick::{step_display, DetailCache, FastCache, FastEntry};
+    use std::cell::{Cell, RefCell};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Mutex;
+    let app = boot();
+    app.set_zoom_always_sharp(true);
+    app.set_zoom(4.0);
+    let list = numbered_photos(5);
+    let img = || slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(4, 3));
+    let frame = |w| FastEntry { img: img(), w, h: 3, blur: std::sync::Arc::from(vec![0u8; 4]), bw: 1, bh: 1, dim: 2048, turns: 0 };
+    let cache: RefCell<FastCache> = RefCell::new((0..5).map(|i| (i, frame(4))).collect());
+    let detail: RefCell<DetailCache> = RefCell::new(DetailCache::new());
+    let (scrubbing, shown, shown_dims) = (RefCell::new(false), RefCell::new(None), RefCell::new((0u32, 0u32)));
+    let (shown_standin, photo_count) = (Cell::new(false), Cell::new(0u64));
+    let thumbs = RefCell::new(HashMap::new());
+    let (fast_failed, det_failed) = (Mutex::new(HashSet::new()), RefCell::new(HashSet::new()));
+    let (cloud, pan_carry) = (RefCell::new(HashSet::new()), Cell::new(None));
+    let rot = crate::RotState::new(false);
+    let epoch = AtomicU64::new(0);
+    let landing = RefCell::new(None::<String>);
+    let show = |c: usize| {
+        step_display(&app, c, 1, &list, &scrubbing, &detail, &cache, &shown, &shown_dims, &shown_standin, &photo_count,
+            &thumbs, &fast_failed, &det_failed, &cloud, &pan_carry, false, &rot, &epoch, &landing);
+        (*shown.borrow()).map(|(i, full, _): crate::support::ShownRec| (i, full))
+    };
+    // Three deletes in a row: each next photo shows its preview at once, and is ready to work on.
+    for c in [1, 2, 3] {
+        *landing.borrow_mut() = Some(list[c].name.clone());
+        assert_eq!(show(c), Some((c, false)), "{}: the preview, at once", list[c].name);
+        assert!(app.get_photo_ready(), "{}: its own frame is up", list[c].name);
+    }
+    // It sharpens in place when the detail lands.
+    detail.borrow_mut().insert(3, (img(), 8, 6));
+    assert_eq!(show(3), Some((3, true)), "sharp, on the same photo");
+    detail.borrow_mut().clear();
+    // An arrow to a photo not yet sharp holds, as it always has: the previous frame stays, undimmed.
+    assert_eq!(show(4), Some((3, true)), "held");
+    assert!(!app.get_photo_ready() && !app.get_stage_stale(), "not its frame, and the hold doesn't dim");
+    assert_eq!(*landing.borrow(), None, "leaving it forgets it");
+    // And so does an arrow back to the photo the delete landed on.
+    assert_eq!(show(3), Some((3, true)), "the record is still the sharp one, until something presents");
+    *shown.borrow_mut() = None;
+    assert_eq!(show(3), None, "an arrow back holds too");
+    // R45 (owner chose A): Ctrl+Z zoomed. The photo that came back shows its preview at once and sharpens in
+    // place, through the same write, and an arrow from there holds. It's Ctrl+Z x3: each shows.
+    for (was, c) in [(4, 3), (3, 2), (2, 1)] {
+        crate::tick::note_preview_landing(&landing, Some(list[was].name.clone()), Some(list[c].name.clone()));
+        assert_eq!(show(c), Some((c, false)), "{}: the preview, at once", list[c].name);
+    }
+    assert_eq!(show(0), Some((1, false)), "an arrow holds");
+    // It stayed on the photo it was on: nothing to show at once, so a hold stays a hold.
+    crate::tick::note_preview_landing(&landing, Some(list[0].name.clone()), Some(list[0].name.clone()));
+    assert_eq!(*landing.borrow(), None, "the same photo writes nothing");
+    assert_eq!(show(0), Some((1, false)), "and it still holds");
+    *shown.borrow_mut() = None;
+    // A landing with neither a preview nor a thumbnail yet: no hold, so the stage says it's loading.
+    cache.borrow_mut().clear();
+    *landing.borrow_mut() = Some(list[2].name.clone());
+    assert_eq!(show(2), None, "nothing to show yet");
+    assert!(app.get_stage_stale(), "and it dims, as Speed mode does");
+    // At fit, and in Speed mode, nothing holds, whatever the slot says.
+    *cache.borrow_mut() = (0..5).map(|i| (i, frame(4))).collect();
+    *landing.borrow_mut() = None;
+    app.set_zoom_always_sharp(false);
+    assert_eq!(show(4), Some((4, false)), "Speed mode shows the preview on an arrow too");
+    app.set_zoom_always_sharp(true);
+    app.set_zoom(1.0);
+    assert_eq!(show(1), Some((1, false)), "at fit, so does Always sharp");
+}
+
+/// R6, on the real `step_display`: "a second Del could delete a photo you never saw". After a delete's
+/// landing, while the stage still shows the photo that left, a Del is refused. Once the preview is up it
+/// goes. A stand-in passes, because the person can see what it is. Three deletes in a row, naming each photo.
+///
+/// FALSIFIER (L28): `photo_not_on_stage` answers `false`: the first of each. It reads `current` from the
+/// wrong side, or refuses a stand-in: its row. The handlers' calls of the gate: `photo_open`'s
+/// `every_route_goes_at_once_or_asks_by_one_rule`.
+#[test]
+fn second_del_is_refused_until_the_photo_is_shown() {
+    use crate::support::photo_not_on_stage;
+    use crate::tick::{step_display, DetailCache, FastCache, FastEntry};
+    use std::cell::{Cell, RefCell};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Mutex;
+    let app = boot();
+    let list = numbered_photos(5);
+    let img = || slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(4, 3));
+    let frame = || FastEntry { img: img(), w: 4, h: 3, blur: std::sync::Arc::from(vec![0u8; 4]), bw: 1, bh: 1, dim: 2048, turns: 0 };
+    let cache: RefCell<FastCache> = RefCell::new([(0, frame())].into_iter().collect());
+    let detail: RefCell<DetailCache> = RefCell::new(DetailCache::new());
+    let (scrubbing, shown, shown_dims) = (RefCell::new(false), RefCell::new(None), RefCell::new((0u32, 0u32)));
+    let (shown_standin, photo_count) = (Cell::new(false), Cell::new(0u64));
+    let thumbs = RefCell::new(HashMap::new());
+    let (fast_failed, det_failed) = (Mutex::new(HashSet::new()), RefCell::new(HashSet::new()));
+    let (cloud, pan_carry) = (RefCell::new(HashSet::new()), Cell::new(None));
+    let rot = crate::RotState::new(false);
+    let epoch = AtomicU64::new(0);
+    let landing = RefCell::new(None::<String>);
+    // The tick's display step, then what a Del would ask of what it left on stage.
+    let refused = |c: usize| {
+        step_display(&app, c, 1, &list, &scrubbing, &detail, &cache, &shown, &shown_dims, &shown_standin, &photo_count,
+            &thumbs, &fast_failed, &det_failed, &cloud, &pan_carry, false, &rot, &epoch, &landing);
+        photo_not_on_stage((*shown.borrow()).map(|(i, _, _): crate::support::ShownRec| i), c)
+    };
+    assert!(!refused(0), "{} is on stage", list[0].name);
+    for c in [1, 2, 3] {
+        // The delete lands on the next photo, which hasn't decoded and has no thumbnail.
+        *landing.borrow_mut() = Some(list[c].name.clone());
+        assert!(refused(c), "{}: the photo that left is still up, so a second Del is refused", list[c].name);
+        assert!(refused(c), "{}: and again, for as long as that's so", list[c].name);
+        // Its preview arrives.
+        cache.borrow_mut().insert(c, frame());
+        assert!(!refused(c), "{}: now it can be seen, and it can go", list[c].name);
+    }
+    // A stand-in: only its thumbnail so far. It isn't the real frame, and it passes.
+    *landing.borrow_mut() = Some(list[4].name.clone());
+    assert!(refused(4), "{}: nothing of it yet", list[4].name);
+    thumbs.borrow_mut().insert(4, (img(), crate::support::cm_bake_key(app.get_output_gamut())));
+    assert!(!refused(4), "{}: its stand-in is up, and the person can see what it is", list[4].name);
+    assert!(shown_standin.get() && !app.get_photo_ready(), "a stand-in, and not its frame");
+}
+
+/// R19: Del does nothing while the bell panel is open, the same as the arrows. The real key, through the
+/// real scope. A context menu's own row still answers to it: that's `delete-key`'s first question.
+///
+/// FALSIFIER (L28): drop `!root.notif-open` from the key's arm: the panel row.
+#[test]
+fn del_is_refused_with_the_bell_panel_open() {
+    use slint::platform::Key;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let app = boot();
+    let (dels, arrows) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    {
+        let dels = dels.clone();
+        app.on_delete_key(move || dels.set(dels.get() + 1));
+    }
+    {
+        let arrows = arrows.clone();
+        app.on_navigate(move |_| arrows.set(arrows.get() + 1));
+    }
+    key(&app, Key::Delete);
+    assert_eq!(dels.get(), 1, "the panel closed: Del presses");
+    key(&app, Key::RightArrow);
+    let arrowed = arrows.get();
+    assert!(arrowed > 0, "and an arrow steps");
+    app.set_notif_open(true);
+    for _ in 0..3 {
+        key(&app, Key::Delete);
+        key(&app, Key::Backspace);
+        key(&app, Key::RightArrow);
+    }
+    assert_eq!(dels.get(), 1, "the panel open: Del and Backspace do nothing");
+    assert_eq!(arrows.get(), arrowed, "the same as the arrows");
+    app.set_notif_open(false);
+    key(&app, Key::Delete);
+    assert_eq!(dels.get(), 2, "closed again, it presses");
+    app.set_ctx_open(true);
+    key(&app, Key::Delete);
+    assert_eq!(dels.get(), 3, "an open context menu is another matter: it has a Delete row of its own");
+}
+
+/// R18: a held key is one press. A press can delete with no dialog now, so a key held a moment too long
+/// mustn't walk through the folder. Twice, and on both of the key's names.
+///
+/// FALSIFIER (L28): drop `!e.repeat` from the key's arm: 4, not 1.
+#[test]
+fn held_del_is_one_delete() {
+    use slint::platform::{Key, WindowEvent};
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let app = boot();
+    let dels = Rc::new(Cell::new(0));
+    {
+        let dels = dels.clone();
+        app.on_delete_key(move || dels.set(dels.get() + 1));
+    }
+    let mut pressed = 0;
+    for name in [Key::Delete, Key::Backspace, Key::Delete] {
+        let text: slint::SharedString = name.into();
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+        for _ in 0..3 {
+            app.window().dispatch_event(WindowEvent::KeyPressRepeated { text: text.clone() });
+        }
+        app.window().dispatch_event(WindowEvent::KeyReleased { text });
+        pressed += 1;
+        assert_eq!(dels.get(), pressed, "a press and three repeats are one press");
+    }
+}
+
+/// Fix round 2 (11 November 2026, `F14-input-1`): the key arm hands Rust the system's key repeat with
+/// every printable key, so `on_key_typed` can make a held star, flag or reject key act once
+/// (`support::key_repeat_ignored`): a press arrives with `false`, its repeats with `true`.
+///
+/// FALSIFIER (L28): drop `e.repeat` from the FocusScope's `key-typed` call and the repeats arrive as
+/// presses (the call would not compile with one argument; pass `false` and this reddens).
+#[test]
+fn a_held_printable_key_reaches_rust_marked_as_a_repeat() {
+    use slint::platform::WindowEvent;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let app = boot();
+    app.set_welcome_open(false);
+    let typed = Rc::new(RefCell::new(Vec::<(String, bool)>::new()));
+    {
+        let typed = typed.clone();
+        app.on_key_typed(move |t, repeat| typed.borrow_mut().push((t.to_string(), repeat)));
+    }
+    for key in ["3", "p"] {
+        let text: slint::SharedString = key.into();
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+        for _ in 0..2 {
+            app.window().dispatch_event(WindowEvent::KeyPressRepeated { text: text.clone() });
+        }
+        app.window().dispatch_event(WindowEvent::KeyReleased { text });
+    }
+    let want: Vec<(String, bool)> = ["3", "p"]
+        .iter()
+        .flat_map(|k| [(k.to_string(), false), (k.to_string(), true), (k.to_string(), true)])
+        .collect();
+    assert_eq!(*typed.borrow(), want, "one press, then its repeats marked as repeats");
+}
+
+/// R27: the Delete rows' ellipsis promises a dialog, in both menus, and the row still does what it did. The
+/// settings row and the welcome card name the action: neither can say which drive it's about.
+///
+/// FALSIFIER (L28): bind either row's text to a literal: its menu. Reverse the ternary: the first row.
+#[test]
+fn a_delete_rows_ellipsis_follows_whether_it_asks() {
+    let app = boot();
+    app.window().set_size(slint::LogicalSize::new(1200.0, 1000.0));
+    app.set_immersive(false);
+    app.set_compare(false);
+    app.set_info_open(false);
+    let shown = |a: &ui::MainWindow, s: &str| -> usize {
+        i_slint_backend_testing::ElementHandle::find_by_accessible_label(a, s).count()
+    };
+    let at_once = "Delete this photo";
+    let asks = "Delete this photo…";
+    for set_open in [ui::MainWindow::set_ctx_open as fn(&ui::MainWindow, bool), ui::MainWindow::set_sel_ctx_open] {
+        for _ in 0..2 {
+            set_open(&app, true);
+            app.set_delete_asks(true);
+            hover(&app, 600.0, 300.0);
+            assert_eq!((shown(&app, asks), shown(&app, at_once)), (2, 0), "a card or a stick: the dialog follows");
+            app.set_delete_asks(false);
+            hover(&app, 600.0, 300.0);
+            assert_eq!((shown(&app, asks), shown(&app, at_once)), (0, 2), "a fixed disk: it goes at once");
+            set_open(&app, false);
+        }
+    }
+    app.set_delete_asks(true);
+}
+
+/// R3: a free-scrolled strip stays put through a landing that keeps the photo on screen and the order,
+/// and goes back to following when the photo changes or the order does, as it does today.
+///
+/// FALSIFIER (L28): in `RescanCarry::keep_scroll`, drop the `.filter(|_| same_photo)`: the new photo's landing
+/// leaves the strip scrolled away. Drop `film_follow.set(false)` from `restore_free_scroll`: the strip chases the
+/// photo again. Keep it on a re-sort by removing the `is_sorted` line: the last row.
+#[test]
+fn a_free_scrolled_strip_stays_through_a_landing_that_keeps_the_photo() {
+    let app = boot();
+    let mut list = numbered_photos(60);
+    let rig = LandingRig::new(30);
+    let free = |rig: &LandingRig| { rig.view.film_follow.set(false); rig.view.film_pos.set(5.5); rig.view.film_target.set(5.0); };
+    free(&rig);
+    for deleted in ["HWU_0007", "HWU_0003", "HWU_0006"] {
+        let new = without(&list, &[deleted]);
+        let start = crate::support::land_by_photo(&list, *rig.current.borrow(), &new, &[]);
+        rig.land(&app, &list, &new, start, &[]);
+        assert_eq!(new[start].name, "HWU_0030", "{deleted}: on the same photo");
+        assert!(!rig.view.film_follow.get(), "{deleted}: the strip doesn't follow");
+        assert_eq!((rig.view.film_pos.get(), rig.view.film_target.get()), (5.5, 5.0), "{deleted}: it stays where it was scrolled");
+        list = new;
+    }
+    // Del on the photo on screen: the strip follows the next one, as an arrow does.
+    let new = without(&list, &["HWU_0030"]);
+    let start = crate::support::land_by_photo(&list, *rig.current.borrow(), &new, &[]);
+    rig.land(&app, &list, &new, start, &[]);
+    assert_eq!(new[start].name, "HWU_0031");
+    assert!(rig.view.film_follow.get());
+    assert_eq!(rig.view.film_target.get(), start as f32);
+    // A strip that was following stays following, and on the landing.
+    let list = new;
+    let new = without(&list, &["HWU_0001"]);
+    let start = crate::support::land_by_photo(&list, *rig.current.borrow(), &new, &[]);
+    rig.land(&app, &list, &new, start, &[]);
+    assert!(rig.view.film_follow.get());
+    assert_eq!(rig.view.film_pos.get(), start as f32, "the current tile stays centred");
+    // A re-sort recentres.
+    free(&rig);
+    let reversed: Vec<crate::Shot> = new.iter().rev().cloned().collect();
+    let start = reversed.iter().position(|s| s.name == "HWU_0031").unwrap();
+    rig.land(&app, &new, &reversed, start, &[]);
+    assert!(rig.view.film_follow.get(), "a re-sort follows the photo");
+    assert_eq!(rig.view.film_pos.get(), start as f32);
+}
+
+/// R3: the Review panel holds its tile through a landing that keeps the photo on screen and the order, by
+/// the real rows `step_selection` builds, and scrolls by a row only if the tile moved one. A new photo
+/// or a re-sort keeps today's recentre.
+///
+/// FALSIFIER (L28): in `sel_hold_start`, drop `last_sel_view.set((true, gen_now));`: the first delete
+/// recentres. Drop `!kept.same_photo`: the Del row stops recentring. In `sel_hold_finish`, drop the
+/// row shift: the tile leaves its place when tiles above it go. Drop the `sel_vp_prog` write or the
+/// nonce: the panel's own write reads as the person's scroll, or never reaches the panel.
+#[test]
+fn the_review_panel_holds_its_tile_through_a_landing() {
+    use crate::tick::{sel_hold_finish, sel_hold_start, step_selection, FastCache, SEL_GRID_PAD_TOP, SEL_ROW_PITCH};
+    use slint::Model;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
+    let app = boot();
+    app.set_sel_open(true);
+    app.set_sel_rating_filter(-1);
+    app.set_sel_vp_h(600.0);
+    let mut list = numbered_photos(80);
+    let rig = LandingRig::new(1);
+    let cache = RefCell::new(FastCache::new());
+    let film = crate::Film::new();
+    let thumb_gen = Cell::new(0u64);
+    let (thumb_req, _rx) = std::sync::mpsc::channel::<crate::support::ThumbReq>();
+    let (ratings, marks) = (RefCell::new(Vec::new()), RefCell::new(Vec::new()));
+    let filter_mode = Cell::new(0i32); // Reviewed: every photo below is rated, so all are in the list
+    let sel_gen = Cell::new(7u64);
+    let select = RefCell::new(crate::support::SelectSet::default());
+    let select_gen = Cell::new(0u64);
+    let last_sel_key = Cell::new((u64::MAX, i32::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX));
+    let last_count_key = Cell::new((u64::MAX, u64::MAX, u64::MAX, u64::MAX));
+    let last_out_key = Cell::new((u64::MAX, u64::MAX, u64::MAX, i32::MIN, i32::MIN, i32::MIN, i32::MIN));
+    let sel_rated_sig = Cell::new((0i32, 0u64));
+    let last_sel_log = Cell::new((i32::MIN, i32::MIN, usize::MAX, usize::MAX, usize::MAX, i32::MIN, u64::MAX));
+    let last_sel_view = Cell::new((false, u64::MAX));
+    let sel_vp_prog: Cell<Option<crate::support::PanelMemo>> = Cell::new(None);
+    let sel_model = slint::VecModel::<ui::SelTileRow>::default();
+    let rot = crate::RotState::new(false);
+    let cloud: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    let fast_gen = Cell::new(0u64);
+    let run = |shots: &[crate::Shot], c: usize, generation: u64| {
+        *ratings.borrow_mut() = vec![1; shots.len()];
+        *marks.borrow_mut() = vec![0u8; shots.len()];
+        let plan = crate::support::plan_from_shots(shots);
+        step_selection(
+            &app, c, shots.len(), generation, shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
+            &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key, &last_count_key,
+            &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view, &sel_vp_prog, &sel_model,
+            &rot, &cloud, &RefCell::new(crate::tick::SelCache::default()), &|_: &std::path::Path, _: &std::collections::HashSet<std::ffi::OsString>| crate::support::CopyCountListing::default(),
+        );
+    };
+    // The tile's height on screen, from the rows the step really built.
+    let tile_y = |name: &str| {
+        let row = (0..sel_model.row_count()).find(|&r| sel_model.row_data(r).is_some_and(|rw| rw.a.name == name || (rw.has_b && rw.b.name == name))).expect("in the list");
+        SEL_GRID_PAD_TOP + row as f32 * SEL_ROW_PITCH + app.get_sel_vp_y()
+    };
+    // The tick after a landing, in the tick's order, with the panel's `changed scroll-seq` mirror.
+    let land = |list: &[crate::Shot], new: &[crate::Shot], start: usize| {
+        let kept = rig.land(&app, list, new, start, &[]);
+        let generation = rig.folder_gen.get();
+        let hold = kept.as_ref().and_then(|k| sel_hold_start(&app, k, generation, &last_sel_view, &sel_model));
+        sel_vp_prog.set(None);
+        run(new, start, generation);
+        if let Some(hold) = hold {
+            sel_hold_finish(&app, hold, &sel_model, &sel_vp_prog);
+        }
+    };
+    run(&list, 1, rig.folder_gen.get());
+    assert!(sel_model.row_count() >= 30, "two to a row, and enough to scroll: {}", sel_model.row_count());
+    let columns = if sel_model.row_data(0).unwrap().has_b { 2 } else { 1 };
+    let scrolled = -(SEL_GRID_PAD_TOP + 10.0 * SEL_ROW_PITCH + 5.0);
+    app.set_sel_vp_y(scrolled);
+    let top_tile = format!("HWU_{:04}", 10 * columns);
+    let place = tile_y(&top_tile);
+    let at_place = || (tile_y(&top_tile) - place).abs() < 0.01;
+    let seq = app.get_sel_scroll_seq();
+    // Three tiles in view go: nothing moves above them.
+    for offset in [3, 5, 4] {
+        let deleted = format!("HWU_{:04}", 10 * columns + offset);
+        let new = without(&list, &[deleted.as_str()]);
+        let start = crate::support::land_by_photo(&list, *rig.current.borrow(), &new, &[]);
+        land(&list, &new, start);
+        assert_eq!(new[start].name, "HWU_0001", "{deleted}: on the same photo");
+        assert_eq!(app.get_sel_scroll_seq(), seq, "{deleted}: the panel isn't told to scroll");
+        assert!(at_place(), "{deleted}: the same tile, in the same place");
+        list = new;
+    }
+    // As many tiles as a row hold go from above the view: the tile moves up a row, and the scroll with it.
+    let above: Vec<String> = (0..columns).map(|i| format!("HWU_{:04}", 3 + i)).collect();
+    let above: Vec<&str> = above.iter().map(String::as_str).collect();
+    let new = without(&list, &above);
+    let start = crate::support::land_by_photo(&list, *rig.current.borrow(), &new, &[]);
+    land(&list, &new, start);
+    list = new;
+    assert_eq!(app.get_sel_scroll_seq(), seq.wrapping_add(1), "told to scroll, once");
+    let wrote = app.get_sel_scroll_y();
+    assert_eq!(wrote, scrolled + SEL_ROW_PITCH);
+    assert_eq!(sel_vp_prog.get().map(|m| m.target), Some(wrote), "the step declares its write");
+    app.set_sel_vp_y(wrote); // the panel's mirror
+    assert!(at_place(), "the same tile, in the same place");
+    // Del on the photo on screen: a new photo, so today's recentre on it runs.
+    let seq = app.get_sel_scroll_seq();
+    let new = without(&list, &["HWU_0001"]);
+    let start = crate::support::land_by_photo(&list, *rig.current.borrow(), &new, &[]);
+    land(&list, &new, start);
+    list = new;
+    assert_eq!(list[start].name, "HWU_0002");
+    assert_eq!(app.get_sel_scroll_seq(), seq.wrapping_add(1), "the panel is told once");
+    let recentred = crate::tick::sel_recenter_vp_y(start / columns, app.get_sel_vp_h(), sel_model.row_count());
+    assert_eq!(app.get_sel_scroll_y(), recentred, "it recentres on the next photo, as today");
+    app.set_sel_vp_y(scrolled);
+    // A re-sort: today's recentre again.
+    let seq = app.get_sel_scroll_seq();
+    let reversed: Vec<crate::Shot> = list.iter().rev().cloned().collect();
+    let start = reversed.iter().position(|s| s.name == "HWU_0002").unwrap();
+    land(&list, &reversed, start);
+    assert_eq!(app.get_sel_scroll_seq(), seq.wrapping_add(1), "a re-sort recentres");
+    app.set_sel_open(false);
+}
+
 /// v0.8.103 (T1): **one honest failure instead of twenty-six misleading ones.**
 ///
 /// Every `ElementHandle` lookup in this rig resolves through the element-name metadata the Slint
-/// compiler emits only when `SLINT_EMIT_DEBUG_INFO` is set at BUILD time. `build.rs` sets it for the
+/// compiler emits only when `SLINT_EMIT_DEBUG_INFO` is set at BUILD time. The interface crate's
+/// build script (`native/ui/build.rs`) sets it for the
 /// debug profile (and, since v0.8.103, whenever `FALCON_RIG_DEBUG_INFO=1` is in the build env), so a
 /// `cargo test --release` without that opt-in produces a MainWindow in which every
 /// `find_by_element_type_name` / `find_by_element_id` yields zero elements. The ~26 rig tests then
@@ -1807,7 +3132,7 @@ fn require_element_debug_info(app: &ui::MainWindow) {
          UI defect.\n\
          FIX: run the geometry rig in DEBUG — `cargo test` WITHOUT --release (the standing gate) — \
          or, for a deliberate release-profile run, set FALCON_RIG_DEBUG_INFO=1 in the BUILD \
-         environment so build.rs emits SLINT_EMIT_DEBUG_INFO (it is read by the Slint compiler at \
+         environment so native/ui/build.rs emits SLINT_EMIT_DEBUG_INFO (it is read by the Slint compiler at \
          build time, so it must be set for the BUILD, not just for the test run)."
     );
 }
@@ -6704,7 +8029,7 @@ fn expand_after_collapsed_navigation_renders_blank_not_the_previous_shot() {
     // send never errors, and nothing on the other end has to exist for the panel logic under test.
     let (exif_tx, _exif_rx) = channel::<(usize, u64, u8)>();
     let (dims_tx, _dims_rx) = channel::<(usize, u64)>();
-    let (wb_tx, _wb_rx) = channel::<(usize, u64, std::path::PathBuf)>();
+    let (wb_tx, _wb_rx) = channel::<(usize, u64, std::path::PathBuf, bool)>();
 
     let last_motion = RefCell::new(Instant::now());
     let now = *last_motion.borrow() + Duration::from_secs(1); // settled (>= SETTLE_MS)
@@ -6902,7 +8227,7 @@ fn colour_chip_blanks_until_the_gamut_probe_lands() {
     app.set_exif_rows(exif_model.clone().into());
     let (exif_tx, _exif_rx) = channel::<(usize, u64, u8)>();
     let (dims_tx, _dims_rx) = channel::<(usize, u64)>();
-    let (wb_tx, _wb_rx) = channel::<(usize, u64, std::path::PathBuf)>();
+    let (wb_tx, _wb_rx) = channel::<(usize, u64, std::path::PathBuf, bool)>();
 
     let last_motion = RefCell::new(Instant::now());
     let now = *last_motion.borrow() + Duration::from_secs(1); // settled (>= SETTLE_MS)
@@ -9422,7 +10747,8 @@ fn custom_icc_boot_notice_reaches_the_events_centre_once() {
             &app, now, &cur_dir, &live_dir, &sel_slot, &pending, &log, &unread, &toast_left, &refresh,
             &model, &busy, &toast_dir, &counts_unread,
             &toast_prev, // v0.8.155 (D2): the wall-clock countdown's previous-tick Instant
-            None,        // v0.8.186 (U3): no move record in this fixture, so no stamp to tag with
+            &RefCell::new(crate::support::FileHistory::default()),
+            &|| None, // v0.8.186 (U3): no move record in this fixture, so no stamp to tag with
         );
     };
     let rows = || (0..model.row_count()).filter_map(|i| model.row_data(i)).collect::<Vec<_>>();
@@ -9491,16 +10817,11 @@ fn custom_icc_boot_notice_reaches_the_events_centre_once() {
 ///    fire) and block 1's `toast_recover` + `row.recover` asserts fail. Restore step_notifs'
 ///    hardcoded `app.set_toast_recover(false)` and block 1's `toast_recover` assert alone fails
 ///    (`row.recover` comes from `rebuild_notif_model`, not from that write — v0.8.121/F23d
-///    corrects the v0.8.120 doc, which named both). Drop the `undoable || recover` term in the
-///    `toast_pick` call and block 1's "the delete wins the toast over a same-tick info" assert
-///    fails; drop `|| recover` from the linger ladder and the 1800-frame assert fails.
-///  • F1 (v0.8.121, audit A1/A5/A9) — delete the `if e.recover { … old.recover = false }` demote in
-///    step_notifs' FOLD and block 1b fails: two rows carry a live Recover while ONE `delete_record`
-///    exists, so the older row restores the newer files. (v0.8.122/M10 corrects the v0.8.121 doc,
-///    which named the twin at the delete push site as part of the same falsifier. It is not: the
-///    fold runs over every drained entry and demotes the whole log, so it SUBSUMES the push site —
-///    deleting the push-site demote alone reddens nothing here. That line is BELT, kept because it
-///    demotes at the moment the record is overwritten rather than one tick later.)
+///    corrects the v0.8.120 doc, which named both). Drop the `e.recover && e.clean_delete().is_none()` term
+///    in the `toast_pick` call and block 1c's "a Recover outranks a plain red" assert fails; drop
+///    `|| recover` from the linger ladder and its 10 s assert fails.
+///  • Delete round — put a demote back in step_notifs' FOLD (`if e.recover { … old.recover = false }`)
+///    and block 1b fails: an older row loses the Recover its own record still offers.
 ///  • O6 — return `e.jump_to` unconditionally in `rebuild_notif_model` (i.e. delete the
 ///    `resume_target` call) and block 2's row assert fails; delete the toast-retire block at the
 ///    end of step_notifs and block 2's `toast_jump` assert fails.
@@ -9509,7 +10830,7 @@ fn custom_icc_boot_notice_reaches_the_events_centre_once() {
 ///    is the photos-only next-launch memory), so the offer would survive a swap it cannot serve.
 ///  • O7 — restore `app.set_sel_busy(false)` inside the slot drain, or delete the re-derive at the
 ///    top of step_notifs, and block 3 fails (the UI would report "idle" mid-op).
-///  • Y43 — delete `toast_counts_unread.set(true)` where a logged toast is raised and BLOCK 1's
+///  • Y43 — delete `toast_counts_unread.set(!clean)` where a logged toast is raised and BLOCK 1c's
 ///    `counts_unread` assert fails (v0.8.121/F23d corrects the v0.8.120 doc, which named block 4 —
 ///    block 4 asserts the flag is FALSE after a timeout, which a deleted `set(true)` also
 ///    satisfies). The transient half is `show_transient_toast` in main.rs, which clears the flag.
@@ -9540,12 +10861,16 @@ fn the_events_centre_keeps_its_recover_its_folder_and_its_busy_flag() {
     let busy = AtomicBool::new(false);
     let toast_dir = RefCell::new(String::new());
     let counts_unread = Cell::new(false);
+    // Delete round: a delete's result is only as true as its record (R9).
+    let history = RefCell::new(crate::support::FileHistory::default());
+    let filed = |seq: u64| history.borrow_mut().push_delete(crate::support::DeleteRecord::for_test("D:/shoot", "IMG", 0, Vec::new(), seq, Vec::new()));
     let tick = |now: Instant| {
         crate::tick::step_notifs(
             &app, now, &cur_dir, &live_dir, &sel_slot, &pending, &log, &unread, &toast_left, &refresh,
             &model, &busy, &toast_dir, &counts_unread,
             &toast_prev, // v0.8.155 (D2): the wall-clock countdown's previous-tick Instant
-            None,        // v0.8.186 (U3): no move record in this fixture, so no stamp to tag with
+            &history,
+            &|| None, // v0.8.186 (U3): no move record in this fixture, so no stamp to tag with
         );
     };
     let rows = || (0..model.row_count()).filter_map(|i| model.row_data(i)).collect::<Vec<_>>();
@@ -9558,12 +10883,13 @@ fn the_events_centre_keeps_its_recover_its_folder_and_its_busy_flag() {
     pending.borrow_mut().push(crate::tick::NotifEntry::info("a background copy finished", now));
     // v0.8.121 (F23a): the PRODUCTION constructor — `on_delete_recycle` calls this exact fn, so the
     // "drop `.with_recover()`" falsifier the doc names can finally fire.
+    filed(1);
     pending.borrow_mut().push(crate::tick::delete_result_entry(
         "Moved 1 file to the Recycle Bin",
         0, // fail count 0 ⇒ a CLEAN recycle ⇒ kind 1 and a Recover
         "D:/shoot",
         true,
-        Some(1), // v0.8.186 (U3): the act stamp of the record this row describes
+        1, // v0.8.186 (U3): the act stamp of the record this row describes
         now,
     ));
     tick(now);
@@ -9571,8 +10897,43 @@ fn the_events_centre_keeps_its_recover_its_folder_and_its_busy_flag() {
     assert_eq!(
         app.get_toast_text().as_str(),
         "Moved 1 file to the Recycle Bin",
-        "a time-limited recovery must not be buried by a same-tick info"
+        "the newer of the two takes the card"
     );
+    assert_eq!(toast_left.get(), crate::support::CLEAN_DELETE_CARD_MS, "R29: a clean delete's card is short");
+    assert!(!counts_unread.get(), "R30: it fed no badge, so its × has nothing to take off");
+    let r = rows();
+    assert_eq!(r.len(), 2, "both events reach the centre");
+    let del = r.iter().find(|x| x.recover).expect("the delete row carries a Recover");
+    assert_eq!(del.text.as_str(), "Moved 1 file to the Recycle Bin");
+
+    // ── (1b) the Delete round: every delete's row keeps its own Recover ──
+    // v0.8.121 (F1) demoted older rows because one record answered every pill, so the older row
+    // restored the newer delete's files. The pill takes its own record by stamp now, so an older
+    // row can bring back its own photo while it is in the bin.
+    filed(2);
+    pending.borrow_mut().push(crate::tick::delete_result_entry(
+        "Sent 2 file(s) to the Recycle Bin",
+        0,
+        "D:/shoot",
+        true,
+        2, // v0.8.186 (U3): a NEWER delete ⇒ a newer stamp
+        now,
+    ));
+    tick(now);
+    let r = rows();
+    let with_pill: Vec<&ui::NotifRow> = r.iter().filter(|x| x.recover).collect();
+    assert_eq!(with_pill.len(), 2, "two records, two offers");
+    assert_eq!(
+        with_pill.iter().map(|x| (x.text.as_str(), x.seq)).collect::<Vec<_>>(),
+        [("Sent 2 file(s) to the Recycle Bin", 2), ("Moved 1 file to the Recycle Bin", 1)],
+        "…newest first, each naming its own"
+    );
+    // ── (1c) a Recover that goes with a problem: the top band of the ladder, with the long linger ──
+    filed(4);
+    pending.borrow_mut().push(crate::tick::delete_result_entry("Sent the RAW of IMG", 1, "D:/shoot", true, 4, now));
+    pending.borrow_mut().push(crate::tick::NotifEntry::error("a plain red line, pushed after it", now));
+    tick(now);
+    assert_eq!(app.get_toast_text().as_str(), "Sent the RAW of IMG", "a Recover outranks a plain red: losing it loses a recovery");
     // v0.8.155 (D2): the undoable-move linger is the ruled 10 s of WALL CLOCK, not 1800 ticks —
     // and this rig calls `tick` with a FIXED `now`, so the raise-then-spend inside the same call
     // charges zero elapsed time. (1799 stood here: 1800 frames minus the one tick it spent.)
@@ -9592,51 +10953,21 @@ fn the_events_centre_keeps_its_recover_its_folder_and_its_busy_flag() {
     assert_eq!(toast_left.get(), after_3s, "a zero-elapsed tick charges nothing");
     toast_left.set(10_000); // restore the state the blocks below were written against
     assert!(counts_unread.get(), "Y43: a LOGGED toast may discount the badge when dismissed");
-    let r = rows();
-    assert_eq!(r.len(), 2, "both events reach the centre");
-    let del = r.iter().find(|x| x.recover).expect("the delete row carries a Recover");
-    assert_eq!(del.text.as_str(), "Moved 1 file to the Recycle Bin");
-
-    // ── (1b) v0.8.121 (F1 = audit A1/A5/A9): only the NEWEST delete may offer Recover ──
-    // `delete_record` is a SINGLE slot overwritten by every clean recycle and `recover-delete()`
-    // carries no row index, so two live pills meant clicking the OLDER row restored the NEWER
-    // delete's files — then consumed the record, closing the wanted photo's in-app route out with
-    // no message. Same GF6 rule the move sibling has had since v0.7.3.
-    pending.borrow_mut().push(crate::tick::delete_result_entry(
-        "Sent 2 file(s) to the Recycle Bin",
-        0,
-        "D:/shoot",
-        true,
-        Some(2), // v0.8.186 (U3): a NEWER delete ⇒ a newer stamp
-        now,
-    ));
-    tick(now);
-    let r = rows();
-    let with_pill: Vec<&ui::NotifRow> = r.iter().filter(|x| x.recover).collect();
-    assert_eq!(
-        with_pill.len(),
-        1,
-        "exactly ONE row may offer Recover — there is exactly one delete record to recover from"
-    );
-    assert_eq!(
-        with_pill[0].text.as_str(),
-        "Sent 2 file(s) to the Recycle Bin",
-        "…and it is the NEWEST delete, the one the single record actually holds"
-    );
-    // A partial/failed recycle records nothing, so it must not demote the live offer either.
+    assert_eq!(rows().len(), 5, "all of them reach the centre");
+    // A partial/failed recycle records nothing, so it changes no offer either.
     pending.borrow_mut().push(crate::tick::delete_result_entry(
         "Sent 0 file(s) to the Recycle Bin — 1 FAILED",
         1,
         "D:/shoot",
         false,
-        None, // v0.8.186 (U3): nothing recorded ⇒ no act
+        3, // v0.8.186 (U3): nothing recorded ⇒ no act, whatever the press's stamp
         now,
     ));
     tick(now);
     assert_eq!(
         rows().iter().filter(|x| x.recover).count(),
-        1,
-        "a FAILED recycle overwrote no record, so the live offer stands"
+        3,
+        "a FAILED recycle overwrote no record, so the live offers stand"
     );
 
     // ── (2) O6: a Resume offer is scoped to the folder it was made in ──
@@ -9698,6 +11029,1607 @@ fn the_events_centre_keeps_its_recover_its_folder_and_its_busy_flag() {
     tick(now + std::time::Duration::from_millis(50));
     assert!(!app.get_toast_show(), "the countdown expired");
     assert!(!counts_unread.get(), "an IGNORED toast stays unread — its × must not decrement later");
+}
+
+/// The fixture for the Delete round's rows: the real `step_notifs` with its own stores, on the real
+/// model. `folder` is on screen.
+struct NotifRig {
+    app: ui::MainWindow,
+    now: std::time::Instant,
+    cur_dir: std::cell::RefCell<String>,
+    live_dir: std::cell::RefCell<String>,
+    slot: std::sync::Mutex<Option<crate::support::OpResult>>,
+    pending: std::cell::RefCell<Vec<crate::tick::NotifEntry>>,
+    log: std::cell::RefCell<std::collections::VecDeque<crate::tick::NotifEntry>>,
+    counters: (std::cell::Cell<i32>, std::cell::Cell<i32>, std::cell::Cell<u32>),
+    prev: std::cell::Cell<Option<std::time::Instant>>,
+    model: slint::VecModel<ui::NotifRow>,
+    busy: std::sync::atomic::AtomicBool,
+    toast_dir: std::cell::RefCell<String>,
+    counts_unread: std::cell::Cell<bool>,
+    history: std::cell::RefCell<crate::support::FileHistory>,
+    move_armed: std::cell::Cell<Option<u64>>,
+    undo: std::cell::RefCell<crate::support::UndoRedo>,
+    landing_name: std::cell::RefCell<Option<crate::support::Named>>,
+    reread: std::cell::RefCell<crate::file_queue::Reread>,
+    /// How much time has passed in this row: `pass`.
+    later: std::cell::Cell<std::time::Duration>,
+    /// Commit 10: the real queue, for a Recover's press, on [`BinTakesAll`].
+    queue: crate::file_queue::FileQueue,
+}
+
+/// A photo for these rows, RAW + JPEG if `pair`.
+fn notif_photo(name: &str, pair: bool) -> crate::Shot {
+    crate::Shot {
+        id: 0, name: name.into(), raw: pair.then(|| std::path::PathBuf::from(format!("D:/shoot/{name}.CR3"))), jpg: Some(std::path::PathBuf::from(format!("D:/shoot/{name}.JPG"))),
+        has_raw: pair, has_jpg: true, kind: falcon_decode::SrcKind::Jpeg, cloud_placeholder: false, sniffed: None,
+    }
+}
+
+/// A bin that takes everything it's given.
+struct BinTakesAll;
+impl crate::file_queue::FileIo for BinTakesAll {
+    fn barrier(&self) {}
+    fn list_files(&self, targets: &[crate::Shot]) -> Vec<std::path::PathBuf> {
+        targets.iter().flat_map(|s| [s.raw.clone(), s.jpg.clone()]).flatten().collect()
+    }
+    fn recycle(&self, paths: &[std::path::PathBuf]) -> crate::file_queue::Recycled {
+        crate::file_queue::Recycled {
+            files: paths.to_vec(), confirmed: true,
+            #[cfg(target_os = "macos")]
+            trash_paths: Vec::new(),
+        }
+    }
+    /// Commit 10: a for-good press "goes" as the job is told, and nothing is deleted.
+    fn remove_for_good(&self, files: &[std::path::PathBuf]) -> (usize, usize, Vec<std::path::PathBuf>, String) {
+        (files.len(), 0, files.to_vec(), String::new())
+    }
+    /// Commit 10: a Recover's job, with no bin to read.
+    fn restore(&self, _name: &str, shown: &str, sent: &crate::support::DeleteOutcome) -> (usize, String) {
+        (sent.files.len(), format!("Recovered {shown}"))
+    }
+}
+
+impl NotifRig {
+    fn new(folder: &str) -> Self {
+        Self {
+            app: boot(), now: std::time::Instant::now(),
+            cur_dir: Default::default(), // empty, so no open-folder heartbeat on disk
+            live_dir: std::cell::RefCell::new(folder.to_string()),
+            slot: std::sync::Mutex::new(None), pending: Default::default(), log: Default::default(),
+            counters: Default::default(), prev: Default::default(), model: Default::default(),
+            busy: Default::default(), toast_dir: Default::default(), counts_unread: Default::default(),
+            history: Default::default(), move_armed: Default::default(), undo: Default::default(),
+            landing_name: Default::default(), reread: Default::default(), later: Default::default(),
+            queue: crate::file_queue::FileQueue::with_runner(Box::new(|job| crate::file_queue::run_job(job, &BinTakesAll))),
+        }
+    }
+
+    fn tick(&self) {
+        crate::tick::step_notifs(
+            &self.app, self.now + self.later.get(), &self.cur_dir, &self.live_dir, &self.slot, &self.pending, &self.log,
+            &self.counters.0, &self.counters.1, &self.counters.2, &self.model, &self.busy, &self.toast_dir,
+            &self.counts_unread, &self.prev, &self.history, &|| self.move_armed.take(),
+        );
+    }
+
+    fn rows(&self) -> Vec<ui::NotifRow> {
+        use slint::Model;
+        (0..self.model.row_count()).filter_map(|i| self.model.row_data(i)).collect()
+    }
+
+    /// What the handler does for a delete of `photo`, and the tick that folds its result.
+    fn delete(&self, photo: &str, seq: u64) {
+        let file = std::path::PathBuf::from(format!("{}/{photo}.JPG", self.live_dir.borrow()));
+        self.history.borrow_mut().push_delete(crate::support::DeleteRecord::for_test(&self.live_dir.borrow(), photo, 0, vec![file], seq, Vec::new()));
+        self.pending.borrow_mut().push(crate::tick::delete_result_entry(format!("Sent {photo}"), 0, &self.live_dir.borrow(), true, seq, self.now));
+        self.tick();
+    }
+
+    /// Time passing, and the tick after it.
+    fn pass(&self, ms: u64) {
+        self.later.set(self.later.get() + std::time::Duration::from_millis(ms));
+        self.tick();
+    }
+
+    /// The press of a delete, the real one: the record, the steps, the newest press. Its job comes back to
+    /// report, which is when its result reaches the tick.
+    fn press(&self, seq: u64, photos: &[crate::Shot]) -> crate::file_queue::FileJob {
+        self.press_on("D:/shoot", seq, photos, crate::support::DeleteRoute::Bin { asks: false })
+    }
+
+    /// The same in `dir`, by `route`.
+    fn press_on(&self, dir: &str, seq: u64, photos: &[crate::Shot], route: crate::support::DeleteRoute) -> crate::file_queue::FileJob {
+        let (name, count) = if let [one] = photos { (one.name.clone(), 0) } else { (format!("{} photos", photos.len()), photos.len()) };
+        let press = crate::file_queue::TakeOut { dir: dir.into(), gen: 1, name, photos: count, targets: photos.iter().cloned().enumerate().collect(), route };
+        crate::file_queue::press_delete(&self.history, &self.undo, seq, press, Vec::new())
+    }
+
+    fn deleted_on(&self, dir: &str, seq: u64, photos: &[crate::Shot], route: crate::support::DeleteRoute) {
+        let job = self.press_on(dir, seq, photos, route);
+        self.report(job);
+        self.tick();
+    }
+
+    /// Commit 10, `on_recover_delete` from its press on: a row's or the card's Recover and Ctrl+Z all reach it.
+    /// The record by its stamp, then its line leaves its fold, or stays dimmed with the panel open. The handler's
+    /// own lines are pinned by `the_folds_handlers_are_wired`.
+    fn recover(&self, seq: u64) -> bool {
+        let pressed = crate::file_queue::press_recover(&self.history, &self.queue, seq, 0, self.now);
+        if pressed {
+            crate::tick::taken_back(&mut self.log.borrow_mut(), seq, None, self.app.get_notif_open());
+            self.rebuild();
+        }
+        pressed
+    }
+
+    /// `on_recover_line`: a fold line's own Recover, `stamp` the new act stamp it may take.
+    fn recover_line(&self, seq: u64, photo: &str, stamp: u64) -> bool {
+        let live = self.live_dir.borrow().clone();
+        let Some((take, photo)) = crate::tick::line_recover_target(&self.history, seq, photo, &live, || stamp) else { return false };
+        let pressed = self.recover(take);
+        if let Some(photo) = photo.filter(|_| pressed && !self.history.borrow().has_delete(take)) {
+            crate::tick::taken_back(&mut self.log.borrow_mut(), seq, Some(&photo), self.app.get_notif_open());
+            self.rebuild();
+        }
+        pressed
+    }
+
+    /// The arrow on the row at `row`: `notif-fold`, by the row's own fold id.
+    fn toggle(&self, row: usize) {
+        let id = self.rows()[row].fold_id;
+        assert!(crate::tick::toggle_fold(&mut self.log.borrow_mut(), id as u64), "row {row} folds");
+        self.rebuild();
+    }
+
+    /// The open fold's lines at `row`: the name as shown, the label, its delete, Recover, dimmed.
+    fn lines(&self, row: usize) -> Vec<(String, String, i32, bool, bool)> {
+        use slint::Model;
+        let lines = self.rows()[row].lines.clone();
+        (0..lines.row_count()).filter_map(|i| lines.row_data(i)).map(|l| (l.title.to_string(), l.tag.to_string(), l.seq, l.recover, l.recovered)).collect()
+    }
+
+    /// Each row: its words, its stamp, its own Recover, how many lines its fold has.
+    fn folds(&self) -> Vec<(String, i32, bool, i32)> {
+        self.rows().iter().map(|r| (r.text.to_string(), r.seq, r.recover, r.fold)).collect()
+    }
+
+    /// The jobs the queue has run since, once it's quiet: each Recover's files, by name.
+    fn recovered_files(&self) -> Vec<Vec<String>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !self.queue.quiet() {
+            assert!(std::time::Instant::now() < deadline, "the queue goes quiet");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.queue.take_results().into_iter().filter_map(|done| match done {
+            crate::file_queue::FileDone::Recover { files, .. } => Some(files.iter().map(|f| f.file_name().unwrap().to_string_lossy().into_owned()).collect()),
+            _ => None,
+        }).collect()
+    }
+
+    /// A job runs on a bin that takes all, and its report is folded as the tick's top does. The next
+    /// tick puts it on the card.
+    fn report(&self, job: crate::file_queue::FileJob) {
+        let done = crate::file_queue::run_job(job, &BinTakesAll);
+        let to = crate::file_queue::FoldTo { history: &self.history, pending: &self.pending, landing_name: &self.landing_name, reread: &self.reread };
+        crate::file_queue::fold_file_done(done, &to, self.now);
+    }
+
+    fn deleted(&self, seq: u64, photos: &[crate::Shot]) {
+        let job = self.press(seq, photos);
+        self.report(job);
+        self.tick();
+    }
+
+    fn card(&self) -> (String, i32, bool) {
+        (self.app.get_toast_text().to_string(), self.app.get_toast_seq(), self.app.get_toast_recover())
+    }
+
+    /// The panel's own refresh, as opening it or the 1 s timer runs it.
+    fn rebuild(&self) {
+        crate::tick::rebuild_notif_model(&self.model, &self.log.borrow(), self.now, &self.live_dir.borrow());
+    }
+}
+
+/// The round's decision 6: older rows keep a working Recover while their photo is still in the bin. Del
+/// ANT, Del BEE, Del CAT. Each row offers its own, and its pill names its own record, so taking the
+/// older one brings back that photo. The others stay lit, and the newest is still what Ctrl+Z reaches.
+/// Another folder keeps every record and offers none, and coming back offers them again.
+///
+/// FALSIFIER (L28): demote older rows in step_notifs' fold: the first row. `take_delete` ignores the
+/// stamp, or `retire_row_offer` clears every row: the third. Drop `e.dir == live_dir` from
+/// `rebuild_notif_model`: the folder rows. Pass the toast's stamp from a row's pill, or the reverse: the
+/// markup rows.
+#[test]
+fn older_row_recover_takes_its_own_photo() {
+    let rig = NotifRig::new("D:/shoot");
+    let (ant, bee, cat) = (1, 2, 3);
+    rig.delete("ANT", ant);
+    rig.delete("BEE", bee);
+    rig.delete("CAT", cat);
+    let offers = || rig.rows().iter().map(|r| (r.text.to_string(), r.seq, r.recover)).collect::<Vec<_>>();
+    let row = |photo: &str, seq: u64, lit: bool| (format!("Sent {photo}"), seq as i32, lit);
+    assert_eq!(offers(), [row("CAT", cat, true), row("BEE", bee, true), row("ANT", ant, true)], "every row offers its own");
+    assert_eq!(rig.app.get_toast_seq(), cat as i32, "the card names its own");
+
+    // The oldest row's Recover: what `on_recover_delete` does with the stamp the pill passes.
+    let taken = rig.history.borrow_mut().take_delete(ant).expect("ANT is in the bin");
+    assert_eq!(taken.files(), [std::path::PathBuf::from("D:/shoot/ANT.JPG")], "ANT's files, not the newest delete's");
+    crate::tick::retire_row_offer(&mut rig.log.borrow_mut(), ant);
+    rig.rebuild();
+    assert_eq!(offers(), [row("CAT", cat, true), row("BEE", bee, true), row("ANT", ant, false)], "only ANT's row stops offering");
+    assert_eq!(crate::support::live_undo_arm(None, rig.history.borrow().delete_arm("D:/shoot"), "D:/shoot", None), Some(crate::support::UndoArm::Delete(cat)), "CAT is still what Ctrl+Z reaches");
+
+    // A row in the middle next, then the newest: out of order all the way.
+    assert_eq!(rig.history.borrow_mut().take_delete(bee).map(|r| r.name), Some("BEE".to_string()));
+    crate::tick::retire_row_offer(&mut rig.log.borrow_mut(), bee);
+    rig.rebuild();
+    assert_eq!(offers(), [row("CAT", cat, true), row("BEE", bee, false), row("ANT", ant, false)]);
+
+    // Another folder keeps the record, and the row offers nothing there.
+    *rig.live_dir.borrow_mut() = "E:/other".to_string();
+    rig.rebuild();
+    assert_eq!(offers(), [row("CAT", cat, false), row("BEE", bee, false), row("ANT", ant, false)], "nothing can come back into another folder");
+    *rig.live_dir.borrow_mut() = "D:/shoot".to_string();
+    rig.rebuild();
+    assert_eq!(offers()[0], row("CAT", cat, true), "and coming back offers it again");
+
+    // Each pill names its own: the card's, and the row's.
+    let ui = include_str!("../ui/main_window.slint");
+    assert!(ui.contains(r#"PillBtn { text: @tr("falcon" => "Recover"); clicked => { root.recover-delete(root.toast-seq); } }"#));
+    assert!(ui.contains(r#"PillBtn { text: @tr("falcon" => "Recover"); clicked => { root.recover-delete(row.seq); } }"#));
+    assert!(ui.contains(r#"PillBtn { text: @tr("falcon" => "Undo"); clicked => { root.undo-move(root.toast-seq); root.dismiss-toast(); } }"#));
+    assert!(ui.contains(r#"PillBtn { text: @tr("falcon" => "Undo"); clicked => { root.undo-move(row.seq); } }"#));
+}
+
+/// R17: a job's working message goes when the job has reported. On the card, it comes down, unless
+/// something else has taken the card by then. With the panel open it was a row, and the row goes, so no
+/// "Recovering" stands forever beside the photo that came back.
+///
+/// FALSIFIER (L28): `retire_working_message` leaves the card or the row: its row. It takes any card down:
+/// the row where a result has taken the card. It removes by words without the severity: the red row.
+#[test]
+fn the_working_message_goes_with_its_job() {
+    let rig = NotifRig::new("D:/shoot");
+    let (toast_left, words) = (&rig.counters.1, "Recovering ANT…");
+    let say = || crate::say_edit_result(&rig.app, &rig.counts_unread, toast_left, &rig.pending, "D:/shoot", words, 10_000, None);
+    let retire = || crate::tick::retire_working_message(&rig.app, words, &rig.log, &rig.model, rig.now, "D:/shoot", toast_left, &rig.counts_unread);
+
+    // The card: up, and down with the job.
+    say();
+    assert!(rig.app.get_toast_show());
+    assert_eq!(rig.app.get_toast_text(), words);
+    assert!(rig.log.borrow().is_empty() && rig.pending.borrow().is_empty(), "it's no row");
+    retire();
+    assert!(!rig.app.get_toast_show(), "it goes with the job");
+
+    // A result has taken the card already: that stays.
+    say();
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::new("Recovered ANT", 1, rig.now).in_dir("D:/shoot"));
+    rig.tick();
+    assert_eq!(rig.app.get_toast_text(), "Recovered ANT");
+    retire();
+    assert!(rig.app.get_toast_show(), "the result stays up");
+
+    // The panel open: a row, and it goes, leaving the rows around it. Red words stay, even the same ones.
+    rig.app.set_notif_open(true);
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::new(words, 3, rig.now).in_dir("D:/shoot"));
+    rig.tick();
+    say();
+    rig.tick();
+    let texts = || rig.rows().iter().map(|r| (r.text.to_string(), r.kind)).collect::<Vec<_>>();
+    assert_eq!(texts(), [(words.to_string(), 0), (words.to_string(), 3), ("Recovered ANT".to_string(), 1)], "the working row on top");
+    retire();
+    assert_eq!(texts(), [(words.to_string(), 3), ("Recovered ANT".to_string(), 1)], "only the working row went");
+}
+
+/// R14, on the real card and rows: the bin check's amber line takes the card, the delete it's about stops
+/// offering Recover on its row and on the card, and the other delete's row keeps its own.
+///
+/// FALSIFIER (L28): `fold_bin_check` doesn't retire the row: the rows' pills. The line goes out as anything but a
+/// warning: its kind. It isn't tagged with its folder: `Show` opens the wrong one, by the row's `dir`. It isn't
+/// marked as a delete's: the last row's "+1".
+#[test]
+fn the_bin_checks_amber_line_takes_the_card_and_the_pill() {
+    let rig = NotifRig::new("D:/shoot");
+    rig.delete("ANT", 1);
+    rig.delete("BEE", 2);
+    assert!(rig.app.get_toast_recover(), "the card offers BEE's Recover");
+    let (landing_name, reread) = (Default::default(), Default::default());
+    let to = crate::file_queue::FoldTo { history: &rig.history, pending: &rig.pending, landing_name: &landing_name, reread: &reread };
+    let found = vec![crate::file_queue::BinFound { seq: 1, missing: vec![std::path::PathBuf::from("D:/shoot/ANT.JPG")] }];
+    assert!(crate::file_queue::fold_bin_check(found, &to, &rig.log, rig.now));
+    assert!(reread.borrow().wanted_or_running(), "a reread tells the truth about the folder, and hands back any steps");
+    rig.tick();
+    // The line names the platform's own bin ("Trash" on the Mac).
+    let words = format!("ANT isn't in the {}, so it can't be brought back.", crate::platform::bin_noun());
+    let words = words.as_str();
+    assert_eq!(rig.app.get_toast_text(), words, "it takes the card");
+    assert!(!rig.app.get_toast_recover(), "with no pill");
+    assert_eq!(rig.rows().iter().map(|r| (r.text.to_string(), r.kind, r.recover)).collect::<Vec<_>>(), [
+        (words.to_string(), 2, false), ("Sent BEE".to_string(), 1, true), ("Sent ANT".to_string(), 1, false),
+    ], "ANT's row stops offering, and BEE's doesn't");
+    assert_eq!(rig.log.borrow()[0].dir, "D:/shoot", "tagged with its folder");
+    assert!(!rig.history.borrow().has_delete(1) && rig.history.borrow().has_delete(2));
+    // Over a card of another kind: it's about a delete, so there's no "+N" on it (R29).
+    rig.pass(8_001);
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::info("a card up", rig.now));
+    rig.tick();
+    let found = vec![crate::file_queue::BinFound { seq: 2, missing: vec![std::path::PathBuf::from("D:/shoot/BEE.JPG")] }];
+    crate::file_queue::fold_bin_check(found, &to, &rig.log, rig.now);
+    rig.tick();
+    assert_eq!((rig.app.get_toast_kind(), rig.app.get_toast_more()), (2, 0));
+}
+
+/// A Move rejected's row and card name the move that result armed, so an older move keeps its own Undo
+/// and a second one doesn't take it over. A re-move with nothing to do armed nothing, so it offers
+/// nothing, even with an older move still there. The card's Undo goes when its own move has.
+///
+/// FALSIFIER (L28): demote older rows at the result drain: the second row. Tag the result with the newest
+/// move instead of asking which it armed: the no-op row. Ask `can-undo-move` in the countdown: the last
+/// row (another move is still live).
+#[test]
+fn a_moves_result_names_the_move_it_armed() {
+    let rig = NotifRig::new("D:/shoot");
+    let moved = |seq: Option<u64>| {
+        if let Some(seq) = seq {
+            rig.history.borrow_mut().push_move(crate::support::MoveRecord {
+                folder: "D:/shoot".to_string(),
+                pairs: vec![(std::path::PathBuf::from("D:/shoot/ANT.JPG"), std::path::PathBuf::from("D:/shoot/Rejected/ANT.JPG"))],
+                seq,
+                steps: Vec::new(),
+                subject: "ANT".to_string(),
+            });
+        }
+        rig.move_armed.set(seq);
+        *rig.slot.lock().unwrap() = Some(("Moved".to_string(), crate::support::OpSeverity::from_err(false), 1, Some("D:/shoot".to_string())));
+        rig.tick();
+    };
+    moved(Some(1));
+    moved(Some(2));
+    let offers = || rig.rows().iter().map(|r| (r.seq, r.undoable)).collect::<Vec<_>>();
+    assert_eq!(offers(), [(2, true), (1, true)], "each row its own move");
+    assert_eq!((rig.app.get_toast_seq(), rig.app.get_toast_undoable()), (2, true), "and the card too");
+    *rig.live_dir.borrow_mut() = "E:/other".to_string();
+    rig.rebuild();
+    assert_eq!(offers(), [(2, false), (1, false)], "another folder offers nothing");
+    *rig.live_dir.borrow_mut() = "D:/shoot".to_string();
+    rig.rebuild();
+    assert_eq!(offers(), [(2, true), (1, true)], "and coming back offers them again");
+    moved(None);
+    assert_eq!(offers(), [(-1, false), (2, true), (1, true)], "a re-move with nothing to do armed nothing");
+    assert!(!rig.app.get_toast_undoable());
+    // Now a move whose card is up, taken back from elsewhere, with an older move still there.
+    moved(Some(3));
+    assert_eq!((rig.app.get_toast_seq(), rig.app.get_toast_undoable()), (3, true));
+    rig.tick();
+    assert!(rig.app.get_toast_show(), "its move is still there");
+    rig.history.borrow_mut().take_move(3);
+    rig.tick();
+    assert!(!rig.app.get_toast_show(), "its Undo has nothing to take back, though an older move can still be undone");
+}
+
+/// R9, in the shape it has while results still fold on the interface thread: a Ctrl+Z pressed before a
+/// delete's result is folded has taken the record. A lit Recover would do nothing, so the clean "Sent"
+/// goes, card and row: the person reads only that the photo came back. A failure still speaks, with no
+/// pill. A delete whose record is still there is untouched.
+///
+/// FALSIFIER (L28): `delete_result_still_true` always keeps the entry: the first row. It drops a failure
+/// too: the partial row. It clears the pill of a record that's there: the last.
+#[test]
+fn a_recover_pill_never_lights_for_a_taken_record() {
+    let rig = NotifRig::new("D:/shoot");
+    let result = |fail: usize, seq: u64| crate::tick::delete_result_entry("Sent ANT", fail, "D:/shoot", true, seq, rig.now);
+
+    // Del ANT, then Ctrl+Z before the tick: the record has gone by the time the result folds.
+    rig.pending.borrow_mut().push(result(0, 1));
+    rig.tick();
+    assert!(rig.rows().is_empty(), "no row for a delete already taken back");
+    assert!(!rig.app.get_toast_show(), "and no card");
+    assert_eq!(rig.counters.0.get(), 0, "and nothing to count");
+
+    // Part of a pair failed, and the part that went has been taken back: the failure still speaks.
+    rig.pending.borrow_mut().push(result(1, 2));
+    rig.tick();
+    assert_eq!(rig.rows().iter().map(|r| (r.kind, r.recover)).collect::<Vec<_>>(), [(3, false)], "red, with no pill");
+    assert!(!rig.app.get_toast_recover());
+
+    // The ordinary case, once the red line has had its seconds, and a row with no way back at all.
+    rig.pass(9_000);
+    rig.delete("BEE", 3);
+    assert!(rig.app.get_toast_recover(), "its record is there");
+    assert!(rig.rows()[0].recover);
+    rig.pending.borrow_mut().push(crate::tick::delete_result_entry("Couldn't delete", 1, "D:/shoot", false, 9, rig.now));
+    rig.tick();
+    assert_eq!(rig.rows().len(), 3, "a failure with no record is untouched");
+}
+
+/// R29 (owner chose B): "every clean delete replaces the card, so there's always a name to read". About 3 s,
+/// naming the photo, with Recover, with no "+N" whatever came before, and a plain content swap. It replaces
+/// other info cards too, Move rejected's included, whose Undo stays on its row.
+///
+/// FALSIFIER (L28): clean deletes keep the Recover rung: the 3 s. A delete's "+N" counts as today: a chip, on the
+/// clean row and the red row. A card over a clean delete's counts it: the info row's chip. The pill or the role isn't
+/// set from the entry: its row. The swap hides the card first: `toast_show` isn't the only proof, so the slint's
+/// REPLACE note stands.
+#[test]
+fn a_clean_delete_replaces_the_card() {
+    let rig = NotifRig::new("D:/shoot");
+    // One after another at a fast pace, a beat apart: each names its photo, for 3 s from its own press.
+    for (photo, seq) in [("ANT", 1), ("BEE", 2), ("CAT", 3)] {
+        rig.deleted(seq, &[notif_photo(photo, false)]);
+        assert_eq!(rig.card(), (crate::platform::sent_one_text(photo), seq as i32, true), "{photo}");
+        assert_eq!(rig.counters.1.get(), 3_000, "{photo}: about 3 s");
+        assert_eq!(rig.app.get_toast_more(), 0, "{photo}: no +N");
+        assert_eq!(rig.app.get_toast_kind(), 1, "{photo}: no alarm");
+        rig.pass(1_000);
+        assert!(rig.app.get_toast_show(), "{photo}: still up a second later");
+    }
+    rig.pass(1_999);
+    assert!(rig.app.get_toast_show(), "CAT, nearly 3 s on");
+    rig.pass(2);
+    assert!(!rig.app.get_toast_show(), "and then it goes");
+
+    // Over Move rejected's card: the delete takes the card, and the Undo stays on its row.
+    rig.history.borrow_mut().push_move(crate::support::MoveRecord { folder: "D:/shoot".to_string(), pairs: vec![("D:/shoot/DOG.JPG".into(), "D:/shoot/Rejected/DOG.JPG".into())], seq: 4, steps: Vec::new(), subject: "DOG".to_string() });
+    rig.move_armed.set(Some(4));
+    *rig.slot.lock().unwrap() = Some(("Moved DOG".to_string(), crate::support::OpSeverity::from_err(false), 1, Some("D:/shoot".to_string())));
+    rig.tick();
+    assert!(rig.app.get_toast_undoable(), "premise: Move rejected's card, with its Undo");
+    rig.deleted(5, &[notif_photo("EEL", false)]);
+    assert_eq!(rig.card(), (crate::platform::sent_one_text("EEL"), 5, true));
+    assert!(!rig.app.get_toast_undoable(), "the card is about EEL now");
+    assert_eq!(rig.app.get_toast_more(), 0, "with no +N, though a card was up");
+    assert!(rig.rows().iter().any(|r| r.seq == 4 && r.undoable), "the Undo stays on its row");
+    assert!(rig.history.borrow().move_live(4, "D:/shoot"), "and on Ctrl+Z");
+
+    // A delete that went wrong is a delete's card too: R29, "Delete cards always set `toast_more` to 0".
+    rig.pass(3_001);
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::info("a card up", rig.now));
+    rig.tick();
+    rig.pending.borrow_mut().push(crate::tick::delete_result_entry("Couldn't delete GNU", 1, "D:/shoot", false, 9, rig.now));
+    rig.tick();
+    assert_eq!((rig.app.get_toast_kind(), rig.app.get_toast_more()), (3, 0), "no +N on a red delete line");
+    rig.pass(8_001);
+
+    // A plain info card, then a delete, then a card over the delete: nothing was superseded either way.
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::info("a background copy finished", rig.now));
+    rig.tick();
+    assert_eq!(rig.app.get_toast_more(), 0);
+    rig.deleted(6, &[notif_photo("FOX", false)]);
+    assert_eq!(rig.card().0, crate::platform::sent_one_text("FOX"));
+    assert_eq!(rig.app.get_toast_more(), 0);
+    assert_eq!(rig.app.get_toast_role(), crate::tick::CARD_CLEAN_DELETE);
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::info("a second card", rig.now));
+    rig.tick();
+    assert_eq!(rig.app.get_toast_more(), 0, "a clean delete's card isn't a notification it superseded");
+    // A "+1" that other cards have run up: a delete's card clears it.
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::info("a third card", rig.now));
+    rig.tick();
+    assert_eq!(rig.app.get_toast_more(), 1, "premise: that's a card it superseded");
+    rig.deleted(10, &[notif_photo("HEN", false)]);
+    assert_eq!(rig.app.get_toast_more(), 0, "no +N on a delete");
+}
+
+/// R29, R31: a red or amber line is never replaced by a clean delete in its full 8 or 10 s: the clean delete
+/// joins the list quietly. When the line's time is up, the next clean delete has the card again.
+///
+/// FALSIFIER (L28): drop `problem_up`: the first row. Read `kind == 3` for it: the amber row. It joins nothing:
+/// the rows. The model isn't rebuilt with no card to raise: the rows, too.
+#[test]
+fn a_clean_delete_never_replaces_a_red_line() {
+    let rig = NotifRig::new("D:/shoot");
+    let red = "Couldn't delete BEE, another program may have it open. It's still in the folder.";
+    rig.pending.borrow_mut().push(crate::tick::delete_result_entry(red, 1, "D:/shoot", false, 1, rig.now));
+    rig.tick();
+    assert_eq!((rig.app.get_toast_text().as_str(), rig.app.get_toast_kind(), rig.counters.1.get()), (red, 3, 8_000));
+    // Three clean deletes behind it, the last with most of its time gone.
+    rig.deleted(2, &[notif_photo("ANT", false)]);
+    rig.deleted(3, &[notif_photo("CAT", false)]);
+    rig.pass(7_900);
+    rig.deleted(4, &[notif_photo("DOG", false)]);
+    assert_eq!(rig.app.get_toast_text().as_str(), red, "the red line holds its seconds");
+    // Commit 10 (R32): they're one run above the red row, each line with its own Recover.
+    assert_eq!(rig.rows().iter().map(|r| (r.text.to_string(), r.kind, r.recover)).collect::<Vec<_>>(), [
+        (crate::platform::sent_run_text(3), 1, false), (red.to_string(), 3, false),
+    ], "and each joins the list");
+    rig.toggle(0);
+    assert_eq!(rig.lines(0).iter().map(|l| (l.0.as_str(), l.2, l.3)).collect::<Vec<_>>(), [("DOG", 4, true), ("CAT", 3, true), ("ANT", 2, true)], "with its own Recover");
+    rig.pass(101);
+    assert!(!rig.app.get_toast_show(), "its 8 s are up");
+    rig.deleted(5, &[notif_photo("EEL", false)]);
+    assert_eq!(rig.card().0, crate::platform::sent_one_text("EEL"), "and the next delete has the card");
+
+    // Amber, the same. And a clean delete's own card gives way to a line that speaks up.
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::warn("ANT isn't in the Recycle Bin, so it can't be brought back.", rig.now));
+    rig.tick();
+    assert_eq!(rig.app.get_toast_kind(), 2, "the amber line takes a clean delete's card");
+    rig.deleted(6, &[notif_photo("FOX", false)]);
+    assert_eq!(rig.app.get_toast_kind(), 2, "and holds it");
+    assert_ne!(rig.card().0, crate::platform::sent_one_text("FOX"));
+
+    // A red with a Recover in its 10 s, the same.
+    rig.pass(8_001);
+    rig.history.borrow_mut().push_delete(crate::support::DeleteRecord::for_test("D:/shoot", "GNU", 0, Vec::new(), 7, Vec::new()));
+    rig.pending.borrow_mut().push(crate::tick::delete_result_entry("Sent the RAW of GNU", 1, "D:/shoot", true, 7, rig.now));
+    rig.tick();
+    assert_eq!(rig.counters.1.get(), 10_000);
+    rig.pass(9_900);
+    rig.deleted(8, &[notif_photo("HEN", false)]);
+    assert_eq!(rig.card(), ("Sent the RAW of GNU".to_string(), 7, true));
+}
+
+/// R31: a clean delete's Recover ranks no higher than its words. A red in the same tick has the card, in either
+/// order, and the Recover is still on its row and on Ctrl+Z.
+///
+/// FALSIFIER (L28): pass `e.undoable || e.recover` to `toast_pick`: the first row. Rank it below a plain info
+/// by dropping it from what may raise: the last.
+#[test]
+fn a_red_in_the_same_tick_takes_the_card_from_a_clean_deletes_recover() {
+    let rig = NotifRig::new("D:/shoot");
+    let (clean, red) = (crate::platform::sent_one_text("ANT"), "Couldn't delete BEE, another program may have it open. It's still in the folder.");
+    let clean_entry = |seq| crate::tick::delete_result_entry(clean.as_str(), 0, "D:/shoot", true, seq, rig.now);
+    let red_entry = |seq| crate::tick::delete_result_entry(red, 1, "D:/shoot", false, seq, rig.now);
+    rig.history.borrow_mut().push_delete(crate::support::DeleteRecord::for_test("D:/shoot", "ANT", 0, Vec::new(), 1, Vec::new()));
+    rig.pending.borrow_mut().push(clean_entry(1));
+    rig.pending.borrow_mut().push(red_entry(2));
+    rig.tick();
+    assert_eq!(rig.app.get_toast_text().as_str(), red, "clean, then red");
+    rig.pass(9_000);
+    assert!(!rig.app.get_toast_show());
+    rig.history.borrow_mut().push_delete(crate::support::DeleteRecord::for_test("D:/shoot", "ANT", 0, Vec::new(), 3, Vec::new()));
+    rig.pending.borrow_mut().push(red_entry(4));
+    rig.pending.borrow_mut().push(clean_entry(3));
+    rig.tick();
+    assert_eq!(rig.app.get_toast_text().as_str(), red, "red, then clean");
+    assert!(!rig.app.get_toast_recover(), "and its pill isn't on the red");
+    assert!(rig.rows().iter().filter(|r| r.recover).count() == 2, "it's on each row");
+    rig.pass(9_000);
+
+    // An info in the same tick isn't a problem: the newer has the card, as ever.
+    rig.history.borrow_mut().push_delete(crate::support::DeleteRecord::for_test("D:/shoot", "ANT", 0, Vec::new(), 5, Vec::new()));
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::info("an info", rig.now));
+    rig.pending.borrow_mut().push(clean_entry(5));
+    rig.tick();
+    assert_eq!(rig.card(), (clean.clone(), 5, true));
+}
+
+/// R30: "clean deletes never light it. Only red and amber lines do." Single or selection, by either route:
+/// no count, no badge, and an × on the card has nothing to take off. A later red lights it by exactly one.
+///
+/// FALSIFIER (L28): count `added` for the badge: the first row. Set `toast_counts_unread` true for a clean
+/// card: its assert, so the × would discount a red's. Skip the count for a red that arrives with cleans: the batch row.
+#[test]
+fn clean_deletes_never_light_the_bell() {
+    let rig = NotifRig::new("D:/shoot");
+    let (unread, lit) = (&rig.counters.0, |rig: &NotifRig| (rig.counters.0.get(), rig.app.get_notif_unread()));
+    rig.deleted(1, &[notif_photo("ANT", false)]);
+    rig.deleted(2, &[notif_photo("BEE", true)]);
+    rig.deleted(3, &[notif_photo("CAT", false), notif_photo("DOG", false), notif_photo("EEL", false)]);
+    assert_eq!(rig.app.get_toast_text().to_string(), crate::platform::sent_selected_text(3), "a selection's clean delete too");
+    assert_eq!(lit(&rig), (0, 0), "nothing asks for attention");
+    assert!(!rig.counts_unread.get(), "and an × would take nothing off");
+    // A delete that went for good, by the same route, with no record: it's clean too.
+    rig.pending.borrow_mut().push(crate::tick::delete_result_entry(crate::platform::deleted_one_text(crate::platform::GoneFrom::Drive, "FOX"), 0, "D:/shoot", false, 4, rig.now));
+    rig.tick();
+    assert_eq!(rig.app.get_toast_text().to_string(), crate::platform::deleted_one_text(crate::platform::GoneFrom::Drive, "FOX"));
+    assert_eq!((lit(&rig), rig.counts_unread.get(), rig.counters.1.get()), ((0, 0), false, 3_000), "its card is short too, with nothing to light");
+
+    // A red lights it, and a clean delete behind it adds nothing.
+    rig.pending.borrow_mut().push(crate::tick::delete_result_entry("Couldn't delete GNU", 1, "D:/shoot", false, 5, rig.now));
+    rig.tick();
+    assert_eq!(lit(&rig), (1, 1), "only the red");
+    assert!(rig.counts_unread.get(), "its × may discount it");
+    rig.deleted(6, &[notif_photo("HEN", false)]);
+    assert_eq!(lit(&rig), (1, 1));
+    // An amber line and two clean results in one tick: one more, and the card is the amber line.
+    rig.pass(9_000);
+    rig.history.borrow_mut().push_delete(crate::support::DeleteRecord::for_test("D:/shoot", "IBX", 0, Vec::new(), 7, Vec::new()));
+    rig.history.borrow_mut().push_delete(crate::support::DeleteRecord::for_test("D:/shoot", "JAY", 0, Vec::new(), 8, Vec::new()));
+    rig.pending.borrow_mut().push(crate::tick::delete_result_entry("Sent IBX", 0, "D:/shoot", true, 7, rig.now));
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::warn("KOI isn't in the bin", rig.now));
+    rig.pending.borrow_mut().push(crate::tick::delete_result_entry("Sent JAY", 0, "D:/shoot", true, 8, rig.now));
+    rig.tick();
+    assert_eq!(lit(&rig), (2, 2));
+    assert_eq!(rig.app.get_toast_more(), 0, "and the clean ones aren't a +N behind it");
+    assert_eq!(unread.get(), 2);
+}
+
+/// R48: Move rejected's result reaches the tick as its worker leaves it: the words, the severity it chose by
+/// `OpSeverity::of_result` (the handler's own call is pinned in main.rs), folder kind 1, and the record the
+/// move armed. `said` is what the sentence's clauses counted. The folder is named, as the rig's `cur_dir` is
+/// empty (no heartbeat on disk), where the handler's `None` reads the folder open.
+fn r48_moved(rig: &NotifRig, seq: u64, photo: &str, fail: usize, said: usize) {
+    rig.history.borrow_mut().push_move(crate::support::MoveRecord {
+        folder: "D:/shoot".to_string(),
+        pairs: vec![(format!("D:/shoot/{photo}.JPG").into(), format!("D:/shoot/Rejected/{photo}.JPG").into())],
+        seq,
+        steps: Vec::new(),
+        subject: photo.to_string(),
+    });
+    rig.move_armed.set(Some(seq));
+    let msg = format!("{}{}{}", crate::support::moved_to_rejected_text(1), crate::support::clause_skipped(said), crate::support::clause_failed(fail));
+    *rig.slot.lock().unwrap() = Some((msg, crate::support::OpSeverity::of_result(fail, said), 1, Some("D:/shoot".to_string())));
+    rig.tick();
+}
+
+/// R48: an Undo move from its press on: `press_undo_move` takes the record, its job runs on a disk that brings
+/// back what it's told (`back`: `support::undo_moves`'s four counts, so nothing here touches a disk), and its
+/// report folds as the tick's top does. The next tick puts it on the card.
+fn r48_undone(rig: &NotifRig, seq: u64, back: (usize, usize, usize, usize)) {
+    struct Back((usize, usize, usize, usize));
+    impl crate::file_queue::FileIo for Back {
+        fn barrier(&self) {}
+        fn undo_moves(&self, _pairs: &[(std::path::PathBuf, std::path::PathBuf)]) -> (usize, usize, usize, usize) {
+            self.0
+        }
+    }
+    let queue = crate::file_queue::FileQueue::with_runner(Box::new(move |job| crate::file_queue::run_job(job, &Back(back))));
+    assert!(crate::file_queue::press_undo_move(&rig.history, &queue, seq, rig.now), "move {seq} is there to take back");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut done = Vec::new();
+    while done.is_empty() {
+        assert!(std::time::Instant::now() < deadline, "the undo's job reports");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        done = queue.take_results();
+    }
+    let to = crate::file_queue::FoldTo { history: &rig.history, pending: &rig.pending, landing_name: &rig.landing_name, reread: &rig.reread };
+    for d in done {
+        crate::file_queue::fold_file_done(d, &to, rig.now);
+    }
+    rig.tick();
+}
+
+/// R48 (owner, 11 November 2026: "2 B just make sure the notification is still there even though the bell
+/// doesn't light up"). A clean Move rejected: its card as today, with its Undo and its 10 s, and its row in the
+/// bell's list with its Undo. Only the bell stays unlit, and an × on its card has nothing to take off, so it
+/// can't discount a red the bell still holds. Twice, on ANT then BEE.
+///
+/// FALSIFIER (L28): count a clean move for the bell (`lit` as `counted`): the first assert. `of_result` calls
+/// nothing clean: the same. Set `toast_counts_unread` for a clean move: the × assert. Drop the row for a clean
+/// move: the row assert.
+#[test]
+fn a_clean_move_rejected_shows_its_card_and_row_and_leaves_the_bell_unlit() {
+    let rig = NotifRig::new("D:/shoot");
+    let lit = |rig: &NotifRig| (rig.counters.0.get(), rig.app.get_notif_unread());
+    let moved = crate::support::moved_to_rejected_text(1);
+    for (seq, photo) in [(1, "ANT"), (2, "BEE")] {
+        r48_moved(&rig, seq, photo, 0, 0);
+        assert_eq!(lit(&rig), (0, 0), "{photo}: the bell stays unlit");
+        assert!(!rig.counts_unread.get(), "{photo}: an × on its card takes nothing off");
+        assert!(rig.app.get_toast_show(), "{photo}: its card shows");
+        assert_eq!((rig.app.get_toast_text().to_string(), rig.app.get_toast_kind()), (moved.clone(), 1), "{photo}: in its own words, green");
+        assert_eq!((rig.app.get_toast_seq(), rig.app.get_toast_undoable()), (seq as i32, true), "{photo}: with its Undo");
+        assert_eq!(rig.counters.1.get(), crate::support::TOAST_MS_MAX, "{photo}: for as long as an Undo lingers");
+        assert_eq!(rig.rows()[0].text.to_string(), moved, "{photo}: its row is in the list");
+        assert!(rig.rows()[0].undoable && rig.rows()[0].seq == seq as i32, "{photo}: with its Undo");
+    }
+    assert_eq!(rig.rows().len(), 2, "one row each");
+
+    // A red line lights the bell, and a clean move's card over it leaves that count alone.
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::error("Couldn't copy CAT", rig.now));
+    rig.tick();
+    assert_eq!(lit(&rig), (1, 1), "the red counts");
+    r48_moved(&rig, 3, "DOG", 0, 0);
+    assert_eq!(lit(&rig), (1, 1), "the move adds nothing");
+    assert!(!rig.counts_unread.get(), "and its × can't take the red's count off");
+}
+
+/// R48: the same for a clean Undo move ("Brought back ANT"): its card shows, its row is in the list, and the
+/// bell stays unlit. Move ANT, move BEE, Undo BEE, Undo ANT.
+///
+/// FALSIFIER (L28): count a clean move for the bell: the first assert. `run_undo_move` calls a clean undo
+/// `Success` (leave out `Clean` from `of_result`'s answer): the same. Drop the undo's row: the row assert.
+#[test]
+fn a_clean_undo_move_shows_its_card_and_row_and_leaves_the_bell_unlit() {
+    let rig = NotifRig::new("D:/shoot");
+    let lit = |rig: &NotifRig| (rig.counters.0.get(), rig.app.get_notif_unread());
+    r48_moved(&rig, 1, "ANT", 0, 0);
+    r48_moved(&rig, 2, "BEE", 0, 0);
+    for (seq, photo) in [(2, "BEE"), (1, "ANT")] {
+        r48_undone(&rig, seq, (1, 0, 0, 0));
+        let words = crate::platform::brought_back_text(photo);
+        assert_eq!(lit(&rig), (0, 0), "{photo}: the bell stays unlit");
+        assert!(!rig.counts_unread.get(), "{photo}: an × on its card takes nothing off");
+        assert!(rig.app.get_toast_show(), "{photo}: its card shows");
+        assert_eq!((rig.app.get_toast_text().to_string(), rig.app.get_toast_kind()), (words.clone(), 1), "{photo}: in the owner's words");
+        assert_eq!(rig.rows()[0].text.to_string(), words, "{photo}: its row is in the list");
+    }
+    assert_eq!(rig.rows().len(), 4, "two moves and two undos, a row each");
+}
+
+/// R48: "One with something skipped or failed still lights it." Move rejected with a file skipped, then with
+/// one failed; Undo move with a file skipped, with a side file left behind, and with one failed. Each lights the
+/// bell by one, its card and row as today, and its × may take it off.
+///
+/// FALSIFIER (L28): `of_result` calls anything with no failure clean (`(0, _) => Clean`): the skipped rows. It
+/// calls a failure clean: the failed rows. `run_undo_move` leaves `sk` or `side_not` out of what was said: their
+/// rows. `step_notifs` leaves clean moves out of `counted` as well as `lit`: the "+N" row.
+#[test]
+fn a_move_or_its_undo_with_something_skipped_or_failed_lights_the_bell() {
+    let rig = NotifRig::new("D:/shoot");
+    let lit = || rig.counters.0.get();
+    r48_moved(&rig, 1, "ANT", 0, 1);
+    assert_eq!((lit(), rig.app.get_notif_unread()), (1, 1), "a move with a file skipped");
+    assert!(rig.counts_unread.get() && rig.app.get_toast_undoable(), "its × may take it off, and its Undo is there");
+    assert_eq!(rig.app.get_toast_kind(), 1, "green as today");
+    r48_moved(&rig, 2, "BEE", 1, 0);
+    assert_eq!((lit(), rig.app.get_toast_kind()), (2, 3), "a move with a file failed, red");
+    r48_moved(&rig, 3, "CAT", 0, 0);
+    r48_moved(&rig, 4, "DOG", 0, 0);
+    r48_moved(&rig, 5, "EEL", 0, 0);
+    assert_eq!(lit(), 2, "premise: three clean moves light nothing");
+    r48_undone(&rig, 3, (0, 1, 0, 0));
+    assert_eq!(lit(), 3, "an undo with a file skipped");
+    assert!(rig.counts_unread.get());
+    r48_undone(&rig, 4, (1, 0, 0, 1));
+    assert_eq!(lit(), 4, "an undo with a side file left behind");
+    r48_undone(&rig, 5, (0, 0, 1, 0));
+    assert_eq!((lit(), rig.app.get_toast_kind()), (5, 3), "an undo with a file failed, red");
+    assert_eq!(rig.rows().len(), 8, "every one has its row");
+
+    // The "+N" is the card's own count of the cards it replaced, as today: a clean move's card replaced by
+    // another's counts, though the bell doesn't.
+    rig.pass(11_000);
+    r48_moved(&rig, 6, "FOX", 0, 0);
+    r48_moved(&rig, 7, "GNU", 0, 0);
+    assert_eq!((lit(), rig.app.get_toast_more()), (5, 1), "GNU's card replaced FOX's: +1, and no light");
+    *rig.slot.lock().unwrap() = Some(("Copied 1 file(s) to ./Picks".to_string(), crate::support::OpSeverity::from_err(false), 0, None));
+    rig.tick();
+    assert_eq!((lit(), rig.app.get_toast_more()), (6, 2), "the copy lights the bell, and the cards it replaced are its +2");
+}
+
+/// R48: "Copies, exports and every other row stay as they are." A finished copy, an export, and Empty ./Rejected
+/// each light the bell by one, green, with an × that may take it off. Copy twice.
+///
+/// FALSIFIER (L28): count no success for the bell (`lit` filters `kind != 1`): every row. Mark every op result
+/// clean in `op_result_notification`: the same.
+#[test]
+fn a_finished_copy_lights_the_bell_as_today() {
+    let rig = NotifRig::new("D:/shoot");
+    let op = |text: &str, kind: i32| {
+        *rig.slot.lock().unwrap() = Some((text.to_string(), crate::support::OpSeverity::from_err(false), kind, None));
+        rig.tick();
+        (rig.counters.0.get(), rig.app.get_notif_unread(), rig.counts_unread.get(), rig.app.get_toast_kind())
+    };
+    assert_eq!(op("Copied 2 file(s) to ./Picks", 0), (1, 1, true, 1), "a copy");
+    assert_eq!(op("Copied 3 file(s) to ./Picks", 0), (2, 2, true, 1), "another copy");
+    assert_eq!(op("Exported 3 photos", 2), (3, 3, true, 1), "an export");
+    assert_eq!(op(&crate::platform::empty_rejected_toast_text(4), -1), (4, 4, true, 1), "Empty ./Rejected, as today");
+    assert_eq!(rig.rows().len(), 4);
+}
+
+/// R29: "The newest press's result raises it; an older clean result that a newer press has overtaken doesn't."
+/// Del, Del at 0.2 s: the first's report arrives after the second press. The card names the newest either
+/// way, and the older joins the list.
+///
+/// FALSIFIER (L28): `press_delete` doesn't note the newest press: the first row raises ANT. Compare with `<=`: nothing
+/// raises at all. Take the first in a same-tick batch: the second block names the older.
+#[test]
+fn the_newest_press_names_the_card_on_a_double_press() {
+    let rig = NotifRig::new("D:/shoot");
+    let sent = crate::platform::sent_one_text;
+    // Reports one tick apart.
+    let (ant, bee) = (rig.press(1, &[notif_photo("ANT", false)]), rig.press(2, &[notif_photo("BEE", false)]));
+    rig.report(ant);
+    rig.tick();
+    assert!(!rig.app.get_toast_show(), "ANT has been overtaken, so no card");
+    assert_eq!(rig.rows().iter().map(|r| r.text.to_string()).collect::<Vec<_>>(), [sent("ANT")], "it joins the list");
+    rig.report(bee);
+    rig.tick();
+    assert_eq!(rig.card(), (sent("BEE"), 2, true), "the newest press names the card");
+    // Both in one tick, with a card from before: the newest again, and the older in the list.
+    let (cat, dog) = (rig.press(3, &[notif_photo("CAT", false)]), rig.press(4, &[notif_photo("DOG", false)]));
+    rig.report(cat);
+    rig.report(dog);
+    rig.tick();
+    assert_eq!(rig.card(), (sent("DOG"), 4, true));
+    // Commit 10 (R32): one run, in press order.
+    assert_eq!(rig.rows().iter().map(|r| r.text.to_string()).collect::<Vec<_>>(), [crate::platform::sent_run_text(4)]);
+    rig.toggle(0);
+    assert_eq!(rig.lines(0).iter().map(|l| l.0.as_str()).collect::<Vec<_>>(), ["DOG", "CAT", "BEE", "ANT"]);
+    // Three, and the last two still going when the first reports: nothing yet, and the card stays on DOG.
+    let (eel, fox, gnu) = (rig.press(5, &[notif_photo("EEL", false)]), rig.press(6, &[notif_photo("FOX", false)]), rig.press(7, &[notif_photo("GNU", false)]));
+    rig.report(eel);
+    rig.tick();
+    assert_eq!(rig.card().0, sent("DOG"), "no card for EEL");
+    rig.report(fox);
+    rig.tick();
+    assert_eq!(rig.card().0, sent("DOG"), "nor FOX");
+    rig.report(gnu);
+    rig.tick();
+    assert_eq!(rig.card().0, sent("GNU"));
+    // A delete a second after the last: it's the newest press, and it replaces the card.
+    rig.pass(1_000);
+    rig.deleted(8, &[notif_photo("HEN", false)]);
+    assert_eq!(rig.card().0, sent("HEN"));
+}
+
+/// R29: a delete of a photo that isn't on screen always raises a card: the stage doesn't change, so "the next
+/// photo appearing" isn't there to confirm it. Also in the middle of a run of deletes on the photo on screen.
+/// The stage staying put is the landing rule's, pinned in Stage A.
+///
+/// FALSIFIER (L28): a run quiets the card: the second row. A clean delete raises only a card naming the photo on
+/// screen: both.
+#[test]
+fn a_menu_delete_of_another_photo_raises_the_card() {
+    let rig = NotifRig::new("D:/shoot");
+    let sent = crate::platform::sent_one_text;
+    rig.deleted(1, &[notif_photo("DOG", false)]);
+    assert_eq!(rig.card(), (sent("DOG"), 1, true), "on its own");
+    rig.deleted(2, &[notif_photo("ANT", false)]);
+    rig.deleted(3, &[notif_photo("BEE", false)]);
+    rig.deleted(4, &[notif_photo("EEL", true)]);
+    assert_eq!(rig.card(), (sent(&crate::support::photo_subject(&notif_photo("EEL", true))), 4, true), "in the middle of a run");
+    assert!(rig.app.get_toast_text().contains("[RAW+JPG]"), "and a pair says so");
+}
+
+/// R36: "A card whose seq was consumed clears at once." However it was taken: Ctrl+Z, a row's pill, the card's
+/// own, or the bin check. A card about another act stays, so an older row's Recover can't wipe a red or a newer
+/// delete's card, and a Recover's dismissal only touches its own (`on_recover_delete`, by source). A transient
+/// card takes back no act, so it's never that card.
+///
+/// FALSIFIER (L28): the countdown doesn't ask `has_delete`: the second row. It asks about any card: the transient
+/// row, or the older-row row. `write_toast_card` leaves the stamp: the transient row's seq.
+/// `on_recover_delete` dismisses whatever's up: the source row.
+#[test]
+fn a_taken_seq_clears_its_card() {
+    let rig = NotifRig::new("D:/shoot");
+    rig.deleted(1, &[notif_photo("ANT", false)]);
+    rig.deleted(2, &[notif_photo("BEE", false)]);
+    // An older row's Recover: BEE's card stays.
+    rig.history.borrow_mut().take_delete(1);
+    rig.tick();
+    assert_eq!(rig.card().1, 2);
+    assert!(rig.app.get_toast_show(), "it's about BEE");
+    // BEE's own, with no time gone.
+    rig.history.borrow_mut().take_delete(2);
+    rig.tick();
+    assert!(!rig.app.get_toast_show(), "it clears at once");
+
+    // A transient card has no act: it stays, and a stale stamp can't be read off it.
+    let job = rig.press(3, &[notif_photo("CAT", false)]);
+    rig.history.borrow_mut().hold_picture(3, "CAT", slint::Image::default());
+    rig.report(job);
+    rig.tick();
+    assert!(rig.app.get_toast_picture_on(), "premise: all a delete's card has");
+    crate::say_edit_result(&rig.app, &rig.counts_unread, &rig.counters.1, &rig.pending, "D:/shoot", "Still loading", 5_000, None);
+    assert_eq!((rig.card().1, rig.app.get_toast_role(), rig.app.get_toast_picture_on()), (-1, 0, false), "it carries nothing of the delete's card");
+    rig.history.borrow_mut().take_delete(3);
+    rig.tick();
+    assert!(rig.app.get_toast_show(), "it isn't about CAT");
+    rig.pass(5_001);
+
+    // A red with a Recover whose record goes: the same.
+    rig.history.borrow_mut().push_delete(crate::support::DeleteRecord::for_test("D:/shoot", "DOG", 0, Vec::new(), 4, Vec::new()));
+    rig.pending.borrow_mut().push(crate::tick::delete_result_entry("Sent the RAW of DOG", 1, "D:/shoot", true, 4, rig.now));
+    rig.tick();
+    assert!(rig.app.get_toast_recover());
+    rig.history.borrow_mut().take_delete(4);
+    rig.tick();
+    assert!(!rig.app.get_toast_show());
+
+    // Recover's dismissal: only a card about this act.
+    let main = include_str!("main.rs");
+    let handler = main.split_once("app.on_recover_delete(move |seq| {").expect("the handler").1;
+    let pressed = handler.split_once("let Some((rec_dir, rec_gen))").expect("its record").0;
+    assert!(pressed.contains("if app.get_toast_seq() == seq as i32 {") && pressed.matches("app.invoke_dismiss_toast();").count() == 1, "by the card's stamp:\n{pressed}");
+}
+
+/// R29, R35: the card shows a small picture of the photo it names, from the strip's thumbnail at the press,
+/// through the job's report. A blank tile if that wasn't loaded. A selection names no one photo and a problem
+/// isn't about the picture, so they keep the dot. On the real window: the picture is 44 px, takes the dot's
+/// place, and the widest row still fits the 320 px card, with a long name.
+///
+/// FALSIFIER (L28): `fold_file_done` drops the picture: the first row. It keeps it on a failure: the failure row.
+/// It doesn't take it: `pictures` isn't empty. The tile mounts with no picture: the selection row's geometry.
+/// The row keeps it out of its layout or a long name pushes the ×: the geometry rows.
+#[test]
+fn a_clean_deletes_card_shows_its_small_picture() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let rig = NotifRig::new("D:/shoot");
+    rig.app.set_motion_ui(false); // `toastcard.hot` snaps true, so the pills mount with no animation clock
+    let tile = || E::find_by_element_id(&rig.app, "MainWindow::toastpicture").next();
+    let thumb = || slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(6, 4));
+    // A thumbnail, as the drain holds it at the press.
+    let job = rig.press(1, &[notif_photo("ANT", true)]);
+    rig.history.borrow_mut().hold_picture(1, "ANT", thumb());
+    rig.report(job);
+    rig.tick();
+    assert!(rig.app.get_toast_picture_on(), "the picture is on the card");
+    assert_eq!(rig.app.get_toast_picture().size().width, 6, "the very one");
+    assert!(rig.history.borrow().pictures.is_empty(), "nothing holds it for the job any more");
+    // Commit 10 (R35): the row's line keeps it, for as long as the line is listed, and the row hands it over.
+    let line_picture = |rig: &NotifRig| rig.log.borrow()[0].fold.as_ref().map(|f| f.lines[0].picture.size().width);
+    assert_eq!(line_picture(&rig), Some(6), "the line keeps it, for as long as it's listed");
+    assert!(rig.log.borrow()[0].picture.is_none(), "and the row doesn't hold a second");
+    hover(&rig.app, 100.0, 700.0); // a layout pass, off the card
+    let card = E::find_by_element_id(&rig.app, "MainWindow::toastcard").next().expect("the card");
+    let (cx, cw) = (card.absolute_position().x, card.size().width);
+    let t = tile().expect("the tile is mounted");
+    assert_eq!((t.size().width, t.size().height), (44.0, 44.0));
+    assert_eq!(cw, 320.0);
+    assert!((t.absolute_position().x - (cx + 12.0)).abs() < 0.01, "at the card's padding, in the dot's place");
+    let cross = E::find_by_element_id(&rig.app, "MainWindow::tdisa").next().expect("the ×");
+    assert!(cross.absolute_position().x + cross.size().width <= cx + cw - 12.0 + 0.01, "the row fits, with its Recover");
+    // The widest words a real name makes: the row still fits, and the text takes what's left.
+    let long = crate::platform::sent_one_text("20261103_152233_A7R05123_FINAL_EDIT [RAW+HEIC]");
+    rig.app.set_toast_text(long.as_str().into());
+    hover(&rig.app, 100.0, 700.0);
+    let cross = E::find_by_element_id(&rig.app, "MainWindow::tdisa").next().expect("the ×");
+    assert!(cross.absolute_position().x + cross.size().width <= cx + cw - 12.0 + 0.01, "a long name wraps: it pushes nothing off the card");
+    let pill = E::find_by_element_type_name(&rig.app, "PillBtn").next().expect("Recover");
+    assert!(pill.absolute_position().x + pill.size().width <= cross.absolute_position().x, "and Recover keeps its place");
+
+    // With nothing loaded: a blank tile, no decode.
+    let job = rig.press(2, &[notif_photo("BEE", false)]);
+    rig.history.borrow_mut().hold_picture(2, "BEE", slint::Image::default());
+    rig.report(job);
+    rig.tick();
+    assert!(rig.app.get_toast_picture_on() && rig.app.get_toast_picture().size().width == 0, "a blank tile");
+    hover(&rig.app, 100.0, 700.0);
+    assert!(tile().is_some());
+
+    // A selection names no one photo.
+    rig.deleted(3, &[notif_photo("CAT", false), notif_photo("DOG", false)]);
+    assert!(!rig.app.get_toast_picture_on());
+    hover(&rig.app, 100.0, 700.0);
+    assert!(tile().is_none(), "no tile, and the dot is back");
+    assert!(rig.log.borrow()[0].picture.is_none());
+    assert_eq!(rig.log.borrow()[0].fold.as_ref().map(|f| f.lines.len()), Some(2), "its lines have theirs (commit 10)");
+
+    // A failure isn't about the picture, and it doesn't keep it either.
+    let job = rig.press(4, &[notif_photo("EEL", false)]);
+    rig.history.borrow_mut().hold_picture(4, "EEL", thumb());
+    struct BinRefuses;
+    impl crate::file_queue::FileIo for BinRefuses {
+        fn barrier(&self) {}
+        fn list_files(&self, targets: &[crate::Shot]) -> Vec<std::path::PathBuf> {
+            targets.iter().flat_map(|s| [s.raw.clone(), s.jpg.clone()]).flatten().collect()
+        }
+        fn recycle(&self, _paths: &[std::path::PathBuf]) -> crate::file_queue::Recycled {
+            crate::file_queue::Recycled {
+                files: Vec::new(), confirmed: true,
+                #[cfg(target_os = "macos")]
+                trash_paths: Vec::new(),
+            }
+        }
+    }
+    let done = crate::file_queue::run_job(job, &BinRefuses);
+    let to = crate::file_queue::FoldTo { history: &rig.history, pending: &rig.pending, landing_name: &rig.landing_name, reread: &rig.reread };
+    crate::file_queue::fold_file_done(done, &to, rig.now);
+    rig.tick();
+    assert_eq!(rig.app.get_toast_kind(), 3);
+    assert!(!rig.app.get_toast_picture_on(), "the dot says it's red");
+    assert!(rig.history.borrow().pictures.is_empty(), "and nothing keeps the picture");
+
+    // The picture goes with the card's other things when a plain card takes over.
+    rig.pass(9_000);
+    let job = rig.press(5, &[notif_photo("FOX", false)]);
+    rig.history.borrow_mut().hold_picture(5, "FOX", thumb());
+    rig.report(job);
+    rig.tick();
+    assert!(rig.app.get_toast_picture_on());
+    crate::show_transient_toast(&rig.app, &rig.counts_unread, &rig.counters.1, "Filename copied", 5_000);
+    assert!(!rig.app.get_toast_picture_on());
+    assert_eq!(rig.app.get_toast_picture().size().width, 0, "and it holds no thumbnail");
+}
+
+/// R36: "A clean Ctrl+Z raises no card when the photo lands on screen; a short card "Recovered {photo}" if the
+/// person had moved." In Compare, "on screen" is either half: the owner was told a Recover that only returns
+/// to the strip gets the short card. It pushes no row, lights no bell, and any Del clears it.
+///
+/// FALSIFIER (L28): `say_recovered` always speaks: the first row. It never does: the moved row. It reads the
+/// photo on screen in Compare: the half row. It speaks over a red or behind the panel: their rows. It pushes a row: its
+/// asserts. `clear_recovered_card` takes any card: the row after it.
+#[test]
+fn a_recovered_card_speaks_only_when_the_photo_isnt_on_screen() {
+    let rig = NotifRig::new("D:/shoot");
+    let words = "Recovered BEE [RAW+JPG]";
+    let list = [notif_photo("ANT", false), notif_photo("BEE", true), notif_photo("CAT", false), notif_photo("DOG", false)];
+    let named = || {
+        let wait = crate::file_queue::Waited { seq: 1, pressed: rig.now, text: "Recovering BEE [RAW+JPG]…".to_string() };
+        Some(crate::support::Named { files: [list[1].raw.clone(), list[1].jpg.clone()].into_iter().flatten().collect(), nav_at_press: 0, seats: Vec::new(), clean: Some(crate::support::CleanRecover { words: words.to_string(), wait }) })
+    };
+    let said = std::cell::RefCell::new(None);
+    let over = |named, current, halves| crate::tick::recover_over(&rig.app, named, (&list[..], current, halves), &said, &rig.log, &rig.model, rig.now, "D:/shoot", &rig.counters.1, &rig.counts_unread);
+    let nothing_said = || {
+        rig.tick();
+        assert!(rig.rows().is_empty() && rig.pending.borrow().is_empty(), "no row, ever");
+        assert_eq!(rig.counters.0.get(), 0, "and no bell");
+    };
+
+    // It landed on screen: the photo is the word.
+    over(named(), 1, None);
+    assert!(!rig.app.get_toast_show(), "nothing to say");
+    nothing_said();
+    // The person has moved on: it's only in the strip, so the card names it, briefly.
+    over(named(), 3, None);
+    assert_eq!(rig.app.get_toast_text().as_str(), words);
+    assert_eq!((rig.counters.1.get(), rig.app.get_toast_kind(), rig.counts_unread.get()), (5_000, 0, false));
+    nothing_said();
+    assert_eq!(rig.app.get_toast_role(), crate::tick::CARD_RECOVERED);
+    // Any Del clears it, at the press, and a clean delete's card is no "+1" on it.
+    crate::tick::clear_recovered_card(&rig.app, &rig.counters.1);
+    assert!(!rig.app.get_toast_show(), "gone at the press");
+    over(named(), 3, None);
+    rig.deleted(2, &[notif_photo("EEL", false)]);
+    assert_eq!(rig.app.get_toast_more(), 0, "no +1");
+    assert_eq!(rig.app.get_toast_role(), crate::tick::CARD_CLEAN_DELETE);
+    crate::tick::clear_recovered_card(&rig.app, &rig.counters.1);
+    assert!(rig.app.get_toast_show(), "and that clears only a Recovered card");
+    rig.pass(3_001);
+    rig.log.borrow_mut().clear();
+    rig.rebuild();
+
+    // Compare: in either half it's there to be seen. In neither, it went back to the strip.
+    over(named(), 0, Some((1, 2)));
+    assert!(!rig.app.get_toast_show(), "in half A");
+    over(named(), 2, Some((0, 1)));
+    assert!(!rig.app.get_toast_show(), "in half B, with the focus on A or B");
+    over(named(), 0, Some((0, 2)));
+    assert_eq!(rig.app.get_toast_text().as_str(), words, "in neither half");
+    rig.pass(5_001);
+    assert!(!rig.app.get_toast_show());
+
+    // A partial said its piece in its row, and has nothing left to say here.
+    let partial = named().map(|n| crate::support::Named { clean: None, ..n });
+    over(partial, 3, None);
+    assert!(!rig.app.get_toast_show());
+    over(None, 3, None);
+    assert!(!rig.app.get_toast_show(), "nor does a landing with no Recover");
+
+    // The panel open: a card would be behind it, and no row is pushed. A red holds its seconds.
+    rig.app.set_notif_open(true);
+    over(named(), 3, None);
+    assert!(!rig.app.get_toast_show());
+    nothing_said();
+    rig.app.set_notif_open(false);
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::error("a red line", rig.now));
+    rig.tick();
+    over(named(), 3, None);
+    assert_eq!(rig.app.get_toast_text().as_str(), "a red line");
+}
+
+/// R17, R36: "Look at it here and make sure a person is never left wondering." A clean Recover says nothing at its
+/// job's report, so the message it may have raised stays until the photo lands. On the card or as a row with
+/// the panel open. Whichever way the wait falls, job or listing, it's the one from the press:
+/// `file_queue`'s `a_clean_recovers_wait_lasts_until_the_landing`. The tick's wiring is by source.
+///
+/// FALSIFIER (L28): `recover_over` doesn't retire: the card stays. It retires before a wait's own: its row. The tick retires at a clean
+/// report (`ends_wait` answers its stamp): the source row. The Land arm doesn't ask `recover_over`: the source row.
+#[test]
+fn the_working_message_stays_until_the_photo_lands() {
+    let rig = NotifRig::new("D:/shoot");
+    let (toast_left, working) = (&rig.counters.1, "Recovering ANT…");
+    let say = || crate::say_edit_result(&rig.app, &rig.counts_unread, toast_left, &rig.pending, "D:/shoot", working, 10_000, None);
+    let list = [notif_photo("ANT", false), notif_photo("BEE", false)];
+    let named = || {
+        let wait = crate::file_queue::Waited { seq: 1, pressed: rig.now, text: working.to_string() };
+        Some(crate::support::Named { files: list[0].jpg.clone().into_iter().collect(), nav_at_press: 0, seats: Vec::new(), clean: Some(crate::support::CleanRecover { words: "Recovered ANT".to_string(), wait }) })
+    };
+    let said = std::cell::RefCell::new(None);
+    let over = |named, current| crate::tick::recover_over(&rig.app, named, (&list[..], current, None), &said, &rig.log, &rig.model, rig.now, "D:/shoot", toast_left, &rig.counts_unread);
+
+    // Said, and the photo lands on screen: it goes, and nothing else comes.
+    say();
+    *said.borrow_mut() = Some((1, working.to_string()));
+    assert_eq!(rig.app.get_toast_text().as_str(), working);
+    over(None, 0);
+    assert!(rig.app.get_toast_show() && said.borrow().is_some(), "a landing that isn't its own leaves it");
+    over(named(), 0);
+    assert!(!rig.app.get_toast_show() && said.borrow().is_none(), "it goes with the landing");
+    // The person moved on meanwhile: the short card takes its place, at once.
+    say();
+    *said.borrow_mut() = Some((1, working.to_string()));
+    over(named(), 1);
+    assert_eq!(rig.app.get_toast_text().as_str(), "Recovered ANT");
+    assert!(said.borrow().is_none());
+    rig.pass(5_001);
+    // With the panel open it was a row, and the row goes: "no Recovering stands forever".
+    rig.app.set_notif_open(true);
+    say();
+    *said.borrow_mut() = Some((1, working.to_string()));
+    rig.tick();
+    assert_eq!(rig.rows().iter().map(|r| r.text.to_string()).collect::<Vec<_>>(), [working]);
+    over(named(), 0);
+    assert!(rig.rows().is_empty());
+    rig.app.set_notif_open(false);
+
+    // The tick: a report ends a wait only if it speaks, and every end of a landing asks.
+    let main = include_str!("main.rs");
+    let tick = main.split_once("for done in file_queue_t.take_results() {").expect("the drain").1;
+    let report = tick.split_once("file_queue::fold_file_done(done,").expect("the fold").0;
+    assert!(report.contains("let ended = done.ends_wait();") && report.contains("Some(*seq) == ended"), "by what it ends:\n{report}");
+    let landings = tick.split_once("let accepted = {").expect("the acceptance").1;
+    let arms = landings.split_once("// R8: a Ctrl+Z pressed while").expect("the arms").0;
+    assert!(arms.contains("file_queue::Acceptance::Failed => recover_over(file_queue::no_landing(&file_history_t, &undo_stack_t, &landing_name_t, None)),"), "a folder that couldn't be read");
+    assert!(arms.contains("recover_over(file_queue::no_landing(&file_history_t, &undo_stack_t, &landing_name_t, Some(&on_screen)));"), "a listing that found nothing changed");
+    assert!(arms.contains("recover_over(named);"), "a landing");
+    assert!(tick.contains("recover_over(file_queue::no_landing(&file_history_t, &undo_stack_t, &landing_name_t, None));"), "a folder off screen");
+}
+
+// ── Delete round, commit 10: THE FOLD (R32 to R40). The real `step_notifs`, real presses, jobs and folds,
+// and the real Recover presses (`NotifRig::recover`), on the real model. ──────────────────────────────────
+
+/// R32: "the top row of the list: clean single deletes in this folder with a record join it." Stars and arrows
+/// raise no row, so a run goes on through them, and time doesn't end it. A row of one is an ordinary row, with
+/// Recover and no arrow. Two or more: "Sent 3 photos to the Recycle Bin", naming none of them (`seq` −1, so the
+/// pinned row names Ctrl+Z's target), and the lines each name a photo, with its own Recover and stamp. The card
+/// still names each delete (R29). Twice over (L53).
+///
+/// FALSIFIER (L28): `join_or_push` always pushes: the first row's count. It joins a row of any kind: the
+/// selection row. `refold` keeps the run's `seq` at its newest: the row's stamp. It counts the joining line twice
+/// or not at all: the heading. Lines lose their stamps or the newest isn't first: the lines.
+#[test]
+fn a_run_is_one_row_and_stars_do_not_split_it() {
+    let rig = NotifRig::new("D:/shoot");
+    let (sent, run) = (crate::platform::sent_one_text, crate::platform::sent_run_text);
+    rig.deleted(1, &[notif_photo("ANT", false)]);
+    assert_eq!(rig.folds(), [(sent("ANT"), 1, true, 1)], "a row of one is an ordinary row, with Recover and no arrow");
+    // A star, an arrow, a moment: nothing raises a row, so nothing ends the run.
+    crate::support::push_undo(&rig.undo, 2, 0, 3, 0);
+    rig.pass(40_000);
+    rig.deleted(3, &[notif_photo("BEE", true)]);
+    assert_eq!(rig.card().0, sent("BEE [RAW+JPG]"), "the card names this delete");
+    rig.deleted(4, &[notif_photo("CAT", false)]);
+    assert_eq!(rig.folds(), [(run(3), -1, false, 3)], "one row, naming none of them");
+    assert_eq!(rig.card(), (sent("CAT"), 4, true), "and the card names the newest, with its Recover");
+    rig.toggle(0);
+    assert_eq!(rig.lines(0), [
+        ("CAT".to_string(), String::new(), 4, true, false),
+        ("BEE".to_string(), "[RAW+JPG]".to_string(), 3, true, false),
+        ("ANT".to_string(), String::new(), 1, true, false),
+    ], "each photo, newest first, with its own way back");
+    assert!(rig.rows()[0].open && rig.rows()[0].more == 0);
+    // Again, after another row: a second run.
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::info("a background copy finished", rig.now));
+    rig.tick();
+    rig.deleted(5, &[notif_photo("DOG", false)]);
+    crate::support::push_undo(&rig.undo, 6, 0, 2, 0);
+    rig.deleted(7, &[notif_photo("EEL", false)]);
+    assert_eq!(rig.folds()[0], (run(2), -1, false, 2));
+    assert_eq!(rig.folds().len(), 3, "the run, the copy's row, the first run");
+    assert_eq!(rig.folds()[2].3, 3, "which still holds its three");
+    // A selection deleted together is its own row, and the next delete one at a time doesn't join it.
+    rig.deleted(8, &[notif_photo("FOX", false), notif_photo("GNU", false)]);
+    rig.deleted(9, &[notif_photo("HEN", false)]);
+    assert_eq!(rig.folds()[..2], [(sent("HEN"), 9, true, 1), (crate::platform::sent_selected_text(2), 8, true, 2)]);
+}
+
+/// R32: "Any other row landing on top ends it." Move rejected's row, a red delete, a selection, a delete in another
+/// folder: each is a row of its own, and the next clean delete starts a new run above it. Never a run further down.
+///
+/// FALSIFIER (L28): `join_or_push` finds a run anywhere in the list, not only on top: every row. It drops the folder
+/// from the key: the other folder's row. A problem folds (`run_delete`'s seed): the red row and the partial selection.
+#[test]
+fn another_row_ends_a_run() {
+    /// The bin refuses these photos' files, as when another program holds them open.
+    struct Refuses(&'static [&'static str]);
+    impl crate::file_queue::FileIo for Refuses {
+        fn barrier(&self) {}
+        fn list_files(&self, targets: &[crate::Shot]) -> Vec<std::path::PathBuf> {
+            crate::file_queue::FileIo::list_files(&BinTakesAll, targets)
+        }
+        fn recycle(&self, paths: &[std::path::PathBuf]) -> crate::file_queue::Recycled {
+            let taken: Vec<std::path::PathBuf> = paths.iter().filter(|p| !self.0.iter().any(|n| p.file_stem().is_some_and(|s| s == *n))).cloned().collect();
+            crate::file_queue::FileIo::recycle(&BinTakesAll, &taken)
+        }
+    }
+    let rig = NotifRig::new("D:/shoot");
+    let refused = |seq: u64, photos: &[crate::Shot], names: &'static [&'static str]| {
+        let done = crate::file_queue::run_job(rig.press(seq, photos), &Refuses(names));
+        let to = crate::file_queue::FoldTo { history: &rig.history, pending: &rig.pending, landing_name: &rig.landing_name, reread: &rig.reread };
+        crate::file_queue::fold_file_done(done, &to, rig.now);
+        rig.tick();
+    };
+    let (sent, run) = (crate::platform::sent_one_text, crate::platform::sent_run_text);
+    rig.deleted(1, &[notif_photo("ANT", false)]);
+    rig.deleted(2, &[notif_photo("BEE", false)]);
+    rig.history.borrow_mut().push_move(crate::support::MoveRecord { folder: "D:/shoot".to_string(), pairs: vec![("D:/shoot/CAT.JPG".into(), "D:/shoot/Rejected/CAT.JPG".into())], seq: 3, steps: Vec::new(), subject: "CAT".to_string() });
+    rig.move_armed.set(Some(3));
+    *rig.slot.lock().unwrap() = Some(("Moved CAT".to_string(), crate::support::OpSeverity::from_err(false), 1, Some("D:/shoot".to_string())));
+    rig.tick();
+    rig.deleted(4, &[notif_photo("DOG", false)]);
+    rig.deleted(5, &[notif_photo("EEL", false)]);
+    let red = "Couldn't delete FOX, another program may have it open. It's still in the folder.";
+    refused(6, &[notif_photo("FOX", false)], &["FOX"]);
+    rig.deleted(7, &[notif_photo("GNU", false)]);
+    rig.deleted_on("E:/other", 8, &[notif_photo("HEN", false)], crate::support::DeleteRoute::Bin { asks: false });
+    rig.deleted(9, &[notif_photo("IBX", false)]);
+    assert_eq!(rig.folds(), [
+        (sent("IBX"), 9, true, 1),
+        (sent("HEN"), 8, false, 1), // its Recover is for its own folder
+        (sent("GNU"), 7, true, 1),
+        (red.to_string(), -1, false, 0),
+        (run(2), -1, false, 2),
+        ("Moved CAT".to_string(), 3, false, 0),
+        (run(2), -1, false, 2),
+    ], "each other row ends a run, and a delete in another folder is a row of that folder's");
+    // The second time round: the run on top goes on.
+    rig.deleted(10, &[notif_photo("JAY", false)]);
+    assert_eq!(rig.folds()[0], (run(2), -1, false, 2));
+    // Part of a selection stayed: its own row, red, with its Recover, and no fold. The next delete starts afresh.
+    refused(11, &[notif_photo("KOI", false), notif_photo("LYN", false)], &["LYN"]);
+    rig.deleted(12, &[notif_photo("MOA", false)]);
+    assert_eq!(rig.folds()[..2], [(sent("MOA"), 12, true, 1), (format!("Sent 1 of 2 photos to the {}. 1 is still in the folder.", crate::platform::bin_noun()), 11, true, 0)]);
+}
+
+/// R33, R36: "Ctrl+Z: brings back the newest. 30 becomes 29 and its line leaves." At one the row reads by name, as
+/// an ordinary row with Recover and no arrow (and no longer open), and at none it goes: the bell list is what's
+/// still gone. Ctrl+Z reaches the newest line each time, and the job brings back that photo's files. Twice (L53).
+///
+/// FALSIFIER (L28): `taken_back` only retires the pill: the count. It leaves an empty row: the last row. It keeps
+/// the fold open at one (`Fold::settle`): the open row. `line_rim` ignores a closed fold: the rim rows.
+#[test]
+fn ctrl_z_takes_the_newest_line_and_the_count_drops() {
+    let rig = NotifRig::new("D:/shoot");
+    let (sent, run) = (crate::platform::sent_one_text, crate::platform::sent_run_text);
+    let arm = |rig: &NotifRig| crate::support::live_undo_arm(None, rig.history.borrow().delete_arm("D:/shoot"), "D:/shoot", None);
+    for round in 0..2u64 {
+        let s = round * 10;
+        for (photo, seq) in [("ANT", s + 1), ("BEE", s + 2), ("CAT", s + 3)] {
+            rig.deleted(seq, &[notif_photo(photo, false)]);
+        }
+        assert_eq!(rig.folds(), [(run(3), -1, false, 3)], "round {round}");
+        rig.toggle(0);
+        assert_eq!(crate::tick::line_rim(&rig.log.borrow(), Some(s + 3), true), (s + 3) as i32, "round {round}: open, Undo's rim is on the newest line");
+        // Ctrl+Z: what the arm names, the newest.
+        assert_eq!(arm(&rig), Some(crate::support::UndoArm::Delete(s + 3)));
+        assert!(rig.recover(s + 3));
+        assert_eq!(rig.folds(), [(run(2), -1, false, 2)], "round {round}: 3 becomes 2");
+        assert_eq!(rig.lines(0).iter().map(|l| l.0.as_str()).collect::<Vec<_>>(), ["BEE", "ANT"], "round {round}: and its line has left");
+        assert_eq!(crate::tick::line_rim(&rig.log.borrow(), Some(s + 2), true), (s + 2) as i32, "round {round}: the rim moves on");
+        assert_eq!(arm(&rig), Some(crate::support::UndoArm::Delete(s + 2)));
+        assert!(rig.recover(s + 2));
+        assert_eq!(rig.folds(), [(sent("ANT"), (s + 1) as i32, true, 1)], "round {round}: at one, an ordinary row by name");
+        assert!(!rig.rows()[0].open, "round {round}: and no longer open");
+        assert_eq!(crate::tick::line_rim(&rig.log.borrow(), Some(s + 1), true), -1, "round {round}: the row has the rim now");
+        assert!(rig.recover(s + 1));
+        assert!(rig.folds().is_empty(), "round {round}: at none the row goes");
+        assert_eq!(rig.recovered_files(), [["CAT.JPG"], ["BEE.JPG"], ["ANT.JPG"]], "round {round}: each press brought back its own");
+    }
+    // Closed, the rim has no line to sit on, and the pinned row names the target (by source, in the tick).
+    rig.deleted(31, &[notif_photo("DOG", false)]);
+    rig.deleted(32, &[notif_photo("EEL", true)]);
+    assert_eq!(crate::tick::line_rim(&rig.log.borrow(), Some(32), true), -1);
+}
+
+/// R33 (owner: "2 can use the foldable notification"): "lines each with their own Recover, plus a Recover for all
+/// on the heading. ... Ctrl+Z brings back everything left in one press. The record holds per-photo file groups so a
+/// line can restore one photo; the count drops; at one left it reads by name." A photo's side files go with it.
+///
+/// FALSIFIER (L28): `split_photo` takes the whole record, or no side file: the job's files. It leaves the photo in
+/// the selection: Ctrl+Z's files. `line_recover_target` recovers the selection for a line: the first job. The
+/// selection forgets it reads by name at one: the last rows. Steps don't split: BEE's star.
+#[test]
+fn a_selection_line_restores_one_photo_and_ctrl_z_the_rest() {
+    struct WithSides;
+    impl crate::file_queue::FileIo for WithSides {
+        fn barrier(&self) {}
+        fn list_files(&self, targets: &[crate::Shot]) -> Vec<std::path::PathBuf> {
+            targets.iter().flat_map(|s| {
+                let raw = s.raw.iter().flat_map(|r| [r.clone(), falcon_decode::sidecar_path_for(r, true)]);
+                let jpg = s.jpg.iter().flat_map(|j| [j.clone(), falcon_decode::sidecar_path_for(j, false)]);
+                raw.chain(jpg).collect::<Vec<_>>()
+            }).collect()
+        }
+        fn recycle(&self, paths: &[std::path::PathBuf]) -> crate::file_queue::Recycled {
+            crate::file_queue::FileIo::recycle(&BinTakesAll, paths)
+        }
+    }
+    let rig = NotifRig::new("D:/shoot");
+    let photos = [notif_photo("ANT", false), notif_photo("BEE", true), notif_photo("CAT", false)];
+    // BEE had a star, deleted with the selection: its step goes with BEE.
+    crate::support::push_undo(&rig.undo, 1, 1, 0, 0);
+    let job = rig.press(2, &photos);
+    // R35: each photo's picture, a different size for each, held in another order than the lines': by photo.
+    for (photo, w) in [("CAT", 3), ("ANT", 1), ("BEE", 2)] {
+        rig.history.borrow_mut().hold_picture(2, photo, slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, 1)));
+    }
+    let done = crate::file_queue::run_job(job, &WithSides);
+    let to = crate::file_queue::FoldTo { history: &rig.history, pending: &rig.pending, landing_name: &rig.landing_name, reread: &rig.reread };
+    crate::file_queue::fold_file_done(done, &to, rig.now);
+    rig.tick();
+    assert_eq!(rig.folds(), [(crate::platform::sent_selected_text(3), 2, true, 3)], "one row, with a Recover for all");
+    let widths = |rig: &NotifRig| rig.log.borrow()[0].fold.as_ref().map(|f| f.lines.iter().map(|l| (l.name.clone(), l.picture.size().width)).collect::<Vec<_>>());
+    assert_eq!(widths(&rig), Some(vec![("ANT".to_string(), 1), ("BEE".to_string(), 2), ("CAT".to_string(), 3)]), "each line its own picture");
+    assert!(rig.log.borrow()[0].picture.is_none() && !rig.app.get_toast_picture_on(), "and the card names no one photo");
+    rig.toggle(0);
+    assert_eq!(rig.lines(0).iter().map(|l| (l.0.as_str(), l.1.as_str(), l.2, l.3)).collect::<Vec<_>>(), [("ANT", "", 2, true), ("BEE", "[RAW+JPG]", 2, true), ("CAT", "", 2, true)]);
+    // BEE's line: BEE comes back, files and side files, and the selection keeps the other two.
+    assert!(rig.recover_line(2, "BEE", 90));
+    let bee = ["BEE.CR3", "BEE.xmp", "BEE.JPG", "BEE.JPG.xmp"];
+    assert_eq!(rig.recovered_files(), [bee.map(String::from).to_vec()], "that one photo, with its side files");
+    assert_eq!(rig.folds(), [(crate::platform::sent_selected_text(2), 2, true, 2)], "the count drops");
+    assert_eq!(rig.lines(0).iter().map(|l| l.0.as_str()).collect::<Vec<_>>(), ["ANT", "CAT"]);
+    {
+        let hist = rig.history.borrow();
+        let record = hist.delete_by_seq(2).expect("the selection is still there");
+        assert_eq!((record.photos, record.files().len()), (2, 4), "its two photos and their side files");
+        assert!(record.steps.is_empty() && hist.on_the_way.iter().any(|(s, steps)| *s == 90 && steps.iter().any(|st| st.name == "BEE")), "BEE's star went with BEE");
+    }
+    // Ctrl+Z: what's left, in one press.
+    assert_eq!(crate::support::live_undo_arm(None, rig.history.borrow().delete_arm("D:/shoot"), "D:/shoot", None), Some(crate::support::UndoArm::Delete(2)));
+    assert!(rig.recover(2));
+    assert_eq!(rig.recovered_files(), [["ANT.JPG", "ANT.JPG.xmp", "CAT.JPG", "CAT.JPG.xmp"].map(String::from).to_vec()]);
+    assert!(rig.folds().is_empty(), "and the row has gone");
+
+    // A selection of two: a line's Recover leaves one, by name, as an ordinary row. Then its line takes the rest.
+    rig.deleted(3, &[notif_photo("DOG", false), notif_photo("EEL", true)]);
+    rig.toggle(0);
+    assert!(rig.recover_line(3, "DOG", 91));
+    assert_eq!(rig.folds(), [(crate::platform::sent_one_text("EEL [RAW+JPG]"), 3, true, 1)], "at one left it reads by name");
+    assert!(!rig.rows()[0].open);
+    assert_eq!(rig.history.borrow().delete_by_seq(3).map(|r| (r.photos, r.shown_name())), Some((0, "EEL [RAW+JPG]".to_string())));
+    assert!(rig.recover_line(3, "EEL", 92), "the last photo's own Recover is the selection's");
+    assert_eq!(rig.recovered_files(), [vec!["DOG.JPG".to_string()], vec!["EEL.CR3".to_string(), "EEL.JPG".to_string()]]);
+    assert!(rig.folds().is_empty() && !rig.history.borrow().has_delete(3));
+    // A line for a photo the record doesn't hold takes nothing.
+    rig.deleted(4, &[notif_photo("FOX", false), notif_photo("GNU", false)]);
+    assert!(!rig.recover_line(4, "HEN", 93));
+    assert!(rig.history.borrow().has_delete(4));
+}
+
+/// R37: "A recovered line with the panel open stays, dimmed, reading "Recovered", pill inert at the click, until the
+/// panel closes, so the next line can't slide under the pointer. `run` drops it at once, so the count and `e.seq` are
+/// right." A row of one the same. The panel's close, by any route, is what lets them go.
+///
+/// FALSIFIER (L28): `taken_back` ignores the panel: the lines go at once. The line stays live: its pill. The count
+/// keeps it: the heading. `step_notifs` doesn't purge on a closed panel, or purges with it open: the close rows.
+#[test]
+fn a_recovered_line_stays_until_the_panel_closes() {
+    let rig = NotifRig::new("D:/shoot");
+    let (sent, run) = (crate::platform::sent_one_text, crate::platform::sent_run_text);
+    for (photo, seq) in [("ANT", 1), ("BEE", 2), ("CAT", 3)] {
+        rig.deleted(seq, &[notif_photo(photo, false)]);
+    }
+    rig.app.set_notif_open(true);
+    rig.toggle(0);
+    // BEE's line, in the middle.
+    assert!(rig.recover(2));
+    assert_eq!(rig.lines(0), [
+        ("CAT".to_string(), String::new(), 3, true, false),
+        ("BEE".to_string(), String::new(), 2, true, true),
+        ("ANT".to_string(), String::new(), 1, true, false),
+    ], "it stays where it was, dimmed, and CAT and ANT stay put");
+    assert_eq!(rig.folds(), [(run(2), -1, false, 3)], "and the count is right");
+    rig.tick();
+    rig.pass(1_100);
+    assert_eq!(rig.lines(0).len(), 3, "it stays while the panel is open");
+    // CAT's too: one left, and the fold holds still.
+    assert!(rig.recover(3));
+    assert_eq!(rig.folds(), [(run(1), -1, false, 3)]);
+    assert!(rig.rows()[0].open);
+    // The panel closes: what came back goes, and ANT is an ordinary row again.
+    rig.app.set_notif_open(false);
+    rig.tick();
+    assert_eq!(rig.folds(), [(sent("ANT"), 1, true, 1)]);
+    assert!(!rig.rows()[0].open);
+    // A row of one, the same: dimmed, reading "Recovered", with no pill, until the panel closes.
+    rig.app.set_notif_open(true);
+    rig.tick();
+    assert!(rig.recover(1));
+    let row = rig.rows()[0].clone();
+    assert_eq!((row.text.to_string(), row.recover, row.recovered), (sent("ANT"), false, true));
+    rig.pass(2_000);
+    assert!(rig.rows()[0].recovered, "still there");
+    rig.app.set_notif_open(false);
+    rig.tick();
+    assert!(rig.rows().is_empty(), "and gone once it closes");
+}
+
+/// R32: "The run key includes has-record, so "Deleted … for good" never joins "Sent …"." A card's or a stick's
+/// deletes one at a time fold among themselves, with no Recover on their lines (R39: `Option` seq), and a photo only
+/// in the cloud is a row of its own, as its dialog asked about it.
+///
+/// FALSIFIER (L28): drop `to_bin` from the key: the second row. Fold a cloud-only photo: the cloud row. Give a
+/// for-good line a stamp: its lines.
+#[test]
+fn no_bin_rows_never_join_a_sent_run() {
+    let rig = NotifRig::new("D:/shoot");
+    let good = |photo: &str| crate::platform::deleted_one_text(crate::platform::GoneFrom::Drive, photo);
+    let no_bin = || crate::support::DeleteRoute::NoBin;
+    rig.deleted(1, &[notif_photo("ANT", false)]);
+    rig.deleted_on("D:/shoot", 2, &[notif_photo("BEE", false)], no_bin());
+    assert_eq!(rig.folds(), [(good("BEE"), -1, false, 1), (crate::platform::sent_one_text("ANT"), 1, true, 1)], "a for-good delete is no Sent");
+    rig.deleted_on("D:/shoot", 3, &[notif_photo("CAT", true)], no_bin());
+    assert_eq!(rig.folds()[0], (crate::platform::deleted_many_text(crate::platform::GoneFrom::Drive, 2), -1, false, 2), "the card's deletes fold among themselves");
+    rig.toggle(0);
+    assert_eq!(rig.lines(0), [("CAT".to_string(), "[RAW+JPG]".to_string(), -1, false, false), ("BEE".to_string(), String::new(), -1, false, false)], "with nothing to bring back");
+    rig.deleted(4, &[notif_photo("DOG", false)]);
+    assert_eq!(rig.folds()[0], (crate::platform::sent_one_text("DOG"), 4, true, 1), "and a Sent never joins them");
+    // Only in the cloud: a row of its own, and the next delete starts afresh.
+    rig.deleted_on("D:/shoot", 5, &[notif_photo("EEL", false)], crate::support::DeleteRoute::CloudOnly(vec!["EEL".to_string()]));
+    rig.deleted_on("D:/shoot", 6, &[notif_photo("FOX", false)], crate::support::DeleteRoute::CloudOnly(vec!["FOX".to_string()]));
+    assert_eq!(rig.folds().iter().take(2).map(|r| r.3).collect::<Vec<_>>(), [0, 0], "two rows, neither folds");
+}
+
+/// R34: "Open folds tracked by a stable run id (first line's seq), resolved inside the rebuild." A row above an open
+/// fold going, or a row landing above it, leaves it open on its own lines, and the lines' own model is the same
+/// one, changed in place, so a hovered Recover doesn't bounce. Several can be open, and all collapse on a panel open.
+///
+/// FALSIFIER (L28): `toggle_fold` finds the first fold, not its id: the lower fold's row. `rebuild_notif_model` makes
+/// the lines a new model: the identity row. `on_toggle_notif` doesn't collapse (by source) or `collapse_folds` misses
+/// one: the last row.
+#[test]
+fn open_fold_survives_a_row_above_it_going() {
+    let rig = NotifRig::new("D:/shoot");
+    rig.deleted(1, &[notif_photo("ANT", false)]);
+    rig.deleted(2, &[notif_photo("BEE", false)]);
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::warn("a warning", rig.now));
+    rig.tick();
+    rig.deleted(3, &[notif_photo("CAT", false)]);
+    rig.deleted(4, &[notif_photo("DOG", false)]);
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::info("a copy finished", rig.now));
+    rig.tick();
+    // The lower run, ANT and BEE, open.
+    rig.toggle(3);
+    let opened = |rig: &NotifRig| rig.rows().iter().map(|r| r.open).collect::<Vec<_>>();
+    assert_eq!(opened(&rig), [false, false, false, true]);
+    let lines = rig.rows()[3].lines.clone();
+    // The row on top goes (×, as `on_notif_dismiss` does it), and a row lands above it.
+    rig.log.borrow_mut().remove(0);
+    rig.rebuild();
+    assert_eq!(opened(&rig), [false, false, true], "it's still the open one");
+    assert_eq!(rig.lines(2).iter().map(|l| l.0.as_str()).collect::<Vec<_>>(), ["BEE", "ANT"], "on its own lines");
+    rig.pending.borrow_mut().push(crate::tick::NotifEntry::info("another", rig.now));
+    rig.tick();
+    assert_eq!(opened(&rig), [false, false, false, true]);
+    assert!(rig.rows()[3].lines == lines, "the same lines, changed in place");
+    rig.pass(6_000);
+    rig.rebuild();
+    assert!(rig.rows()[3].lines == lines, "also when the times change");
+    // The upper one too: both open.
+    rig.toggle(1);
+    assert_eq!(opened(&rig), [false, true, false, true]);
+    crate::tick::collapse_folds(&mut rig.log.borrow_mut());
+    rig.rebuild();
+    assert_eq!(opened(&rig), [false; 4], "all collapse");
+    // R34: the newest 50 lines, then "Show 50 more", here 4.
+    for seq in 5..59 {
+        rig.deleted(seq, &[notif_photo(&format!("P{seq:02}"), false)]);
+    }
+    assert_eq!(rig.rows()[0].fold, 54, "one run of 54");
+    rig.toggle(0);
+    assert_eq!((rig.lines(0).len(), rig.rows()[0].more), (50, 4), "the newest 50, and 4 more to show");
+    assert_eq!((rig.lines(0)[0].0.as_str(), rig.lines(0)[49].0.as_str()), ("P58", "P09"));
+    assert!(crate::tick::show_more_lines(&mut rig.log.borrow_mut(), rig.rows()[0].fold_id as u64));
+    rig.rebuild();
+    assert_eq!((rig.lines(0).len(), rig.rows()[0].more), (54, 0), "all of them");
+    assert_eq!(rig.lines(0)[53].0, "P05");
+
+    let main = include_str!("main.rs");
+    let toggle = main.split_once("app.on_toggle_notif(move || {").expect("the bell").1.split_once("app.on_notif_clear(").expect("its end").0;
+    assert!(toggle.contains("tick::collapse_folds(&mut log_tn.borrow_mut()); // R34: all collapse on a panel open"), "on a panel open");
+}
+
+/// R39: "`line.recover = e.dir == live_dir`, and one sentence inside a fold from another folder". A line there
+/// offers nothing and its Recover takes nothing; coming back offers them again. A press from another folder says
+/// so by name, in the fold's words.
+///
+/// FALSIFIER (L28): `sync_lines` ignores the folder: the lines. `away` is never set: the row. `line_recover_target`
+/// takes it anyway: the press. The refusal keeps the old words: its pin.
+#[test]
+fn a_line_in_another_folder_offers_no_recover() {
+    let rig = NotifRig::new("D:/shoot");
+    rig.deleted(1, &[notif_photo("ANT", false)]);
+    rig.deleted(2, &[notif_photo("BEE", false)]);
+    rig.deleted(3, &[notif_photo("CAT", false), notif_photo("DOG", false)]);
+    rig.toggle(0);
+    rig.toggle(1);
+    *rig.live_dir.borrow_mut() = "E:/other".to_string();
+    rig.rebuild();
+    for row in [0, 1] {
+        assert!(rig.rows()[row].away, "row {row}: about another folder");
+        assert!(rig.lines(row).iter().all(|l| !l.3), "row {row}: so its lines offer nothing");
+    }
+    assert!(!rig.rows()[0].recover, "nor the selection's own");
+    assert!(!rig.recover_line(1, "ANT", 90) && !rig.recover_line(3, "CAT", 91), "and nothing is taken");
+    assert!(rig.history.borrow().has_delete(1) && rig.history.borrow().has_delete(3));
+    *rig.live_dir.borrow_mut() = "D:/shoot".to_string();
+    rig.rebuild();
+    assert!(!rig.rows()[1].away && rig.lines(1).iter().all(|l| l.3), "back in the folder, they offer it again");
+    assert_eq!(crate::platform::cross_folder_recover_text("ANT", 0), "ANT is in another folder. Go back to it to bring it back.");
+    let ui = include_str!("../ui/main_window.slint");
+    assert!(ui.contains(r#"if row.open && row.away : nlinesaway := Text {"#) && ui.contains(r#"@tr("falcon" => "These are in another folder. Go back to it to bring them back.")"#), "the sentence, inside the open fold");
+}
+
+/// R38, R40 and the fold's handlers, by source: the pinned row names Ctrl+Z's target when no row or open line has
+/// it, in its own grammar without "Deleted"; a line's rim comes from the same derivation; a Recover's press takes
+/// the line through `taken_back`; a fold line's Recover through `line_recover_target`; a join inherits R9's drop.
+///
+/// FALSIFIER (L28): any of the lines below goes, or the pinned row keeps "Deleted — {photo}".
+#[test]
+fn the_folds_handlers_are_wired() {
+    let main = include_str!("main.rs").replace("\r\n", "\n");
+    let surfaces = main.split_once("'surfaces: {").expect("the tick's surfaces").1.split_once("step_immersive_reveal(").expect("their end").0;
+    assert!(surfaces.contains("let undo_line = tick::line_rim(&log, target, app.get_notif_open());") && surfaces.contains("app.set_undo_target_line(undo_line);"));
+    assert!(surfaces.contains("let matched = if undo_line >= 0 { i32::MAX } else { undo_row };"), "a line's rim and the pinned row are never both");
+    assert!(surfaces.contains("Some(support::UndoArm::Delete(s)) if matched < 0 => {\n                        hist.delete_by_seq(s).map_or_else(String::new, |r| platform::pinned_sent_text(&r.shown_name()))"));
+    assert!(!surfaces.contains("Deleted — {photo}"));
+    let recover = main.split_once("app.on_recover_delete(move |seq| {").expect("the handler").1.split_once("let shots_fr = shots.clone();").expect("its end").0;
+    assert!(recover.contains("tick::taken_back(&mut log_rc.borrow_mut(), seq, None, app.get_notif_open());"));
+    let line = main.split_once("app.on_recover_line(move |seq, photo| {").expect("the line's handler").1.split_once("\n        });").expect("its end").0;
+    assert!(line.contains("tick::line_recover_target(&history_rl, seq as u64, photo.as_str(), &live_dir, || next_act_seq(&aseq_rl))"));
+    assert!(line.contains("app.invoke_recover_delete(take as i32);") && line.contains("tick::taken_back(&mut log_rl.borrow_mut(), seq as u64, Some(&photo), app.get_notif_open());"));
+    let tick = include_str!("tick.rs").replace("\r\n", "\n");
+    let fold = tick.split_once("pub(crate) fn step_notifs(").expect("step_notifs").1;
+    let (retain, join) = (fold.find("p.retain_mut(|e| delete_result_still_true(e, &history.borrow())); // R9").expect("R9"), fold.find("join_or_push(&mut lg, e); // R32").expect("the join"));
+    assert!(retain < join, "R40: the join inherits `has_delete`");
+    assert_eq!(crate::platform::pinned_sent_text("EEL [RAW+JPG]"), format!("Sent to the {} — EEL [RAW+JPG]", crate::platform::bin_noun()));
+}
+
+/// R34, R35 on the real window: an open fold's lines sit under the heading's text column, each with its 32 px
+/// picture, its name with the pair's label kept whole (only the name shortens), the time under it, and its own
+/// Recover inside the card. The arrow is a 24 px box beside the ×, and the whole heading opens the fold, while its
+/// × keeps its own click. The row's height takes the open lines.
+///
+/// FALSIFIER (L28): drop the tag's `min-width`: the long name's tag row. Lines lose their column: the x row. The
+/// heading's hit target goes, or covers the ×: the click rows. The row's height leaves the lines out: the height row.
+#[test]
+fn an_open_folds_lines_fit_the_card() {
+    use i_slint_backend_testing::ElementHandle as E;
+    use i_slint_core::items::PointerEventButton::Left;
+    let rig = NotifRig::new("D:/shoot");
+    let long = "20261103_152233_A7R05123_FINAL_EDIT_SELECTS_V2";
+    for (photo, seq, pair) in [("ANT", 1, false), (long, 2, true), ("CAT", 3, false)] {
+        let job = rig.press(seq, &[notif_photo(photo, pair)]);
+        rig.history.borrow_mut().hold_picture(seq, photo, slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(6, 4)));
+        rig.report(job);
+        rig.tick();
+    }
+    let model = std::rc::Rc::new(slint::VecModel::<ui::NotifRow>::default());
+    let toggled = std::rc::Rc::new(std::cell::Cell::new(-1));
+    let t = toggled.clone();
+    rig.app.on_notif_fold(move |id| t.set(id));
+    rig.app.set_can_recover(true);
+    rig.app.set_notif_open(true);
+    crate::tick::rebuild_notif_model(&model, &rig.log.borrow(), rig.now, "D:/shoot");
+    rig.app.set_notif_model(model.clone().into());
+    hover(&rig.app, 100.0, 700.0);
+    let one = |id: &str| E::find_by_element_id(&rig.app, id).next().unwrap_or_else(|| panic!("{id} is mounted"));
+    let all = |id: &str| E::find_by_element_id(&rig.app, id).collect::<Vec<_>>();
+    let row = one("MainWindow::nrow");
+    let (rx, rw) = (row.absolute_position().x, row.size().width);
+    let chevron = one("MainWindow::nfoldbox");
+    assert_eq!((chevron.size().width, chevron.size().height), (24.0, 26.0), "the arrow's 24 px box, as tall as the ×");
+    // A click on the heading's words opens it, by the fold's own id; the × keeps its own.
+    let text = E::find_by_element_type_name(&rig.app, "Text").find(|t| t.accessible_label().is_some_and(|l| l == crate::platform::sent_run_text(3).as_str())).expect("the heading's words");
+    click(&rig.app, text.absolute_position().x + 4.0, text.absolute_position().y + 4.0, Left);
+    assert_eq!(toggled.get(), 1, "the heading opens its fold, by its first press's stamp");
+    toggled.set(-1);
+    let cross = one("MainWindow::ndxta");
+    click(&rig.app, cross.absolute_position().x + 13.0, cross.absolute_position().y + 13.0, Left);
+    assert_eq!(toggled.get(), -1, "the × isn't the arrow");
+    // Open, as the handler does it.
+    assert!(crate::tick::toggle_fold(&mut rig.log.borrow_mut(), 1));
+    crate::tick::rebuild_notif_model(&model, &rig.log.borrow(), rig.now, "D:/shoot");
+    hover(&rig.app, 100.0, 700.0);
+    let lines = all("MainWindow::nline");
+    assert_eq!(lines.len(), 3, "a line for each");
+    let pics = all("MainWindow::nlpic");
+    let column = rx + 12.0 + 8.0 + 8.0;
+    for (pic, line) in pics.iter().zip(&lines) {
+        assert_eq!((pic.size().width, pic.size().height), (32.0, 32.0), "the small picture");
+        assert!((line.absolute_position().x - column).abs() < 0.01, "under the heading's words");
+        assert!(line.absolute_position().x + line.size().width <= rx + rw - 12.0 + 0.01, "inside the card");
+    }
+    let tag = one("MainWindow::nltag");
+    let titles = all("MainWindow::nltitle");
+    let pill = all("MainWindow::nlrecover");
+    assert_eq!(pill.len(), 3, "each with its own Recover");
+    assert!(tag.absolute_position().x + tag.size().width <= pill[1].absolute_position().x, "the pair's label stays whole, before Recover");
+    let title = &titles[1];
+    assert!(title.size().width > 20.0 && title.size().width < 200.0, "only the name shortens: {}", title.size().width);
+    assert!(title.absolute_position().x + title.size().width <= tag.absolute_position().x + 0.01, "and it doesn't run into the label");
+    // The lines sit under the heading, and the card takes them in.
+    let (head, host, card) = (one("MainWindow::nrow"), one("MainWindow::nlines"), one("MainWindow::nrowcard"));
+    assert!((host.absolute_position().y - (head.absolute_position().y + head.size().height)).abs() < 0.01, "under the heading");
+    let last = lines.last().expect("a line");
+    let card_bottom = card.absolute_position().y + card.size().height;
+    assert!(last.absolute_position().y + last.size().height + 12.0 <= card_bottom + 0.01, "the card's height takes the lines, and its inset under them");
+    assert!((host.absolute_position().y + host.size().height - card_bottom).abs() < 0.01);
 }
 
 /// v0.8.120 (design-sweep Y75 + O8): the title bar's two arbitration rules, on the real bar.
@@ -11063,8 +13995,8 @@ fn row_enabled(app: &ui::MainWindow, row: &str) -> bool {
 ///  1. TARGET — the menu is reused verbatim by the filmstrip and the grid dock with `ctx-target` =
 ///     the CLICKED thumb, while r / Shift+R / Del act on the CURRENT shot. Reading "Rotate right R"
 ///     over thumb #57 while browsing #12 taught a key that rotates a different photo.
-///  2. MODE — `delete_key_allowed` hard-refuses in compare, where the menu is still reachable via a
-///     thumb, so the Del cap taught a dead key in the very mode it was read in.
+///  2. MODE — the Del cap once taught a key that was refused in compare. It works there now, on the
+///     active half (R5), so the cap stays in both modes.
 ///  3. WHICH COPY ROW — Ctrl+C walks the §33 ranked list; at the shipped default ranking a RAW+JPG
 ///     shot resolves to "Copy both", so the chip sitting on the fixed first row was on the wrong
 ///     one. Every label and dispatch is untouched; only the cap moved.
@@ -11797,12 +14729,12 @@ fn a_delete_result_offers_recovery_only_when_a_recovery_exists() {
     let now = Instant::now();
 
     // Row 1+2: a CLEAN recycle — success severity, and the Recover pill.
-    let ok = crate::tick::delete_result_entry("Sent 2 file(s) to the Recycle Bin", 0, "D:/shoot", true, Some(7), now);
+    let ok = crate::tick::delete_result_entry("Sent 2 file(s) to the Recycle Bin", 0, "D:/shoot", true, 7, now);
     assert!(ok.recover, "a clean recycle recorded a recovery, so it offers one");
     assert_eq!(ok.kind, 1, "…as a success, the op-result convention every sibling uses");
 
     // Row 3: a TOTAL failure — error severity, and no offer: nothing reached the bin.
-    let bad = crate::tick::delete_result_entry("Delete did not complete — locked", 1, "D:/shoot", false, Some(7), now);
+    let bad = crate::tick::delete_result_entry("Delete did not complete — locked", 1, "D:/shoot", false, 7, now);
     assert!(!bad.recover, "nothing reached the bin, so there is nothing to recover");
     assert_eq!(bad.kind, 3, "…and it reads as an error");
 
@@ -11810,7 +14742,7 @@ fn a_delete_result_offers_recovery_only_when_a_recovery_exists() {
     // error AND offers Recover — the caller re-stats the batch, so it knows exactly which files
     // left. Before the reconciliation this pair was impossible to produce and the doctrine comment
     // said it should be; that was a claim about what the app could see, not about what is true.
-    let partial = crate::tick::delete_result_entry("Sent 2 of 3 file(s) to the Recycle Bin — 1 did not go", 1, "D:/shoot", true, Some(7), now);
+    let partial = crate::tick::delete_result_entry("Sent 2 of 3 file(s) to the Recycle Bin — 1 did not go", 1, "D:/shoot", true, 7, now);
     assert_eq!(partial.kind, 3, "a partial delete still reads as an error");
     assert!(partial.recover, "…and still offers back the files that DID go");
 
@@ -11824,6 +14756,10 @@ fn a_delete_result_offers_recovery_only_when_a_recovery_exists() {
     // FALSIFIER: move `with_seq` outside the `if can_recover` arm and the `bad` row reddens; drop
     // it entirely and the `ok` row does.
     assert_eq!(ok.seq, Some(7), "a recoverable delete is an undoable act, and the row says which");
+    // Row 6 (R29, R30): nothing failed is a clean delete, of that press, and anything else isn't.
+    assert_eq!((ok.clean_delete(), bad.clean_delete(), partial.clean_delete()), (Some(7), None, None));
+    let for_good = crate::tick::delete_result_entry("Deleted IMG for good", 0, "D:/shoot", false, 8, now);
+    assert_eq!((for_good.clean_delete(), for_good.seq), (Some(8), None), "a delete with no way back is clean, and has no act to rim");
     assert_eq!(partial.seq, Some(7), "…a partial one too: its Recover pill is live");
     assert_eq!(bad.seq, None, "nothing reached the bin ⇒ no act ⇒ nothing for a rim to point at");
 }
@@ -12302,7 +15238,7 @@ fn the_colour_chip_names_the_settled_raw_develops_space() {
     app.set_exif_rows(exif_model.clone().into());
     let (exif_tx, _exif_rx) = channel::<(usize, u64, u8)>();
     let (dims_tx, _dims_rx) = channel::<(usize, u64)>();
-    let (wb_tx, _wb_rx) = channel::<(usize, u64, std::path::PathBuf)>();
+    let (wb_tx, _wb_rx) = channel::<(usize, u64, std::path::PathBuf, bool)>();
 
     let last_motion = RefCell::new(Instant::now());
     let now = *last_motion.borrow() + Duration::from_secs(1); // settled
@@ -15867,7 +18803,13 @@ fn the_review_panel_feeds_from_the_selections_own_generation() {
             &app, 0, 6, 1, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
             &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key, &last_count_key,
             &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view, &sel_vp_prog, &sel_model,
+            // Fix round 2 (`CS-27`): a made-up listing in which every photo's file is online-only and
+            // nothing is in ./Picks; the scan's tag (`cloud`) decides which photos are asked about.
             &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()),
+            &|_: &std::path::Path, wanted: &std::collections::HashSet<std::ffi::OsString>| crate::support::CopyCountListing {
+                online: Some(wanted.clone()),
+                in_picks: std::collections::HashSet::new(),
+            },
         )
     };
     use slint::Model;
@@ -15958,6 +18900,11 @@ fn the_review_panel_feeds_from_the_selections_own_generation() {
     select_gen.set(select_gen.get() + 1);
     sel_gen.set(sel_gen.get() + 1);
     run();
+    // Fix round 2 (`CS-27`): the download line is counted only while the copy confirm is open (it is
+    // drawn nowhere else), so closed it is empty; opened, it counts the one file.
+    assert_eq!(app.get_copy_cloud_notice(), "", "closed confirm: nothing asked, nothing said");
+    app.set_confirm_kind(1);
+    run();
     assert_eq!(app.get_count_out_col1(), 1, "the copy targets the one selected photograph");
     assert!(
         app.get_copy_rot_notice().starts_with("1 photo has unapplied rotation"),
@@ -15969,6 +18916,7 @@ fn the_review_panel_feeds_from_the_selections_own_generation() {
         "…and so does the download advisory: {:?}",
         app.get_copy_cloud_notice()
     );
+    app.set_confirm_kind(0);
     // v0.8.131 (F-P7): the WEB sheet's strings follow the same walk — noun-led and numberless,
     // beside the big count the headline now reads from `count-out-col1`.
     assert_eq!(app.get_out_web_sentence(), "selected photo → export copies → export folder");
@@ -16151,7 +19099,7 @@ fn the_review_panels_open_recenter_does_not_stamp_the_input_clock() {
             &app, c, 40, 1, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
             &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key, &last_count_key,
             &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view, &sel_vp_prog, &sel_model,
-            &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()),
+            &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()), &|_: &std::path::Path, _: &std::collections::HashSet<std::ffi::OsString>| crate::support::CopyCountListing::default(),
         )
     };
 
@@ -16275,7 +19223,7 @@ fn the_frost_feeder_does_not_get_ahead_of_the_visible_tiles() {
         &app, 0, N, 1, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
         &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key,
         &last_count_key, &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view,
-        &sel_vp_prog, &sel_model, &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()),
+        &sel_vp_prog, &sel_model, &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()), &|_: &std::path::Path, _: &std::collections::HashSet<std::ffi::OsString>| crate::support::CopyCountListing::default(),
     );
 
     // THE DEQUEUE POINT, which is where the lane lives: `take` is what the fixed pools block in
@@ -16380,7 +19328,7 @@ fn the_open_review_jump_list_pins_its_photos_and_asks_for_them_after_the_visible
             &app, 0, N, 1, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
             &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key,
             &last_count_key, &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view,
-            &sel_vp_prog, &sel_model, &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()),
+            &sel_vp_prog, &sel_model, &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()), &|_: &std::path::Path, _: &std::collections::HashSet<std::ffi::OsString>| crate::support::CopyCountListing::default(),
         )
     };
     app.set_sel_vp_h(400.0);
@@ -16497,7 +19445,7 @@ fn the_tick_keys_the_review_rows_on_their_photos_not_their_pictures() {
             &app, 0, N, gen, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
             &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key,
             &last_count_key, &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view,
-            &sel_vp_prog, &sel_model, &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()),
+            &sel_vp_prog, &sel_model, &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()), &|_: &std::path::Path, _: &std::collections::HashSet<std::ffi::OsString>| crate::support::CopyCountListing::default(),
         )
     };
     app.set_sel_vp_h(400.0);
@@ -16632,7 +19580,7 @@ fn the_review_rows_are_rewritten_only_where_a_tile_changed_and_match_a_full_rebu
                 &rig.app, c, N, gen, s, p, &ratings, &marks, &filter_mode, &sel_gen, &select,
                 &select_gen, &fast, &fast_gen, &film, &thumb_gen, &thumb_req, &rig.key,
                 &rig.count, &rig.out, &rig.rated, &rig.log, &rig.view,
-                &rig.prog, &rig.model, &rot, &cloud, cache,
+                &rig.prog, &rig.model, &rot, &cloud, cache, &|_: &std::path::Path, _: &std::collections::HashSet<std::ffi::OsString>| crate::support::CopyCountListing::default(),
             );
         }
     };
@@ -16764,7 +19712,7 @@ fn the_jump_lists_rows_stay_when_a_pick_comes_in_and_resample_after_a_bigger_cha
         step_selection(
             &rig.app, 0, N, 1, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
             &select_gen, &fast, &fast_gen, &film, &thumb_gen, &thumb_req, &rig.key, &rig.count,
-            &rig.out, &rig.rated, &rig.log, &rig.view, &rig.prog, &rig.model, &rot, &cloud, &memo,
+            &rig.out, &rig.rated, &rig.log, &rig.view, &rig.prog, &rig.model, &rot, &cloud, &memo, &|_: &std::path::Path, _: &std::collections::HashSet<std::ffi::OsString>| crate::support::CopyCountListing::default(),
         );
         rig.app.get_review_jump_rows().iter().map(|r| r as usize).collect::<Vec<usize>>()
     };
@@ -23570,10 +26518,12 @@ fn the_pinned_last_action_row_mounts_above_the_list_and_yields_to_it() {
         when: "just now".into(),
         reveal_path: "".into(),
         undoable: false,
+        seq: -1,
         jump_to: -1,
         jump_name: "".into(),
         recover: false,
         open_settings: false,
+        ..Default::default()
     }]));
     app.set_notif_model(rows.clone().into());
     app.set_last_act_text("Flagged — HWU_1234".into());
@@ -23758,7 +26708,7 @@ fn the_move_download_advisory_follows_the_live_placeholder_set() {
             &app, 0, 6, 1, &shots, &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
             &select_gen, &cache, &fast_gen, &film, &thumb_gen, &thumb_req, &last_sel_key, &last_count_key,
             &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view, &sel_vp_prog, &sel_model,
-            &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()),
+            &rot, &cloud, &std::cell::RefCell::new(crate::tick::SelCache::default()), &|_: &std::path::Path, _: &std::collections::HashSet<std::ffi::OsString>| crate::support::CopyCountListing::default(),
         )
     };
 
@@ -26703,12 +29653,12 @@ fn the_chevron_is_one_drawing_centred_in_every_cell() {
         }
     }
     assert_eq!(
-        plain, 8,
-        "eight ChevronGlyph mounts app-wide — six in main_window (the EXIF header, the \
+        plain, 9,
+        "nine ChevronGlyph mounts app-wide — seven in main_window (the EXIF header, the \
          per-display colour sections, the font dropdown W3-A created, the TWO developer \
-         folds v1.0.0-rc item 33 split the one legacy fold into, and the LANGUAGE dropdown \
-         the round-1 language review asked for) and two on the edge pills — all eight exactly \
-         centred"
+         folds v1.0.0-rc item 33 split the one legacy fold into, the LANGUAGE dropdown \
+         the round-1 language review asked for, and the Delete round's fold in the events list) \
+         and two on the edge pills — all nine exactly centred"
     );
 
     // ── AND THE LIVE GEOMETRY: each mounted chevron sits at (cell − glyph) / 2 in its own host.
@@ -30243,7 +33193,8 @@ fn a_logged_event_that_displaces_the_question_names_it_and_the_log_row_does_not(
     let tick = |at: Instant| {
         crate::tick::step_notifs(
             &app, at, &cur_dir, &live_dir, &sel_slot, &pending, &log, &unread, &toast_left,
-            &refresh, &model, &busy, &toast_dir, &counts_unread, &toast_prev, None,
+            &refresh, &model, &busy, &toast_dir, &counts_unread, &toast_prev,
+            &RefCell::new(crate::support::FileHistory::default()), &|| None,
         );
     };
     let arm = |stars: i32, n: usize| {
@@ -33080,7 +36031,6 @@ fn raw_selector_is_authoritative_and_no_raw_message_preserves_panel_geometry() {
         )
     };
     app.set_opening_photo(true);
-    app.set_photo_open_edits(true);
     tap(0.75);
     assert!(!app.get_raw_mode() && !raw.load(Ordering::Relaxed));
     assert_eq!(epoch.load(Ordering::Relaxed), 1);
@@ -33179,7 +36129,6 @@ fn opening_ready_photo_allows_fullscreen_without_unlocking_edits() {
         app.set_native_window_controls(native);
         app.set_welcome_open(false);
         app.set_opening_photo(true);
-        app.set_photo_open_edits(false);
         let calls = Rc::new(Cell::new(0));
         let c = calls.clone();
         app.on_toggle_fullscreen(move || c.set(c.get() + 1));
@@ -33194,7 +36143,9 @@ fn opening_ready_photo_allows_fullscreen_without_unlocking_edits() {
         app.set_empty_state(false);
         for boundary in [false, true] {
             app.set_opening_wait_dir(if boundary { 1 } else { 0 });
-            assert!(app.get_modal_open(), "View only must still protect edits");
+            // Queue entry 6 (changed on purpose): edits no longer wait for the folder, only for an
+            // unfinished edge the person has asked past.
+            assert_eq!(app.get_modal_open(), boundary, "edits wait only at an unfinished edge");
             assert!(!app.get_modal_open_fs(), "fullscreen needs no complete folder");
             press();
         }
@@ -33233,13 +36184,13 @@ fn opening_photo_accepts_inspection_before_collection_ready() {
     hover(&app, 600., 400.);
     let stage = i_slint_backend_testing::ElementHandle::find_by_element_id(&app, "MainWindow::stage").next().unwrap();
     let pos = stage.absolute_position(); let size = stage.size();
-    for edits in [false, true] {
-        app.set_photo_open_edits(edits);
-        assert_eq!(app.get_modal_open(), !edits, "editing contract stays separate");
+    // Queue entry 6 (changed on purpose): one opening mode now, so the same pass twice.
+    for _pass in 0..2 {
+        assert!(!app.get_modal_open(), "a folder still loading holds no edit");
         app.set_zoom(1.);
         // A real stage pointer click, wired to production handlers, before scan completion.
         click(&app, pos.x + size.width/2., pos.y + size.height/2., i_slint_core::items::PointerEventButton::Left);
-        assert!(app.get_zoom() > 4., "45MP source zooms immediately in both opening modes");
+        assert!(app.get_zoom() > 4., "45MP source zooms immediately while its folder loads");
         assert!(input.get().elapsed() < Duration::from_secs(1), "click inspection suppresses speculation");
         app.invoke_pan_start(); app.invoke_pan_move(20., 15.);
         assert!(app.get_pan_x() > 0.);
@@ -33247,7 +36198,6 @@ fn opening_photo_accepts_inspection_before_collection_ready() {
         app.invoke_zoom_at(300.,200.,1.); assert!(app.get_zoom()>1.);
         app.invoke_pan_reset();
     }
-    app.set_photo_open_edits(false);
     app.set_photo_ready(false);
     app.invoke_photo_clicked(300.,200.); app.invoke_zoom_at(300.,200.,1.);
     assert_eq!(app.get_zoom(),1.,"stale/thumbnail stand-ins remain protected");
@@ -33294,7 +36244,7 @@ fn photo_menu_keys_and_mouse_share_target_and_do_not_fall_through() {
     let sink=calls.clone(); app.on_undo(move || sink.borrow_mut().push(("undo".into(),-1,0)));
     let fallback=Rc::new(Cell::new(0));
     let weak=app.as_weak(); let count=fallback.clone();
-    app.on_key_typed(move |text| {
+    app.on_key_typed(move |text, _repeat| {
         let a=weak.upgrade().unwrap();
         let action=match text.as_str() {"k"=>"flag","x"=>"reject","u"=>"unflag","r"=>"rotcw","1"=>"rate1",_=>return};
         if !a.invoke_menu_action(action.into(),true) { count.set(count.get()+1); }
@@ -33502,7 +36452,7 @@ fn full_mac_toolbar_uses_owner_actions_and_original_key_handler() {
     let aw = app.as_weak();
     bar.on_forward_key(move |e,p| { aw.unwrap().invoke_toolbar_key(e,p); });
     let calls = Rc::new(RefCell::new(Vec::new()));
-    let c = calls.clone(); app.on_key_typed(move |s| c.borrow_mut().push(s.to_string()));
+    let c = calls.clone(); app.on_key_typed(move |s, _| c.borrow_mut().push(s.to_string()));
     let full = Rc::new(std::cell::Cell::new(0));
     let f = full.clone(); app.on_toggle_fullscreen(move || f.set(f.get()+1));
     bar.window().dispatch_event(W::KeyPressed { text: "f".into() });
@@ -33671,15 +36621,17 @@ fn refinement_sort_options_wait_for_complete_folder_identity() {
     assert_eq!(row.accessible_enabled(),Some(true));
 }
 
-// Owner-approved View only now permits browsing a verified partial list; edits
-// remain modal-gated. Falsifier: keep arrows/wheel on popup-open rather than the
-// inspection/navigation gate, or let real dialogs/menus fall through that gate.
+// Browsing a verified partial list works while the folder loads. Queue entry 6 (changed on purpose):
+// stars, flags, rejects and turns no longer wait for the folder (`modal-open` is false); Home and End
+// still do, through their own term. Falsifier: keep arrows/wheel on popup-open rather than the
+// inspection/navigation gate, drop Home/End's opening term, or let real dialogs/menus fall through
+// that gate.
 #[test]
 fn refinement_view_only_browses_neighbours_but_true_popups_still_block() {
     use std::{cell::Cell,rc::Rc};
     use slint::platform::Key;
     let app=boot_titlebar(); app.set_motion_ui(false); app.set_empty_state(false);
-    app.set_opening_photo(true); app.set_photo_ready(true); app.set_photo_open_edits(false);
+    app.set_opening_photo(true); app.set_photo_ready(true);
     app.set_grid_open(false); app.set_film_visible(false); app.set_raw_open(false); app.set_info_open(false);
     app.set_count_all(21); app.set_cur_idx(10); app.set_wheel_nav(true);
     let hits=Rc::new(Cell::new(0));
@@ -33687,7 +36639,7 @@ fn refinement_view_only_browses_neighbours_but_true_popups_still_block() {
     let h=hits.clone(); app.on_navigate_step(move |_|h.set(h.get()+1));
     let h=hits.clone(); app.on_sel_jump(move |_|h.set(h.get()+1));
     hover(&app,700.,400.);
-    assert!(app.get_modal_open(),"ratings/rotation/file action gates remain closed");
+    assert!(!app.get_modal_open(),"stars, flags, rejects and turns work while the folder loads");
     assert_eq!(app.invoke_sel_gesture_kind(true,false),-1,"no partial-list multi-selection");
     key(&app,Key::RightArrow); key(&app,Key::LeftArrow);
     key(&app,Key::Home); key(&app,Key::End); wheel(&app,700.,400.,-40.);
@@ -33700,8 +36652,131 @@ fn refinement_view_only_browses_neighbours_but_true_popups_still_block() {
             2=>app.set_sort_open(true),_=>app.set_welcome_open(true) }
         i_slint_core::properties::ChangeTracker::run_change_handlers();
         let before=hits.get(); key(&app,Key::RightArrow); wheel(&app,700.,400.,-40.);
-        assert_eq!(hits.get(),before,"popup {popup} keeps navigation blocked");
+        // Queue entry 6 (changed on purpose): with Settings open the arrow key browses; the wheel still waits.
+        assert_eq!(hits.get(),before+usize::from(popup==0),"popup {popup}: the wheel stays blocked, and the key unless it is Settings");
         app.set_settings_open(false); app.set_confirm_kind(0); app.set_sort_open(false); app.set_welcome_open(false);
+    }
+}
+
+/// Queue entry 6 (the owner's row: "browsing keys work while the browse-speed panel or Settings is
+/// open"), through the real key handler, on a list of named photos whose callbacks move `cur-idx` as
+/// Rust would. With Settings open, then with the browse-speed panel open, twice each: → and ← step,
+/// Home and End go to ANT and JAY, ↓ and ↑ in the grid move a row; a held → presses, repeats and
+/// releases; a star key still reaches nothing (the Rust key handler reads `modal-open`, still true);
+/// the wheel and a click on a thumbnail still wait, as they did. With a confirm dialog, the
+/// forget-display confirm or the language list on top of Settings, or a menu open, → waits.
+///
+/// FALSIFIER (L28): the arrows, Home/End or the grid's arrows read `photo-popup-open` again; `dialog-open`
+/// leaves out a real dialog from `real-dialog-open`; `browse-keys-blocked` leaves out the menus or the
+/// language list; `modal-open` stops counting Settings.
+#[test]
+fn the_browsing_keys_work_with_settings_or_the_speed_panel_open() {
+    use slint::platform::{Key, WindowEvent as W};
+    use std::{cell::{Cell, RefCell}, rc::Rc};
+    const NAMES: [&str; 10] = ["ANT", "BEE", "CAT", "DOG", "EEL", "FOX", "GNU", "HEN", "IBIS", "JAY"];
+    let app = boot_titlebar();
+    app.set_motion_ui(false); app.set_welcome_open(false); app.set_empty_state(false);
+    app.set_count_all(10); app.set_cur_idx(4); app.set_wheel_nav(true);
+    app.set_grid_open(true); app.set_grid_cols(3); app.set_grid_virtual_h(400.);
+    let items: Vec<ui::FilmItem> = NAMES.iter().enumerate().map(|(i, n)| ui::FilmItem {
+        idx: i as i32, name: (*n).into(), valid: true, ..Default::default() }).collect();
+    app.set_grid_items(slint::ModelRc::new(slint::VecModel::from(items)));
+    let weak = app.as_weak();
+    app.on_navigate(move |d| { let a = weak.upgrade().unwrap(); a.set_cur_idx((a.get_cur_idx() + d).clamp(0, 9)); });
+    let weak = app.as_weak();
+    app.on_sel_jump(move |i| weak.upgrade().unwrap().set_cur_idx(i));
+    let released = Rc::new(Cell::new(0)); let r = released.clone(); app.on_nav_released(move || r.set(r.get() + 1));
+    let wheel_steps = Rc::new(Cell::new(0)); let w = wheel_steps.clone(); app.on_navigate_step(move |_| w.set(w.get() + 1));
+    let typed = Rc::new(RefCell::new(Vec::<String>::new())); let t = typed.clone();
+    app.on_key_typed(move |k, _| t.borrow_mut().push(k.to_string()));
+    let on = || NAMES[app.get_cur_idx() as usize];
+    let settle = || i_slint_core::properties::ChangeTracker::run_change_handlers();
+    for (panel, open) in [("Settings", 0), ("the browse-speed panel", 1), ("Settings", 0), ("the browse-speed panel", 1)] {
+        if open == 0 { app.set_settings_open(true) } else { app.set_loading_open(true) }
+        settle();
+        hover(&app, 900., 400.);
+        app.set_cur_idx(4);
+        key(&app, Key::RightArrow);
+        assert_eq!(on(), "FOX", "{panel}: → steps from EEL");
+        key(&app, Key::RightArrow); key(&app, Key::LeftArrow);
+        assert_eq!(on(), "FOX", "{panel}: → then ←");
+        key(&app, Key::DownArrow);
+        assert_eq!(on(), "IBIS", "{panel}: ↓ in the grid moves a row");
+        key(&app, Key::UpArrow);
+        assert_eq!(on(), "FOX", "{panel}: ↑ moves back");
+        key(&app, Key::End);
+        assert_eq!(on(), "JAY", "{panel}: End");
+        key(&app, Key::Home);
+        assert_eq!(on(), "ANT", "{panel}: Home");
+        // Held: the press, two of the system's repeats, the release.
+        let before = released.get();
+        app.window().dispatch_event(W::KeyPressed { text: Key::RightArrow.into() });
+        for _ in 0..2 { app.window().dispatch_event(W::KeyPressRepeated { text: Key::RightArrow.into() }); }
+        app.window().dispatch_event(W::KeyReleased { text: Key::RightArrow.into() });
+        settle();
+        assert_eq!((on(), released.get() - before), ("DOG", 1), "{panel}: a held → runs and stops");
+        // Everything else the panel blocks stays blocked.
+        assert!(app.get_modal_open(), "{panel}: the star key's own gate (Rust's `key_typed` reads `modal-open`)");
+        typed.borrow_mut().clear();
+        app.window().dispatch_event(W::KeyPressed { text: "3".into() });
+        app.window().dispatch_event(W::KeyReleased { text: "3".into() });
+        assert_eq!(*typed.borrow(), ["3"], "{panel}: the digit goes to the Rust handler, which refuses it");
+        let steps = wheel_steps.get();
+        wheel(&app, 900., 400., -40.);
+        assert_eq!(wheel_steps.get(), steps, "{panel}: the photo wheel still waits");
+        // Every thumbnail click (the grid's, the filmstrip's, the Review list's, the blue edges) asks this.
+        assert!(!app.invoke_neighbour_browse_allowed(false, false), "{panel}: a click on a thumbnail still waits");
+        // What still stops the keys with the panel open.
+        let blockers: [(&str, &dyn Fn(bool)); 4] = [
+            ("a confirm dialog", &|b| app.set_confirm_kind(i32::from(b))),
+            ("the forget-display confirm", &|b| app.set_display_del_confirm(b)),
+            ("the language list", &|b| app.set_language_menu_open(b)),
+            ("the photo menu", &|b| app.set_ctx_open(b)),
+        ];
+        for (what, set) in blockers {
+            set(true); settle();
+            key(&app, Key::RightArrow); key(&app, Key::End); key(&app, Key::DownArrow);
+            assert_eq!(on(), "DOG", "{panel}: {what} still stops the browsing keys");
+            set(false); settle();
+        }
+        app.set_settings_open(false); app.set_loading_open(false); settle();
+    }
+}
+
+/// Queue entry 6: a text field in the browse-speed panel that has the keyboard keeps its arrows. A
+/// click on the speed's Custom cell opens its number field; → and End there move the caret, not the
+/// photo; Enter hands the keyboard back, and → browses again. Twice.
+///
+/// FALSIFIER (L28): the speed panel's `custom-committed` stops giving the keyboard back
+/// (`keys.focus()`): → after Enter does nothing.
+#[test]
+fn a_focused_text_field_in_the_speed_panel_keeps_its_arrows() {
+    use i_slint_backend_testing::ElementHandle as E;
+    use slint::platform::Key;
+    const NAMES: [&str; 6] = ["ANT", "BEE", "CAT", "DOG", "EEL", "FOX"];
+    let app = boot();
+    app.window().set_size(slint::LogicalSize::new(1200.0, 900.0));
+    app.set_motion_ui(false); app.set_welcome_open(false); app.set_empty_state(false);
+    app.set_count_all(6); app.set_cur_idx(1); app.set_scrub_fps(12.0);
+    let weak = app.as_weak();
+    app.on_navigate(move |d| { let a = weak.upgrade().unwrap(); a.set_cur_idx((a.get_cur_idx() + d).clamp(0, 5)); });
+    let weak = app.as_weak();
+    app.on_sel_jump(move |i| weak.upgrade().unwrap().set_cur_idx(i));
+    app.on_set_fps_custom(|_| {});
+    let on = || NAMES[app.get_cur_idx() as usize];
+    app.set_loading_open(true);
+    hover(&app, 600.0, 300.0);
+    for (from, to) in [("BEE", "CAT"), ("CAT", "DOG")] {
+        assert_eq!(on(), from);
+        // The Custom cell is the control's first, at its left end.
+        let custom = E::find_by_element_id(&app, "CustomSeg::ta").next().expect("the speed control");
+        let (p, size) = (custom.absolute_position(), custom.size());
+        click(&app, p.x + 12., p.y + size.height / 2., i_slint_core::items::PointerEventButton::Left);
+        key(&app, Key::RightArrow); key(&app, Key::End); key(&app, Key::LeftArrow);
+        assert_eq!(on(), from, "the field has the keyboard: its arrows are its own");
+        key(&app, Key::Return);
+        key(&app, Key::RightArrow);
+        assert_eq!(on(), to, "Enter gives the keyboard back, and → browses");
     }
 }
 
@@ -33786,15 +36861,19 @@ fn batch_boundary_grid_keys_keep_the_original_photo_and_row_width() {
     assert_eq!(photo_open::promoted_navigation(38,100,-4,false,(false,false)),(34,0));
 }
 
-// Owner-approved disabled thumbnail actions. Falsifier: let badge callbacks fire
-// during View only, or allow a refused compare drag to create/drop its overlay.
+// Queue entry 6 (changed on purpose; owner, 2 November 2026: "always allow and remove the setting"):
+// while the folder loads, the grid's and the Review list's flag and reject badges work (they were
+// greyed and swallowed the click under View only), a badge click is still not a jump, plain browsing
+// works, and compare drags and multi-selection still wait. A real dialog greys the badges again.
+// Falsifier: put the opening term back into `modal-open`; let a badge click jump; allow a refused
+// compare drag to create/drop its overlay; let `sel-affordance-live` ignore the opening.
 #[test]
 fn refinement_unavailable_thumbnail_actions_do_not_swallow_plain_browsing() {
     use std::{cell::Cell,rc::Rc};
     use i_slint_core::items::PointerEventButton;
     for review in [false,true] {
         let app=boot_titlebar(); app.set_motion_ui(false); app.set_empty_state(false);
-        app.set_opening_photo(true); app.set_photo_open_edits(false); app.set_photo_ready(true);
+        app.set_opening_photo(true); app.set_photo_ready(true);
         app.set_info_open(false); app.set_raw_open(false); app.set_film_visible(false);
         app.set_count_all(21); app.set_cur_idx(10);
         let item=ui::FilmItem { idx:0,name:"Test photo".into(),badge:"JPG".into(),
@@ -33816,20 +36895,84 @@ fn refinement_unavailable_thumbnail_actions_do_not_swallow_plain_browsing() {
         let d=drops.clone(); app.on_sel_to_compare(move |_,_|d.set(d.get()+1));
         hover(&app,800.,500.);
         let ids=if review {["SelTile::fbta","SelTile::rbta"]} else {["GridThumb::fta","GridThumb::rta"]};
-        for id in ids { one(&app,id).mock_single_click(PointerEventButton::Left); }
-        assert_eq!(edits.get(),0,"disabled thumbnail edits still swallow the click, review={review}");
-        assert_eq!(jumps.get(),0,"a disabled badge click is not a thumbnail jump");
+        for pass in 1..=2 {
+            for id in ids { one(&app,id).mock_single_click(PointerEventButton::Left); }
+            assert_eq!(edits.get(),2*pass,"the badges work while the folder loads, review={review}, pass {pass}");
+        }
+        assert_eq!(jumps.get(),0,"a badge click is not a thumbnail jump");
         let tile=one(&app,if review {"SelTile::jta"} else {"GridThumb::jta"});
         tile.mock_single_click(PointerEventButton::Left);
         assert_eq!(jumps.get(),1,"plain browsing remains active, review={review}");
         tile.mock_drag(slint::LogicalPosition::new(850.,350.),PointerEventButton::Left);
         assert_eq!(drops.get(),0,"no unavailable compare action offered during discovery");
         assert!(!app.get_sel_dragging());
-        app.set_photo_open_edits(true);
         assert!(!app.get_sel_affordance_live(),"early edits do not promise unavailable multi-selection");
+        app.set_confirm_kind(1);
         for id in ids { one(&app,id).mock_single_click(PointerEventButton::Left); }
-        assert_eq!(edits.get(),2,"approved early-edit mode retains its actions");
+        assert_eq!(edits.get(),4,"a real dialog still greys the badges and swallows the click");
+        app.set_confirm_kind(0);
     }
+}
+
+/// Queue entry 6: the photo menu while the folder loads, through its real `menu-action` body (the rows'
+/// clicks and their keys both run it). Its star, flag, reject, unmark and turn rows act on the photo the
+/// menu was opened on; its Delete and Copy rows still wait for the whole folder; Home and End wait; a
+/// real dialog stops the review rows too. Twice. Then, once the folder has loaded, Delete, Copy, Home
+/// and End go.
+///
+/// FALSIFIER (L28): put the opening term back into `modal-open-base` (the review rows stop); drop the
+/// `opening-photo` line from the menu's delete or copy arm (they go during the load); drop Home/End's
+/// `opening-photo` term (they jump to the batch's ends).
+#[test]
+fn while_a_folder_loads_the_photo_menu_reviews_but_never_deletes_or_copies() {
+    use slint::platform::Key;
+    use std::{cell::RefCell, rc::Rc};
+    let app = boot_titlebar();
+    app.set_motion_ui(false); app.set_welcome_open(false); app.set_empty_state(false);
+    app.set_opening_photo(true); app.set_photo_ready(true);
+    app.set_opening_before(true); app.set_opening_after(true);
+    app.set_count_all(21); app.set_cur_idx(10);
+    let calls = Rc::new(RefCell::new(Vec::<String>::new()));
+    let c = calls.clone(); app.on_sel_toggle_flag(move |i, _| c.borrow_mut().push(format!("flag {i}")));
+    let c = calls.clone(); app.on_sel_toggle_reject(move |i, _| c.borrow_mut().push(format!("reject {i}")));
+    let c = calls.clone(); app.on_sel_unmark(move |i, _| c.borrow_mut().push(format!("unmark {i}")));
+    let c = calls.clone(); app.on_sel_set_rating(move |i, n, _| c.borrow_mut().push(format!("{n} stars {i}")));
+    let c = calls.clone(); app.on_rotate_shot(move |i, d| c.borrow_mut().push(format!("turn {d} {i}")));
+    let c = calls.clone(); app.on_delete_shot(move |i| c.borrow_mut().push(format!("delete {i}")));
+    let c = calls.clone(); app.on_copy_files(move |i, m| c.borrow_mut().push(format!("copy {m} {i}")));
+    let c = calls.clone(); app.on_sel_jump(move |i| c.borrow_mut().push(format!("jump {i}")));
+    app.on_context_stale(|| false);
+    app.set_ctx_has_finished(true); app.set_ctx_has_raw(true); app.set_ctx_rank_mode(0);
+    app.set_ctx_flag(true);
+    let open_on = |idx: i32| { app.set_ctx_target(idx); app.set_ctx_idx(idx); app.set_ctx_open(true); };
+    // The photo the menu is on: 12 the first time, 7 the second (a filmstrip right-click each time).
+    for photo in [12, 7] {
+        calls.borrow_mut().clear();
+        for action in ["rate3", "flag", "reject", "unflag", "rotcw", "delete-one", "copy-fin"] {
+            open_on(photo);
+            assert!(app.invoke_menu_action(action.into(), false), "{action}: the menu takes it");
+        }
+        assert_eq!(*calls.borrow(), [format!("3 stars {photo}"), format!("flag {photo}"), format!("reject {photo}"),
+            format!("unmark {photo}"), format!("turn 1 {photo}")], "photo {photo}: review rows act on it, Delete and Copy wait");
+        app.set_ctx_open(false);
+        calls.borrow_mut().clear();
+        key(&app, Key::Home); key(&app, Key::End);
+        assert!(calls.borrow().is_empty(), "Home and End wait for the folder's real first and last photo");
+        app.set_confirm_kind(1);
+        open_on(photo);
+        assert!(app.invoke_menu_action("rate3".into(), false));
+        assert!(calls.borrow().is_empty(), "a real dialog still stops a review row");
+        app.set_confirm_kind(0); app.set_ctx_open(false);
+    }
+    // The whole list has landed.
+    app.set_opening_photo(false); app.set_opening_before(false); app.set_opening_after(false);
+    for action in ["delete-one", "copy-fin"] {
+        open_on(7);
+        assert!(app.invoke_menu_action(action.into(), false));
+    }
+    app.set_ctx_open(false);
+    key(&app, Key::Home); key(&app, Key::End);
+    assert_eq!(*calls.borrow(), ["delete 7", "copy 0 7", "jump 0", "jump 20"], "once loaded, all of them go");
 }
 
 // Falsifiers: default On; drop the saved getter/callback; apply the preference before
@@ -33918,7 +37061,7 @@ fn about_card_version_links_modal_gates_and_dismissal() {
         assert!(app.get_dialog_open() && app.get_modal_blocking() && app.get_inspection_blocked());
         let hits=Rc::new(Cell::new(0)); let h=hits.clone(); app.on_navigate(move |_|h.set(h.get()+1));
         let h=hits.clone(); app.on_navigate_step(move |_|h.set(h.get()+1));
-        let h=hits.clone(); app.on_key_typed(move |_|h.set(h.get()+1));
+        let h=hits.clone(); app.on_key_typed(move |_, _|h.set(h.get()+1));
         let h=hits.clone(); app.on_escape_pressed(move ||h.set(h.get()+1));
         app.set_capture_armed(true);
         key(&app,slint::platform::Key::RightArrow); key(&app,slint::platform::Key::F12);
@@ -34633,18 +37776,50 @@ fn release_review_corner_caption_is_singular_at_one_second() {
         .iter()
         .any(|s| s.starts_with("Keep corner controls visible for 1 second after")));
     assert!(!labels.iter().any(|s| s.contains("1 seconds")));
-    let caption = one(&app, "MainWindow::photo-open-caption");
-    let wheel_label =
-        i_slint_backend_testing::ElementHandle::find_by_element_type_name(&app, "Text")
-            .find(|e| {
-                e.accessible_label()
-                    .is_some_and(|s| s == "Mouse wheel changes photo")
-            })
-            .unwrap();
-    assert!(
-        caption.absolute_position().y + caption.size().height <= wheel_label.absolute_position().y,
-        "single-photo explanation stays with the loading preference, above the wheel setting"
-    );
+    // (Queue entry 6 removed the "While the folder is loading" group and its caption, which this row
+    // also placed above the wheel setting; `settings_input_part_starts_with_the_wheel_setting` has
+    // the INPUT part's layout now.)
+}
+
+/// Queue entry 6 (owner, 2 November 2026: "always allow and remove the setting"): the Settings page's
+/// INPUT part without its first group. The heading is followed straight by "Mouse wheel changes photo",
+/// at the same distance as DISPLAY's heading from its first row ("Auto-orient (EXIF)"), so no empty
+/// space or empty heading is left where the group stood; the rest follows in its order; no
+/// "While the folder is loading" anywhere on the page. The window is tall enough that the whole body
+/// mounts (the rig's element finder skips what a `Flickable` clips).
+///
+/// FALSIFIER (L28): put an empty `SettingsGroup { }` back under the INPUT heading (the gap differs);
+/// put the group back (its title is found).
+#[test]
+fn settings_input_part_starts_with_the_wheel_setting() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let app = boot();
+    app.window().set_size(slint::LogicalSize::new(1200., 9000.));
+    app.set_motion_ui(false);
+    app.set_settings_open(true);
+    hover(&app, 700., 400.);
+    let top = |label: &str| {
+        let e = E::find_by_element_type_name(&app, "Text")
+            .find(|e| e.accessible_label().is_some_and(|s| s == label))
+            .unwrap_or_else(|| panic!("{label} is on the page"));
+        e.absolute_position().y
+    };
+    let bottom = |id: &str| { let e = one(&app, id); e.absolute_position().y + e.size().height };
+    let input = bottom("MainWindow::input-cap");
+    let rows = ["Mouse wheel changes photo", "Press current rating again to clear", "Never browse onto a blank photo",
+        "Resume position memory", "Remember sorting and panel layout"];
+    let ys: Vec<f32> = rows.iter().map(|r| top(r)).collect();
+    assert!(ys.windows(2).all(|w| w[0] < w[1]), "the INPUT rows keep their order: {ys:?}");
+    assert!(ys[4] < one(&app, "MainWindow::copy-cap").absolute_position().y, "…all above COPY SHORTCUT");
+    let display = bottom("MainWindow::disp-cap");
+    let (gap_input, gap_display) = (ys[0] - input, top("Auto-orient (EXIF)") - display);
+    assert!((gap_input - gap_display).abs() < 0.5,
+        "INPUT's first row sits where DISPLAY's does under its heading ({gap_input} vs {gap_display})");
+    for gone in ["While the folder is loading", "View only", "Allow photo edits",
+        "Applies when you open a single photo and the rest of its folder is still loading."] {
+        assert!(E::find_by_element_type_name(&app, "Text").all(|e| e.accessible_label().is_none_or(|s| s != gone)),
+            "{gone:?} is gone from the page");
+    }
 }
 
 /// Grid review R1 (re-check): Compare with both halves free and "Never browse onto a blank photo"
@@ -36336,7 +39511,7 @@ fn on_screen_cloud_tiles_settle_with_the_cloud_mark_and_are_never_read() {
                     &app, 0, m, 0, &shots[..m], &plan, &ratings, &marks, &filter_mode, &sel_gen, &select,
                     &select_gen, &cache, &fast_gen, &film, &thumb_gen, &tx, &last_sel_key, &last_count_key,
                     &last_out_key, &sel_rated_sig, &last_sel_log, &last_sel_view, &sel_vp_prog, &sel_model,
-                    &rot, &tagged, &std::cell::RefCell::new(crate::tick::SelCache::default()),
+                    &rot, &tagged, &std::cell::RefCell::new(crate::tick::SelCache::default()), &|_: &std::path::Path, _: &std::collections::HashSet<std::ffi::OsString>| crate::support::CopyCountListing::default(),
                 );
                 serve(&film, &rx, &thumb_gen)
             })
@@ -36616,4 +39791,1667 @@ fn the_opening_let_through_is_wired_into_the_tick() {
     once("prime_hold, app.get_photo_ready(), det_cpu_t.load(Ordering::Relaxed),");
     once("if thumbnail_startup_hold { 0 } else { det_ahead }");
     once("if thumbnail_startup_hold { 0 } else { det_behind }");
+}
+
+// ── Delete round, commit 11: the movement (R41 to R43) ─────────────────────────────────────────────────────
+
+/// Commit 11: landings as the tick runs them, on the window, 16 ms a frame. `apply_scan`'s part is
+/// `LandingRig::land`, which reads where the tiles were beside the view and the scroll, as `apply_scan` does;
+/// then each frame runs the real strip step, R3's hold, the real grid step and the slide's clock
+/// (`tick::step_tile_slide`), in the tick's order. The strip's cells are the landing rig's `ViewReset`, the
+/// ones `apply_scan` resets, and the models are the window's, so the slint draws them.
+struct SlideRig {
+    app: ui::MainWindow,
+    land: LandingRig,
+    list: std::cell::RefCell<Vec<crate::Shot>>,
+    /// The number chips' plan for the list, as the tick keeps it (`tile_plan_t`), made again at a landing.
+    plan: std::cell::RefCell<falcon_decode::TileNumberPlan>,
+    cache: std::cell::RefCell<crate::tick::FastCache>,
+    thumb_gen: std::cell::Cell<u64>,
+    thumb_req: std::sync::mpsc::Sender<crate::support::ThumbReq>,
+    _thumb_rx: std::sync::mpsc::Receiver<crate::support::ThumbReq>,
+    fast_gen: std::cell::Cell<u64>,
+    ratings: std::cell::RefCell<Vec<i32>>,
+    marks: std::cell::RefCell<Vec<u8>>,
+    sel_gen: std::cell::Cell<u64>,
+    select: std::cell::RefCell<crate::support::SelectSet>,
+    select_gen: std::cell::Cell<u64>,
+    film_last_tick: std::cell::Cell<std::time::Instant>,
+    film_clamp: std::cell::Cell<(f32, f32)>,
+    strip: std::rc::Rc<slint::VecModel<ui::FilmItem>>,
+    last_grid_key: std::cell::Cell<GridKey>,
+    last_grid_view: std::cell::Cell<(bool, u64)>,
+    last_grid_c: std::cell::Cell<usize>,
+    grid_vp_prog: std::cell::Cell<Option<crate::support::PanelMemo>>,
+    grid: std::rc::Rc<slint::VecModel<ui::FilmItem>>,
+    now: std::cell::Cell<std::time::Instant>,
+    /// The tick's `last_input`: a stage drag, a zoom, a panel scroll.
+    input: std::cell::Cell<std::time::Instant>,
+    /// A held arrow, a scrub, a strip drag or banked wheel notches, as the tick reads them.
+    gesture: std::cell::Cell<bool>,
+    /// What the posture read last frame.
+    live: std::cell::Cell<bool>,
+}
+
+/// Where a photo's tile is drawn: its left edge (the strip: in the strip; the grid: in the dock), its top
+/// (the grid's, in the viewport; the strip's is fixed), and how opaque.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Drawn {
+    x: f32,
+    y: f32,
+    opacity: f32,
+}
+
+/// Every photo drawn on the strip, then on the grid, and where.
+type AllDrawn = (Vec<(String, Drawn)>, Vec<(String, Drawn)>);
+/// Where a photo's tile is at home on a surface, if it's in that surface's rows.
+type Home<'a> = &'a dyn Fn(&str) -> Option<(f32, f32)>;
+/// Something the person does mid-slide, done to the rig.
+type Input<'a> = &'a dyn Fn(&SlideRig);
+
+impl SlideRig {
+    fn new(list: Vec<crate::Shot>, on: &str, grid: bool, motion: bool) -> Self {
+        use std::cell::{Cell, RefCell};
+        let app = boot();
+        app.set_motion_ui(motion);
+        let at = list.iter().position(|s| s.name == on).expect("the photo is in the list");
+        let (thumb_req, _thumb_rx) = std::sync::mpsc::channel();
+        let t0 = std::time::Instant::now();
+        let n = list.len();
+        let rig = Self {
+            app,
+            land: LandingRig::new(at),
+            plan: RefCell::new(crate::support::plan_from_shots(&list)),
+            list: RefCell::new(list),
+            cache: RefCell::new(crate::tick::FastCache::new()),
+            thumb_gen: Cell::new(0),
+            thumb_req,
+            _thumb_rx,
+            fast_gen: Cell::new(0),
+            ratings: RefCell::new(vec![0; n + 64]),
+            marks: RefCell::new(vec![0; n + 64]),
+            sel_gen: Cell::new(0),
+            select: RefCell::new(crate::support::SelectSet::default()),
+            select_gen: Cell::new(0),
+            film_last_tick: Cell::new(t0),
+            film_clamp: Cell::new((0.0, 0.0)),
+            strip: std::rc::Rc::new(slint::VecModel::default()),
+            last_grid_key: Cell::new(crate::background_memory::GRID_KEY_UNBUILT),
+            last_grid_view: Cell::new((false, u64::MAX)),
+            last_grid_c: Cell::new(usize::MAX),
+            grid_vp_prog: Cell::new(None),
+            grid: std::rc::Rc::new(slint::VecModel::default()),
+            now: Cell::new(t0),
+            input: Cell::new(t0),
+            gesture: Cell::new(false),
+            live: Cell::new(false),
+        };
+        rig.land.view.film_pos.set(at as f32);
+        rig.land.view.film_target.set(at as f32);
+        rig.app.set_film(rig.strip.clone().into());
+        rig.app.set_grid_items(rig.grid.clone().into());
+        if grid {
+            rig.app.set_grid_open(true);
+            hover(&rig.app, 600.0, 300.0);
+            if rig.app.get_grid_vp_h() <= 0.0 {
+                rig.app.set_grid_vp_h(654.0);
+            }
+        }
+        rig.frame(None);
+        rig.frame(None);
+        rig
+    }
+
+    /// One tick's strip, grid and clock, 16 ms after the last.
+    fn frame(&self, kept: Option<&crate::photo_open::KeptScroll>) {
+        let now = self.now.get() + std::time::Duration::from_millis(16);
+        self.now.set(now);
+        let list = self.list.borrow();
+        let c = *self.land.current.borrow();
+        let generation = self.land.folder_gen.get();
+        let plan = self.plan.borrow();
+        let v = &self.land.view;
+        crate::tick::step_filmstrip(
+            &self.app, c, list.len(), now, &self.film_last_tick, generation, &list, &plan, &self.cache, &self.land.film,
+            &self.thumb_gen, &self.thumb_req, &self.fast_gen, &self.ratings, &self.marks, &self.sel_gen, &self.select,
+            &self.select_gen, &v.film_pos, &v.film_base, &v.film_dragging, &v.film_follow, &v.film_target,
+            &self.film_clamp, &v.last_film_key, &self.strip, &self.land.rot, crate::support::ThumbScope::Nearby,
+        );
+        if let Some(kept) = kept {
+            crate::tick::hold_grid_on_landing(&self.app, kept, generation, list.len(), &self.last_grid_view, &self.last_grid_c, &self.grid_vp_prog);
+        }
+        crate::tick::step_folder_grid(
+            &self.app, c, list.len(), generation, &list, &plan, &self.cache, &self.land.film, &self.thumb_gen, &self.thumb_req,
+            &self.fast_gen, &self.ratings, &self.marks, &self.sel_gen, &self.select, &self.select_gen, &self.last_grid_key,
+            &self.last_grid_view, &self.last_grid_c, &self.grid_vp_prog, &self.grid, &self.land.rot, crate::support::ThumbScope::Nearby,
+        );
+        let watch = crate::tile_slide::Watch {
+            current: c, follow: v.film_follow.get(), target: v.film_target.get(),
+            cols: self.app.get_grid_cols(), strip_w: self.app.get_strip_w(), input: self.input.get(),
+        };
+        self.live.set(crate::tick::step_tile_slide(&self.app, &self.land.film, now, self.gesture.get(), watch));
+        // R46: the blue edge, after the slide's clock, as the tick runs it.
+        let stage = crate::blue_edge::Stage { current: c, halves: v.compare.get().then(|| (self.land.halves.0.get(), self.land.halves.1.get())) };
+        crate::tick::step_blue_edge(&self.app, &self.land.film, now, stage, v.film_pos.get(), list.len());
+    }
+
+    /// A landing on `new`, on photo `on`, and the tick that follows it.
+    fn land(&self, new: Vec<crate::Shot>, on: &str) {
+        let start = new.iter().position(|s| s.name == on).expect("it lands on a photo in the list");
+        *self.plan.borrow_mut() = crate::support::plan_from_shots(&new);
+        let old = self.list.replace(new);
+        let kept = self.land.land(&self.app, &old, &self.list.borrow(), start, &[]);
+        self.frame(kept.as_ref());
+    }
+
+    /// A landing on `new` as a real listing read it, settled by photo on `start`, and the tick that follows it:
+    /// the refresh on coming back. `stamps` are the list on screen's and the listing's. The zoom tiles are what
+    /// the overlay holds, as `apply_scan` reads them.
+    fn land_listing(&self, new: Vec<crate::Shot>, start: usize, compare: crate::photo_open::CompareLanding, stamps: (&crate::support::ListingStamps, &crate::support::ListingStamps)) {
+        *self.plan.borrow_mut() = crate::support::plan_from_shots(&new);
+        let old = self.list.replace(new);
+        let tiles = self.land.roi.tiles.borrow().clone();
+        let kept = self.land.land_listed(&self.app, (&old, stamps.0), (&self.list.borrow(), stamps.1), start, compare, &tiles);
+        self.frame(kept.as_ref());
+    }
+
+    /// Frames until the slide is over, and how many.
+    fn settle(&self) -> usize {
+        let mut frames = 0;
+        while self.live.get() {
+            self.frame(None);
+            frames += 1;
+            assert!(frames < 60, "a slide ends");
+        }
+        frames
+    }
+
+    /// The window's own `slid`: the offset scaled by the clock and snapped to device pixels.
+    fn slid(&self, offset: f32) -> f32 {
+        let sf = self.app.get_win_sf().max(0.5);
+        (offset * self.app.get_tile_slide_k() * sf).round() / sf
+    }
+
+    fn fade(&self, row: &ui::FilmItem) -> f32 {
+        if row.arriving { 1.0 - self.app.get_tile_fade_k() } else { 1.0 }
+    }
+
+    fn slot(model: &slint::VecModel<ui::FilmItem>, name: &str) -> Option<(usize, ui::FilmItem)> {
+        use slint::Model;
+        (0..model.row_count()).find_map(|i| model.row_data(i).filter(|t| t.name == name).map(|t| (i, t)))
+    }
+
+    /// Where photo `name`'s strip tile is drawn now.
+    fn on_strip(&self, name: &str) -> Option<Drawn> {
+        let (slot, row) = Self::slot(&self.strip, name)?;
+        Some(Drawn { x: self.app.get_film_offset_px() + slot as f32 * 128.0 + self.slid(row.slide_x), y: 0.0, opacity: self.fade(&row) })
+    }
+
+    /// …where a plain update puts it: its place in the strip's layout.
+    fn strip_home(&self, name: &str) -> Option<f32> {
+        let (slot, _) = Self::slot(&self.strip, name)?;
+        Some(self.app.get_film_offset_px() + slot as f32 * 128.0)
+    }
+
+    /// Where photo `name`'s grid tile is drawn now.
+    fn on_grid(&self, name: &str) -> Option<Drawn> {
+        let (slot, row) = Self::slot(&self.grid, name)?;
+        let cols = self.app.get_grid_cols() as usize;
+        Some(Drawn {
+            x: 8.0 + (slot % cols) as f32 * 128.0 + self.slid(row.slide_x),
+            y: self.app.get_grid_win_y() + (slot / cols) as f32 * 88.0 + self.app.get_grid_vp_y() + self.slid(row.slide_y),
+            opacity: self.fade(&row),
+        })
+    }
+
+    fn grid_home(&self, name: &str) -> Option<(f32, f32)> {
+        let (slot, _) = Self::slot(&self.grid, name)?;
+        let cols = self.app.get_grid_cols() as usize;
+        Some((8.0 + (slot % cols) as f32 * 128.0, self.app.get_grid_win_y() + (slot / cols) as f32 * 88.0 + self.app.get_grid_vp_y()))
+    }
+
+    /// Every photo on the strip and the grid, and where it's drawn.
+    fn drawn(&self) -> AllDrawn {
+        use slint::Model;
+        let names = |m: &slint::VecModel<ui::FilmItem>| m.iter().filter(|t| !t.name.is_empty()).map(|t| t.name.to_string()).collect::<Vec<_>>();
+        (
+            names(&self.strip).into_iter().filter_map(|n| self.on_strip(&n).map(|d| (n, d))).collect(),
+            names(&self.grid).into_iter().filter_map(|n| self.on_grid(&n).map(|d| (n, d))).collect(),
+        )
+    }
+
+    /// The layout alone, which a plain update leaves: the strip's offset, the grid's scroll and window, and
+    /// each row's photo.
+    fn layout(&self) -> (f32, f32, f32, Vec<String>, Vec<String>) {
+        use slint::Model;
+        (
+            self.app.get_film_offset_px(), self.app.get_grid_vp_y(), self.app.get_grid_win_y(),
+            self.strip.iter().map(|t| t.name.to_string()).collect(), self.grid.iter().map(|t| t.name.to_string()).collect(),
+        )
+    }
+}
+
+/// Every photo that's drawn both before and at the landing's first frame is where it was, to the pixel,
+/// unless it was further than two cells (or rows) from its new place, when it starts two from home. A photo
+/// that arrived is drawn clear. Its name in the message.
+fn assert_nothing_jumped(what: &str, before: &AllDrawn, rig: &SlideRig) {
+    let after = rig.drawn();
+    let strip_home = |n: &str| rig.strip_home(n).map(|x| (x, 0.0));
+    let grid_home = |n: &str| rig.grid_home(n);
+    let homes: [Home; 2] = [&strip_home, &grid_home];
+    for ((surface, then, now), home) in [("strip", &before.0, &after.0), ("grid", &before.1, &after.1)].into_iter().zip(homes) {
+        for (name, d) in now {
+            match then.iter().find(|(n, _)| n == name) {
+                None if d.opacity == 0.0 => {}
+                None => {
+                    // Not drawn before: it came from off the edge, or it arrived. An arrival is clear.
+                    let row = if surface == "strip" { SlideRig::slot(&rig.strip, name) } else { SlideRig::slot(&rig.grid, name) };
+                    assert!(!row.unwrap().1.arriving, "{what}: {surface} {name} arrived and isn't clear");
+                }
+                Some((_, was)) => {
+                    let (hx, hy) = home(name).unwrap();
+                    let cap = |from: f32, to: f32, cell: f32| to + (from - to).clamp(-2.0 * cell, 2.0 * cell);
+                    let expect = (cap(was.x, hx, 128.0), if surface == "grid" { cap(was.y, hy, 88.0) } else { 0.0 });
+                    assert_eq!((d.x, d.y), expect, "{what}: {surface} {name} is drawn where it was (or two cells from home)");
+                    assert_eq!(d.opacity, 1.0, "{what}: {surface} {name} stayed, so it doesn't fade");
+                }
+            }
+        }
+    }
+}
+
+/// R41, R42 (owner: "#9 do not move but the filmstrip and grid should update with an animation"; look A,
+/// for Undo move, Move rejected, Del and Recover). Final positions equal a plain update's: at a landing's
+/// first frame the strip's place, the grid's scroll and every row are exactly what the same landing leaves
+/// with "Interface motion" off, and when the slide ends every tile is drawn there. Nothing jumps at the
+/// landing: each photo starts where it was drawn. On HWU_0041: Move rejected of HWU_0040 and Undo move,
+/// twice (L53), the second time with HWU_0038 too, then of five and of eleven (capped, in the grid by
+/// rows too); then Del three times on the photo on screen, and Ctrl+Z.
+///
+/// On 41 after Undo move: 41 holds, 40 fades in directly to its left, 39 steps a cell left; in the grid 41
+/// keeps its row and steps sideways. Del: the next photo slides into the middle from a cell right, and the
+/// photos before it hold. Ctrl+Z: the photo back fades in at the middle and the one after slides a cell right.
+///
+/// FALSIFIER (L28): read where a tile was at the new place (`pos` for `pos_was` in `place_strip`): the Move
+/// rejected rows. Drop the cap in `place_strip`, or the grid's down the rows: the five and eleven rows. Read the
+/// grid's old place at the new scroll: the five row. Leave the strip's or the grid's rows without their offsets:
+/// the first rows. "Interface motion" off still slides: the plain rig slides.
+#[test]
+fn a_slide_ends_where_a_plain_update_puts_every_tile() {
+    let all = numbered_photos(80);
+    let rig = SlideRig::new(all.clone(), "HWU_0041", true, true);
+    let plain = SlideRig::new(all.clone(), "HWU_0041", true, false);
+    let name = |i: usize| format!("HWU_{i:04}");
+    let steps: Vec<(&str, Vec<crate::Shot>, String)> = vec![
+        ("Move rejected of 40", without(&all, &["HWU_0040"]), name(41)),
+        ("Undo move", all.clone(), name(41)),
+        ("Move rejected of 38 and 40", without(&all, &["HWU_0038", "HWU_0040"]), name(41)),
+        ("Undo move again", all.clone(), name(41)),
+        ("Move rejected of 36 to 40", without(&all, &["HWU_0036", "HWU_0037", "HWU_0038", "HWU_0039", "HWU_0040"]), name(41)),
+        ("Undo move of five", all.clone(), name(41)),
+        ("Move rejected of 30 to 40", (0..80).filter(|i| !(30..=40).contains(i)).map(|i| all[i].clone()).collect(), name(41)),
+        ("Undo move of eleven", all.clone(), name(41)),
+        ("Del on 41", without(&all, &["HWU_0041"]), name(42)),
+        ("Del on 42", without(&all, &["HWU_0041", "HWU_0042"]), name(43)),
+        ("Del on 43", without(&all, &["HWU_0041", "HWU_0042", "HWU_0043"]), name(44)),
+        ("Ctrl+Z brings 43 back", without(&all, &["HWU_0041", "HWU_0042"]), name(43)),
+    ];
+    for (what, new, on) in steps {
+        let before = rig.drawn();
+        let held = (rig.on_strip(&on), rig.on_grid(&on));
+        rig.land(new.clone(), &on);
+        plain.land(new, &on);
+        assert!(rig.live.get(), "{what}: it slides");
+        assert!(!plain.live.get(), "{what}: with motion off it doesn't");
+        assert_eq!(rig.layout(), plain.layout(), "{what}: the first frame's layout is a plain update's");
+        assert_nothing_jumped(what, &before, &rig);
+        match what {
+            "Undo move" | "Undo move again" => {
+                let mid = rig.strip_home(&name(41)).unwrap();
+                assert_eq!(rig.on_strip(&name(41)).map(|d| d.x), held.0.map(|d| d.x), "{what}: 41 holds");
+                assert_eq!(rig.strip_home(&name(40)), Some(mid - 128.0), "{what}: 40 comes back directly to its left");
+                assert_eq!(rig.on_strip(&name(40)).map(|d| d.opacity), Some(0.0), "{what}: and fades in");
+                assert_eq!(rig.on_strip(&name(39)).map(|d| d.x), Some(mid - 128.0), "{what}: 39 starts where it was");
+                assert_eq!(rig.strip_home(&name(39)), Some(mid - 256.0), "{what}: and steps a cell left");
+                let (g41, h41) = (rig.on_grid(&name(41)).unwrap(), rig.grid_home(&name(41)).unwrap());
+                assert_eq!(g41.y, held.1.unwrap().y, "{what}: in the grid 41 keeps its row");
+                assert_eq!(h41.1, held.1.unwrap().y, "{what}: and its row stays put when the slide ends");
+            }
+            "Del on 41" | "Del on 42" | "Del on 43" => {
+                let mid = rig.strip_home(&on).unwrap();
+                assert_eq!(rig.on_strip(&on).map(|d| d.x), Some(mid + 128.0), "{what}: {on} starts a cell right");
+                assert_eq!(rig.on_strip(&name(40)).map(|d| d.x), rig.strip_home(&name(40)), "{what}: the photos before it hold");
+            }
+            "Ctrl+Z brings 43 back" => {
+                let mid = rig.strip_home(&name(43)).unwrap();
+                assert_eq!(rig.on_strip(&name(43)).map(|d| d.opacity), Some(0.0), "{what}: 43 fades in at the middle");
+                assert_eq!(rig.on_strip(&name(44)).map(|d| (d.x, d.opacity)), Some((mid, 1.0)), "{what}: 44 starts at the middle");
+                assert_eq!(rig.strip_home(&name(44)), Some(mid + 128.0), "{what}: and slides a cell right");
+            }
+            _ => {}
+        }
+        let frames = rig.settle();
+        assert!(frames > 0, "{what}: frames of it");
+        assert_eq!(rig.layout(), plain.layout(), "{what}: the layout never moved");
+        assert_eq!(rig.drawn(), plain.drawn(), "{what}: and every tile ends where a plain update put it");
+        for (n, d) in rig.drawn().0 {
+            assert_eq!(Some(d.x), rig.strip_home(&n), "{what}: {n} is home");
+        }
+    }
+}
+
+/// R42: "the slide is a paint offset decaying to exactly 0, one write at the end", in about 0.2 s on the
+/// strip's chase curve (R41), and the posture holds the full rate while it runs (R43: "A posture term so it
+/// can't run at 8 Hz"). Del on HWU_0041, 42 and 43, a beat apart: each next photo comes in from a cell right,
+/// a little nearer each frame, and the window's clock reaches exactly 0 in 12 to 14 frames (the grid's
+/// row-end tiles travel two cells, which sets the end).
+///
+/// FALSIFIER (L28): drop the `END_PX` end in `TileSlide::step`: it never ends. Write the clock only while it's
+/// above 0: the window keeps the last fraction. Return `false` from `step_tile_slide`: the posture term fails.
+/// Use `CHASE` 0.5: it ends in 8 frames.
+#[test]
+fn a_slides_offsets_decay_to_exactly_zero() {
+    let list = numbered_photos(80);
+    let rig = SlideRig::new(list.clone(), "HWU_0041", true, true);
+    let mut gone = Vec::new();
+    for (deleted, next) in [("HWU_0041", "HWU_0042"), ("HWU_0042", "HWU_0043"), ("HWU_0043", "HWU_0044")] {
+        gone.push(deleted);
+        rig.land(without(&list, &gone), next);
+        let home = rig.strip_home(next).unwrap();
+        let mut left = rig.on_strip(next).unwrap().x - home;
+        assert_eq!(left, 128.0, "{next} starts a cell right");
+        assert_eq!((rig.app.get_tile_slide_k(), rig.app.get_tile_fade_k()), (1.0, 1.0), "{next}: the clock starts at 1");
+        let mut frames = 0;
+        while rig.live.get() {
+            rig.frame(None);
+            frames += 1;
+            let now = rig.on_strip(next).unwrap().x - home;
+            assert!(now <= left && now >= 0.0, "{next}: nearer each frame ({left} then {now})");
+            left = now;
+            assert!(frames < 30);
+        }
+        // The grid's tiles at the row ends travel two cells (capped), so this runs to two cells' end.
+        assert!((12..=14).contains(&frames), "{next}: about 0.2 s at 16 ms a frame, {frames} frames");
+        assert_eq!((rig.app.get_tile_slide_k(), rig.app.get_tile_fade_k()), (0.0, 0.0), "{next}: exactly 0, written");
+        assert_eq!(rig.on_strip(next).unwrap().x, home, "{next} is home");
+        rig.frame(None);
+        assert!(!rig.live.get(), "and the posture lets go");
+    }
+}
+
+/// R43: "Any input ends it at once (k = 0)", and the normal glide takes over. Undo move on HWU_0041 after
+/// moving HWU_0040, then one frame, then each of: an arrow (the photo on screen changes), a wheel on the
+/// strip (its free target), a scroll of the grid or a stage drag (the input clock), a held arrow starting
+/// (the gesture terms). Each ends it on the next frame, with every tile at its new place. A second Undo move
+/// mid-slide carries on from where the tiles are drawn: nothing jumps.
+///
+/// FALSIFIER (L28): compare only `current` in `TileSlide::step`'s watch: the wheel and scroll rows. Ignore
+/// `hold` once a slide runs: the held-arrow row. Read the running slide's offsets as 0 in `SlideFrom::read`, or
+/// leave the running slide's tables on at `landed`: the second Undo move jumps.
+#[test]
+fn an_arrow_ends_a_slide_at_once() {
+    let all = numbered_photos(80);
+    let away = without(&all, &["HWU_0040"]);
+    let ends: [(&str, Input); 4] = [
+        ("an arrow", &|rig| *rig.land.current.borrow_mut() += 1),
+        ("a wheel on the strip", &|rig| { rig.land.view.film_follow.set(false); rig.land.view.film_target.set(rig.land.view.film_pos.get() + 3.0); }),
+        ("a grid scroll", &|rig| rig.input.set(rig.now.get())),
+        ("a held arrow", &|rig| rig.gesture.set(true)),
+    ];
+    for (what, input) in ends {
+        let rig = SlideRig::new(away.clone(), "HWU_0041", true, true);
+        rig.land(all.clone(), "HWU_0041");
+        rig.frame(None);
+        assert!(rig.live.get() && rig.app.get_tile_slide_k() < 1.0, "{what}: premise, mid-slide");
+        input(&rig);
+        rig.frame(None);
+        assert!(!rig.live.get(), "{what} ends it");
+        assert_eq!(rig.app.get_tile_slide_k(), 0.0, "{what}: at once");
+        for (n, d) in rig.drawn().0 {
+            assert_eq!(Some(d.x), rig.strip_home(&n), "{what}: {n} at its new place");
+        }
+    }
+    // A second Undo move mid-slide: the tiles carry on from where they're drawn.
+    let rig = SlideRig::new(without(&all, &["HWU_0038", "HWU_0040"]), "HWU_0041", true, true);
+    rig.land(without(&all, &["HWU_0038"]), "HWU_0041");
+    rig.frame(None);
+    rig.frame(None);
+    let before = rig.drawn();
+    assert!(rig.live.get(), "premise: the first is still sliding");
+    rig.land(all.clone(), "HWU_0041");
+    assert_nothing_jumped("a second Undo move", &before, &rig);
+    assert_eq!(rig.on_strip("HWU_0040").map(|d| d.opacity), Some(1.0), "40's fade finishes at once");
+    assert_eq!(rig.on_strip("HWU_0038").map(|d| d.opacity), Some(0.0), "38 fades in");
+}
+
+/// R42: "Offsets by photo, re-applied on every rebuild", because a thumbnail landing rewrites every row.
+/// Mid-slide after an Undo move on HWU_0041, HWU_0039's thumbnail lands (the strip and the grid rebuild their
+/// rows): every tile is drawn where it was a moment before the rebuild would have left it, and the rebuild
+/// did happen (39 has its picture).
+///
+/// FALSIFIER (L28): don't put `strip_tile` on the strip's rows: the "39 is still on its way" row. Don't put
+/// `grid_tile` on the grid's: the grid row (the twin is changed the same way, so the comparison alone can't).
+#[test]
+fn a_thumbnail_landing_mid_slide_moves_no_tile() {
+    let all = numbered_photos(80);
+    let rig = SlideRig::new(without(&all, &["HWU_0040"]), "HWU_0041", true, true);
+    let plain = SlideRig::new(without(&all, &["HWU_0040"]), "HWU_0041", true, true);
+    for r in [&rig, &plain] {
+        r.land(all.clone(), "HWU_0041");
+        r.frame(None);
+        r.frame(None);
+    }
+    assert!(rig.live.get() && rig.on_strip("HWU_0039").unwrap().x != rig.strip_home("HWU_0039").unwrap(), "premise: 39 is sliding");
+    // 39's thumbnail lands, in this rig only.
+    let picture = slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(6, 4));
+    rig.land.film.thumbs.borrow_mut().insert(39, (picture, crate::support::cm_bake_key(rig.app.get_output_gamut())));
+    rig.thumb_gen.set(rig.thumb_gen.get() + 1);
+    rig.frame(None);
+    plain.frame(None);
+    assert!(SlideRig::slot(&rig.strip, "HWU_0039").unwrap().1.valid, "premise: the strip's rows were rebuilt");
+    assert!(SlideRig::slot(&rig.grid, "HWU_0039").unwrap().1.valid, "premise: so were the grid's");
+    assert!(rig.live.get());
+    assert_eq!(rig.drawn(), plain.drawn(), "every tile carries on as if no thumbnail had landed");
+    let moving = rig.on_strip("HWU_0039").unwrap().x - rig.strip_home("HWU_0039").unwrap();
+    assert!(moving > 0.0, "39 is still on its way");
+    let in_grid = rig.on_grid("HWU_0041").map(|d| (d.x, d.y)) != rig.grid_home("HWU_0041");
+    assert!(in_grid, "and 41 is still on its way in the grid");
+}
+
+/// R43: "Skip when nothing in view changes, during held arrow, scrub, strip drag, banked wheel notches and
+/// sel_dragging, and when motion-ui is off", and R41 "Sort changes keep the snap". Each is the same Undo move
+/// on HWU_0041: no frame of slide, the clock stays 0, and every tile is drawn at its new place at once. A
+/// Move rejected of a photo far off the strip with the grid closed changes nothing in view: no slide.
+///
+/// FALSIFIER (L28): drop `!app.get_motion_ui()` from `step_tile_slide`'s hold: the first row. Drop `hold` at
+/// the start in `TileSlide::step`: the gesture and drag rows. Start whatever was placed (drop `shows`): the
+/// last row. The sort row's guard (the read only with a kept scroll) is `apply_scan`'s, pinned by
+/// `the_slide_is_read_at_the_landing_and_clocked_after_the_grid`; this rig reads the same way.
+#[test]
+fn no_slide_with_interface_motion_off_a_gesture_or_a_re_sort() {
+    let all = numbered_photos(80);
+    let away = without(&all, &["HWU_0040"]);
+    let snaps = |what: &str, rig: &SlideRig| {
+        assert!(!rig.live.get(), "{what}: no slide");
+        assert_eq!(rig.app.get_tile_slide_k(), 0.0, "{what}: the clock stays 0");
+        let (strip, grid) = rig.drawn();
+        assert!(!strip.is_empty(), "premise: the strip is drawn");
+        for (n, d) in strip {
+            assert_eq!((Some(d.x), d.opacity), (rig.strip_home(&n), 1.0), "{what}: {n} at its new place, clear");
+        }
+        for (n, d) in grid {
+            assert_eq!((Some((d.x, d.y)), d.opacity), (rig.grid_home(&n), 1.0), "{what}: grid {n} at its new place, clear");
+        }
+    };
+    let rig = SlideRig::new(away.clone(), "HWU_0041", true, false);
+    rig.land(all.clone(), "HWU_0041");
+    snaps("Interface motion off", &rig);
+    let rig = SlideRig::new(away.clone(), "HWU_0041", true, true);
+    rig.gesture.set(true);
+    rig.land(all.clone(), "HWU_0041");
+    snaps("a held arrow", &rig);
+    let rig = SlideRig::new(away.clone(), "HWU_0041", true, true);
+    rig.app.set_sel_dragging(true);
+    rig.land(all.clone(), "HWU_0041");
+    snaps("a drag from the grid", &rig);
+    rig.app.set_sel_dragging(false);
+    let rig = SlideRig::new(all.clone(), "HWU_0041", true, true);
+    let reversed: Vec<crate::Shot> = all.iter().rev().cloned().collect();
+    rig.land(reversed, "HWU_0041");
+    snaps("a re-sort", &rig);
+    let rig = SlideRig::new(all.clone(), "HWU_0060", false, true);
+    rig.land(without(&all, &["HWU_0002"]), "HWU_0060");
+    snaps("a photo far off the strip", &rig);
+    assert_eq!(rig.list.borrow().len(), 79, "premise: it did land");
+}
+
+/// R42, R43, in the slint: every tile is drawn where its row and the clock say, in the real window. At an
+/// Undo move's first frame on HWU_0041, the strip's thumbs (`FilmThumb::content`, inside the slide's wrapper)
+/// and the grid's tiles (`GridThumb::content`) are where the rows' places plus `slid(offset)` put them, all
+/// by one origin; that isn't where the rows' places alone are (39 is a cell right of its place, 41 holds);
+/// and when the slide ends, they are at the places alone. Matched as sets of what's on screen: the finder skips
+/// a tile its clip hides entirely (so its nth element isn't the model's nth row), and an arriving tile and a
+/// sliding one can share a place at the first frame.
+///
+/// FALSIFIER (L28): bind `x` of `slide` to 0 in `FilmThumb`: the strip row. Drop `root.slid(item.slide-x)`
+/// from the grid's `x`: the grid row. Drop the clock from `slid`: the end rows.
+#[test]
+fn a_sliding_tile_is_drawn_where_its_row_says() {
+    use i_slint_backend_testing::ElementHandle as E;
+    use slint::Model;
+    let all = numbered_photos(80);
+    let rig = SlideRig::new(without(&all, &["HWU_0040"]), "HWU_0041", true, true);
+    rig.land(all, "HWU_0041");
+    let sorted = |mut v: Vec<(f32, f32)>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    };
+    let drawn = |id: &str| sorted(E::find_by_element_id(&rig.app, id).map(|e| (e.absolute_position().y, e.absolute_position().x)).collect());
+    // Where the rows put each tile, with the slide (`moving`) or without it.
+    let strip_w = rig.app.get_strip_w();
+    let strip_rows = |moving: bool| sorted(rig.strip.iter().enumerate().map(|(slot, t)| {
+        (0.0, rig.app.get_film_offset_px() + slot as f32 * 128.0 + if moving { rig.slid(t.slide_x) } else { 0.0 })
+    }).filter(|&(_, x)| x + 120.0 > 0.0 && x < strip_w).collect());
+    let grid_rows = |moving: bool| {
+        let cols = rig.app.get_grid_cols() as usize;
+        sorted(rig.grid.iter().enumerate().map(|(slot, t)| {
+            let (sx, sy) = if moving { (rig.slid(t.slide_x), rig.slid(t.slide_y)) } else { (0.0, 0.0) };
+            (rig.app.get_grid_win_y() + (slot / cols) as f32 * 88.0 + rig.app.get_grid_vp_y() + sy, 8.0 + (slot % cols) as f32 * 128.0 + sx)
+        }).filter(|&(y, _)| y + 80.0 > 0.0 && y < rig.app.get_grid_vp_h()).collect())
+    };
+    // One origin carries every row's place onto the window.
+    let by_one_origin = |drawn: &[(f32, f32)], rows: &[(f32, f32)]| {
+        drawn.len() == rows.len() && !rows.is_empty() && {
+            let o = (drawn[0].0 - rows[0].0, drawn[0].1 - rows[0].1);
+            drawn.iter().zip(rows).all(|(d, r)| (d.0 - r.0 - o.0).abs() < 0.01 && (d.1 - r.1 - o.1).abs() < 0.01)
+        }
+    };
+    let (strip, grid) = (drawn("FilmThumb::content"), drawn("GridThumb::content"));
+    assert!(by_one_origin(&strip, &strip_rows(true)), "the strip's thumbs are drawn where their rows say:\n{strip:?}\n{:?}", strip_rows(true));
+    assert!(!by_one_origin(&strip, &strip_rows(false)), "premise: some are off their places");
+    assert_eq!(rig.on_strip("HWU_0039").map(|d| d.x), rig.strip_home("HWU_0039").map(|x| x + 128.0), "39 a cell right of its place");
+    assert_eq!(rig.on_strip("HWU_0041").map(|d| d.x), rig.strip_home("HWU_0041"), "41 holds");
+    assert!(by_one_origin(&grid, &grid_rows(true)), "the grid's tiles are drawn where their rows say");
+    assert!(!by_one_origin(&grid, &grid_rows(false)), "premise: some are off their places");
+    rig.settle();
+    let (strip, grid) = (drawn("FilmThumb::content"), drawn("GridThumb::content"));
+    assert!(by_one_origin(&strip, &strip_rows(false)), "the strip's at their places at the end");
+    assert!(by_one_origin(&grid, &grid_rows(false)), "the grid's too");
+}
+
+/// R43: "Measure the longest tick during a slide against a normal glide", at 16,000 photos (the owner's
+/// "performance first"). The rows are the tick's own steps for the strip and the grid and the slide's clock,
+/// in a debug build, so the times are an upper bound on the release build's; the drawing isn't measured (no
+/// renderer here). Five photos before HWU_8000 moved, then Undo move: the landing's own extra (reading where
+/// the tiles were, `SlideFrom::read`), the landing tick's steps, and the slide's frames, against an arrow's
+/// glide on the same strip and grid. The numbers are printed for the record; the bounds are loose on purpose.
+///
+/// FALSIFIER (L28): build the slide's reading per tile with a pass over the whole list (O(n) per tile in
+/// `SlideFrom::read`): the read's bound.
+#[test]
+fn the_slide_costs_no_more_than_a_glide_at_16000_photos() {
+    let all = numbered_photos(16_000);
+    let moved: Vec<String> = (7990..7995).map(|i| format!("HWU_{i:04}")).collect();
+    let moved: Vec<&str> = moved.iter().map(String::as_str).collect();
+    let rig = SlideRig::new(without(&all, &moved), "HWU_8000", true, true);
+    // The read alone, as apply_scan does it at this size.
+    let identity = crate::photo_open::identity_map(&rig.list.borrow(), &all);
+    let t = std::time::Instant::now();
+    let from = crate::tile_slide::SlideFrom::read(&identity, all.len(), Some(8000.0), None, &rig.land.film.slide.borrow());
+    let read = t.elapsed();
+    drop(from);
+    // The landing tick: apply_scan's part, then the steps and the clock.
+    let old = rig.list.replace(all.clone());
+    let kept = rig.land.land(&rig.app, &old, &rig.list.borrow(), all.iter().position(|s| s.name == "HWU_8000").unwrap(), &[]);
+    let t = std::time::Instant::now();
+    rig.frame(kept.as_ref());
+    let landing_steps = t.elapsed();
+    assert!(rig.live.get(), "premise: it slides");
+    let mut slide_worst = std::time::Duration::ZERO;
+    let mut frames = 0;
+    while rig.live.get() {
+        let t = std::time::Instant::now();
+        rig.frame(None);
+        slide_worst = slide_worst.max(t.elapsed());
+        frames += 1;
+    }
+    // An arrow's glide on the same strip and grid: the photo on screen moves on by one.
+    *rig.land.current.borrow_mut() += 1;
+    let mut glide_worst = std::time::Duration::ZERO;
+    for _ in 0..frames.max(12) {
+        let t = std::time::Instant::now();
+        rig.frame(None);
+        glide_worst = glide_worst.max(t.elapsed());
+    }
+    eprintln!(
+        "slide cost at 16,000 photos (debug build): read {:.3} ms, landing tick's steps {:.3} ms, slide frame worst {:.3} ms over {frames} frames, glide frame worst {:.3} ms",
+        read.as_secs_f64() * 1e3, landing_steps.as_secs_f64() * 1e3, slide_worst.as_secs_f64() * 1e3, glide_worst.as_secs_f64() * 1e3,
+    );
+    // Wall-clock bounds are judged on the developer PC only (Windows), where these numbers are the record.
+    // The Mac build runs on a shared 3-core machine beside other tests, where one frame's worst time is the
+    // scheduler's doing; there the run still happens and prints.
+    if cfg!(windows) {
+        assert!(read < std::time::Duration::from_millis(20), "the read is one pass: {read:?}");
+        assert!(slide_worst <= glide_worst.max(std::time::Duration::from_millis(2)) * 3, "a slide's frame costs no more than a glide's: {slide_worst:?} against {glide_worst:?}");
+    }
+}
+
+/// R42, R43, the wiring no rig reaches: `apply_scan` reads where the tiles were beside the scroll, before
+/// the swap resets the strip, only with a kept scroll, and hands every landing's answer to the slide; the
+/// tick clocks it after the grid's step, with the gesture terms, and holds the full rate for it; the slint
+/// draws the offset and the fade from the rows and the one clock.
+///
+/// FALSIFIER (L28): read the new place (`done.start`) in place of `view.film_pos`: the read's row. Drop the
+/// posture term: its row. Stop the thumb's wrapper moving, the grid's x, or the clock in `slid`: the slint
+/// rows. Each of the order rows fails the same way when the line it names moves.
+#[test]
+fn the_slide_is_read_at_the_landing_and_clocked_after_the_grid() {
+    let main = include_str!("main.rs").replace("\r\n", "\n");
+    let prod = main.split_once("\nmod tests {").map_or(main.as_str(), |(p, _)| p);
+    let at = |needle: &str| prod.find(needle).unwrap_or_else(|| panic!("`{needle}` is in main.rs"));
+    let read = at("let (strip, grid) = tile_slide::seen(&a, old.len(), view.film_pos.get());");
+    assert!(at("let kept_scroll = rescan_carry.as_ref().and_then(|carry| {") < read, "beside the scroll");
+    assert!(read < at("            view.reset_for_swap(start);\n"), "before the swap resets the strip");
+    assert!(prod.contains("let slide_from = kept_scroll.as_ref().and_then(|kept| {"), "only with a kept scroll");
+    assert_eq!(prod.matches("film.slide.borrow_mut().landed(slide_from);").count(), 1, "one hand-over");
+    assert!(at("film.slide.borrow_mut().landed(slide_from);") > at("landing_scroll.set(photo_open::KeptScroll::after("), "at every landing, beside the scroll's");
+    let tick = at("let tile_slide_live = tick::step_tile_slide(");
+    assert!(at("        step_folder_grid(\n") < tick, "after the grid's step");
+    assert!(prod[tick..].starts_with("let tile_slide_live = tick::step_tile_slide(\n            &app, &film_t, now,\n            *hd_t.borrow() != 0 || *scr_t.borrow() || film_dragging_t.get() || wacc_t.get() != 0 || cmp_wacc_t.get() != 0,"), "with the gesture terms");
+    assert!(prod.contains("else if tile_slide_live { \"tile-slide\" }"), "the posture holds the full rate");
+    let ui = include_str!("../ui/main_window.slint").replace("\r\n", "\n");
+    assert!(ui.contains("slide-x: root.slid(item.slide-x);\n                        appear: item.arriving ? 1 - root.tile-fade-k : 1;"), "the strip's thumb");
+    assert!(ui.contains("x: 8px + Math.mod(i, root.grid-cols) * 128px + root.slid(item.slide-x);"), "the grid's x");
+    assert!(ui.contains("y: Math.floor(i / root.grid-cols) * 88px + root.slid(item.slide-y);"), "the grid's y");
+    assert!(ui.contains("opacity: item.arriving ? 1 - root.tile-fade-k : 1;"), "the grid's fade");
+    assert!(ui.contains("return Math.round(offset / 1px * root.tile-slide-k * max(root.win-sf, 0.5)) / max(root.win-sf, 0.5) * 1px;"), "snapped (L48)");
+    let thumb = include_str!("../ui/filmstrip.slint").replace("\r\n", "\n");
+    assert!(thumb.contains("        slide := Rectangle {\n        x: root.slide-x;\n        width: 100%;\n        height: 100%;\n        opacity: root.appear;\n        content := Rectangle {"), "the wrapper, around `content`");
+}
+
+// ── Delete round, R46: the blue edge ───────────────────────────────────────────────────────────────────────────────
+
+/// R46: an Undo move's job on a disk that brings back every pair it's told, so nothing here touches a disk.
+struct EdgeDisk;
+impl crate::file_queue::FileIo for EdgeDisk {
+    fn undo_moves(&self, pairs: &[(std::path::PathBuf, std::path::PathBuf)]) -> (usize, usize, usize, usize) {
+        (pairs.len(), 0, 0, 0)
+    }
+}
+
+/// The blue edge's moment, and one frame past it.
+const PAST_THE_MOMENT: u64 = crate::blue_edge::MOMENT.as_millis() as u64;
+
+impl SlideRig {
+    /// A job's report folded as the tick folds it (`file_queue::fold_file_done`), into the landing rig's history.
+    fn fold(&self, done: crate::file_queue::FileDone) {
+        let (pending, named, reread) = (Default::default(), Default::default(), Default::default());
+        let to = crate::file_queue::FoldTo { history: &self.land.history, pending: &pending, landing_name: &named, reread: &reread };
+        crate::file_queue::fold_file_done(done, &to, self.now.get());
+    }
+
+    /// The photo on screen, by name.
+    fn on(&self) -> String {
+        self.list.borrow()[*self.land.current.borrow()].name.clone()
+    }
+
+    /// The list now with `photos` of `all` back in their places.
+    fn with_back(&self, photos: &[&str], all: &[crate::Shot]) -> Vec<crate::Shot> {
+        let list = self.list.borrow();
+        all.iter().filter(|s| photos.contains(&s.name.as_str()) || list.iter().any(|l| l.name == s.name)).cloned().collect()
+    }
+
+    /// Move rejected of `photos`: the photo on screen stays, and its reread lands without them.
+    fn move_out(&self, photos: &[&str]) {
+        let on = self.on();
+        let left = without(&self.list.borrow(), photos);
+        self.land(left, &on);
+    }
+
+    /// Undo move of `photos` (R1: it never moves you): the real job on `EdgeDisk`, its report folded, then the
+    /// reread's landing with them back, on the photo on screen.
+    fn undo_move_back(&self, photos: &[&str], all: &[crate::Shot]) {
+        let pairs = photos.iter().map(|p| {
+            let file = std::path::PathBuf::from(format!("{p}.jpg"));
+            (file.clone(), std::path::PathBuf::from("Rejected").join(file))
+        }).collect();
+        let job = crate::file_queue::FileJob::UndoMove { seq: 1, dir: "folder".into(), pairs, subject: String::new() };
+        self.fold(crate::file_queue::run_job(job, &EdgeDisk));
+        let on = self.on();
+        self.land(self.with_back(photos, all), &on);
+    }
+
+    /// A clean Recover of `photos` (Ctrl+Z, a row, a line or the card): its report folded, then the reread's
+    /// landing on `lands_on` (R2: the photo it brought back, unless the person had moved on).
+    fn recover_back(&self, photos: &[&str], all: &[crate::Shot], lands_on: &str) {
+        let files: Vec<std::path::PathBuf> = photos.iter().map(|p| std::path::PathBuf::from(format!("{p}.jpg"))).collect();
+        let waited = crate::file_queue::Waited { seq: 1, pressed: self.now.get(), text: String::new() };
+        self.fold(crate::file_queue::FileDone::Recover {
+            seq: 1, dir: "folder".into(), recovered: files.len(), files, failed: 0, msg: Some("Recovered".into()), nav_at_press: 0, seats: Vec::new(), waited,
+        });
+        self.land(self.with_back(photos, all), lands_on);
+    }
+
+    /// `ms` of frames, 16 ms each.
+    fn wait(&self, ms: u64) {
+        for _ in 0..ms.div_ceil(16) {
+            self.frame(None);
+        }
+    }
+
+    /// The four sides as the window has them, by photo: left, right, top, bottom.
+    fn sides(&self) -> [Option<String>; 4] {
+        let list = self.list.borrow();
+        let name = |i: i32| usize::try_from(i).ok().map(|i| list[i].name.clone());
+        [name(self.app.get_blue_edge_left()), name(self.app.get_blue_edge_right()), name(self.app.get_blue_edge_top()), name(self.app.get_blue_edge_bottom())]
+    }
+
+    /// Whether `photo`'s grid tile shows at least half of itself (the edge's own test of "on screen").
+    fn grid_shows(&self, photo: &str) -> bool {
+        self.grid_home(photo).is_some_and(|(_, y)| y + 40.0 >= 0.0 && y + 40.0 <= self.app.get_grid_vp_h())
+    }
+}
+
+/// `[left, right, top, bottom]` by photo name, for the asserts.
+fn edges(sides: [Option<&str>; 4]) -> [Option<String>; 4] {
+    sides.map(|s| s.map(str::to_string))
+}
+
+/// An edge that isn't lit.
+const DARK: Option<&str> = None;
+
+/// R46. The owner: "if the user already scrolled past the recovered image and it is off the visible filmstrip, the
+/// edge of the filmstrip (left or right depending on where it is) should lit up in a blue gradient", and "the grid
+/// do get the blue edge (top/bottom instead of left/right as that's how it scrolls)". On HWU_0060 of 100, the strip
+/// showing HWU_0056 to HWU_0064 and the grid (three columns) HWU_0051 to HWU_0071, Undo move brings photos back
+/// while the person stays (R1). Each surface judges for itself:
+/// - 40 back: the strip's left and the grid's top, both going to 40.
+/// - 52: the strip's left only, as the grid shows it. 68: the strip's right only.
+/// - 75: the strip's right and the grid's bottom.
+/// - 58: nothing, since both show it.
+/// - 40, 52, 58, 68 and 75 together: each side goes to the nearest photo on its side, 52 and 68 on the strip, 40 and
+///   75 on the grid.
+///
+/// Each twice (L53), the moment let pass between. The grid's tiles slide (commit 11) in the same frames as its edge
+/// lights, a cell sideways under an edge that only covers the dock's top 48 px.
+///
+/// FALSIFIER (L28): swap the strip's two sides (`sides[0]`, `sides[1]`): the 40 row. Judge the grid by the strip's
+/// place: the 52 and 68 rows. Take the farthest photo on a side (`found.next()` for `Before`): the together row.
+/// The fold forgets the Undo move's photos: every row. Light a photo in view: the 58 row.
+#[test]
+fn the_blue_edge_lights_the_side_each_photo_came_back_on() {
+    let all = numbered_photos(100);
+    let rig = SlideRig::new(all.clone(), "HWU_0060", true, true);
+    let rounds: [(&[&str], [Option<&str>; 4]); 6] = [
+        (&["HWU_0040"], [Some("HWU_0040"), DARK, Some("HWU_0040"), DARK]),
+        (&["HWU_0052"], [Some("HWU_0052"), DARK, DARK, DARK]),
+        (&["HWU_0068"], [DARK, Some("HWU_0068"), DARK, DARK]),
+        (&["HWU_0075"], [DARK, Some("HWU_0075"), DARK, Some("HWU_0075")]),
+        (&["HWU_0058"], [DARK; 4]),
+        (&["HWU_0040", "HWU_0052", "HWU_0058", "HWU_0068", "HWU_0075"], [Some("HWU_0052"), Some("HWU_0068"), Some("HWU_0040"), Some("HWU_0075")]),
+    ];
+    for (photos, want) in rounds {
+        for _ in 0..2 {
+            rig.move_out(photos);
+            rig.wait(PAST_THE_MOMENT);
+            assert_eq!(rig.sides(), [None, None, None, None], "premise: nothing lit before {photos:?} come back");
+            rig.undo_move_back(photos, &all);
+            assert_eq!(rig.on(), "HWU_0060", "Undo move never moves you");
+            // The premises the rows rest on: what each surface shows.
+            assert!(rig.strip_home("HWU_0056").is_some_and(|x| x >= 0.0) && rig.strip_home("HWU_0064").is_some_and(|x| x + 120.0 <= rig.app.get_strip_w()));
+            for (photo, shows) in [("HWU_0052", true), ("HWU_0068", true), ("HWU_0058", true), ("HWU_0040", false), ("HWU_0075", false)] {
+                assert_eq!(rig.grid_shows(photo), shows, "premise: the grid shows {photo}: {shows}");
+            }
+            assert_eq!(rig.sides(), edges(want), "{photos:?} back on 60");
+            if photos == ["HWU_0040"] {
+                assert!(rig.live.get(), "the grid's tiles slide in the frames the edge lights");
+            }
+        }
+    }
+}
+
+/// R46: "clicking on the gradient should take them to that image immediately". In the real window: HWU_0040 and
+/// HWU_0075 back on HWU_0060, so all four edges are lit. A click on each goes to its photo through `sel-jump`, the
+/// grid tile's own click (the strip follows a jump there, and in Compare the focused half takes it), and never to the
+/// strip's own click on the tile beneath. Each edge is 48 px deep at its surface's edge, the strip's full height and
+/// the dock's full width. Once the moment has passed it isn't mounted, and a click there is the strip's own again.
+///
+/// FALSIFIER (L28): call `film-clicked` from the left edge: its row. Swap the grid's two targets: their rows. Mount an
+/// edge whether or not it's lit (`if true`): the unlit row. Leave the edge's click enabled while it fades: the fading
+/// row. Declare the strip's edges before the strip-wide area: the left row.
+#[test]
+fn a_click_on_a_lit_blue_edge_goes_to_its_photo() {
+    use i_slint_backend_testing::ElementHandle as E;
+    use i_slint_core::items::PointerEventButton::Left;
+    let all = numbered_photos(100);
+    let rig = SlideRig::new(without(&all, &["HWU_0040", "HWU_0075"]), "HWU_0060", true, true);
+    let jumps = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let strip_clicks = std::rc::Rc::new(std::cell::Cell::new(0));
+    { let j = jumps.clone(); rig.app.on_sel_jump(move |idx| j.borrow_mut().push(idx)); }
+    { let c = strip_clicks.clone(); rig.app.on_film_clicked(move |_, _| c.set(c.get() + 1)); }
+    rig.undo_move_back(&["HWU_0040", "HWU_0075"], &all);
+    assert_eq!(rig.sides(), edges([Some("HWU_0040"), Some("HWU_0075"), Some("HWU_0040"), Some("HWU_0075")]));
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(250));
+    let place = |photo: &str| all.iter().position(|s| s.name == photo).unwrap() as i32;
+    let depth = rig.app.get_blue_edge_depth();
+    let win = rig.app.window().size().to_logical(rig.app.window().scale_factor());
+    let box_of = |id: &str| {
+        let found: Vec<_> = E::find_by_element_id(&rig.app, id).collect();
+        assert_eq!(found.len(), 1, "{id} is mounted while it's lit");
+        let (p, s) = (found[0].absolute_position(), found[0].size());
+        (p.x, p.y, s.width, s.height)
+    };
+    let dock = E::find_by_element_id(&rig.app, "MainWindow::griddock").next().expect("the grid's dock");
+    let (dp, ds) = (dock.absolute_position(), dock.size());
+    for (id, want, (x, y, w, h)) in [
+        ("MainWindow::edgeleft", place("HWU_0040"), (0.0, win.height - 102.0, depth, 102.0)),
+        ("MainWindow::edgeright", place("HWU_0075"), (win.width - depth, win.height - 102.0, depth, 102.0)),
+        ("MainWindow::edgetop", place("HWU_0040"), (dp.x, dp.y, ds.width, depth)),
+        ("MainWindow::edgebottom", place("HWU_0075"), (dp.x, dp.y + ds.height - depth, ds.width, depth)),
+    ] {
+        assert_eq!(box_of(id), (x, y, w, h), "{id}: where it's drawn");
+        jumps.borrow_mut().clear();
+        click(&rig.app, x + w / 2.0, y + h / 2.0, Left);
+        assert_eq!(*jumps.borrow(), [want], "{id}: the click goes to its photo");
+        assert_eq!(strip_clicks.get(), 0, "{id}: not to the tile beneath");
+    }
+    // The pointer goes back to the photo and the moment passes. While it fades it has let go of the click, which is
+    // the strip's own again.
+    hover(&rig.app, 800.0, 300.0);
+    assert!(!rig.app.get_blue_edge_hot(), "the pointer left the edges");
+    rig.wait(PAST_THE_MOMENT);
+    assert_eq!(rig.sides(), [None, None, None, None]);
+    assert_eq!(E::find_by_element_id(&rig.app, "MainWindow::edgeleft").count(), 1, "premise: still fading out");
+    jumps.borrow_mut().clear();
+    click(&rig.app, depth / 2.0, win.height - 51.0, Left);
+    assert_eq!((jumps.borrow().len(), strip_clicks.get()), (0, 1), "a fading edge passes the click to the strip");
+    // Then nothing is mounted.
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(250));
+    for id in ["MainWindow::edgeleft", "MainWindow::edgeright", "MainWindow::edgetop", "MainWindow::edgebottom"] {
+        assert_eq!(E::find_by_element_id(&rig.app, id).count(), 0, "{id} isn't mounted when it isn't lit");
+    }
+    click(&rig.app, depth / 2.0, win.height - 51.0, Left);
+    assert_eq!((jumps.borrow().len(), strip_clicks.get()), (0, 2), "the strip's own click on the tile there");
+}
+
+/// R46: the edge is for a photo that came back where the person can't see it. One that lands where it can be seen
+/// lights nothing, and so does one the landing goes to. On HWU_0060: Undo move of HWU_0058, in both views, lights
+/// nothing. Ctrl+Z of HWU_0040 that lands on it (R2: the person hadn't moved on) lights nothing either; the same
+/// Ctrl+Z after the person moved on to 60 lights the strip's left and the grid's top. Twice (L53).
+///
+/// FALSIFIER (L28): light a photo in view (seen counts as `Before`): the 58 row. Dropping `stage.shows` from the
+/// landing isn't seen here, as a photo on the stage is at the strip's middle and judged seen at once; the Culling row
+/// `a_ctrl_z_after_moving_on_points_the_strip_edge_at_the_photo` catches it (the term matters in Compare, for a photo
+/// that goes back into the half without the focus while the strip follows the other).
+#[test]
+fn a_returned_photo_that_lands_in_view_or_on_the_stage_lights_no_blue_edge() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let all = numbered_photos(100);
+    let rig = SlideRig::new(all.clone(), "HWU_0060", true, true);
+    for _ in 0..2 {
+        rig.move_out(&["HWU_0058"]);
+        rig.undo_move_back(&["HWU_0058"], &all);
+        rig.wait(250);
+        assert_eq!(rig.sides(), [None, None, None, None], "58 shows on both");
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(250));
+        assert_eq!(E::find_by_element_id(&rig.app, "MainWindow::edgeleft").count(), 0, "nothing mounted");
+        // Del on 40 (it was on screen), and Ctrl+Z straight away: it lands on 40.
+        rig.land(without(&all, &["HWU_0040"]), "HWU_0041");
+        rig.recover_back(&["HWU_0040"], &all, "HWU_0040");
+        assert_eq!((rig.on().as_str(), rig.sides()), ("HWU_0040", [None, None, None, None]), "the stage shows it");
+        // Del again, the person goes on to 60, then Ctrl+Z: they stay, and the edges point at it.
+        rig.land(without(&all, &["HWU_0040"]), "HWU_0041");
+        rig.land(without(&all, &["HWU_0040"]), "HWU_0060");
+        rig.wait(500); // the strip and the grid follow the person to 60
+        rig.recover_back(&["HWU_0040"], &all, "HWU_0060");
+        assert_eq!(rig.sides(), edges([Some("HWU_0040"), DARK, Some("HWU_0040"), DARK]));
+        rig.wait(PAST_THE_MOMENT);
+    }
+}
+
+/// R46: "the cue goes as soon as it has nothing left to say". HWU_0040 and HWU_0045 back on HWU_0060, the grid open:
+/// - the person scrolls the strip left: once 45 shows, the left edge goes to 40; once 40 shows, it goes. The grid,
+///   which hasn't moved, still points at 45 and then, scrolled up to show it, at 40, then goes;
+/// - back again, and an arrow to 61: everything goes at once (they moved on);
+/// - back again and left alone: lit for its moment (3 s), then gone; with the pointer on it, it waits for the pointer
+///   to leave;
+/// - back while the events panel is open: nothing lights until it closes, then the edge has its whole moment.
+///
+/// FALSIFIER (L28): never mark a photo seen (`Where::of` never answers `Seen`): the scroll rows. Ignore the stage
+/// (`self.stage != Some(stage)` dropped): the arrow row. No moment (`MOMENT` never reached): the time row. Ignore the
+/// pointer: the hover row. Light under the panel: the panel row.
+#[test]
+fn the_blue_edge_goes_once_it_has_nothing_left_to_say() {
+    let all = numbered_photos(100);
+    let back = ["HWU_0040", "HWU_0045"];
+    let rig = SlideRig::new(without(&all, &back), "HWU_0060", true, true);
+    let v = &rig.land.view;
+    rig.undo_move_back(&back, &all);
+    assert_eq!(rig.sides(), edges([Some("HWU_0045"), DARK, Some("HWU_0045"), DARK]), "the nearest on each side");
+    v.film_follow.set(false);
+    v.film_target.set(49.0);
+    rig.wait(400);
+    assert_eq!(rig.sides(), edges([Some("HWU_0040"), DARK, Some("HWU_0045"), DARK]), "45 shows on the strip: its left goes to 40");
+    v.film_target.set(43.0);
+    rig.wait(400);
+    assert_eq!(rig.sides(), edges([DARK, DARK, Some("HWU_0045"), DARK]), "40 shows too: the strip has nothing left to say");
+    let row_top = |photo: usize| 8.0 + (photo / rig.app.get_grid_cols() as usize) as f32 * 88.0;
+    rig.app.set_grid_vp_y(-(row_top(45) - 100.0));
+    rig.frame(None);
+    assert_eq!(rig.sides(), edges([DARK, DARK, Some("HWU_0040"), DARK]), "the grid shows 45: its top goes to 40");
+    rig.app.set_grid_vp_y(-(row_top(40) - 100.0));
+    rig.frame(None);
+    assert_eq!(rig.sides(), [None, None, None, None], "and then 40");
+
+    // Back again; the person moves on.
+    v.film_follow.set(true);
+    rig.move_out(&back);
+    rig.wait(PAST_THE_MOMENT);
+    rig.undo_move_back(&back, &all);
+    assert_eq!(rig.sides()[0].as_deref(), Some("HWU_0045"));
+    *rig.land.current.borrow_mut() += 1;
+    rig.frame(None);
+    assert_eq!(rig.sides(), [None, None, None, None], "an arrow ends it at once");
+    *rig.land.current.borrow_mut() -= 1;
+
+    // Left alone: its moment, then gone. The pointer on it holds it.
+    for hover in [false, true] {
+        rig.move_out(&back);
+        rig.wait(PAST_THE_MOMENT);
+        rig.undo_move_back(&back, &all);
+        rig.app.set_blue_edge_hot(hover);
+        rig.wait(PAST_THE_MOMENT - 200);
+        assert_eq!(rig.sides()[0].as_deref(), Some("HWU_0045"), "still lit just before its moment ends");
+        rig.wait(400);
+        assert_eq!(rig.sides()[0].is_some(), hover, "after it, only the pointer keeps it (hover: {hover})");
+        rig.app.set_blue_edge_hot(false);
+        rig.frame(None);
+        assert_eq!(rig.sides(), [None, None, None, None], "the pointer leaves, and it goes");
+    }
+
+    // The events panel open as it lands: nothing until it closes, and then the whole moment.
+    rig.move_out(&back);
+    rig.wait(PAST_THE_MOMENT);
+    rig.app.set_notif_open(true);
+    rig.undo_move_back(&back, &all);
+    assert_eq!(rig.sides(), [None, None, None, None], "nothing lights under the panel, from its first frame");
+    rig.wait(PAST_THE_MOMENT + 500);
+    assert_eq!(rig.sides(), [None, None, None, None], "nothing lights under the panel");
+    rig.app.set_notif_open(false);
+    rig.frame(None);
+    assert_eq!(rig.sides()[0].as_deref(), Some("HWU_0045"), "lit when it closes");
+    rig.wait(PAST_THE_MOMENT - 200);
+    assert_eq!(rig.sides()[0].as_deref(), Some("HWU_0045"), "for its whole moment");
+    rig.wait(400);
+    assert_eq!(rig.sides(), [None, None, None, None]);
+}
+
+/// R46: a person with "Interface motion" off still gets the cue (the setting turns motion off, not information). The
+/// edge is there in full in the frame it lights, with no fade, lasts the same moment, and is gone in one frame. With
+/// motion on, the same edge fades in over the edge pills' 0.2 s.
+///
+/// FALSIFIER (L28): read the reveal with motion off too (`edge-l: self.edge-l-reveal`): the motion-off row. Take
+/// motion off as "no cue" (`!motion-ui` in the mount): the same row.
+#[test]
+fn interface_motion_off_still_shows_the_blue_edge() {
+    use i_slint_backend_testing::ElementHandle as E;
+    let all = numbered_photos(100);
+    for motion in [false, true] {
+        let rig = SlideRig::new(without(&all, &["HWU_0040"]), "HWU_0060", true, motion);
+        rig.undo_move_back(&["HWU_0040"], &all);
+        assert_eq!(rig.sides(), edges([Some("HWU_0040"), DARK, Some("HWU_0040"), DARK]), "motion {motion}: lit");
+        let shown = |id: &str| E::find_by_element_id(&rig.app, id).count();
+        assert_eq!(shown("MainWindow::edgeleft"), usize::from(!motion), "motion {motion}: shown in full at once only with motion off");
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(100));
+        assert_eq!(shown("MainWindow::edgeleft"), 1, "motion {motion}: and with it on, on its way in");
+        rig.wait(PAST_THE_MOMENT - 200);
+        assert_eq!(rig.sides()[0].as_deref(), Some("HWU_0040"), "motion {motion}: the same moment");
+        rig.wait(400);
+        assert_eq!(rig.sides(), [None, None, None, None]);
+        assert_eq!(shown("MainWindow::edgeleft"), usize::from(motion), "motion {motion}: gone at once only with motion off");
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(250));
+        assert_eq!(shown("MainWindow::edgeleft"), 0, "motion {motion}: and with it on, faded out");
+    }
+}
+
+/// R46: a re-sort or another folder clears it. Lit for HWU_0040 on HWU_0060: a re-sort lands (the order reversed),
+/// and the edge goes at once; lit again, a landing that keeps nothing (another folder: `apply_scan` hands `None`)
+/// clears it too. A landing that keeps the order (a photo saved beside the others arrives) only carries it through:
+/// still pointing at 40, at its new place.
+///
+/// FALSIFIER (L28): a landing that keeps nothing keeps the edge (`kept` of `None` returns without `end`): the re-sort
+/// row. A landing forgets what's lit (`photos.clear()` at every landing): the carry row.
+#[test]
+fn a_re_sort_or_another_folder_clears_the_blue_edge() {
+    let all = numbered_photos(100);
+    let rig = SlideRig::new(without(&all, &["HWU_0040"]), "HWU_0060", true, true);
+    rig.undo_move_back(&["HWU_0040"], &all);
+    assert_eq!(rig.sides()[0].as_deref(), Some("HWU_0040"));
+    // A photo another program saved arrives before 40: the edge carries through, to 40 at its new place.
+    let mut more = all.clone();
+    more.insert(10, landing_photo("HWU_0009b"));
+    rig.land(more.clone(), "HWU_0060");
+    assert_eq!(rig.sides()[0].as_deref(), Some("HWU_0040"), "carried through a landing that keeps the order");
+    let mut reversed = more.clone();
+    reversed.reverse();
+    rig.land(reversed, "HWU_0060");
+    assert_eq!(rig.sides(), [None, None, None, None], "a re-sort clears it");
+    // Lit again, then another folder.
+    let rig = SlideRig::new(without(&all, &["HWU_0040"]), "HWU_0060", true, true);
+    rig.undo_move_back(&["HWU_0040"], &all);
+    assert_eq!(rig.sides()[0].as_deref(), Some("HWU_0040"));
+    let stage = crate::blue_edge::Stage { current: 60, halves: None };
+    rig.land.film.edge.borrow_mut().landed(None, &[], &all, stage);
+    rig.frame(None);
+    assert_eq!(rig.sides(), [None, None, None, None], "another folder clears it");
+}
+
+/// R46: "The edge is for a photo the person brought back." A photo another program saved (the refresh on coming back
+/// will bring these) arrives at a reread: it fades in (commit 11), and no edge points at it, far off the strip or
+/// not. Then a Ctrl+Z after moving on brings HWU_0040 back, and only 40 lights. The only source is
+/// `FileHistory::brought_back`, which only a Recover's or an Undo move's report fills
+/// (`the_blue_edge_is_read_at_the_landing_and_judged_after_the_grid` pins that nothing else writes it).
+///
+/// FALSIFIER (L28): light every photo a landing adds (the arrivals of the landing's map in place of `brought`):
+/// the first row.
+#[test]
+fn a_photo_nobody_brought_back_lights_no_blue_edge() {
+    let all = numbered_photos(100);
+    for saved in ["HWU_0030", "HWU_0090", "HWU_0059"] {
+        let rig = SlideRig::new(without(&all, &[saved, "HWU_0040"]), "HWU_0060", true, true);
+        let with_saved = rig.with_back(&[saved], &all);
+        rig.land(with_saved, "HWU_0060");
+        rig.wait(100);
+        assert_eq!(rig.sides(), [None, None, None, None], "{saved}, saved by another program, lights nothing");
+        rig.recover_back(&["HWU_0040"], &all, "HWU_0060");
+        assert_eq!(rig.sides(), edges([Some("HWU_0040"), DARK, Some("HWU_0040"), DARK]), "40, brought back, lights");
+    }
+}
+
+/// R46, "It costs nothing when it isn't showing", measured the way the movement's was (debug build, so an upper bound
+/// on the release build; the drawing isn't measured, as the test backend has no renderer). At 16,000 photos on
+/// HWU_8000: the tick's step with nothing lit (the usual case: one borrow and a test), the landing's reading of 1,000
+/// photos an Undo move brought back from all over the folder, and the worst lit frame judging all 1,000 on the strip
+/// and the grid. Printed for the record; the bounds are loose on purpose.
+///
+/// FALSIFIER (L28): match the files with a pass over them per photo (a list, not a set): the landing's bound. That an
+/// unlit edge is never judged at all is pinned by source (`the_blue_edge_is_read_at_the_landing_and_judged_after_the_grid`),
+/// as an empty judgement is too cheap to time.
+#[test]
+fn the_blue_edge_costs_nothing_unlit_at_16000_photos() {
+    let all = numbered_photos(16_000);
+    let rig = SlideRig::new(all.clone(), "HWU_8000", true, true);
+    let stage = crate::blue_edge::Stage { current: 8000, halves: None };
+    let unlit = (0..2_000).map(|_| {
+        let t = std::time::Instant::now();
+        crate::tick::step_blue_edge(&rig.app, &rig.land.film, rig.now.get(), stage, 8000.0, all.len());
+        t.elapsed()
+    }).max().unwrap();
+    // Every 16th photo, 1,000 of them, back at once, none of them on the stage.
+    let back: Vec<std::path::PathBuf> = (8..16_000).step_by(16).map(|i| std::path::PathBuf::from(format!("HWU_{i:04}.jpg"))).collect();
+    let identity: Vec<Option<usize>> = (0..all.len()).map(Some).collect();
+    let t = std::time::Instant::now();
+    rig.land.film.edge.borrow_mut().landed(Some(&identity), &back, &all, stage);
+    let read = t.elapsed();
+    let mut lit = std::time::Duration::ZERO;
+    for _ in 0..30 {
+        let t = std::time::Instant::now();
+        crate::tick::step_blue_edge(&rig.app, &rig.land.film, rig.now.get(), stage, 8000.0, all.len());
+        lit = lit.max(t.elapsed());
+    }
+    assert_eq!(rig.sides()[0].as_deref(), Some("HWU_7992"), "premise: lit, the nearest on the left");
+    eprintln!(
+        "blue edge cost at 16,000 photos (debug build): unlit step worst {:.4} ms, landing's read of 1,000 back {:.3} ms, lit frame worst {:.3} ms",
+        unlit.as_secs_f64() * 1e3, read.as_secs_f64() * 1e3, lit.as_secs_f64() * 1e3,
+    );
+    // Wall-clock bounds are judged on the developer PC only (Windows), where these numbers are the record.
+    // The Mac build runs on a shared 3-core machine beside other tests, where one call's worst time is the
+    // scheduler's doing; there the run still happens and prints.
+    if cfg!(windows) {
+        assert!(unlit < std::time::Duration::from_millis(1), "unlit, the step is a borrow and a test: {unlit:?}");
+        assert!(read < std::time::Duration::from_millis(50), "the read is one pass over the list: {read:?}");
+        assert!(lit < std::time::Duration::from_millis(5), "a lit frame: {lit:?}");
+    }
+}
+
+/// R46, the wiring no rig reaches. `apply_scan` takes what the person brought back at every landing, after the
+/// stage has settled (the view and Compare restored) and hands it to the edge with the landing's map, which is
+/// `None` when it keeps nothing. The tick judges it after the strip's, the grid's and the slide's steps. Only a
+/// Recover's and an Undo move's reports write `brought_back`, and a landing that never happened drops it, so no
+/// other reread (another program's file, the refresh on coming back) can light the edge. In the slint: each edge
+/// goes to its own side's photo through `sel-jump`, the grid tile's click, mounted only while it shows, with motion
+/// off snapping its reveal.
+///
+/// FALSIFIER (L28): hand the edge the stage before the view is restored: the order row. Write `brought_back` from the
+/// take-out or the reread: the writers' row. A landing that never happened keeps it: the `no_landing` row. Judge before
+/// the grid's step: the tick's row. Judge while nothing is lit: the unlit row. Swap two edges' targets, call
+/// `film-clicked`, or read the reveal with motion off: the slint rows.
+#[test]
+fn the_blue_edge_is_read_at_the_landing_and_judged_after_the_grid() {
+    let prod = |text: &str| {
+        let text = text.replace("\r\n", "\n");
+        let code = text.split_once("\nmod tests {").map_or(text.as_str(), |(p, _)| p).to_string();
+        code.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    };
+    let main = prod(include_str!("main.rs"));
+    let queue = prod(include_str!("file_queue.rs"));
+    let at = |text: &str, needle: &str| text.find(needle).unwrap_or_else(|| panic!("`{needle}`"));
+    let take = "let brought = std::mem::take(&mut file_history.borrow_mut().brought_back);";
+    let hand = "film.edge.borrow_mut().landed(kept_scroll.as_ref().map(|kept| kept.identity()), &brought, &new_arc, stage);";
+    assert_eq!((main.matches(take).count(), main.matches(hand).count()), (1, 1), "one take and one hand-over");
+    assert!(at(&main, "kept.restore(&a, &view.compare, (&cmp_a_idx, &cmp_b_idx), &roi);") < at(&main, take), "after the stage has settled");
+    assert!(at(&main, hand) < at(&main, "landing_scroll.set(photo_open::KeptScroll::after("), "while the scroll's map is still there");
+    assert!(main.contains("let stage = blue_edge::Stage { current: *current.borrow(), halves: view.compare.get().then(|| (cmp_a_idx.get(), cmp_b_idx.get())) };"));
+    // Nothing is read or judged while nothing is lit or waiting.
+    let tick = prod(include_str!("tick.rs"));
+    let step = &tick[at(&tick, "pub(crate) fn step_blue_edge(")..];
+    assert!(step.split_once('{').unwrap().1.trim_start().starts_with("let mut edge = film.edge.borrow_mut();\n    if !edge.live() {\n        return;\n    }"), "an unlit edge costs one borrow and a test");
+    let judge = at(&main, "tick::step_blue_edge(");
+    assert!(at(&main, "let tile_slide_live = tick::step_tile_slide(") < judge && at(&main, "        step_folder_grid(\n") < judge, "after the grid and the slide");
+    // The one source, and its two writers.
+    let mut writers = 0;
+    for (name, text) in [("main.rs", main.clone()), ("tick.rs", tick.clone()), ("support.rs", prod(include_str!("support.rs"))), ("file_queue.rs", queue.clone()), ("photo_open.rs", prod(include_str!("photo_open.rs"))), ("platform.rs", prod(include_str!("platform.rs")))] {
+        let writes = text.matches("brought_back.extend(").count();
+        writers += writes;
+        assert!(writes == 0 || name == "file_queue.rs", "{name} writes brought_back");
+    }
+    assert_eq!(writers, 2, "a Recover's and an Undo move's reports");
+    let recover = &queue[at(&queue, "FileDone::Recover { seq, dir, files, recovered, failed, msg, nav_at_press, seats, waited } => {")..at(&queue, "FileDone::UndoMove { seq, dir, msg, severity, back } => {")];
+    assert!(recover.contains("to.history.borrow_mut().brought_back.extend(files.iter().cloned());"), "a Recover's");
+    let undo = &queue[at(&queue, "FileDone::UndoMove { seq, dir, msg, severity, back } => {")..at(&queue, "FileDone::Crashed { seq, dir } => {")];
+    assert!(undo.contains("to.history.borrow_mut().brought_back.extend(back);"), "an Undo move's");
+    let nothing = &queue[at(&queue, "pub(crate) fn no_landing(")..];
+    assert!(nothing[..nothing.find("\n}").unwrap()].contains("history.borrow_mut().brought_back.clear();"), "a landing that didn't happen drops it");
+    // The slint: each edge to its own side's photo, through the grid tile's own jump, mounted while it shows.
+    let ui = include_str!("../ui/main_window.slint").replace("\r\n", "\n");
+    for (side, host, id) in [("left", "fsinner.edge-l", "edgeleft"), ("right", "fsinner.edge-r", "edgeright"), ("top", "griddock.edge-t", "edgetop"), ("bottom", "griddock.edge-b", "edgebottom")] {
+        let mount = format!("if {host} > 0.001 : {id} := BlueEdge {{");
+        let start = at(&ui, &mount);
+        let body = &ui[start..start + ui[start..].find("hot(on) =>").unwrap()];
+        assert!(body.contains(&format!("live: root.blue-edge-{side} >= 0")), "{id}: takes the click only while lit");
+        assert!(body.contains(&format!("go => {{ if (root.neighbour-browse-allowed(false, false)) {{ root.sel-jump(root.blue-edge-{side}); }} }}")), "{id}: the grid tile's jump, to its own photo");
+        assert!(!body.contains("film-clicked"), "{id}: never the strip's own click");
+    }
+    for (side, short) in [("left", "l"), ("right", "r"), ("top", "t"), ("bottom", "b")] {
+        assert!(ui.contains(&format!("property <float> edge-{short}: root.motion-ui ? self.edge-{short}-reveal : (root.blue-edge-{side} >= 0 ? 1.0 : 0.0);")), "{side}: motion off snaps");
+    }
+    let strip_edges = at(&ui, "if fsinner.edge-l > 0.001 : edgeleft := BlueEdge {");
+    assert!(at(&ui, "                ta := TouchArea {") < strip_edges && at(&ui, "if root.film-vis-frac < 0.999 : Rectangle {") < strip_edges, "over the strip-wide area and the seek bar");
+    assert!(at(&ui, "dockdiv := AaHairline {") < at(&ui, "if griddock.edge-t > 0.001 : edgetop := BlueEdge {"), "over the grid's tiles and bar");
+}
+
+// ── Delete round: the refresh on coming back (11 November 2026) ────────────────────────────────────────────
+
+/// The refresh on coming back, on a real folder of generated files, end to end but for the window's activation:
+/// the tick's own ask (`file_queue::ask_on_return`, fed "away" then "in front" as `falcon_is_active` reads them),
+/// the real reread (`file_queue::Reread`), the real listing on its own thread (`file_queue::spawn_listing`, the
+/// app's `reopen_scan` with id 0 and the folder's live sort), its acceptance against the real stamps with the
+/// real holds read from the window (`support::LandingHolds::from_window`), the landing settled by photo
+/// (`photo_open::settle_by_photo`, as `apply_scan` settles it), and the landing itself through commit 11's
+/// `SlideRig` (prepared work, view and scroll kept by `RescanCarry`, the slide and the blue edge), one frame
+/// after. The tick's order: the ask, the folder guard, the acceptance, the listing's start.
+struct ReturnRig {
+    slide: SlideRig,
+    dir: std::path::PathBuf,
+    reread: std::cell::RefCell<crate::file_queue::Reread>,
+    /// The tick's last known answer to "is Falcon in front?".
+    front: std::cell::Cell<Option<bool>>,
+    /// `listing_stamps`, as the last landing left them.
+    stamps: std::cell::RefCell<Option<crate::support::ListingStamps>>,
+    /// The folder generation as the listing's thread reads it, to stop reading when it's out of date.
+    gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    queue: crate::file_queue::FileQueue,
+    /// The folder's live sort, which a listing sorts by (`folder_attrs.sort`).
+    sort: std::cell::RefCell<Option<String>>,
+    applying: std::cell::Cell<bool>,
+}
+
+impl Drop for ReturnRig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// HWU_0001.jpg and on, as a camera names them.
+fn return_files(n: usize) -> Vec<String> {
+    (1..=n).map(|i| format!("HWU_{i:04}.jpg")).collect()
+}
+
+impl ReturnRig {
+    /// A new folder holding `files` (generated bytes, never a photo), listed as its open lists it, with the person
+    /// on `on`, Falcon in front.
+    fn new(tag: &str, files: &[String], on: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("falcon_return_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in files {
+            std::fs::write(dir.join(f), [1u8; 16]).unwrap();
+        }
+        let input = crate::file_queue::ListingInput { live: Default::default(), live_sort: None, sort_lru: Vec::new(), sort_cap: 0, inline_dates: false };
+        let mut opened = crate::file_queue::run_listing(&dir, input, falcon_decode::scan_folder_with_metadata).result.expect("the folder lists");
+        let stamps = opened.stamps.take();
+        let rig = Self {
+            slide: SlideRig::new(opened.shots, on, false, true),
+            dir,
+            reread: Default::default(),
+            front: std::cell::Cell::new(Some(true)),
+            stamps: std::cell::RefCell::new(stamps),
+            gen: Default::default(),
+            queue: crate::file_queue::FileQueue::new(),
+            sort: Default::default(),
+            applying: std::cell::Cell::new(false),
+        };
+        rig.slide.settle();
+        rig
+    }
+
+    fn app(&self) -> &ui::MainWindow {
+        &self.slide.app
+    }
+
+    /// Another program writes `file` in the folder: a new file, or one saved over with a new size.
+    fn write(&self, file: &str, size: usize) {
+        std::fs::write(self.dir.join(file), vec![2u8; size]).unwrap();
+    }
+
+    fn remove(&self, file: &str) {
+        std::fs::remove_file(self.dir.join(file)).unwrap();
+    }
+
+    fn on_screen(&self) -> String {
+        self.dir.display().to_string()
+    }
+
+    /// The person goes to another program: the tick reads "not in front".
+    fn away(&self) {
+        assert!(!crate::file_queue::ask_on_return(&self.front, Some(false), &self.on_screen(), &self.reread), "leaving asks nothing");
+    }
+
+    /// …and comes back: "in front". `true`: it asked.
+    fn back(&self) -> bool {
+        crate::file_queue::ask_on_return(&self.front, Some(true), &self.on_screen(), &self.reread)
+    }
+
+    fn input(&self) -> crate::file_queue::ListingInput {
+        crate::file_queue::ListingInput {
+            live: std::sync::Arc::new(self.slide.list.borrow().clone()),
+            live_sort: self.sort.borrow().clone(),
+            sort_lru: Vec::new(),
+            sort_cap: 10, // sort memory on, the default, so the live sort counts
+            inline_dates: false,
+        }
+    }
+
+    /// One tick of the reread, in the tick's order, and what the acceptance did.
+    fn tick(&self) -> &'static str {
+        let on_screen = self.on_screen();
+        if self.reread.borrow_mut().forget_unless(|d| d.display().to_string() == on_screen) {
+            return "forgot";
+        }
+        let held = || crate::support::LandingHolds { applying_rotations: self.applying.get(), ..crate::support::LandingHolds::from_window(self.app()) }.any();
+        let accepted = {
+            let stamps = self.stamps.borrow();
+            self.reread.borrow_mut().accept(self.slide.land.folder_gen.get(), self.queue.pushes(), stamps.as_ref(), held)
+        };
+        let said = match accepted {
+            crate::file_queue::Acceptance::Nothing => "nothing",
+            crate::file_queue::Acceptance::Discarded => "discarded",
+            crate::file_queue::Acceptance::Failed => "failed",
+            crate::file_queue::Acceptance::Unchanged(_) => "unchanged",
+            crate::file_queue::Acceptance::Land(done, _) => {
+                self.land(*done);
+                "landed"
+            }
+        };
+        let generation = self.slide.land.folder_gen.get();
+        if self.reread.borrow().due(std::time::Instant::now(), self.queue.quiet(), false) {
+            let ticket = self.reread.borrow_mut().start(generation, self.queue.pushes());
+            if let Some(ticket) = ticket {
+                self.gen.store(generation, std::sync::atomic::Ordering::Relaxed);
+                crate::file_queue::spawn_listing(ticket, self.input(), self.gen.clone(), self.queue.clone());
+            }
+        }
+        said
+    }
+
+    /// `apply_scan`'s settling: by photo, on the photo on screen now, with Compare as it is, and the landing.
+    fn land(&self, mut done: crate::support::ScanDone) {
+        let on_screen = self.slide.list.borrow().clone();
+        done.land_by_photo = Some(crate::support::Named::default());
+        let compare = self.slide.land.pair(self.app());
+        let landing = crate::photo_open::settle_by_photo(&mut done, &on_screen, *self.slide.land.current.borrow(), 0, compare);
+        let listed = done.stamps.take().expect("a listing has stamps");
+        let previous = self.stamps.replace(Some(listed.clone())).expect("the list on screen has stamps");
+        self.slide.land_listing(done.shots, done.start, landing, (&previous, &listed));
+    }
+
+    /// Ticks until the reread has nothing left to do, and what each acceptance that did something did.
+    fn settle(&self) -> Vec<&'static str> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut said = Vec::new();
+        loop {
+            let did = self.tick();
+            if did != "nothing" {
+                said.push(did);
+            }
+            if !self.reread.borrow().wanted_or_running() {
+                self.slide.settle();
+                return said;
+            }
+            assert!(std::time::Instant::now() < deadline, "the listing should arrive: {said:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Ticks until the listing has arrived and waits for a hold, landing nothing.
+    fn until_held(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            assert_eq!(self.tick(), "nothing", "it waits");
+            if !self.reread.borrow().working() && self.reread.borrow().wanted_or_running() {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "the listing should arrive");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A sort pick of name order, `desc` or not, landing now on the interface thread, as `reload` lands it: a
+    /// listing in the new order, by photo.
+    fn sort_pick(&self, desc: bool) {
+        *self.sort.borrow_mut() = Some(crate::support::encode_sort_spec(crate::support::SortMethod::Name, desc));
+        let picked = crate::file_queue::run_listing(&self.dir, self.input(), falcon_decode::scan_folder_with_metadata);
+        self.land(picked.result.expect("the folder lists"));
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.slide.list.borrow().iter().map(|s| s.name.clone()).collect()
+    }
+
+    fn place(&self, photo: &str) -> usize {
+        self.slide.list.borrow().iter().position(|s| s.name == photo).unwrap_or_else(|| panic!("{photo} is listed"))
+    }
+
+    /// The photo on screen.
+    fn on(&self) -> String {
+        self.slide.list.borrow()[*self.slide.land.current.borrow()].name.clone()
+    }
+
+    fn view(&self) -> (f32, f32, f32) {
+        (self.app().get_zoom(), self.app().get_pan_x(), self.app().get_pan_y())
+    }
+
+    /// Nothing glows: no edge is lit, and nothing waits to be.
+    fn no_edge(&self) -> bool {
+        let app = self.app();
+        self.slide.land.film.edge.borrow().photos().is_empty()
+            && [app.get_blue_edge_left(), app.get_blue_edge_right(), app.get_blue_edge_top(), app.get_blue_edge_bottom()] == [-1; 4]
+    }
+
+    /// Photo `name`'s row on the strip.
+    fn strip_row(&self, name: &str) -> ui::FilmItem {
+        SlideRig::slot(&self.slide.strip, name).unwrap_or_else(|| panic!("{name} is on the strip")).1
+    }
+}
+
+/// The owner, 2 November 2026: "it should try to diff the folder and refresh if changes happen as usually I would
+/// save a photo next to the original", and of zoom and Compare: "Yes keep don't reset". What a person expects
+/// ("My files"): "My new photo is there beside the original ... I'm still on the photo I was on, still zoomed or
+/// in Compare". On HWU_0005, zoomed, another program saves HWU_0005-Edit while the person is away; at the return
+/// it is listed beside the original, the person is still on HWU_0005 at the same zoom and spot, the new photo
+/// fades in where it lands and HWU_0006 slides a cell over (commit 11), and nothing glows (R46). Again with a
+/// second edit. Then in Compare on HWU_0005 and HWU_0006: Compare stays on the same two photos, zoomed.
+///
+/// FALSIFIER (L28): the ask asks nothing (REFRESH-6): no listing. `RescanCarry::keep_view` has no first form
+/// (REFRESH-21): the zoom. Every arrival lights the edge (REFRESH-18) passes this row on purpose: the new photos
+/// land in view and are seen at once; `coming_back_points_no_blue_edge_at_what_another_program_saved` catches it.
+#[test]
+fn coming_back_shows_a_photo_saved_beside_yours_and_keeps_your_view() {
+    let rig = ReturnRig::new("beside", &return_files(9), "HWU_0005");
+    let app = rig.app();
+    app.set_img_aspect(1.5);
+    app.set_zoom(3.0);
+    app.set_pan_x(40.0);
+    app.set_pan_y(-20.0);
+    for edit in ["HWU_0005-Edit", "HWU_0005-Edit-2"] {
+        rig.away();
+        rig.write(&format!("{edit}.jpg"), 16);
+        assert!(rig.back(), "{edit}: coming back asks");
+        // One frame of the landing: what the strip shows as it lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut said = Vec::new();
+        while said.is_empty() {
+            let did = rig.tick();
+            if did != "nothing" {
+                said.push(did);
+            }
+            assert!(std::time::Instant::now() < deadline, "{edit}: the listing should arrive");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(said, ["landed"], "{edit}: one listing, one landing");
+        assert_eq!(rig.on(), "HWU_0005", "{edit}: still on your photo");
+        let (at, new) = (rig.place("HWU_0005"), rig.place(edit));
+        assert!(at < new && new < rig.place("HWU_0006"), "{edit}: beside the original: {:?}", rig.names());
+        assert_eq!(rig.view(), (3.0, 40.0, -20.0), "{edit}: at the same zoom and spot");
+        assert!(rig.strip_row(edit).arriving && app.get_tile_slide_k() > 0.0, "{edit}: it fades in where it lands");
+        assert_eq!(rig.strip_row("HWU_0006").slide_x, -128.0, "{edit}: the photo after it slides a cell over");
+        assert_eq!(rig.strip_row("HWU_0005").slide_x, 0.0, "{edit}: yours holds");
+        rig.slide.settle();
+        assert!(rig.no_edge(), "{edit}: nothing glows");
+        assert!(!rig.reread.borrow().wanted_or_running(), "{edit}: nothing more to list");
+    }
+
+    // Compare on HWU_0005 and HWU_0006, zoomed.
+    let (a, b) = (rig.place("HWU_0005"), rig.place("HWU_0006"));
+    rig.slide.land.view.compare.set(true);
+    app.set_compare(true);
+    rig.slide.land.halves.0.set(a);
+    rig.slide.land.halves.1.set(b);
+    app.set_cmp_focus(0);
+    app.set_zoom(2.0);
+    for edit in ["HWU_0006-Edit", "HWU_0004-Edit"] {
+        rig.away();
+        rig.write(&format!("{edit}.jpg"), 16);
+        assert!(rig.back());
+        assert_eq!(rig.settle(), ["landed"], "{edit}");
+        let names = rig.names();
+        let halves = (names[rig.slide.land.halves.0.get()].as_str(), names[rig.slide.land.halves.1.get()].as_str());
+        assert!(app.get_compare() && rig.slide.land.view.compare.get(), "{edit}: Compare stays");
+        assert_eq!(halves, ("HWU_0005", "HWU_0006"), "{edit}: on the same two photos");
+        assert_eq!((rig.on(), app.get_zoom()), ("HWU_0005".to_string(), 2.0), "{edit}: and zoomed");
+        assert!(names.iter().any(|n| n == edit), "{edit}: listed");
+        assert!(rig.no_edge());
+    }
+}
+
+/// What a person expects ("My files"): "an overwritten one shows its new picture". Another program saves over
+/// HWU_0005, the photo on screen, while the person is away. At the return it is still HWU_0005, at the same
+/// zoom and spot, its own prepared work and zoom tiles go so it reloads alone, and every other photo keeps
+/// what was prepared, by photo. No tile moves and nothing fades: the photo kept its place and its identity.
+/// Then a neighbour, HWU_0006, saved over: HWU_0005 keeps its new work and its tile, and only HWU_0006 reloads.
+///
+/// FALSIFIER (L28): `unchanged_map` ignores the stamps: the saved-over photo keeps its old pixels. `keep_view`
+/// keeps tiles by `identity`, not `unchanged`: the saved-over photo's old tile rides along. `keep_view` has no
+/// first form: the zoom.
+#[test]
+fn coming_back_after_a_save_over_reloads_that_photo_alone_and_keeps_the_zoom() {
+    use slint::Model;
+    let rig = ReturnRig::new("over", &return_files(9), "HWU_0005");
+    let app = rig.app();
+    app.set_img_aspect(1.5);
+    app.set_zoom(2.5);
+    app.set_pan_x(-30.0);
+    app.set_pan_y(10.0);
+    let land = &rig.slide.land;
+    // Each photo's prepared work, marked by its number, by place in the list on screen.
+    let prepare = |rig: &ReturnRig| {
+        let names = rig.names();
+        let mut src = land.roi.src.borrow_mut();
+        for (i, name) in names.iter().enumerate() {
+            src.entry(i).or_insert((name[4..].parse::<u32>().unwrap(), 1));
+        }
+    };
+    let prepared = |rig: &ReturnRig| -> Vec<String> {
+        let names = rig.names();
+        let src = land.roi.src.borrow();
+        let mut kept: Vec<String> = src.iter().map(|(&i, &(n, _))| {
+            assert_eq!(names[i][4..].parse::<u32>().unwrap(), n, "{}: its own work, by photo", names[i]);
+            names[i].clone()
+        }).collect();
+        kept.sort();
+        kept
+    };
+    prepare(&rig);
+    for (saved, keeps_tile) in [("HWU_0005", "HWU_0006"), ("HWU_0006", "HWU_0005")] {
+        let c = rig.place("HWU_0005");
+        land.roi.kept_tiles.borrow_mut().clear();
+        *land.roi.tiles.borrow_mut() = vec![landing_tile(c), landing_tile(c + 1)];
+        rig.away();
+        rig.write(&format!("{saved}.jpg"), 32);
+        assert!(rig.back());
+        assert_eq!(rig.settle(), ["landed"], "{saved}");
+        assert_eq!(rig.on(), "HWU_0005", "{saved}: still on it");
+        assert_eq!(rig.view(), (2.5, -30.0, 10.0), "{saved}: at the same zoom and spot");
+        let others: Vec<String> = rig.names().into_iter().filter(|n| n != saved).collect();
+        assert_eq!(prepared(&rig), others, "{saved}: reloads alone, and the rest keep what was prepared");
+        let tiles: Vec<usize> = land.roi.kept_tiles.borrow().iter().map(|t| t.id).collect();
+        assert_eq!(tiles, [rig.place(keeps_tile)], "{saved}: its zoom tile goes, the other stays");
+        assert!(rig.slide.strip.iter().all(|t| !t.arriving), "{saved}: nothing fades in");
+        assert_eq!(app.get_tile_slide_k(), 0.0, "{saved}: and nothing slides");
+        assert!(rig.no_edge());
+        prepare(&rig); // its new picture is prepared again
+    }
+}
+
+/// Another program removes HWU_0005, the photo on screen, while the person is away: at the return they are on
+/// the next photo that stayed, HWU_0006, at the same zoom and spot, as a Delete lands. Again from HWU_0006.
+///
+/// FALSIFIER (L28): `keep_view`'s second form resets: the zoom.
+#[test]
+fn coming_back_to_a_photo_another_program_removed_lands_on_the_next() {
+    let rig = ReturnRig::new("removed", &return_files(9), "HWU_0005");
+    let app = rig.app();
+    app.set_img_aspect(1.5);
+    app.set_zoom(2.0);
+    app.set_pan_x(25.0);
+    app.set_pan_y(-15.0);
+    for (removed, next) in [("HWU_0005", "HWU_0006"), ("HWU_0006", "HWU_0007")] {
+        assert_eq!(rig.on(), removed, "premise");
+        rig.away();
+        rig.remove(&format!("{removed}.jpg"));
+        assert!(rig.back());
+        assert_eq!(rig.settle(), ["landed"], "{removed}");
+        assert!(!rig.names().iter().any(|n| n == removed), "{removed}: it has gone");
+        assert_eq!(rig.on(), next, "{removed}: on the next photo that stayed");
+        assert_eq!(rig.view(), (2.0, 25.0, -15.0), "{removed}: at the same zoom and spot");
+        assert!(rig.no_edge());
+    }
+}
+
+/// What a person expects: "If nothing changed, nothing moves." Away and back with nothing saved: the listing
+/// finds the folder as it is, nothing lands (no new generation, no rebuilt strip, no slide), and a menu and the
+/// bell's panel left open stay open. Twice. Then something saved while a menu is open: it waits for the menu,
+/// closing nothing, and lands when the menu closes, with the bell's panel still open.
+///
+/// FALSIFIER (L28): `accept` lands an unchanged listing: the generation moves and the menu closes. It ignores
+/// the holds: it lands with the menu open.
+#[test]
+fn coming_back_with_nothing_changed_moves_nothing() {
+    use slint::Model;
+    let rig = ReturnRig::new("same", &return_files(7), "HWU_0004");
+    let app = rig.app();
+    app.set_img_aspect(1.5);
+    app.set_zoom(2.0);
+    app.set_notif_open(true);
+    app.set_ctx_open(true);
+    let strip = |rig: &ReturnRig| rig.slide.strip.iter().map(|t| (t.name.to_string(), t.slide_x, t.arriving)).collect::<Vec<_>>();
+    for _ in 0..2 {
+        let (gen, rows) = (rig.slide.land.folder_gen.get(), strip(&rig));
+        rig.away();
+        assert!(rig.back());
+        assert_eq!(rig.settle(), ["unchanged"]);
+        assert_eq!(rig.slide.land.folder_gen.get(), gen, "no landing");
+        assert_eq!(strip(&rig), rows, "the strip as it was");
+        assert!(app.get_ctx_open() && app.get_notif_open(), "the menu and the bell's panel stay open");
+        assert_eq!((app.get_zoom(), app.get_tile_slide_k()), (2.0, 0.0));
+        assert!(rig.no_edge());
+    }
+    let gen = rig.slide.land.folder_gen.get();
+    rig.away();
+    rig.write("HWU_0004-Edit.jpg", 16);
+    assert!(rig.back());
+    rig.until_held();
+    for _ in 0..3 {
+        assert_eq!(rig.tick(), "nothing", "the menu is open");
+    }
+    assert!(app.get_ctx_open() && rig.slide.land.folder_gen.get() == gen, "and stays open, with nothing landed");
+    app.set_ctx_open(false);
+    assert_eq!(rig.settle(), ["landed"]);
+    assert!(rig.names().iter().any(|n| n == "HWU_0004-Edit") && rig.on() == "HWU_0004");
+    assert!(app.get_notif_open(), "a landing leaves the bell's panel open");
+}
+
+/// A RAW that gains a JPEG of the same name while the person is away (a photo developed in another program and
+/// exported beside it) becomes one photo, a pair, and stays the photo on screen, at the same zoom. Twice.
+///
+/// FALSIFIER (L28): `land_by_photo` follows exact identity only (no file in common): the person lands on the next
+/// photo.
+#[test]
+fn a_raw_that_gains_a_jpeg_while_away_becomes_a_pair_and_stays_on_screen() {
+    let files: Vec<String> = ["HWU_0004.jpg", "HWU_0005.CR3", "HWU_0006.jpg", "HWU_0007.CR3", "HWU_0008.jpg"].map(String::from).to_vec();
+    let rig = ReturnRig::new("pair", &files, "HWU_0005");
+    let app = rig.app();
+    app.set_img_aspect(1.5);
+    app.set_zoom(2.0);
+    for raw in ["HWU_0005", "HWU_0007"] {
+        if rig.on() != raw {
+            // An arrow to the next RAW, and the strip's glide to it.
+            let to = rig.place(raw);
+            *rig.slide.land.current.borrow_mut() = to;
+            rig.slide.land.view.film_target.set(to as f32);
+            rig.slide.frame(None);
+            rig.slide.settle();
+        }
+        let before = rig.names();
+        {
+            let list = rig.slide.list.borrow();
+            let shot = &list[rig.place(raw)];
+            assert!(shot.raw.is_some() && shot.jpg.is_none(), "premise: {raw} is a RAW alone");
+        }
+        rig.away();
+        rig.write(&format!("{raw}.jpg"), 16);
+        assert!(rig.back());
+        assert_eq!(rig.settle(), ["landed"], "{raw}");
+        assert_eq!(rig.names(), before, "{raw}: still one photo");
+        assert_eq!(rig.on(), raw, "{raw}: and on screen");
+        let list = rig.slide.list.borrow();
+        let shot = &list[rig.place(raw)];
+        assert!(shot.raw.is_some() && shot.jpg.is_some(), "{raw}: a pair now");
+        assert_eq!(app.get_zoom(), 2.0, "{raw}: at the same zoom");
+    }
+}
+
+/// A sort pick and the return together. In the same tick: the return asks, the pick lands first (it reads the
+/// folder itself, on this thread, as `reload` does), and the return's listing starts after it, in the new order,
+/// and finds nothing more. The other way round: the return's listing has arrived and waits for the sort menu,
+/// another file is saved meanwhile, the pick lands, and the waiting listing, read in the old order before that
+/// file, is out of date: it lists again and finds nothing more. Either way one order, the one picked, with every
+/// photo, and the person on their photo.
+///
+/// FALSIFIER (L28): `accept` ignores the generation: the old order lands back, without the last file. The tick
+/// starts the listing before the pick in the same tick: its order is the old one (not built: the listing's start
+/// is after the pick, `the_reread_runs_off_the_interface_thread`).
+#[test]
+fn coming_back_and_a_sort_pick_land_once_in_the_order_picked() {
+    let rig = ReturnRig::new("sort", &return_files(6), "HWU_0003");
+    let app = rig.app();
+    let descending = |names: Vec<String>| {
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.reverse();
+        names == sorted
+    };
+    rig.away();
+    rig.write("HWU_0003-Edit.jpg", 16);
+    assert!(rig.back());
+    rig.sort_pick(true);
+    assert_eq!(rig.settle(), ["unchanged"], "the pick listed it");
+    assert!(descending(rig.names()) && rig.names().iter().any(|n| n == "HWU_0003-Edit"), "{:?}", rig.names());
+    assert_eq!(rig.on(), "HWU_0003");
+
+    rig.away();
+    rig.write("HWU_0004-Edit.jpg", 16);
+    assert!(rig.back());
+    app.set_sort_open(true);
+    rig.until_held();
+    rig.write("HWU_0005-Edit.jpg", 16);
+    app.set_sort_open(false);
+    rig.sort_pick(false);
+    assert_eq!(rig.settle(), ["discarded", "unchanged"], "older than the pick");
+    let names = rig.names();
+    let mut ascending = names.clone();
+    ascending.sort();
+    assert_eq!(names, ascending, "the order picked");
+    assert!(["HWU_0003-Edit", "HWU_0004-Edit", "HWU_0005-Edit"].iter().all(|n| names.iter().any(|m| m == n)), "{names:?}");
+    assert_eq!(rig.on(), "HWU_0003");
 }

@@ -133,7 +133,6 @@
     "one": "⟦All {n} photo are already {target}★⟧",
     "other": "⟦All {n} photos are already {target}★⟧"
   },
-  "Allow photo edits": "⟦Allow photo edits⟧",
   "Also while Windows' Battery saver is on.": "⟦Also while Windows' Battery saver is on.⟧",
   "Altitude": "⟦Altitude⟧",
   "Always sharp": "⟦Always sharp⟧",
@@ -143,7 +142,6 @@
   "Applied": "⟦Applied⟧",
   "Applied to all supported formats": "⟦Applied to all supported formats⟧",
   "Applies to this screen when the Falcon window is on it.": "⟦Applies to this screen when the Falcon window is on it.⟧",
-  "Applies when you open a single photo and the rest of its folder is still loading.": "⟦Applies when you open a single photo and the rest of its folder is still loading.⟧",
   "Apply": "⟦Apply⟧",
   "Apply rotations": "⟦Apply rotations⟧",
   "Apply to all": "⟦Apply to all⟧",
@@ -175,6 +173,7 @@
   "Both floating panels start parked as small buttons in the photo's bottom corners — a magnifier bottom-left for image/RAW & zoom, an \"i\" bottom-right for shot info & EXIF. Click either to open that panel.": "⟦Both floating panels start parked as small buttons in the photo's bottom corners — a magnifier bottom-left for image/RAW & zoom, an \"i\" bottom-right for shot info & EXIF. Click either to open that panel.⟧",
   "Both halves are pinned — the wheel zooms": "⟦Both halves are pinned — the wheel zooms⟧",
   "Both halves are pinned — unpin one to move it.": "⟦Both halves are pinned — unpin one to move it.⟧",
+  "Brought back {photos}": "⟦Brought back {photos}⟧",
   "Browse": "⟦Browse⟧",
   "Browse at maximum speed · Faster preview {res} px": "⟦Browse at maximum speed · Faster preview {res} px⟧",
   "Browse at maximum speed · Sharper preview {res} px": "⟦Browse at maximum speed · Sharper preview {res} px⟧",
@@ -185,6 +184,7 @@
   "Browsing speed": "⟦Browsing speed⟧",
   "Browsing waits until the next photo has something to show — a thumbnail or a preview — instead of landing on an empty frame. Applies to the wheel and the arrow keys, in single view and in compare.": "⟦Browsing waits until the next photo has something to show — a thumbnail or a preview — instead of landing on an empty frame. Applies to the wheel and the arrow keys, in single view and in compare.⟧",
   "Busy with another file operation — delete cancelled": "⟦Busy with another file operation — delete cancelled⟧",
+  "Busy with another file operation — try again in a moment": "⟦Busy with another file operation — try again in a moment⟧",
   "Busy with another file operation — undo cancelled": "⟦Busy with another file operation — undo cancelled⟧",
   "CHOOSE A PRESET": "⟦CHOOSE A PRESET⟧",
   "COLOUR": "⟦COLOUR⟧",
@@ -361,6 +361,11 @@
   "Couldn't decode this HEIC — the file may be corrupt or an unsupported variant": "⟦Couldn't decode this HEIC — the file may be corrupt or an unsupported variant⟧",
   "Couldn't decode this file — it may be corrupt or unreadable": "⟦Couldn't decode this file — it may be corrupt or unreadable⟧",
   "Couldn't decode — the HEVC/HEIF Image Extension may not be installed": "⟦Couldn't decode — the HEVC/HEIF Image Extension may not be installed⟧",
+  "Couldn't delete {n} photo, another program may have it open. It's still in the folder.": {
+    "one": "⟦Couldn't delete {n} photo, another program may have it open. It's still in the folder.⟧",
+    "other": "⟦Couldn't delete {n} photos, another program may have them open. They're still in the folder.⟧"
+  },
+  "Couldn't delete {photo}, another program may have it open. It's still in the folder.": "⟦Couldn't delete {photo}, another program may have it open. It's still in the folder.⟧",
   "Couldn't detect a monitor colour profile — use Load profile instead": "⟦Couldn't detect a monitor colour profile — use Load profile instead⟧",
   "Couldn't empty ./Rejected — the files are still there": "⟦Couldn't empty ./Rejected — the files are still there⟧",
   "Couldn't empty ./Rejected — {error}": "⟦Couldn't empty ./Rejected — {error}⟧",
@@ -394,22 +399,36 @@
   "Default: system default": "⟦Default: system default⟧",
   "Default: {app}": "⟦Default: {app}⟧",
   "Del": "⟦Del⟧",
-  "Delete (always confirms)": "⟦Delete (always confirms)⟧",
-  "Delete did not complete — the files are still in the folder": "⟦Delete did not complete — the files are still in the folder⟧",
-  "Delete did not complete — {error}": "⟦Delete did not complete — {error}⟧",
-  "Delete did not complete — {failed} of {n} file(s) couldn't be moved to the {bin}": {
-    "one": "⟦Delete did not complete — {failed} of {n} file(s) couldn't be moved to the {bin}⟧",
-    "other": "⟦Delete did not complete — {failed} of {n} file(s) couldn't be moved to the {bin}⟧"
-  },
-  "Delete needs a single photo — exit compare, or use the right-click menu on a thumbnail": "⟦Delete needs a single photo — exit compare, or use the right-click menu on a thumbnail⟧",
+  "Delete": "⟦Delete⟧",
+  "Delete for good": "⟦Delete for good⟧",
+  "Delete from {provider}": "⟦Delete from {provider}⟧",
+  "Delete photo": "⟦Delete photo⟧",
+  "Delete photo for good?": "⟦Delete photo for good?⟧",
+  "Delete photo from {provider}?": "⟦Delete photo from {provider}?⟧",
   "Delete photo?": "⟦Delete photo?⟧",
-  "Delete photo…": "⟦Delete photo…⟧",
   "Delete preset": "⟦Delete preset⟧",
+  "Delete this photo": "⟦Delete this photo⟧",
   "Delete this photo…": "⟦Delete this photo…⟧",
   "Delete this preset?": "⟦Delete this preset?⟧",
+  "Delete {n} Photo": {
+    "one": "⟦Delete {n} Photo⟧",
+    "other": "⟦Delete {n} Photos⟧"
+  },
   "Delete {n} Photo…": {
     "one": "⟦Delete {n} Photo…⟧",
     "other": "⟦Delete {n} Photos…⟧"
+  },
+  "Delete {n} photo": {
+    "one": "⟦Delete {n} photo⟧",
+    "other": "⟦Delete {n} photos⟧"
+  },
+  "Delete {n} photo for good?": {
+    "one": "⟦Delete {n} photo for good?⟧",
+    "other": "⟦Delete {n} photos for good?⟧"
+  },
+  "Delete {n} photo from {provider}?": {
+    "one": "⟦Delete {n} photo from {provider}?⟧",
+    "other": "⟦Delete {n} photos from {provider}?⟧"
   },
   "Delete {n} photo?": {
     "one": "⟦Delete {n} photo?⟧",
@@ -419,8 +438,39 @@
     "one": "⟦Delete {n} photo…⟧",
     "other": "⟦Delete {n} photos…⟧"
   },
-  "Deleted file was in another folder — recover it from the {bin}": "⟦Deleted file was in another folder — recover it from the {bin}⟧",
-  "Deleted — {photo}": "⟦Deleted — {photo}⟧",
+  "Deleted the {gone} of {name} for good. The {stayed} is still in the folder.": "⟦Deleted the {gone} of {name} for good. The {stayed} is still in the folder.⟧",
+  "Deleted the {gone} of {name} from {provider}. The {stayed} is still in the folder.": "⟦Deleted the {gone} of {name} from {provider}. The {stayed} is still in the folder.⟧",
+  "Deleted {n} file from ./Rejected for good.": {
+    "one": "⟦Deleted {n} file from ./Rejected for good.⟧",
+    "other": "⟦Deleted {n} files from ./Rejected for good.⟧"
+  },
+  "Deleted {n} from {provider}.": {
+    "one": "⟦Deleted {n} from {provider}.⟧",
+    "other": "⟦Deleted {n} from {provider}.⟧"
+  },
+  "Deleted {n} photo for good": {
+    "one": "⟦Deleted {n} photo for good⟧",
+    "other": "⟦Deleted {n} photos for good⟧"
+  },
+  "Deleted {n} photo from {provider}": {
+    "one": "⟦Deleted {n} photo from {provider}⟧",
+    "other": "⟦Deleted {n} photos from {provider}⟧"
+  },
+  "Deleted {ok} of {n} file from ./Rejected for good.": {
+    "one": "⟦Deleted {ok} of {n} file from ./Rejected for good.⟧",
+    "other": "⟦Deleted {ok} of {n} files from ./Rejected for good.⟧"
+  },
+  "Deleted {ok} of {n} photo for good.": {
+    "one": "⟦Deleted {ok} of {n} photo for good.⟧",
+    "other": "⟦Deleted {ok} of {n} photos for good.⟧"
+  },
+  "Deleted {ok} of {n} photo from {provider}.": {
+    "one": "⟦Deleted {ok} of {n} photo from {provider}.⟧",
+    "other": "⟦Deleted {ok} of {n} photos from {provider}.⟧"
+  },
+  "Deleted {photo} for good": "⟦Deleted {photo} for good⟧",
+  "Deleted {photo} from {provider}": "⟦Deleted {photo} from {provider}⟧",
+  "Deletes every file in ./Rejected for good. This drive has no {bin}, so they can't be brought back. Photos NOT yet moved to ./Rejected are untouched.": "⟦Deletes every file in ./Rejected for good. This drive has no {bin}, so they can't be brought back. Photos NOT yet moved to ./Rejected are untouched.⟧",
   "Delete…": "⟦Delete…⟧",
   "Descending": "⟦Descending⟧",
   "Deselect": "⟦Deselect⟧",
@@ -911,6 +961,7 @@
   "Reading this photo's colour space…": "⟦Reading this photo's colour space…⟧",
   "Recommended": "⟦Recommended⟧",
   "Recover": "⟦Recover⟧",
+  "Recovered": "⟦Recovered⟧",
   "Recovered {name}": "⟦Recovered {name}⟧",
   "Recovered {recovered}/{n} file(s) for {name} — a file named {names} already exists": {
     "one": "⟦Recovered {recovered}/{n} file(s) for {name} — a file named {names} already exists⟧",
@@ -920,6 +971,7 @@
     "one": "⟦Recovered {recovered}/{n} file(s) for {name} — see log⟧",
     "other": "⟦Recovered {recovered}/{n} file(s) for {name} — see log⟧"
   },
+  "Recovering {name}…": "⟦Recovering {name}…⟧",
   "Recycle Bin": "⟦Recycle Bin⟧",
   "Redo": "⟦Redo⟧",
   "Redo last change": "⟦Redo last change⟧",
@@ -1061,18 +1113,33 @@
   "Selection restored ({applied})": "⟦Selection restored ({applied})⟧",
   "Sends every file currently in ./Rejected to the OS {bin} — recoverable from there until you empty the bin. Photos NOT yet moved to ./Rejected are untouched.": "⟦Sends every file currently in ./Rejected to the OS {bin} — recoverable from there until you empty the bin. Photos NOT yet moved to ./Rejected are untouched.⟧",
   "Sends every file currently in ./Rejected to the {bin} — recoverable from there until you empty the {bin}. Photos NOT yet moved to ./Rejected are untouched.": "⟦Sends every file currently in ./Rejected to the {bin} — recoverable from there until you empty the {bin}. Photos NOT yet moved to ./Rejected are untouched.⟧",
+  "Sent the {gone} of {name} to the {bin}. The {stayed} is still in the folder.": "⟦Sent the {gone} of {name} to the {bin}. The {stayed} is still in the folder.⟧",
+  "Sent to the {bin} — {photo}": "⟦Sent to the {bin} — {photo}⟧",
   "Sent {n} file(s) from ./Rejected to the {bin}.": {
     "one": "⟦Sent {n} file(s) from ./Rejected to the {bin}.⟧",
     "other": "⟦Sent {n} file(s) from ./Rejected to the {bin}.⟧"
   },
-  "Sent {n} file(s) to the {bin}": {
-    "one": "⟦Sent {n} file(s) to the {bin}⟧",
-    "other": "⟦Sent {n} file(s) to the {bin}⟧"
+  "Sent {n} photo to the {bin}": {
+    "one": "⟦Sent {n} photo to the {bin}⟧",
+    "other": "⟦Sent {n} photos to the {bin}⟧"
+  },
+  "Sent {n} photo to the {bin}.": {
+    "one": "⟦Sent {n} photo to the {bin}.⟧",
+    "other": "⟦Sent {n} photos to the {bin}.⟧"
+  },
+  "Sent {n} selected photo to the {bin}": {
+    "one": "⟦Sent {n} selected photo to the {bin}⟧",
+    "other": "⟦Sent {n} selected photos to the {bin}⟧"
   },
   "Sent {ok} of {n} file to the {bin} — {failed} did not go": {
     "one": "⟦Sent {ok} of {n} file to the {bin} — {failed} did not go⟧",
     "other": "⟦Sent {ok} of {n} files to the {bin} — {failed} did not go⟧"
   },
+  "Sent {ok} of {n} photo to the {bin}.": {
+    "one": "⟦Sent {ok} of {n} photo to the {bin}.⟧",
+    "other": "⟦Sent {ok} of {n} photos to the {bin}.⟧"
+  },
+  "Sent {photo} to the {bin}": "⟦Sent {photo} to the {bin}⟧",
   "Settings": "⟦Settings⟧",
   "Settings file was unreadable — couldn't preserve it; reset to defaults": "⟦Settings file was unreadable — couldn't preserve it; reset to defaults⟧",
   "Settings file was unreadable — kept as {name} and reset to defaults (keybinds/presets)": "⟦Settings file was unreadable — kept as {name} and reset to defaults (keybinds/presets)⟧",
@@ -1091,6 +1158,10 @@
   "Show panels": "⟦Show panels⟧",
   "Show photo grid": "⟦Show photo grid⟧",
   "Show welcome": "⟦Show welcome⟧",
+  "Show {n} more": {
+    "one": "⟦Show {n} more⟧",
+    "other": "⟦Show {n} more⟧"
+  },
   "Shutter": "⟦Shutter⟧",
   "Simple": "⟦Simple⟧",
   "Simulate GPU memory (re-sizes the texture budget live)": "⟦Simulate GPU memory (re-sizes the texture budget live)⟧",
@@ -1139,8 +1210,13 @@
   "The fast preview shown while browsing matches your window size. Pick its detail tier: one step below your window (faster) or one above, downsampled (sharper).": "⟦The fast preview shown while browsing matches your window size. Pick its detail tier: one step below your window (faster) or one above, downsampled (sharper).⟧",
   "The graphics device was lost (a GPU driver reset or update, or the GPU was disconnected).\n\nFalcon can't keep rendering and needs to be restarted. Your ratings and picks were saved.": "⟦The graphics device was lost (a GPU driver reset or update, or the GPU was disconnected).\n\nFalcon can't keep rendering and needs to be restarted. Your ratings and picks were saved.⟧",
   "The most Falcon prepares; memory limits can lower these.": "⟦The most Falcon prepares; memory limits can lower these.⟧",
+  "The other {n} goes to the {bin}.": {
+    "one": "⟦The other {n} goes to the {bin}.⟧",
+    "other": "⟦The other {n} go to the {bin}.⟧"
+  },
   "The rate comes from a SIMULATED latency (a dev lever), not from this machine.": "⟦The rate comes from a SIMULATED latency (a dev lever), not from this machine.⟧",
   "The taskbar's third of a second, or the instant the pointer lands — try both.": "⟦The taskbar's third of a second, or the instant the pointer lands — try both.⟧",
+  "These are in another folder. Go back to it to bring them back.": "⟦These are in another folder. Go back to it to bring them back.⟧",
   "These photos are stored only in the cloud. Exporting them downloads them to this computer first.": "⟦These photos are stored only in the cloud. Exporting them downloads them to this computer first.⟧",
   "This animated GIF's rotation was reset — the viewer can't turn one": "⟦This animated GIF's rotation was reset — the viewer can't turn one⟧",
   "This display": "⟦This display⟧",
@@ -1225,7 +1301,6 @@
   "Uses each camera's built-in preview, not a developed RAW. Some cameras embed a small one, and it is never upscaled.": "⟦Uses each camera's built-in preview, not a developed RAW. Some cameras embed a small one, and it is never upscaled.⟧",
   "View": "⟦View⟧",
   "View EXIF": "⟦View EXIF⟧",
-  "View only": "⟦View only⟧",
   "Visible and nearby: also the ones just off screen and around the current photo.": "⟦Visible and nearby: also the ones just off screen and around the current photo.⟧",
   "Visible only: thumbnails for the photos on screen.": "⟦Visible only: thumbnails for the photos on screen.⟧",
   "WATERMARK": "⟦WATERMARK⟧",
@@ -1243,7 +1318,6 @@
   "While browsing: {reject} = reject.": "⟦While browsing: {reject} = reject.⟧",
   "While comparing, bring them back from this control. Also on a filmstrip thumbnail's right-click menu, and on the View menu.": "⟦While comparing, bring them back from this control. Also on a filmstrip thumbnail's right-click menu, and on the View menu.⟧",
   "While comparing, bring them back from this control. Also on a filmstrip thumbnail's right-click menu.": "⟦While comparing, bring them back from this control. Also on a filmstrip thumbnail's right-click menu.⟧",
-  "While the folder is loading": "⟦While the folder is loading⟧",
   "White balance": "⟦White balance⟧",
   "Whole folder": "⟦Whole folder⟧",
   "Whole folder: then the rest of the folder while Falcon is idle, up to about {} MB. Cloud-only files are skipped.": "⟦Whole folder: then the rest of the folder while Falcon is idle, up to about {} MB. Cloud-only files are skipped.⟧",
@@ -1324,7 +1398,9 @@
   "existing sidecar is not valid UTF-8 — not modified": "⟦existing sidecar is not valid UTF-8 — not modified⟧",
   "existing sidecar structure unrecognised — not modified": "⟦existing sidecar structure unrecognised — not modified⟧",
   "fast, social-first": "⟦fast, social-first⟧",
+  "file in ./Rejected → gone for good": "⟦file in ./Rejected → gone for good⟧",
   "file in ./Rejected → {bin}": "⟦file in ./Rejected → {bin}⟧",
+  "files in ./Rejected → gone for good": "⟦files in ./Rejected → gone for good⟧",
   "files in ./Rejected → {bin}": "⟦files in ./Rejected → {bin}⟧",
   "fully opaque logo": "⟦fully opaque logo⟧",
   "generating test images…": "⟦generating test images…⟧",
@@ -1466,6 +1542,7 @@
   "{mode} limits browsing to {fps} fps, two-thirds of this machine's benchmark speed.": "⟦{mode} limits browsing to {fps} fps, two-thirds of this machine's benchmark speed.⟧",
   "{mode} limits browsing to {fps} fps.": "⟦{mode} limits browsing to {fps} fps.⟧",
   "{modifier}click": "⟦{modifier}click⟧",
+  "{name} [RAW+{format}]": "⟦{name} [RAW+{format}]⟧",
   "{name} is connected again — set it back to sRGB to clear its saved colour setting": "⟦{name} is connected again — set it back to sRGB to clear its saved colour setting⟧",
   "{name} is set to {chip} — adjust in Settings if needed.": "⟦{name} is set to {chip} — adjust in Settings if needed.⟧",
   "{name} isn't connected — plug it in to read its profile": "⟦{name} isn't connected — plug it in to read its profile⟧",
@@ -1507,9 +1584,21 @@
     "one": "⟦{n} image⟧",
     "other": "⟦{n} images⟧"
   },
+  "{n} is still in the folder.": {
+    "one": "⟦{n} is still in the folder.⟧",
+    "other": "⟦{n} are still in the folder.⟧"
+  },
+  "{n} is still there.": {
+    "one": "⟦{n} is still there.⟧",
+    "other": "⟦{n} are still there.⟧"
+  },
   "{n} moved photo(s) have unapplied rotations — Apply rotations first if you want them upright elsewhere": {
     "one": "⟦{n} moved photo(s) have unapplied rotations — Apply rotations first if you want them upright elsewhere⟧",
     "other": "⟦{n} moved photo(s) have unapplied rotations — Apply rotations first if you want them upright elsewhere⟧"
+  },
+  "{n} of {total} selected photos is only in {provider}. Deleting it removes it from {provider}, and Falcon can't bring it back. {provider} keeps it in its online recycle bin for a while.": {
+    "one": "⟦{n} of {total} selected photos is only in {provider}. Deleting it removes it from {provider}, and Falcon can't bring it back. {provider} keeps it in its online recycle bin for a while.⟧",
+    "other": "⟦{n} of {total} selected photos are only in {provider}. Deleting them removes them from {provider}, and Falcon can't bring them back. {provider} keeps them in its online recycle bin for a while.⟧"
   },
   "{n} photo copied to clipboard ({files} file)": {
     "one": "⟦{n} photo copied to clipboard ({files} file)⟧",
@@ -1523,13 +1612,25 @@
     "one": "⟦{n} photo has unapplied rotation — Apply rotations first if you want it to travel.⟧",
     "other": "⟦{n} photos have unapplied rotation — Apply rotations first if you want them to travel.⟧"
   },
+  "{n} photo is in another folder. Go back to it to bring it back.": {
+    "one": "⟦{n} photo is in another folder. Go back to it to bring it back.⟧",
+    "other": "⟦{n} photos are in another folder. Go back to it to bring them back.⟧"
+  },
   "{n} photos": {
     "one": "⟦{n} photos⟧",
     "other": "⟦{n} photos⟧"
   },
+  "{n} photos aren't in the {bin}, so they can't be brought back.": {
+    "one": "⟦{n} photos aren't in the {bin}, so they can't be brought back.⟧",
+    "other": "⟦{n} photos aren't in the {bin}, so they can't be brought back.⟧"
+  },
   "{n} pick(s) have unapplied rotations — Apply rotations first if you want them upright elsewhere": {
     "one": "⟦{n} pick(s) have unapplied rotations — Apply rotations first if you want them upright elsewhere⟧",
     "other": "⟦{n} pick(s) have unapplied rotations — Apply rotations first if you want them upright elsewhere⟧"
+  },
+  "{n} selected photo is only in {provider}. Deleting it removes it from {provider}, and Falcon can't bring it back. {provider} keeps it in its online recycle bin for a while.": {
+    "one": "⟦{n} selected photo is only in {provider}. Deleting it removes it from {provider}, and Falcon can't bring it back. {provider} keeps it in its online recycle bin for a while.⟧",
+    "other": "⟦{n} selected photos are only in {provider}. Deleting them removes them from {provider}, and Falcon can't bring them back. {provider} keeps them in its online recycle bin for a while.⟧"
   },
   "{n} selected photo — {files} file go to the {bin}.": {
     "one": "⟦{n} selected photo — {files} file go to the {bin}.⟧",
@@ -1538,6 +1639,14 @@
   "{n} selected photo — {files} files go to the {bin}.": {
     "one": "⟦{n} selected photo — {files} files go to the {bin}.⟧",
     "other": "⟦{n} selected photos — {files} files go to the {bin}.⟧"
+  },
+  "{n} selected photo, {files} file": {
+    "one": "⟦{n} selected photo, {files} file⟧",
+    "other": "⟦{n} selected photos, {files} file⟧"
+  },
+  "{n} selected photo, {files} files": {
+    "one": "⟦{n} selected photo, {files} files⟧",
+    "other": "⟦{n} selected photos, {files} files⟧"
   },
   "{n}h ago": {
     "one": "⟦{n}h ago⟧",
@@ -1553,10 +1662,14 @@
   },
   "{path}: {reason}": "⟦{path}: {reason}⟧",
   "{photos_and_files}{sidecar_note} Recoverable from there, and Recover restores the whole batch.": "⟦{photos_and_files}{sidecar_note} Recoverable from there, and Recover restores the whole batch.⟧",
+  "{photos_and_files}{sidecar_note}. This drive has no {bin}, so they can't be brought back.": "⟦{photos_and_files}{sidecar_note}. This drive has no {bin}, so they can't be brought back.⟧",
   "{photo} RAW + {format} copied to clipboard": "⟦{photo} RAW + {format} copied to clipboard⟧",
   "{photo} RAW copied to clipboard": "⟦{photo} RAW copied to clipboard⟧",
+  "{photo} is in another folder. Go back to it to bring it back.": "⟦{photo} is in another folder. Go back to it to bring it back.⟧",
+  "{photo} is only in {provider}. Deleting it removes it from {provider}, and Falcon can't bring it back. {provider} keeps it in its online recycle bin for a while.": "⟦{photo} is only in {provider}. Deleting it removes it from {provider}, and Falcon can't bring it back. {provider} keeps it in its online recycle bin for a while.⟧",
+  "{photo} isn't in the {bin}, so it can't be brought back.": "⟦{photo} isn't in the {bin}, so it can't be brought back.⟧",
   "{photo} {format} copied to clipboard": "⟦{photo} {format} copied to clipboard⟧",
-  "{result} — folder re-checked": "⟦{result} — folder re-checked⟧",
+  "{photo}. This drive has no {bin}, so it can't be brought back.": "⟦{photo}. This drive has no {bin}, so it can't be brought back.⟧",
   "{rotated} — {gifs}": "⟦{rotated} — {gifs}⟧",
   "{size} px": "⟦{size} px⟧",
   "{size} · {quality} · {mark}": "⟦{size} · {quality} · {mark}⟧",

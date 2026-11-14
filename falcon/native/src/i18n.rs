@@ -47,7 +47,8 @@ struct Pack {
 
 impl Pack {
     /// Parsed once; its strings live for the rest of the run, so lookups return `&'static str` and
-    /// functions that return `&'static str` keep their signatures. `build.rs` has already refused a
+    /// functions that return `&'static str` keep their signatures. The build (`build_translations.rs`,
+    /// run by the interface crate's `ui/build.rs`) has already refused a
     /// malformed pack, so `None` here only guards against the impossible.
     fn parse(json: &str, plural: &'static str) -> Option<Pack> {
         let doc: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).ok()?;

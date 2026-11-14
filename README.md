@@ -162,7 +162,8 @@ step through challengers against it. Your rating goes to whichever half you are 
 - **Immersive mode.** Press **F** and the interface disappears. Move to a corner and the rating
   controls appear.
 - **Safe with your originals.** Falcon never re-encodes your photos. Deletes go to the Recycle Bin
-  or Trash with Undo, and your ratings are saved safely beside the photos.
+  or Trash with Undo. On Windows, SD cards, USB sticks, network drives and photos stored only in
+  OneDrive can't, so Falcon asks first. Your ratings are saved safely beside the photos.
 - **Ready for location work.** Eco mode, used on battery by default, stretches a laptop's battery, and photos that live
   only in OneDrive aren't downloaded just because you scrolled past them.
 - **At home on a Mac.** The native menu bar and full screen, trackpad pinch to zoom, and Falcon as

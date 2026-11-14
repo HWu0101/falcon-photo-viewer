@@ -244,10 +244,12 @@ mod tests {
 
     #[test]
     fn legacy_raw_preference_is_not_part_of_saved_settings() {
+        // Queue entry 6: `photo_open_edits` ("While the folder is loading") is retired the same way. A
+        // file that still has it loads, and the save drops it.
         let settings:Settings=serde_json::from_str(r#"{"raw_mode":true,"photo_open_edits":true}"#).unwrap();
-        assert!(settings.photo_open_edits);
         let saved=serde_json::to_value(settings).unwrap();
         assert!(saved.get("raw_mode").is_none());
+        assert!(saved.get("photo_open_edits").is_none());
     }
 
     /// Build a `Shot` with a chosen id + cloud flag (the only two fields the swap reseed reads).

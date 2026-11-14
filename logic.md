@@ -102,22 +102,22 @@ How to read the tables:
 
 | Feature | How you reach it | What can switch it off | What it changes | Code |
 | --- | --- | --- | --- | --- |
-| Step and browse | **←/→** tap or hold (`navigate`, `navigate-step`, `nav-released`); **Home/End**; **↑/↓** move a row in the grid | Arrow keys wait only for dialogs, the welcome guide and open menus (`photo-popup-open`), so they work on the verified nearby photos during a photo-first open. Home/End read `popup-open` and, in View only, wait for the whole folder. In compare with both halves pinned, `nav_allowed` refuses before anything moves, pulses the pins and says why. The opt-in **Never browse onto a blank photo** (Settings → INPUT, `scrub_wait_cache`) holds a step until the next photo has a thumbnail or preview. | `current`, the kind of navigation (`NavKind`), the motion clock | `nav_allowed`, `scrub_wait_ready` |
+| Step and browse | **←/→** tap or hold (`navigate`, `navigate-step`, `nav-released`); **Home/End**; **↑/↓** move a row in the grid | These browsing keys wait only for real dialogs, the welcome guide and open menus (`browse-keys-blocked`). Settings and the browse-speed panel don't stop them, so you can hold an arrow with the speed panel open, or step through photos with Settings open to see what a setting does; everything else those two panels block stays blocked. A number field in either panel that has the keyboard keeps its own arrows until Enter or the panel closing (picking a stop also ends a Custom cell's typing). The arrows and the grid's ↑/↓ work on the verified nearby photos during a photo-first open; Home/End wait for the whole folder. In compare with both halves pinned, `nav_allowed` refuses before anything moves, pulses the pins and says why. The opt-in **Never browse onto a blank photo** (Settings → INPUT, `scrub_wait_cache`) holds a step until the next photo has a thumbnail or preview. | `current`, the kind of navigation (`NavKind`), the motion clock | `nav_allowed`, `scrub_wait_ready` |
 | Wheel browse | The wheel over the photo or the filmstrip | **Mouse wheel changes photo** (Settings → INPUT, default On; Off makes the wheel zoom). Refused while `photo-popup-open`. | `wheel_accum`, a drift-free bank of notches the tick pays out at the browse rate. On a Mac a held arrow key owns navigation and wheel notches during the hold are dropped (`HELD_KEY_OWNS_NAV`), because a trackpad's resting finger and its inertia produce real notches that would pull `current` back. | `step_wheel_advance`, `wheel_step_decision` |
 | Sharp browsing while zoomed | Browsing while zoomed in | **When zoomed** in the toolbar's browse-speed panel: Speed or Always sharp (`zoom_always_sharp`, default Speed) | Paces each step to the measured full-resolution rate. If the next sharp frame is not ready, the step shows the preview and sharpens in place, so no notch is silently lost; a notch that must be dropped is reported in a toast. | `wheel_step_decision` |
 | Zoom and pan | Ctrl+wheel (⌘+wheel on Mac), or the plain wheel when wheel browsing is off (`zoom-at`); pinch on a Mac trackpad; drag to pan (`pan-start`, `pan-move`); **z** resets (`pan-reset`); the zoom badge toggles 1:1 and Fit | Only real dialogs and the welcome guide block it (`inspection-blocked`); a folder that is still loading does not. A notch that would not change the zoom at 1× or at the maximum (12×, `MAX_ZOOM`) is ignored (`zoom_notch_target`). | Zoom and pan. Stamps the input clock, which pauses preparing-ahead work (see [Rationing work ahead of the user](#rationing-work-ahead-of-the-user)). | `zoom_notch_target`, `inspection.rs` |
 | Zoom badge | The image/RAW panel's chip and its compact twin on the compare bar; a tap toggles 1:1 and Fit | — | Shows only what is true: accent **Focus 1:1** (100 % or more over the full-resolution frame); amber **Loading…** (zoomed in over the preview while a sharper frame is still coming); amber **Not sharp** (the full-resolution decode failed and the retry card is up); grey **Loading…** at Fit (a sharper frame really is on its way); otherwise **Zoomed** or **Fit**. "Still coming" is `support::detail_pending`, never just "no detail frame": a playing GIF, an unsupported file, a failed decode and a mid-browse frame have no detail frame but are not loading. Amber appears only when zoomed in. | `FocusBadge` (`controls.slint`), `detail_pending` |
 | Zoomed-region tiles | Zooming past fit on a large image | **Adaptive Hi-Res** (Settings → PERFORMANCE, default On); the GPU memory tier | `roi.tiles`, `roi.region`. The publish gate never holds them. | `RoiZoom` (`roi.rs`) |
-| Filmstrip | Click a thumbnail (`film-clicked`); the wheel over it (`film-scroll`); drag 1:1 (`film-drag-start`, `film-drag-move`, `film-drag-end`); its mini scroll bar (`film-seek`); the toolbar's position chip recentres it (`film-recenter`) | `film-visible` | `film_pos`, `film_target`, `film_follow`. Strip gestures stamp the input clock. Dragging scrolls the strip without changing `current`. | `film.rs` |
+| Filmstrip | Click a thumbnail (`film-clicked`); the wheel over it (`film-scroll`); drag 1:1 (`film-drag-start`, `film-drag-move`, `film-drag-end`); its mini scroll bar (`film-seek`); **Scroll to current**, the first row of the sort menu that the toolbar's position chip opens, recentres it (`film-recenter`) | `film-visible` | `film_pos`, `film_target`, `film_follow`. Strip gestures stamp the input clock. Dragging scrolls the strip without changing `current`. | `film.rs` |
 | Drag up to compare | Drag a filmstrip thumbnail upward (`film-classify`) | The drag must stay within a cone around straight up: Settings → DEVELOPER → Advanced → **Filmstrip drag-up tolerance** (`film_drag_cone_deg`, default 20°, 5–45°) | Sends that shot to a compare half. The shot is captured when the pointer goes down, so it cannot change during the drag. | `film_drag_classify` |
 | Grid dock | The toolbar's grid button; click a tile; **↑/↓** | `grid-open` | `current`. Its scroll bar is the shared `MiniVBar`, the same component as the Review panel's. When it recentres on the current photo it remembers the value it wrote, so its own scroll is never mistaken for the user's. | `grid-vp-y` |
-| Compare A/B | **c** (`toggle-compare`); photo menu **Compare — send to A (left)** or **B (right)**; drag up from the filmstrip | Not available in immersive mode | `cmp_a_idx`, `cmp_b_idx`, the focused half and the pins. **Tab** swaps the active half, **Space** pins it, Ctrl+wheel always zooms. Rating and marking act on the focused half, not `current`. Selection and bulk keys go dormant. | `unpinned_target`, `PinTarget` |
+| Compare A/B | **c** (`toggle-compare`); photo menu **Compare — send to A (left)** or **B (right)**; drag up from the filmstrip | Not available in immersive mode | `cmp_a_idx`, `cmp_b_idx`, the focused half and the pins. **Tab** swaps the active half, **Space** pins it, Ctrl+wheel always zooms. Rating and marking act on the focused half, not `current`. Selection and bulk keys go dormant. Sending a photo to a half while Compare is closed puts the next photo (the previous one at the end) in the other half, as **c** does, never a position an earlier Compare left behind (fix round 2, `CS-66`; the owner, 11 November 2026: "a, the next photo"); with Compare open the other half stays. | `unpinned_target`, `PinTarget`, `support::compare_halves_after_send` |
 | Info / EXIF panel | **i** (`toggle-info-panel`), the photo menu, Settings → DISPLAY → **Floating panels** | **Hidden** hides both floating panels. The **i** key minimises or expands the info panel, and from Hidden brings both panels back; it does nothing in immersive mode. | `info_open_v2`, `info-min`, the folder's remembered view (Simple, Standard or Full) | `info_key_action`, `InfoView` |
 | Floating EXIF panel | **View EXIF** in either photo menu (`float-exif-open`) | — | Draggable (`float-exif-moved`), pinnable (`float-exif-toggle-pin`) and closable. It reads the shared metadata stores, not a copy taken when it opened. | `FloatingExif` |
 | Image/RAW panel | Shown for every photo; for a pair, its **Preview / RAW** selector (`set-raw`) chooses which file the full-resolution tier shows | The Floating panels setting; RAW mode lasts for the session only | `raw_mode`. Changing it bumps `det_epoch`, so a frame developed in the old mode is thrown away. | `on_set_raw` |
 | Immersive / full screen | **f** (`toggle-fullscreen`), **F11**, **⌃⌘F** on Mac (on a Mac laptop F11 is the system's Show Desktop key), the Mac menu's Enter/Exit Full Screen, the photo menu; **Esc** leaves | Windows: Falcon covers the screen with a borderless window and never calls winit's `set_fullscreen`, which briefly repaints a framed window. Mac: see [Platform rules and the Mac](#platform-rules-and-the-mac). | Hides all chrome; rating and marking keys stay live. Corner controls reappear on hover and stay for **Corner controls stay visible** seconds (`reveal_linger_sec`, default 3). See [Motion and immersive mode](#motion-and-immersive-mode). | `immersive`, `FKeyIntent` |
 | Window controls | Title-bar minimise, maximise and close; double-click; drag (`titlebar-pressed`, `square-release-requested`) | `modal-blocking` mutes the toolbar's panel buttons | Windows: a latch squares the window's rounded corners while maximized or immersive (`chrome-square`). Mac: Falcon draws no window buttons (`native-window-controls`); Apple's own buttons sit beside the toolbar in the title bar. | `chrome-square` |
-| Toolbar status area | Always, in the toolbar's `hudclip` area | Shrinks in four fixed steps as room runs out: everything (384 px or more); without the path pill (316 px or more); only the filmstrip and grid toggles and the cache meter (76 px or more); buttons only. See [Title-bar geometry](#title-bar-geometry). | Position chip (click recentres the strip and resumes following), path pill (click copies the photo's path), cache meter, events bell | `MainToolbar` (`toolbar.slint`) |
+| Toolbar status area | Always, in the toolbar's `hudclip` area | Shrinks in four fixed steps as room runs out: everything (384 px or more); without the path pill (316 px or more); only the filmstrip and grid toggles and the cache meter (76 px or more); buttons only. See [Title-bar geometry](#title-bar-geometry). | Position chip (click opens the sort menu; its first row, **Scroll to current**, recentres the strip and resumes following), path pill (click copies the photo's path), cache meter, events bell | `MainToolbar` (`toolbar.slint`) |
 | Developer readouts | Settings → DEVELOPER → **Dev panel (HUD)** (`toggle-hud`) | — | Extra engine readouts; also reveals the Simulate GPU memory chips | `dev_hud` |
 | GIF playback | An animated GIF with two or more frames, in single view | Not in compare | `step_gif_advance` owns the stage and `step_display` steps aside | `tick.rs` |
 
@@ -130,10 +130,10 @@ How to read the tables:
 | Flag, reject, unmark | **p** / **x** / **u**, both photo menus, the cull card | Rebindable. Flag and reject exclude each other. | `marks` | `ACTIONS` |
 | Next unrated | **n** (`next-unrated`) | A folder is open | `current` | — |
 | Selection | Click a tile; **Ctrl-click** toggles; **Shift-click** selects a range (`sel-gesture`); **Select / Deselect** in either photo menu (the word follows whether the menu's photo is selected); **Select all** (**Ctrl+A**, `select-all-displayed`: every photo currently displayed — the Review panel's filtered list while it is open, the whole folder when it is closed); **Select new / edited** (`select-new-edited`); **Clear selection** (`clear-selection`); **Esc** clears it when no menu or dialog is open, compare is off and the Review panel is closed | `sel-affordance-live` = not opening a photo, not in compare, not immersive, no dialog. One classifier, `sel-gesture-kind(ctrl, shift)`, is read by all four tile surfaces and by the menu row. | `SelectSet`: in memory only, kept by file name through a same-folder rescan, cleared by a folder change, never saved. When you clear or replace a selection of three or more photos, a toast offers **Restore**. | `SelectSet`, `esc_clears_selection` |
-| Bulk rate, flag, reject, unmark, delete, rotate, reveal, copy | The same keys (including **r** / **Shift+R** and **Ctrl+C**), or the counted rows in either photo menu: Flag N, Reject N, Unmark N, Delete N photos…, Rotate N right/left, Reveal N in Explorer/Finder and the counted Copy rows. Counted rows appear only when at least two photos are selected and the menu's own photo is one of them (`ctx-plural`); otherwise the single-photo rows show. | `bulk-actions-armed` = something selected, not in compare, not immersive. This one property decides whether the keys act on one photo or on the selection, and every plural label and shortcut hint follows it. Bulk rating asks first (`BulkAsk`) unless **Direct bulk rating** (DEVELOPER → Advanced) is on. | `ratings` / `marks` over `bulk_targets`; delete uses the normal recycle path | `bulk_actions_allowed`, `bulk_targets`, `BulkAsk` |
+| Bulk rate, flag, reject, unmark, delete, rotate, reveal, copy | The same keys (including **r** / **Shift+R** and **Ctrl+C**), or the counted rows in either photo menu: Flag N, Reject N, Unmark N, Delete N photos, Rotate N right/left, Reveal N in Explorer/Finder and the counted Copy rows. Counted rows appear only when at least two photos are selected and the menu's own photo is one of them (`ctx-plural`); otherwise the single-photo rows show. | `bulk-actions-armed` = something selected, not in compare, not immersive. This one property decides whether the keys act on one photo or on the selection, and every plural label and shortcut hint follows it. Bulk rating asks first (`BulkAsk`) unless **Direct bulk rating** (DEVELOPER → Advanced) is on. | `ratings` / `marks` over `bulk_targets`; a delete goes at once when the photo on screen is one of the selected photos and asks first with a count when it isn't (the row then reads "Delete N photos…") | `bulk_actions_allowed`, `bulk_targets`, `BulkAsk` |
 | Review panel | **s** (`toggle-sel-panel`), the toolbar's Review button, the Picks and Rejects count chips, the rotation reminder's **Open Review** | Shares the top-left area with Settings and the browse-speed panel: one at a time | Filters: **Reviewed** (rated, flagged or rejected), **Picks**, **Rejects**, **Rated** (with per-star chips) and **Rotated**, plus a hidden **Selected** filter whose chip appears only while something is selected. The generic open lands on Selected when a selection exists, otherwise on Reviewed. It loads and pins its own thumbnails. Its output area holds Copy and Export (for whatever it displays), Move rejected, Empty to Recycle Bin/Trash, the Rotations Apply and Discard buttons, and **XMP sync**. | `sel_open`, `filter-mode`, `out_col1_label` |
 | Hover preview | Rest the pointer on a Review thumbnail | **Hover to preview** (Settings → REVIEW, default On); **Appears**: after a short rest (333 ms, `HOVER_REST_MS`) or at once. Off in compare, in immersive, under any dialog or menu, and while the Review jump list is open (`hover-preview-live`). No room below about 759 px of window width. **Esc** hides it. | Shows the photo larger beside the panel, using the browsing preview (a preview decode on a miss, never full resolution). The box keeps the photo's shape: a 3:2 photo is half the window wide, other shapes get the same area, capped at 60 % of the window width and 80 % of the height between toolbar and filmstrip. The hovered frame is protected from eviction. | `hover_box`, `hover_preview_step`, `fast_evict_protected` |
-| Undo / redo | **Ctrl+Z**; **Ctrl+Shift+Z** or **Ctrl+Y** (`undo`, `redo`); the events centre's Undo and Redo buttons | Per folder, up to 500 steps. A delete, move or sort change in the same folder keeps the steps for the photos that stayed (`remap_history`). Blocked by any dialog or menu (`popup-open`), because undo jumps `current` to the edited photo. While a photo menu is open, the keys act on that menu's photo. There is no redo of a delete or a move. | One history: the `UndoRedo` stack plus the last delete and the last move, ordered by `Act.seq`, so Ctrl+Z always undoes the most recent of them | `undo_arm`, `UndoRedo`, `UndoEntry` |
+| Undo / redo | **Ctrl+Z**; **Ctrl+Shift+Z** or **Ctrl+Y** (`undo`, `redo`); the events centre's Undo and Redo buttons | Per folder, up to 500 steps. A delete, move or sort change in the same folder keeps the steps for the photos that stayed (`remap_history`), and a photo that left keeps its steps waiting with it until it comes back. Blocked by any dialog or menu (`popup-open`), because undo jumps `current` to the edited photo. While a photo menu is open, the keys act on that menu's photo. There is no redo of a delete or a move, and a delete or a move empties what Ctrl+Y could re-apply. | One history: the `UndoRedo` stack plus every delete and every move of the session (`FileHistory`), ordered by `Act.seq`, so Ctrl+Z always undoes the most recent of them, one at a time. See [Undo history](#undo-history) | `undo_arm`, `UndoRedo`, `UndoEntry`, `FileHistory` |
 | Rotate | **r** / **Shift+R** (`rotate-shot`), both photo menus. With a selection armed, `bulk-rotate(dir)` makes one undo step for the whole batch and skips animated GIFs, GIFs it could not check and unchecked GIFs that are still cloud-only, saying so. | Automatic EXIF orientation combines with the manual turn | `RotState` holds turns over unrotated cached pixels: rotation is applied when drawing, so it never throws away decoded pixels | `RotState`, `UndoEntry::BulkRot` |
 | Apply rotations | Review panel → Rotations → **Apply** or **Discard** (`apply-rotations`, `discard-rotations`), each with a counted confirm. Closing the app with turns pending shows a reminder: **Open Review** or **Close anyway**. | Pending turns exist. **Apply** also waits (faded) while the folder's review file couldn't be read | Writes the original. A JPEG gets a 2-byte orientation patch at a re-parsed, verified position, checked before and after the write (compare-and-swap). RAW files, finished PNG, TIFF, WebP and HEIC, and JPEGs without a usable EXIF orientation get an XMP sidecar instead. See [Orientation and rotation](#orientation-and-rotation). | `apply_rotation`, `patch_jpeg_orientation`, `write_xmp_sidecar` |
 | XMP rating sync | Review panel → **XMP sync** (`toggle-xmp-sync`); turning it on can offer to write sidecars for existing ratings (`xmp-backfill-confirm`) | `xmp_sync_ratings`, default Off | `<photo>.xmp` `xmp:Rating` through the writer. A name-keyed record, reloaded for each folder, stops existing ratings from being rewritten in bulk. | `write_xmp_rating_sidecar` |
@@ -147,12 +147,12 @@ How to read the tables:
 | Copy a name or path | Click the photo menu's header, which is the photo's name (`copy-ctx-name`); click the name in the info panel (`copy-name`); click the toolbar's path pill (`copy-path`) | — | Clipboard text | — |
 | Copy the displayed photos | Review panel → **Copy picks** (the label follows the panel's filter: picks, rated, selected or displayed) opens a counted confirm (`copy-picks`) | Something to copy in the current filter; the Rejects filter says "Nothing to copy" | Copies the original bytes into `./Picks` using the `.part` protocol (write under a temporary name, then rename). The confirm chooses **RAW + image**, **RAW only** or **Image only**; can include rejected photos in the set (off by default); warns about unapplied rotations, because a copy carries the original bytes; and counts cloud files that must download first. Each copied file takes its own XMP sidecar (a small side file, `IMG.xmp` or `IMG.JPG.xmp`, where Falcon keeps an applied RAW or HEIC turn and synced stars) along, never overwriting one already there; sidecars are not counted as photos and not listed in the export record (see [Side files](#side-files)). The finish message also counts copied files this computer cannot open, judged from what Falcon knows about each file: its name, or its bytes once they have been read — for example "· 3 HEIC files this PC can't open — a Mac or phone can". | `PICKS_SUBFOLDER`, `out_col1_label` |
 | Move rejected | Review panel → **Move rejected** (`move-rejects`), with a counted confirm | Rejected photos exist | Moves them and their XMP sidecars into `./Rejected`. That folder deliberately has no export manifest, because Empty would recycle it. | `result_subfolder` |
-| Empty to Recycle Bin / Trash | Review panel (`empty-rejected`), with a confirm | `./Rejected` is not empty | Recycles the contents of `./Rejected` in the folder on screen (`scanned_dir`) after a writer barrier (a wait until every queued save has reached disk), including the XMP sidecars moved there, which the confirm's count includes. With no folder open there is nothing to empty. | — |
-| Undo a move | The toast's **Undo** (`undo-move`); **Ctrl+Z** | The last file operation was a move, made in the folder on screen | Moves the files back, photos first and then their XMP sidecars; across drives it falls back to the same `.part` protocol | `undo_moves` |
+| Empty to Recycle Bin / Trash | Review panel (`empty-rejected`), with a confirm | `./Rejected` is not empty | Recycles the contents of `./Rejected` in the folder on screen (`scanned_dir`) after a writer barrier (a wait until every queued save has reached disk), including the XMP sidecars moved there, which the confirm's count includes. With no folder open there is nothing to empty. On Windows, on a drive with no Recycle Bin (an SD card, a USB stick, a network drive), the confirm says the files go for good, and Falcon deletes them itself (`empty_rejected_for_good`). | — |
+| Undo a move | The toast's **Undo** and the row's **Undo** in the events centre (`undo-move`); **Ctrl+Z** | A move made in the folder on screen. Every move of the session is remembered, so two moves take two presses | Moves the files back, photos first and then their XMP sidecars; across drives it falls back to the same `.part` protocol. You stay on the photo you are on, and the filmstrip and grid slide. Runs on the file queue | `undo_moves`, `press_undo_move` |
 | Web export | Review panel → **Export…** (`open-export`); the export sheet (`export-web`, `cancel-export`) | A recipe that names a watermark image needs that file; the export refuses if it is missing | Writes `./export` atomically (`.part`, then rename) with a progress bar, **Cancel**, and a `falcon_export.json` manifest. Every exported file is newly encoded from the original. Format: **JPG** (default; quality tier; embedded sRGB profile) or **PNG** (lossless at `png::Compression::Fast`; tagged with the `sRGB` chunk rather than an embedded profile; keeps the source's transparency and 16-bit depth). One pipeline, `export_web_file`: resize → convert to sRGB → stamp the watermark → encode, so the sRGB watermark never passes through the colour transform. Copy and move always carry original bytes (`CopyOriginal`); only export converts colour. Optional **Append the preset name to filenames** writes `<name>_<preset>.<ext>` through one name builder, `web_deliverable_name`, whose extension comes from the run's format. Before anything is decoded, a collision check asks **Cancel / Skip existing / Overwrite** when files of the same format already exist. RAW-only shots follow the run's **Skip / Camera preview / Develop RAW** choice. See [Export](#export). | `EXPORT_SUBFOLDER`, `WebFormat`, `export_web_file`, `web_deliverable_name` |
 | Watermark and presets | In the export sheet: watermark None, Image or Text (`set-wm-type`); choose the image (`choose-watermark`); text and font (`wm-text-changed`, `set-wm-font`); custom size and opacity (`set-wm-custom`); live preview (`wm-request-sample`); presets (`save-preset`, `apply-preset`, `delete-preset`, `new-preset`) | — | A preset is a complete recipe, not a partial overlay. Each saved preset shows four chips — format, size, quality and watermark (`PresetBrief`) — so you can see what it will do before running a large batch. | `WmPreset`, `PresetBrief` |
-| Delete to Recycle Bin / Trash | **Del** or **Backspace** (`delete-key`), both photo menus (`delete-shot`) | A three-button dialog: **Cancel**, **Mark as rejected**, **Move to Recycle Bin** / **Move to Trash** (danger colour). **Enter cancels.** | Captures the photo's identity — folder-open counter, folder, position and name — and checks it again before acting. Recycles the pair's files and their XMP sidecars after a writer barrier; the rescan lands on the neighbouring photo. See [File operations, delete and recovery](#file-operations-delete-and-recovery). | `DeleteRecord`, `del_pending` |
-| Recover a delete | The **Recover** toast (`recover-delete`); **Ctrl+Z** | The session's one remembered delete (`DeleteRecord`), with the file still in the bin | Windows restores from the Recycle Bin (`trash::os_limited`); the Mac renames the file back from the Trash location captured at delete time with `renamex_np(…, RENAME_EXCL)`. A name clash is skipped, never overwritten. | `DeleteRecord` |
+| Delete to Recycle Bin / Trash | **Del** or **Backspace** (`delete-key`), both photo menus (`delete-shot`) | On a drive with a Recycle Bin it goes at once, with no dialog. On Windows an SD card, a USB stick, a network drive or a photo stored only in OneDrive asks first and deletes for good (**Cancel**, **Mark as rejected**, **Delete for good**; **Enter cancels**). A selection goes at once only if the photo on screen is in it; otherwise the count dialog asks. Refused while the bell's panel is open, and for a photo not yet on screen. | The photo leaves the list at the press and the next one shows at once, at the same zoom and spot; the files go to the bin behind it, on the file queue, after a writer barrier. See [Delete and recovery](#delete-and-recovery). | `TakeOut`, `press_delete`, `DeleteRoute` |
+| Recover a delete | **Recover** on the card, on the delete's row in the events centre and on each line of a folded row (`recover-delete`, `recover-line`); **Ctrl+Z** | Any delete of the session, in the folder on screen, with its files still in the bin. Ctrl+Z takes the newest first | Windows restores from the Recycle Bin (`trash::os_limited`); the Mac renames the file back from the Trash location captured at delete time with `renamex_np(…, RENAME_EXCL)`. A name clash is skipped, never overwritten. The photo's stars, marks, turns and Undo steps come back with it. | `DeleteRecord`, `press_recover` |
 | Restore an earlier selection | The **Restore** offer (`restore-selection`) after you clear or replace three or more selected photos | `restore_offer_live(stash_dir, scanned_dir)`: the offer names a folder and works only while that folder is on screen | `SelectSet` | `restore_offer_live` |
 
 ### Settings
@@ -181,7 +181,7 @@ The Settings body scrolls beneath its header. When it overflows, the same `MiniV
 
 | Section | Rows | Notes |
 | --- | --- | --- |
-| INPUT | **While the folder is loading**: View only or Allow photo edits (`photo_open_edits`, default View only) · **Mouse wheel changes photo** (default On) · **Press current rating again to clear** (default On) · **Never browse onto a blank photo** (`scrub_wait_cache`, default Off) · **Resume position memory** · **Remember sorting and panel layout** | |
+| INPUT | **Mouse wheel changes photo** (default On) · **Press current rating again to clear** (default On) · **Never browse onto a blank photo** (`scrub_wait_cache`, default Off) · **Resume position memory** · **Remember sorting and panel layout** | |
 | COPY SHORTCUT | The ordered preference for what **Ctrl+C** copies: the image, the RAW or both (`CopyPrefRow`, `copy_prefs`) | One preference drives both Ctrl+C and the menu's shortcut hint. |
 | PERFORMANCE | **GPU JPEG decode** (nvJPEG on Windows; on Mac the row names Image I/O, `accel_toggle_label`) · **Adaptive Hi-Res** (default On; when off, a whole-image resolution limit) · **HEIC speed priority** (default Off) · **Colour-managed CMYK JPEGs** (Windows only, default Off: sends four-channel JPEGs to Windows' own codec instead of Falcon's portable conversion; hidden on Mac because its wording is about Windows' codec, `cmyk_route_visible`) · **Mode**: Turbo, Balanced, Eco or Custom (default Balanced; Custom adds a card of its own numbers), with **Use Eco on battery power** (default on) · **In the background**: release memory after 5, 20, 60 or 300 s in another application, or a typed 5–300 s (default 20 s); with Custom, also its **GPU memory usage limit** and **Release over** · **Fast View**: preview detail (Faster preview or Sharper preview) and **Benchmark** with the current folder or a generated target size (`run-benchmark`, `set-bench-target-mp`, `apply-bench-rec`) | The rows that trade decode work against what you see sit together. A mode limits only preparing-ahead work — never the displayed photo, the compare halves, explicit requests, zoom tiles or the thumbnails on screen — and a status line says which mode is in effect and why. The battery switch follows the power source and, on Windows, Battery saver. See [The mode control](#the-mode-control-turbo-balanced-eco-custom). The browse rate itself (5, 12, 20, 30 or 120 fps, or custom; default 30) and **When zoomed** (Speed or Always sharp) are in the toolbar's browse-speed panel. |
 | DISPLAY | **Auto-orient (EXIF)** (default On) · **Interface motion** (default On) · **Remember window size & position** (default Off) · **Floating panels**: Hidden, Minimised or On · **Info panel view**: Simple, Standard or Full · **Corner controls stay visible** (1–10 s, default 3) | `motion_ui` is a pure interface switch: Off makes every panel, toast and full-screen transition instant. **Info panel view** is the launch default for folders without a remembered view and applies to the open panel at once; the panel's own header buttons change only the current view and that folder's memory. |
@@ -198,8 +198,8 @@ The Settings body scrolls beneath its header. When it overflows, the same `MiniV
 
 | Surface | When it appears | Behaviour | Code |
 | --- | --- | --- | --- |
-| Toast | Any operation result | One slot. A replacement carries a "+N" counter. Dismissing it acknowledges it (`dismiss-toast`). Notices last up to 10 s (`TOAST_MS_MAX`). The countdown freezes while the pointer is anywhere on the card, and while a blocking dialog or the welcome guide covers it (`toast-blocked`), so an offer such as Recover cannot expire while you could not click it. The ask-first rating question has its own 20 s clock (`ASK_MS`). If another message replaces an unanswered question, the new card adds a line such as "Rating question cancelled — the 12 photos are unchanged". | `show_transient_toast`, `show_ask_toast` |
-| Events centre | The toolbar bell (`toggle-notif`, `notif-dismiss`, `notif-clear`) | The lasting list, up to 50 entries: save failures, damaged-file warnings and operation results, with **Resume**, **Show**, **Undo** and **Redo** buttons. Opening it removes the current toast. | `NotifEntry` |
+| Toast | Any operation result | One slot. A replacement carries a "+N" counter. Dismissing it acknowledges it (`dismiss-toast`). Notices last up to 10 s (`TOAST_MS_MAX`). A delete that went cleanly gets a short card instead: about 3 s, with the photo's small picture, and no "+N" (see [The events centre and notifications](#the-events-centre-and-notifications)). The countdown freezes while the pointer is anywhere on the card, and while a blocking dialog or the welcome guide covers it (`toast-blocked`), so an offer such as Recover cannot expire while you could not click it. The ask-first rating question has its own 20 s clock (`ASK_MS`). If another message replaces an unanswered question, the new card adds a line such as "Rating question cancelled — the 12 photos are unchanged". | `show_transient_toast`, `show_ask_toast` |
+| Events centre | The toolbar bell (`toggle-notif`, `notif-dismiss`, `notif-clear`) | The lasting list, up to 50 entries: save failures, damaged-file warnings and operation results, with **Resume**, **Show**, **Undo**, **Recover** and **Redo** buttons. Deletes made one after another share one folded row with an arrow that opens a line per photo. Opening it removes the current toast. The bell lights only for something that needs attention. | `NotifEntry`, `tick::Fold` |
 | Tooltip | After a 600 ms hover | One always-present tooltip layer at the window root; `cy == 0` marks a toolbar tooltip. The cache meter keeps its own twin because its text updates while you hover it. See [Tooltips](#tooltips). | `Tip` (`theme.slint`) |
 | Loading state | The current photo has no decoded frame yet | The stage dims the previous photo's pixels, so they never pass for the current photo, and shows a quiet **Loading…** pill | — |
 | Failure cards | A photo that cannot be shown | Three kinds. A **genuine failure**: warning colour and "Tap to retry — the other photos are unaffected". A **cloud placeholder**: a calm cloud and no retry line, because Falcon retries by itself; nothing is damaged. **Unsupported**: "This file type can't be previewed yet", with a format badge named from the file's bytes where they are readable — a HEIC on a Windows PC without the codec says HEIC, which tells the user what to install; a container Falcon can read but not decode (today AVIF) gets the generic wording. | `cur-failed`, `cur-cloud`, `cur-unsupported` |
@@ -215,7 +215,7 @@ The Settings body scrolls beneath its header. When it overflows, the same `MiniV
 
 Open a folder → the photo appears while the filmstrip fills → browse with **←/→** or the wheel, each stop settling to a sharp full-resolution frame → **z** or the wheel to check focus at 1:1 → **1–5 / p / x** to judge → **c** to compare two near-identical frames → **s** to open Review and check the picks → **Copy** or **Export** to hand them off.
 
-Every step can be undone (undo, redo, unmark, Recover) except a finished export, an export that overwrote files, and an emptied bin.
+Every step can be undone (undo, redo, unmark, Recover) except a finished export, an export that overwrote files, an emptied bin, and a delete Falcon said was for good (on Windows: an SD card, a USB stick, a network drive, or a photo stored only in OneDrive, where Falcon asks first).
 
 The diagram shows that workflow as a loop: browsing and judging repeat until the picks are checked and handed off.
 
@@ -235,9 +235,10 @@ flowchart LR
 
 Most "why can't I do this right now?" answers come from one of these. Each is a single named property or function, not a rule repeated in every control.
 
-1. **Dialogs (`modal-open`).** `dialog-open` is true while the About card, Settings, the browse-speed panel (`loading-open`), a confirm dialog (`confirm-kind` not 0), the export sheet, the rotation reminder, the forget-display confirm, the Mac first-launch association prompt or the Windows update prompt is open. `modal-open` adds the welcome guide, an unfinished-boundary loading wait, and, in **View only**, a photo-first open that is still scanning the folder (`opening-photo` and not `photo-open-edits`). Rating, marking, rotating, copying and the other edits read it; Rust reads it through `get_modal_open()`. Narrower gates sit beside it:
+1. **Dialogs (`modal-open`).** `dialog-open` is true while the About card, Settings, the browse-speed panel (`loading-open`), a confirm dialog (`confirm-kind` not 0), the export sheet, the rotation reminder, the forget-display confirm, the Mac first-launch association prompt or the Windows update prompt is open. `modal-open` adds the welcome guide and an unfinished-boundary loading wait. A folder that is still loading is not one of its terms: stars, flags, rejects and turns work while it loads (see [While the folder is loading](#opening-and-inspection)). Rating, marking, rotating, copying and the other edits read it; Rust reads it through `get_modal_open()`. Narrower gates sit beside it:
    - `inspection-blocked` = dialogs plus the welcome guide. Zoom, pan, Fit and 1:1 read it, so you can inspect the clicked photo while its folder is still loading.
-   - `menu-open` = a photo menu, the Review-tile menu, the sort menu, the Open menu or the events dropdown. `popup-open` = `modal-open` or a menu; Home/End, undo and redo, compare swap and pin, the compare wheel and the hover preview read it. `photo-popup-open` = `inspection-blocked` or a menu; the arrow keys and the photo and filmstrip wheels read it, which is why a wheel notch over Settings or over a menu never changes the photo.
+   - `menu-open` = a photo menu, the Review-tile menu, the sort menu, the Open menu or the events dropdown. `popup-open` = `modal-open` or a menu; undo and redo, compare swap and pin, the compare wheel and the hover preview read it. `photo-popup-open` = `inspection-blocked` or a menu; the photo and filmstrip wheels and a click on a thumbnail read it, which is why a wheel notch over Settings or over a menu never changes the photo.
+   - `browse-keys-blocked` = the real dialogs (everything in `dialog-open` but Settings and the browse-speed panel), the welcome guide, a menu or Settings' language list. The browsing keys read it (←/→, Home/End, ↑/↓ in the grid), so they work with Settings or the browse-speed panel open (the owner's choice, 2 November 2026); Home and End also wait for a folder that is still loading.
    - `modal-blocking` is the subset that draws a full-window dimmed layer: About, confirms, the rotation reminder, the export sheet, forget display and the association prompt. It mutes the toolbar's panel buttons, and together with the welcome guide and the pointer it freezes the toast countdown.
    - The full-screen key has its own gate, `modal-open-fs`. On Mac it leaves out the welcome guide, so **F** works on the welcome screen.
 
@@ -260,9 +261,9 @@ Each of these is a real, deliberate coupling.
 | Something is **selected** | Rating, marking, rotating, deleting and Ctrl+C act on the selection. The Review panel shows its hidden **Selected** filter. The photo menus show counted rows that say what they will do ("Flag 12", "Delete 12 photos…", "Rotate 12 right", "Reveal 12 in Explorer"; the Mac menu bar says "Flag 12 Photos", "Rotate 12 Photos Right"). **r / Shift+R** turn the whole selection as one undo step. |
 | **Compare** is on | Selection and bulk keys are dormant; rating and marking act on the focused half; Ctrl+wheel always zooms in; the immersive cull card and the hover preview are off. |
 | **Immersive** is on | All chrome hides and corner controls appear on hover; selection and bulk keys are dormant; the Review panel is removed, not just hidden; on a Mac the window's full-screen state changes too (see [Platform rules and the Mac](#platform-rules-and-the-mac)). |
-| **Settings** is open | The dialog gate blocks the action keys and the photo wheels. Preparing ahead is slowed, not stopped: at most one prepared full-resolution frame is shown every 250 ms (`SETTINGS_PUBLISH_PACE_MS`). |
+| **Settings** or the **browse-speed panel** is open | The browsing keys still work (←/→, Home/End, ↑/↓ in the grid). The dialog gate blocks the action keys, the photo wheels and a click on a thumbnail. With Settings open, preparing ahead is slowed, not stopped: at most one prepared full-resolution frame is shown every 250 ms (`SETTINGS_PUBLISH_PACE_MS`). |
 | The user is **gesturing** (pan, zoom, panel or strip scroll) | Preparing ahead parks: no new prepared full-resolution decodes, finished ones are held, a bounded drain continues, and the preview tier holds too (`fast_speculation_held`). It eases back through a paced tail: parked for 0.9 s after the last input, paced until 3 s. |
-| A photo-first open is still **scanning the folder** | In View only, edits wait (`modal-open`); zoom, pan and browsing the verified nearby photos work; sorting and selection gestures wait. |
+| A photo-first open is still **scanning the folder** | Stars, flags, rejects and turns work on the photo on screen, as do zoom, pan and browsing the checked nearby photos. Sorting, selection gestures, Home and End, Compare, and the file and whole-folder actions wait for the whole folder, each at its own gate. |
 | **Balanced**, **Eco** or **Custom** is in effect | The browse rate has a lower ceiling and fewer previews are kept ready (`EfficiencyLimits`); in Eco prepared full-resolution frames are also paced (`GateArm::Efficiency`). The displayed photo is never slowed. |
 | Falcon is **in the background** for the set wait (default 20 s), or **minimised** | Preparing ahead stops and the photo caches give their graphics memory back gradually over 10 s (in Custom, at once or over 30 s if chosen), farthest photos first, down to the tier's target (`background_memory`). The displayed photo, both compare halves, the hovered Review tile, the awaited frame and thumbnails stay. Coming back stops it at once. See [Sharing the card with other applications](#sharing-the-card-with-other-applications). |
 | **Auto-orient** is off | EXIF orientation is ignored; manual turns still apply. |
@@ -280,8 +281,8 @@ One severity rule applies everywhere: the consequential button carries the sever
 | Rate, flag, reject | Key, photo menu, cull card, Review tile | None for one photo. For a selection, the ask-first question (`BulkAsk`) unless Direct bulk rating is on; it lasts 20 s, pauses under the pointer, and is cancelled aloud if another message replaces it. | **Ctrl+Z**, or press the same key again |
 | Rotate | **r** / **Shift+R**, either photo menu; the whole selection when armed | None. An animated GIF in a selection is skipped and named in the finish message. | Rotate back; one **Ctrl+Z** undoes a whole batch; the original file is untouched until **Apply** |
 | Apply rotations | Review panel → Rotations → **Apply** (or **Discard**) | A counted confirm. Closing the app with turns pending shows a reminder: **Open Review** or **Close anyway**. | None: this is the point of no return for the file. The JPEG patch re-reads the file and checks the current value before writing (compare-and-swap); an unusual file gets a sidecar instead, and a file that cannot be written keeps its pending turn. |
-| Delete | **Del**, either photo menu | Three buttons; **Enter cancels** | The **Recover** toast or **Ctrl+Z**, from the Recycle Bin or Trash; a name clash is skipped, never overwritten |
-| Empty to Recycle Bin / Trash | Review panel | Counted confirm | The system Recycle Bin or Trash |
+| Delete | **Del**, either photo menu | None on a drive with a Recycle Bin or Trash: the photo can come back. A selection that doesn't include the photo on screen gets the counted dialog. On Windows, a drive with no Recycle Bin or a photo stored only in OneDrive gets three buttons (**Cancel**, **Mark as rejected**, **Delete for good**); **Enter cancels** | **Recover** on the card, the row or its line, or **Ctrl+Z**, one delete at a time, newest first, from the Recycle Bin or Trash; a name clash is skipped, never overwritten. A delete for good has no way back, and the dialog says so first |
+| Empty to Recycle Bin / Trash | Review panel | Counted confirm. On a drive with no Recycle Bin it says the files go for good | The system Recycle Bin or Trash; none on a drive with no Recycle Bin |
 | Copy, Move rejected | Review panel | Counted confirm, which also warns about unapplied rotations and about cloud files that must download first | **Undo** for a move; a copy only adds files |
 | Write XMP sidecars for existing ratings | Turning **XMP sync** on | Confirm; Enter cancels | — |
 | Web export | The export sheet | The sheet is the confirm, plus a collision confirm (**Cancel / Skip existing / Overwrite**) when the run would replace files of the same format in `./export` — a `.png` collides with a `.png`, not with the `.jpg` of the same name, because the run will not touch the `.jpg`. Progress with **Cancel**. | Cancel mid-run; files already written stay. **Overwrite** is the one export path with no undo, and its message says so. |
@@ -332,7 +333,7 @@ These are current design facts, not unfinished work:
 - **A very still zoom-drag eventually releases background work.** While the user drags a zoomed photo, `fast_hold_engaged` holds back preparing-ahead work so that it does not compete with the gesture. Every pointer event restarts the clock: preparing ahead stays parked for 0.9 s after the last movement (`INTERACT_PARK_WINDOW_MS`) and returns to full speed after 3 s (`INTERACT_PACE_TAIL_MS`). If the user holds the button down without moving for longer than 3 s, background work resumes at full rate while the button is still down. The cause is that `main_window.slint` provides `pan-start`, `pan-move` and `pan-reset`, but no `pan-end` and no "button is down" state, so Rust cannot tell "holding still" from "let go". (The filmstrip does have this state, as `film_dragging`.) The structural fix is a pan-end or press-state callback from the interface.
 - **While Settings is open, the publish gate stops at its first row** (`GateArm::Sheet`), so no gesture parks anything during that time.
 - **The compare wheel can still drop a single notch when the browse target is below about 7 fps.** The paced step is then longer than the 140 ms after which a quiet wheel's leftover notches are discarded (`HOLD_TIMEOUT_MS`).
-- **While a photo-first open is still discovering the folder,** plain browsing of the verified nearby photos works, but the selection preview and drag-to-compare are not offered yet; unavailable thumbnail edits show the disabled colours and swallow clicks. See [Opening and inspection](#opening-and-inspection).
+- **While a photo-first open is still discovering the folder,** plain browsing of the verified nearby photos works, and so do stars, flags, rejects and turns, but the selection preview and drag-to-compare are not offered yet. See [Opening and inspection](#opening-and-inspection).
 
 #### Files and formats
 
@@ -425,13 +426,14 @@ Three answers still do not follow the rule:
 
 Each of these is a scheduling decision. Replace them with runtime tests of whether the lane is actually serving. See [Windows HEIC hardware decoding](#windows-heic-hardware-decoding).
 
-#### The rescan after a file operation runs on the interface thread
+#### A changed folder still lands on the interface thread
 
-After a delete, move or undo, the operation stores a request in `reload_req`. The next tick runs the synchronous `reload` in `main.rs`, but only if the user is still on that folder (checked with `last_scanned_dir.still_on_screen`). `reload` calls `falcon_decode::scan_folder_with_metadata` on the interface thread.
+Since the Delete round (1.1.2), the folder is read again after a delete, a move, their undo or coming back to Falcon on its own thread, and a delete takes the photo out of the list without reading the folder at all (see [The background reread](#the-background-reread)). Before, that listing ran on the interface thread after every delete, move and undo, 0.23 to 0.29 s at 16,000 photos. Two parts still run on the interface thread:
 
-Since the owner's decision of 2 November 2026 (check a photo's type when it is opened), that scan lists the folder and reads no file contents for ordinary names, so it is quick on any drive. It still reads names shared by two or more finished files. A folder of exported pairs (`X.jpg` beside `X.png` for every photo) therefore still reads every file: about 15 µs per file on a local SSD, one round trip per file on a network share, one head seek per file on a cold external hard disk, so the interface can pause there. See [File type detection](#file-type-detection-bytes-over-names).
+- **The landing when the folder really changed** (`apply_scan`): a photo another program saved or removed, a Recover, a move. A clean delete's reread lands nothing. At 16,000 photos this landing is unmeasured. A delete's own take-out, which lands without reading the folder, took 24 to 27 ms on 16,002 generated photos in the Delete round's clicking test.
+- **A sort pick's own reread** (`reload` in `main.rs`, which also serves a Date taken landing): it lists the folder with `falcon_decode::scan_folder_with_metadata` on the interface thread, 0.23 to 0.31 s at 16,000 photos, an accepted pause on an explicit choice.
 
-Since the owner's choice of 2 November 2026 (keeping prepared photos and undo), this rescan no longer throws away what is ready for unchanged photos: see [Switching folders](#switching-folders). It stays on the interface thread for now, so the list stays true to the disk and its brief pause stays.
+Since the owner's decision of 2 November 2026 (check a photo's type when it is opened), a listing reads no file contents for ordinary names, so it is quick on any drive. It still reads names shared by two or more finished files. A folder of exported pairs (`X.jpg` beside `X.png` for every photo) therefore still reads every file: about 15 µs per file on a local SSD, one round trip per file on a network share, one head seek per file on a cold external hard disk. The background reread pays that off the interface thread; a sort pick's reread can pause there. See [File type detection](#file-type-detection-bytes-over-names).
 
 #### No RAM keep-alive for full-detail frames, and no disk cache
 
@@ -494,14 +496,14 @@ Paths are relative to `falcon/native/src/` unless shown in full.
 | Windows file associations, the icon helper and per-format shell icons | `windows_assoc.rs`, `windows_icon_bridge.rs`, `file_icons.rs`; `falcon/native/shell-icons/` |
 | Mac default-app settings (LaunchServices) and Finder's open-document events | `mac_assoc.rs`, `macos_open.rs` |
 | Mac menu bar: what the menus contain and enable (pure, tested on Windows), and the native menu | `menubar_model.rs`, `mac_menu.rs` |
-| Mac title-bar toolbar: route choice, the AppKit host and the hidden toolbar window (`mac_titlebar_window_attributes` in `main.rs`). The word "experiment" in these names does not mean optional: this is the normal Mac toolbar. Diagnostic-only variants sit beside it. | `mac_experiment.rs`, `mac_experiment_native.rs`, `ui/mac_toolbar.slint`; diagnostics: `mac_chrome_compat.rs`, `mac_experiment_ui.rs`, `ui/mac_experiment.slint` |
-| Interface markup (18 `.slint` files). `MainWindow` (`main_window.slint`) holds state, panels and the input gates; `MainToolbar` (`toolbar.slint`) is the shared toolbar. `ui.rs` compiles the markup and exposes its types to Rust; it contains no markup. | `falcon/native/ui/`; `ui.rs` |
+| Mac title-bar toolbar: route choice, the AppKit host and the hidden toolbar window (`mac_titlebar_window_attributes` in `main.rs`). The word "experiment" in these names does not mean optional: this is the normal Mac toolbar. Diagnostic-only variants sit beside it. | `mac_experiment.rs`, `mac_experiment_native.rs`, `ui/mac_toolbar.slint`; diagnostics: `mac_chrome_compat.rs`, `mac_experiment_ui.rs` (its test), `ui/mac_experiment.slint` (compiled as `falcon_ui::mac_probe`) |
+| Interface markup (18 `.slint` files). `MainWindow` (`main_window.slint`) holds state, panels and the input gates; `MainToolbar` (`toolbar.slint`) is the shared toolbar. The folder is its own crate, `falcon-ui` (the interface crate): `lib.rs` compiles the markup and exposes its types to the app as `ui`; it contains no markup. `build.rs` there sets the Slint compiler's build-time settings. | `falcon/native/ui/` (`lib.rs`, `build.rs`) |
 | File-type detection, folder scan, decoding and the export encoders (`lib.rs`); the finished-image decoder interface (`decode.rs`); bounded header reads for shared names and the opened photo (`scan_io.rs`); HEIF grid parsing (`heif_grid.rs`); NV12-to-RGB conversion (`yuv_kernel.rs`); rotation write-back and XMP sidecars (`apply.rs`); RAW development for export and for X-Trans (`raw_export.rs`, `xtrans.rs`) | `falcon/crates/falcon-decode/` |
 | Colour spaces, ICC profiles and transforms | `falcon/crates/falcon-color/` |
 | GPU work: RAW development on the GPU (`lib.rs`), HEIC tile assembly (`heic.rs`) and banded read-back planning (`band.rs`) | `falcon/crates/falcon-gpu/` |
 | Optional NVIDIA JPEG decoding | `falcon/crates/falcon-nvjpeg/` |
 | Libraries carried with Falcon's changes: winit, the window library, changed for the Mac title-bar toolbar; and zune-jpeg, a JPEG decoder. Falcon's own JPEG viewing uses `jpeg-decoder` (plus nvJPEG on Windows and Image I/O on Mac). zune-jpeg is linked only through the `image` library that rawler (the RAW library), Slint and resvg use; its only known route at run time is rawler's `raw_image()` for DNG files whose raw data is lossy-JPEG compressed. Falcon never calls rawler's preview functions. See [Public source and release packaging](#public-source-and-release-packaging). | `falcon/vendor/winit/`, `falcon/vendor/zune-jpeg/` |
-| Tests outside the source files: the Mac title-bar move test and the opt-in Windows Shell icon tests | `falcon/native/tests/mac_hosted_view.rs`, `falcon/native/tests/windows_shell_icons.rs` |
+| Tests outside the source files, each needing a process of its own: the Mac title-bar move test and the opt-in Windows Shell icon tests. They are their own small package (`falcon-platform-tests`), so `cargo test` does not compile a second, plain copy of the app for them. | `falcon/native/platform-tests/mac_hosted_view.rs`, `falcon/native/platform-tests/windows_shell_icons.rs` |
 
 The full list of Mac-only modules is under [Platform rules and the Mac](#platform-rules-and-the-mac).
 
@@ -551,14 +553,14 @@ flowchart TB
     direction TB
     T0["Before the guarded steps<br/>Mac: copy state to the title-bar toolbar (sync_toolbar)<br/>Rendering device lost? Stop all GPU work and quit to the restart prompt"]
     T1["Inside catch_unwind, in this fixed order<br/>1 Display and watchers: tick_top, disp_sub, disp_resolve, colour_watch, power_watch"]
-    T2["2 Folder hand-offs: reload_req, apply_scan (resolved open, clicked photo, nearby stage, full scan, upload_focus),<br/>picker (file pickers, Mac open-documents and menu pump), rot_apply, shots_snap (shot list + folder-open counter)"]
+    T2["2 Folder hand-offs: take_out (a delete's photo leaves the list), reload_req (file-queue reports, the background reread, a Move's ask, coming back to Falcon),<br/>apply_scan (resolved open, clicked photo, nearby stage, full scan, upload_focus),<br/>picker (file pickers, Mac open-documents and menu pump), rot_apply, shots_snap (shot list + folder-open counter)"]
     T3["3 Window upkeep and small drains: screen_wh, chrome_settle, want_max, export_prog,<br/>drains (benchmark, white balance, EXIF, dimensions, fonts, watermark strips)"]
     T4["4 vram: compare retarget and compare-wheel advance, bookkeeping (navigation),<br/>GPU-capacity check, GPU-memory recovery"]
     T5["5 Uploads: up_fast (at most 2 in flight), up_det (1 slot), up_roi (2 per tick),<br/>up_drain (landed textures into caches), thumbs"]
     T6["6 Movement: devhooks, scrub_adv, wheel_adv, cmp_retarget, adapt_res"]
     T7["7 Metadata: exif, float_exif"]
     T8["8 Requests: prime_arm, prime_hold, derive_c, pf_fast (momentum split, RAM-cache hits upload only),<br/>frost_feed, pf_det (current photo first, settle-gated), roi, gif"]
-    T9["9 Show: display, blur (one backdrop in flight), film, sel, hover_preview, grid"]
+    T9["9 Show: display, blur (one backdrop in flight), film, sel, hover_preview, grid,<br/>tile_slide (the filmstrip and grid slide after a landing), blue_edge"]
     T10["10 Upkeep: cloud_retry, zoom_pct, cache_meter, cmp_feed, cmp_zoom, cmp_linger,<br/>wm_preview, photo_rate, l2_pressure"]
     T11["11 Report and save: perf_log (with the Mac pool governor), hud,<br/>persist+notif (saves about every 1 s, quit-when-idle, notifications, immersive reveal), then the ACTIVE list"]
     T12["After catch_unwind: a panic streak raises the banner and a rescue save<br/>choose FULL or IDLE (tick_wants_full) · optional tickrate line"]
@@ -574,7 +576,10 @@ flowchart TB
     THUMB["Thumbnail pool, 2 to 4 workers on Windows<br/>256 px, colour-managed on the worker, visible tiles first"]
     META["White balance, EXIF, dimensions, fonts, watermark strips, benchmark"]
     GIF["GIF worker x1<br/>keeps only the newest request"]
-    OPS["File operations under OpGuard<br/>apply rotations, copy to Picks, move to Rejected, undo move, empty to bin, export"]
+    OPS["File operations under OpGuard<br/>apply rotations, copy to Picks, move to Rejected, empty to bin, export"]
+    FQ["File queue x1 (falcon-file-queue), started when there is work<br/>delete, Recover, Undo move, one at a time, in press order"]
+    RR["Background reread x1 (falcon-reread)<br/>lists the folder on screen, names, sizes and dates only"]
+    BC["Bin check x1 (falcon-bin-check)<br/>lists the Recycle Bin once after a quiet second"]
     U1["Upload thread x1<br/>the only GPU stager · GPU colour and rotation passes"]
     WR["Durable writer x1 (falcon-writer)<br/>settings, review data, XMP, opted-in log lines"]
     WATCH["Colour watcher (Windows) and power watcher<br/>every 2 s, lowest priority"]
@@ -600,6 +605,12 @@ flowchart TB
   T9 -- "menu-blur canvas" --> U1
   U1 -- "UploadDone" --> T5
   CB -- "start" --> OPS
+  T2 -- "jobs, in press order" --> FQ
+  FQ -- "reports, folded at the tick's top" --> T2
+  T2 -- "one listing at a time, once the queue is quiet" --> RR
+  RR -- "listing, landed only if the folder changed" --> T2
+  T2 -- "records not checked yet" --> BC
+  BC -- "what the bin lacks" --> T2
   OPS -- "result slots and export progress" --> UI
   T11 -- "WriteMsg, unbounded FIFO" --> WR
   WR -- "save failures to the events centre" --> T11
@@ -639,13 +650,13 @@ Just before the rate decision, the tick asks "is anything live?" in one short-ci
 | --- | --- |
 | 1. Gestures in progress | `key-hold`, `scrub`, `strip-drag`, `wheel`, `compare-wheel` |
 | 2. Settle and pacing windows | `motion`: navigation from any source in the last 2 s (`last_motion`, restamped by `step_bookkeeping`); covers `SETTLE_MS`, 2 × `SETTLE_MS` and `IDLE_DEEPEN_MS` |
-| 3. Animation this tick drives | `strip-glide` (measured movement, `support::film_glided`), `gif`, `gif-decode` |
+| 3. Animation this tick drives | `strip-glide` (measured movement, `support::film_glided`), `tile-slide` (the filmstrip and grid sliding after a landing), `gif`, `gif-decode` |
 | 4. Decode or upload in flight | `fast-pool`, `detail-worker`, `detail-cpu`, `roi-worker`, `detail-upload`, `detail-queued`, `fast-upload`, `thumb-pool`, `backdrop` |
-| 5. Operations running | `export`, `bench`, `file-op`, `picker`, `scan`, `quit-pending` |
+| 5. Operations running | `export`, `bench`, `file-op` (an operation holding `sel_busy`, or the file queue not quiet), `reread` (a background listing being read), `picker`, `scan`, `quit-pending` |
 | 6. Countdowns counted in ticks | `cull-chip-linger`, `raw-peek-linger`, `info-stub-linger`, `compare-pulse`, `compare-hint`, `selection-flush` |
 | 7. Window and startup deadlines | `open-priming`, `chrome-settle`, `display-move`, `display-retry`, `display-listener` |
 
-There are 35 terms; a repeating panic adds `tick-panic` outside the chain. Rules:
+There are 37 terms; a repeating panic adds `tick-panic` outside the chain. Rules:
 
 - Slint's own `animate` bindings are not listed, because Slint schedules their frames itself.
 - Toasts are not listed. A toast's countdown is wall-clock milliseconds, so an idle tick ends it within 125 ms of its deadline, and the click that raised it already holds full rate for 2 s.
@@ -658,7 +669,7 @@ GPU uploads must be limited per frame, caches are trimmed against a budget that 
 
 ### Tick timing labels (`worst_step=`)
 
-The tick times itself with the `mk!("label")` macro. Each `mk!` records the time since the *previous* `mk!`, so a label names a **span** of code, not a single function. If one label spans several steps, a slow tick gets blamed on the wrong step. The rule is **one label per step wherever a step can block**. There are 54 labels (`grep -c 'mk!(' falcon/native/src/main.rs`).
+The tick times itself with the `mk!("label")` macro. Each `mk!` records the time since the *previous* `mk!`, so a label names a **span** of code, not a single function. If one label spans several steps, a slow tick gets blamed on the wrong step. The rule is **one label per step wherever a step can block**. There are 60 labels (`grep -c 'mk!(' falcon/native/src/main.rs`).
 
 The always-on `perf:` line reports the slowest tick in its window as `worst_tick=` and the label of that tick's slowest span as `worst_step=`. The two are recorded together, so they always describe the same tick. Each label costs one `Instant::now()` and a comparison. `FALCON_TICK_PROF=1` also logs a `tickprof:` line with the six slowest spans for any tick slower than `FALCON_TICK_PROF_MS` (default 25 ms).
 
@@ -666,7 +677,8 @@ The always-on `perf:` line reports the slowest tick in its window as `worst_tick
 | --- | --- |
 | `tick_top` · `disp_sub` · `disp_resolve` | start of the tick; installing the Windows display-change listener; finding the active display and installing its colour (a Win32 display enumeration) |
 | `colour_watch` · `power_watch` | draining the colour-settings watcher (Windows; a no-op elsewhere) and the power watcher (Windows and Mac) |
-| `reload_req` · `apply_scan` | a pending reload; the folder swap: the resolved open, the clicked-photo and nearby results, the full scan (`apply_scan`), and publishing the photo on screen to the upload thread (`upload_focus`) |
+| `take_out` | a delete's take-out: the photo leaves the list at the press, and its job goes on the file queue |
+| `reload_req` · `apply_scan` | the file queue's reports, a Move's ask, coming back to Falcon, the background reread's acceptance and its landing, the bin check; the folder swap: the resolved open, the clicked-photo and nearby results, the full scan (`apply_scan`), and publishing the photo on screen to the upload thread (`upload_focus`) |
 | `picker` · `rot_apply` | file-picker results, plus on Mac the Finder open-documents queue and the menu-bar pump (`mac_menu::tick_pump`); finished rotation writes |
 | `shots_snap` · `screen_wh` · `chrome_settle` · `want_max` · `export_prog` | the shot-list snapshot with the folder-open counter; the gated `current_monitor()` call; window-corner settle; the re-maximize watchdog; export progress |
 | `drains` | six `drain_*` calls (benchmark, white balance, EXIF, dimensions, fonts, watermark strips) plus `start_wm_strips` |
@@ -678,7 +690,7 @@ The always-on `perf:` line reports the slowest tick in its window as `worst_tick
 | `roi` | `step_roi_single`, `step_compare_pan_reclamp`, `step_roi_compare` |
 | `gif` · `display` · `blur` · `film` | GIF advance; display; the blurred backdrop; filmstrip |
 | `sel` | resume memory, upload-problem notices, the Rejected-folder count check, `step_selection` |
-| `hover_preview` · `grid` | `step_hover_preview` (must run after `step_selection`); the folder grid |
+| `hover_preview` · `grid` · `tile_slide` · `blue_edge` | `step_hover_preview` (must run after `step_selection`); the folder grid; the clock of the slide after a landing (`step_tile_slide`); the blue edge (`step_blue_edge`) |
 | `cloud_retry` · `zoom_pct` · `cache_meter` · `cmp_feed` · `cmp_zoom` · `cmp_linger` · `wm_preview` | one step each (`wm_preview` also refreshes the export sheet's captions while it is open) |
 | `photo_rate` · `l2_pressure` · `perf_log` · `hud` | photos per second; RAM-cache pressure; the perf log (on Mac this span also contains the elastic pool governor's 1 s step); the HUD |
 | `persist+notif` | `step_persistence` (~1 s saves), Developer change counts, the quit-when-idle gate, `step_notifs`, recovery availability, the last-action sentence, `step_immersive_reveal`. This is the one compound span left |
@@ -701,6 +713,9 @@ All workers are detached threads. Each job runs inside `catch_unwind`, and every
 | Durable writer (thread `falcon-writer`) | 1 | `mpsc::channel::<WriteMsg>`, the app's one unbounded queue (see [The save queue has no length limit](#the-save-queue-has-no-length-limit)) | none (a barrier answers) | `writer_barrier` |
 | Date read (threads `falcon-dates`) | One per read: half the logical cores, at most 8, below normal priority | `TakenPass::start`, a claim loop over the photos still unread | a slot inside `TakenPass`, taken by the tick; see [The date read](#the-date-read) | `TakenPass` `done`, `total`, `ended`, through `taken_pass` |
 | Fonts, watermark strips, benchmark, file operations | One-off or per run | — | a `channel` or an `Arc<Mutex<Option<…>>>` slot | `wm_strips_started`, `bench_running`, `sel_busy` |
+| File queue (thread `falcon-file-queue`) | 1, started when there is work and ending when there is none; a crashed job hands the rest to a new thread | `FileQueue::push`, never refused: deletes, Recovers and Undo moves, in press order (`FileJob`) | `FileDone`, folded by the tick (`file_queue::fold_file_done`) | `FileQueue::quiet()`, one atomic flag. See [Delete and recovery](#delete-and-recovery) |
+| Background reread (thread `falcon-reread`) | One listing at a time | `Reread::start`, when `Reread::due` | a slot the tick reads with `Reread::accept` | `Reread::working()`. See [The background reread](#the-background-reread) |
+| Bin check (thread `falcon-bin-check`) | 1 at a time, after the queue's quiet second | `BinCheck::start` with the delete records not checked yet | `BinCheck::take_found` | `BinCheck::running()` |
 | Colour watcher (Windows), power watcher (Windows and Mac) | 1 each, lowest priority, every 2 s | — | `mpsc` of changes only | none (drained with `try_iter`) |
 | Low-priority pools (Windows; threads `falcon-prep-W-N`) | One pool per worker, below normal priority: one thread for each preview and thumbnail worker, one per core for the full-resolution worker | Only its own worker hands it work: a preview or thumbnail job nobody asked for (`prep_priority::Worker::run`), or a speculative full-resolution job's CPU decode, RAW read and develop, and colour conversion (`Guard::on_low_pool`). The worker waits for it. See [Lower priority for work done ahead](#lower-priority-for-work-done-ahead-windows) | the handing worker's own channel | the handing worker's |
 
@@ -852,13 +867,13 @@ The boxes are grouped. The exact line order is in `apply_scan`; for example, the
 - full-detail images and their order;
 - thumbnails and blur images;
 - source sizes;
-- zoom tiles, although the same timer tick then clears them, so the sharp zoom detail loads again (`view.reset_for_swap` resets `last_seen`, and `step_bookkeeping` clears the tiles when it sees that). A sort change is the exception: it keeps your view, and its tiles come back right after that clear (`kept_tiles`, see [Keeping the view on a sort change](#keeping-the-view-on-a-sort-change));
+- zoom tiles, although the same timer tick then clears them, so the sharp zoom detail loads again (`view.reset_for_swap` resets `last_seen`, and `step_bookkeeping` clears the tiles when it sees that). A landing that keeps your view is the exception: its tiles come back right after that clear (`kept_tiles`, see [Keeping the view when the list changes](#keeping-the-view-when-the-list-changes));
 - colour facts and rotation bases;
 - undo history, zoom and pan.
 
 The normal resets then run, and `Promotion::restore` puts the copies back at their new positions. The per-format cost measurements are kept too (`reset_fast_cost` is skipped), because the folder has not changed. See [Opening and inspection](#opening-and-inspection) for the photo-first open itself.
 
-**A delete, move or sort change keeps prepared work too (2 November 2026, the owner's choice).** After Delete, Move rejected, Undo move, Recover or a sort change in the same folder, the photos that stayed keep what was ready. The next photo usually appears straight away if it was prepared, and the filmstrip and grid stay filled. The rescan itself stays on the interface thread, so the list stays true to the disk and a brief pause stays for now. That pause has never been measured. The design's estimate is 0.1 to 0.2 s on 6,000 photos on a local drive, plus Delete's own wait for the Recycle Bin. One folder-open swap with 8.5 GB in the RAM cache took 348 ms in total; how much of that was freeing memory is unmeasured. All of this was checked by tests on Windows and compiled for Mac; it has not yet been run in the app.
+**A delete, move or sort change keeps prepared work too (2 November 2026, the owner's choice).** After Delete, Move rejected, Undo move, Recover, a sort change or a reread of the same folder, the photos that stayed keep what was ready. The next photo usually appears straight away if it was prepared, and the filmstrip and grid stay filled. Since the Delete round a delete lands without reading the folder (its take-out, see [Delete and recovery](#delete-and-recovery)), and the folder is read again on its own thread (see [The background reread](#the-background-reread)), so no delete waits for a listing or for the Recycle Bin. Clicked on 16,002 generated photos: a delete's take-out took 24 to 27 ms, with the worst tick 29 ms.
 
 How it works: `photo_open::RescanCarry::take` copies the work out before the list swap, and `RescanCarry::restore` puts it back at the end of the same `apply_scan` call. Every normal reset runs in between, and no timer tick can run there. So when the carry is refused, the result is exactly the full reset.
 
@@ -874,13 +889,14 @@ How it works: `photo_open::RescanCarry::take` copies the work out before the lis
                                                      no:  they are dropped (it left the folder)
 ```
 
-- **Who keeps it.** `rescan_carries` answers yes only for a rescan of the folder on screen after a file operation or sort pick. A reopen still reloads everything, as the manual "read it all again". The first photo and nearby stages of an open have no full listing, so nothing can be kept right after them. Recover during a long Apply rotations reloads everything too: that is the one way to reach a rescan while Apply runs (it holds `sel_busy`, so Delete, Move rejected and Undo move refuse, and sorting is greyed), and a RAW written by a side file keeps its own stamp.
+- **Who keeps it.** `rescan_carries` answers yes only for a rescan of the folder on screen after a file operation, a sort pick or coming back to Falcon. A reopen still reloads everything, as the manual "read it all again". The first photo and nearby stages of an open have no full listing, so nothing can be kept right after them. Recover during a long Apply rotations reloads everything too: that is the one way to reach a rescan while Apply runs (it holds `sel_busy`, so Delete, Move rejected and Undo move refuse, and sorting is greyed), and a RAW written by a side file keeps its own stamp.
 - **What moves.** Everything in `PreparedWork`, the one list shared with Promotion: fast previews, sharp frames, thumbnails, blur images, source sizes, colour facts and rotation bases. Also, new compared with Promotion, the RAM cache (`L2Store::carried`) and the note of thumbnails whose blur image was trimmed (`film.mipless`). Sharp frames are ordered again by distance from the photo landed on.
 - **File stamps.** At every landing `apply_scan` remembers each RAW and finished file's size and modified date (`ListingStamps`), from the listing the scan already reads. No file is opened, nothing is downloaded and no system call is added. The memory is replaced at every landing, so a partial stage clears it. A stamp missing on either side counts as changed. A file another program saved, such as a Photoshop save over the same file, loads again alone, and it keeps its Undo steps.
-- **Undo and Redo.** `remap_history` moves both stacks by exact file identity (`same_photo`, never a name alone), in the same call as the list swap, which is the only place positions change. The steps of a photo that left drop, and a group drops whole if any member left. They do not come back when the photo returns, although its stars, marks and turns do, by name. The stamps stay, so after a Delete, Ctrl+Z first recovers the photo and then undoes the earlier stars on the right photo. New to see: Redo stays lit across a delete, move or sort change when there is something to redo, and Ctrl+Z after Recover or Undo move can jump to another photo because it undoes an older star.
+- **Undo and Redo.** `remap_history` moves both stacks by exact file identity (`same_photo`, never a name alone), in the same call as the list swap, which is the only place positions change. The steps of a photo that a delete or Move rejected took away don't drop: they wait in its delete or move record, by name (`park_steps`), and go back at their old place in the order when the photo returns. A group step keeps its other members. The stamps stay, so star, Del, Ctrl+Z, Ctrl+Z brings the photo back and then takes off that star, on that photo. A photo that left any other way (another program removed it) drops its steps; its stars, marks and turns come back by name if it returns. A delete or a move empties the Redo list; a sort change keeps it.
 - **Sort.** The photo you are on stays, and prepared tiles stay. New neighbours that were not prepared load. The thumbnail cache keeps the nearest 400 in Eco and about 2,900 in Balanced. Frames far from where you now are get trimmed as new ones arrive, under the same memory limits.
 - **Kept on purpose:** the learned decode costs and the HEIC service record (`reset_fast_cost` is skipped), because the folder has not changed.
-- **Still reset, as before:** zoom back to fit, Compare closing, failure marks (a failing file is tried again once per rescan), the info panel blanking and refilling, and `reset_fast_latency`. With kept frames fewer fast decodes land, so the speed limits sit on the benchmark seed or the default for longer. That moves pace, worker count and reach only; nothing kept is evicted by it. Work still decoding at the moment of the rescan is dropped as before, because the folder-open counter moves.
+- **The view stays:** zoom, spot and Compare (see [Keeping the view when the list changes](#keeping-the-view-when-the-list-changes)).
+- **Still reset, as before:** failure marks (a failing file is tried again once per rescan), the info panel blanking and refilling, and `reset_fast_latency`. With kept frames fewer fast decodes land, so the speed limits sit on the benchmark seed or the default for longer. That moves pace, worker count and reach only; nothing kept is evicted by it. Work still decoding at the moment of the rescan is dropped as before, because the folder-open counter moves.
 - **Log line:** `scan: rescan kept fast=… detail=… thumbnails=… ram=… undo=… redo=… changed=… in … ms`, where the time is the cost of the two copies, not of the whole pause.
 
 Some pacing state resets in the timer tick instead, when the tick sees the folder-open counter change. An example is the full-detail landing rate and its clock (`DetailPace::on_folder_swap`).
@@ -897,9 +913,18 @@ Some pacing state resets in the timer tick instead, when the tick sees the folde
 
 One helper, `reset_transient_ui`, closes or resets interface state that points into the old folder: open confirm dialogs, the pending delete identity, both photo context menus, the zoom region, compare, zoom and pan.
 
-#### Keeping the view on a sort change
+#### Keeping the view when the list changes
 
-A sort change is a same-folder reread, so it passes through that reset too. Since the Date taken sort round it keeps your place. `apply_scan` reads the view before the list swap (`RescanCarry::keep_view`), lets every reset run, and puts it back at the end of the same call, so no frame is drawn in between: zoom, pan, Compare and its two photos, and the zoom tiles. It keeps them only if the photo on screen is still the photo it lands on, and both Compare photos are still there, by exact file identity. Otherwise today's reset stands. The view is measured to cost nothing a person can feel (`memory_archive/rounds/2026-11-02_keep_view_cost/RESULTS.md`). Delete, Move rejected and Undo move still reset: that is the Delete round.
+A sort change, a delete, Move rejected, Undo move, Recover and a reread of the folder all keep your place (owner, 2 November 2026: "Keep", "Both" for a sort change and Move rejected, and "Yes to both" for a delete while zoomed and Undo move). `apply_scan` reads the view before the list swap (`RescanCarry::keep_view`), lets every reset run, and puts it back at the end of the same call, so no frame is drawn in between. The view has two forms:
+
+- **The photo on screen stayed:** zoom, pan, Compare and its two photos, and the zoom tiles all stay.
+- **The photo on screen left** (you deleted it, Move rejected took it, another program removed it): you land on the next photo that stayed, at the same zoom and spot, as an arrow key does. That photo's own zoom detail loads, because the tiles belonged to the photo that left.
+
+In Compare, a half whose photo left takes the next photo that stayed, never the photo already in the other half, and the other half, the focus and both pins stay (`support::halves_after`). Ctrl+Z puts a photo back in its half if that half still shows the photo that took its place (`CompareSeat`). With fewer than two photos left, Compare closes on the one left, at fit. An emptied folder goes back to fit.
+
+**The scroll stays too.** A landing that leaves the same photo on screen keeps the grid on the same tile (the photo on screen's tile if its row is in view, otherwise the first tile in view), keeps the filmstrip's free-scroll place and whether it follows the photo, and leaves the Review panel on its tile. When the photo on screen changes, the grid recentres only if the photo went off screen. A re-sort still recentres, because every photo has moved. The filmstrip and the grid then slide to their new places (see [Photos slide to their new places](#photos-slide-to-their-new-places)).
+
+The view is measured to cost nothing a person can feel (`memory_archive/rounds/2026-11-02_keep_view_cost/RESULTS.md`).
 
 The landing photo is worked out when the reread runs, from the live list (`landing_file`), never when the sort was picked: the reread can run seconds later, and by then you may be on another photo.
 
@@ -917,6 +942,13 @@ Process-wide memos are reset next to the owners:
 Owner, 2 November: "re-sorting large folder was very slow". The first Date taken sort of 16,775 photos left the order unchanged for 14 to 24 seconds with nothing on screen.
 
 **The sort itself reads no file**, at any scale. It only asks what is known (`taken_key`). The reading is one background job, `TakenPass`, on half the logical cores (at most 8) at below-normal priority.
+
+**What reading one date costs.** One read of the file's first 64 KiB, and for most photos nothing more. Two kinds of photo need a second, small read (since 14 November 2026):
+
+- **An iPhone HEIC.** The file keeps its capture date wherever its own index says: anywhere from 3 to 95 KiB in, measured on a real phone library. Falcon reads the index, which is in those first 64 KiB, and follows it to the date: about 3 KiB more, read only when it lies past the first 64 KiB.
+- **A JPEG whose camera data is cut off by the 64 KiB.** Falcon reads on to the end of that block and no further. A JPEG with no camera data near its start has no date, as before.
+
+Before this, about a third of a real phone library's HEIC photos, and about one dated JPEG in thirty, got no capture date and sorted by their file date with no message. The info panel always showed the right date, because it reads more of the file; now the sort agrees with it. Every extra read has a limit (see [Source-pixel guard and size caps](#source-pixel-guard-and-size-caps)), follows only what the file's own index says after checking it against the file's length, and a damaged file is simply "no date" (`date_exif_from`, `heif_grid::heif_exif_item`, `jpeg_exif_segment`). A photo stored only in the cloud is still never read.
 
 ```mermaid
 flowchart TB
@@ -939,6 +971,74 @@ flowchart TB
 - **A landing that changes nothing doesn't run.** When an open's read ends, it has already worked out the final order on its own thread. If that is the order on screen and nothing has reread since, the rows go in the memo and there is no reread, so no pause and no blank Info panel.
 - **The Resume offer follows the photo.** The order can now change on its own, so the offer keeps the photo's name and finds it at the click. If the photo has gone, nothing happens.
 - **The card.** "Reading capture dates · 4,210 of 16,775", in the Export card's style, once reading has passed a second and at least about 0.3 seconds of it is left. It takes no presses. It gives way to Export's card and to dialogs, and it isn't part of the quit gate: closing is never delayed by a read.
+
+#### The background reread
+
+After a file operation, and when Falcon comes back to the front, Falcon reads the folder on screen again to see what else changed: a photo another program saved beside yours, one it saved over or removed (`file_queue::Reread`). The listing runs on its own thread (`falcon-reread`), so the interface never waits for it. Until the Delete round (1.1.2) it ran on the interface thread after every delete, move and undo, 0.23 to 0.29 s at 16,000 photos.
+
+```mermaid
+flowchart TB
+  ASK["Something asks for a reread<br/>a delete's job: after a quiet second, so a burst reads once<br/>a failed delete, a Recover, Undo move: at once<br/>Move rejected when it finishes · coming back to Falcon: at once"] --> DUE{"File queue quiet,<br/>no Move rejected or Empty running?<br/>Reread::due"}
+  DUE -- "not yet" --> ASK
+  DUE -- "yes" --> LIST["List the folder on its own thread<br/>names, sizes, dates and cloud marks; nothing downloaded"]
+  LIST --> OLD{"A landing, a press or a newer ask<br/>since it started?<br/>Reread::accept"}
+  OLD -- "yes" --> AGAIN["Dropped, listed again"]
+  OLD -- "no" --> SAME{"Every file the same<br/>as the list on screen?"}
+  SAME -- "yes" --> NONE["Nothing lands<br/>nothing moves, blinks or closes"]
+  SAME -- "no" --> HOLD["Waits while a menu, a dialog, an open, Apply rotations<br/>or a file operation is in the way (LandingHolds)"]
+  HOLD --> LAND["Lands by photo through apply_scan<br/>view, scroll and prepared work kept"]
+```
+
+- **Who asks.** A file job's report: a clean delete after a quiet second, so a burst of deletes reads the folder once; a failed delete, a Recover and an Undo move at once. Move rejected when it has finished. Coming back to Falcon ([below](#coming-back-to-falcon-reads-the-folder-on-screen-again)).
+- **One at a time, and only when quiet.** A listing starts only when the file queue is quiet and no Move rejected or Empty is running, so it reads what they did (`Reread::due`).
+- **A listing that is out of date never lands.** If a landing, a press or a newer ask has come since it started, it is dropped when it would land and the folder is listed again (`Reread::accept`). So a listing read before a delete's take-out can't bring that photo back, and one read before a sort pick can't undo the pick.
+- **Nothing changed, nothing lands.** If every file's size, date and cloud mark match the list on screen, nothing lands: no blink, nothing closes, and nothing prepared moves. A cloud mark that changed (OneDrive freed or downloaded a file) counts as a change.
+- **Something changed.** The landing waits for an open menu, a dialog and the other holds (`LandingHolds`), with no time limit, because nothing is lost by waiting. Then it lands by photo, keeping the view, the scroll and the prepared work of the photos whose files are unchanged. What lands is what was read, so a file saved while a menu stays open appears at the next reread. A photo that arrives fades in and its neighbours slide (see [Photos slide to their new places](#photos-slide-to-their-new-places)).
+- **What it reads.** The folder's names, sizes, dates and cloud marks, as a folder open does. It downloads nothing and decodes no photo; like any listing it reads the first bytes of names shared by two finished files (see [File type detection](#file-type-detection-bytes-over-names)), never of a cloud-only file. With no date read running it may read up to 32 capture dates for a Date taken order, never of a cloud-only photo (see [The date read](#the-date-read)).
+- **Log lines:** `reread: unchanged in … ms`, `reread: changed, listed in … ms`, `reread: discarded, older than a landing or a press`.
+
+The landing itself, when the folder really changed, still runs on the interface thread: see [A changed folder still lands on the interface thread](#a-changed-folder-still-lands-on-the-interface-thread).
+
+#### Coming back to Falcon reads the folder on screen again
+
+The owner, 2 November 2026: "it should try to diff the folder and refresh if changes happen as usually I would save a photo next to the original", and of zoom and Compare when it lands: "Yes keep don't reset". Built in the Delete round (11 November 2026), on the folder reread that round moved off the interface thread.
+
+**What a person sees.** You go to another program, save something, and click back to Falcon:
+
+- **A photo saved beside the one on screen** (an edit saved next to the original) appears in the filmstrip and the grid beside it, usually within a second. It fades in where it lands and the photos after it slide over, as a photo brought back with Ctrl+Z does. You are still on your photo, at the same zoom and spot, and Compare stays on the same two photos.
+- **The photo on screen saved over** stays on screen at your zoom and loads its new picture. Only that photo loads again: every other photo keeps what was prepared (see [file stamps](#switching-folders), above). Its sharp zoom detail loads again too. Nothing slides or fades, because no photo moved.
+- **The photo on screen removed** by the other program: you land on the next photo that stayed, at the same zoom, as after a Delete.
+- **A RAW that gains a JPEG of the same name** (developed and exported beside it) becomes one photo, a pair, and stays on screen.
+- **Nothing changed:** nothing lands, so nothing moves or blinks, and an open menu, the bell's panel and an open fold stay as they are.
+- **A change while a menu or dialog is open** waits for it to close, then lands. So does one while Apply rotations writes, while a folder is still opening, or while a delete, a Recover, Move rejected or Undo move is still running.
+- No message says that photos arrived, and the blue edge never points at them: it is only for photos you brought back.
+
+```mermaid
+flowchart TB
+  T["Every tick: is Falcon the active program?<br/>background_memory::falcon_is_active"] --> B{"Away last time,<br/>in front now?<br/>file_queue::came_back"}
+  B -- "no" --> N["Nothing"]
+  B -- "yes" --> A["Ask for a reread of the folder on screen, at once<br/>file_queue::ask_on_return → Reread::want"]
+  A --> L["The folder is listed on its own thread<br/>names, sizes and dates only, no photo opened"]
+  L --> S{"Every file's size and date<br/>the same as the list on screen?"}
+  S -- "yes" --> U["Nothing lands: nothing moves, nothing closes"]
+  S -- "no" --> H["Waits while a menu, a dialog, an open,<br/>Apply rotations or a file operation is in the way<br/>(LandingHolds)"]
+  H --> D["Lands by photo: you stay on your photo,<br/>zoom and Compare stay, prepared work stays,<br/>a saved-over photo loads again alone"]
+```
+
+**How it works.** The tick already asks every tick whether Falcon is the active program, for the background memory rule (`background_memory::falcon_is_active`). On Windows that is "the window in front belongs to Falcon", so Falcon's own dialogs count as Falcon and closing a file dialog is not coming back. On a Mac it is the application being active. The tick keeps the last known answer in one cell (`in_front_t`). `file_queue::came_back` says yes only when the last known answer was "away" and this tick's is "in front". A moment when the answer is unknown (mid-switch, a locked screen) keeps the last known answer, and the first tick after launch is never a return. On a return, `file_queue::ask_on_return` asks the reread for the folder on screen, the same folder its own folder check uses (`LastScannedDir`), at once rather than after the quiet second a clean delete waits. It does nothing else. From there it is [the background reread](#the-background-reread):
+
+- One listing at a time, on its own thread, started only when the file queue is quiet and no Move rejected or Empty is running.
+- A listing that a landing, a press or a newer ask has overtaken is out of date: it is dropped when it would land, and the folder is listed again. So a listing read before a sort pick, a delete or the end of a folder's open never lands over it.
+- It lands only if a file's size or date differs from the list on screen, and then by photo, keeping the view, the scroll and prepared work for the photos whose files are unchanged.
+
+**What it never does.**
+
+- It never watches the folder and never checks it on a timer. Updating while Falcon is visible but another program is in front (two programs side by side) would need the system's folder-change notices or polling; the owner left it out ("2 leave it out"). The folder is read when you come back to Falcon, or after a file operation.
+- It opens no photo and downloads nothing. The listing reads the folder's names, sizes and dates. It never reads a cloud-only file, and the few dates it may read for a Date taken order are never of a cloud-only photo.
+- It reads only the folder on screen, and not review data (stars, marks) another program changed.
+- It shows no message and adds no setting.
+
+The log line is `reread: Falcon is in front again`, followed by the reread's own `reread: unchanged in … ms` or `reread: changed, listed in … ms`. The laptop's log of a folder of 16,774 photos shows the listing itself took 68 ms. Checked by tests on Windows through the real listing and landing, and compiled for Mac. Nobody has yet tried it in a real window, and the real switch from another program can only be tried there.
 
 ### Colour changes versus folder switches
 
@@ -1020,6 +1120,17 @@ retain the original pruning policy. Otherwise every redraw discards and recompil
 scene pipelines (upstream Slint issue #12030). The patch retains drawing pipelines, not
 photo textures, and leaves shader code, colour conversion and render order unchanged.
 
+A second patch (14 November 2026, `FALCON-CHANGES.md` in the vendored folder) stops FemtoVG from
+making new graphics objects for almost every shape it draws. Before it, a grid of 500 thumbnails cost
+about 8,000 binding objects and 33,000 other objects a frame, most of the interface thread's frame
+time. Now the samplers are kept (at most 8), each image keeps its own texture view, one frame's
+drawing values share one buffer, and a binding is kept for each pair of images (a picture and a text
+atlas) until either image is deleted. A deleted image's binding goes at once, so a window that
+draws nothing for a while (minimised during the background memory release) frees the picture's
+graphics memory as before. Same pixels as before; measured on the desktop, the grid's interface-
+thread time per frame fell two to seven times. Upstream FemtoVG made the same kind of change in
+0.27.0, which Slint 1.17 cannot take yet.
+
 The GPU backend is the graphics interface wgpu uses: Vulkan or DX12 on Windows, Metal on Mac. The order of precedence is: the `WGPU_BACKEND` environment variable, then the Developer pin, then the saved memo, then auto-tune. The diagram shows that decision and the fallbacks that stop a bad choice from blocking startup.
 
 ```mermaid
@@ -1057,7 +1168,7 @@ Boot log lines such as `boot: settings loaded in … ms`, `boot: wgpu backend se
 
 Every way out of Falcon runs one save sequence, built once in `main()` before the event loop (`support::SaveSequence`). Every way out of the event loop (closing the window, a device loss, ⌘Q on Mac) runs it after `app.run()` returns. On a Mac, a system log-out, restart or shut-down runs it inside the quit handler instead (below). First, unfinished export work is told to stop, and so are Copy picks, Move rejected and Apply rotations (after the file or photo they are writing; `op_cancel`). Then `support::graceful_shutdown` emits a fixed list of steps that `main` carries out:
 
-`AwaitFileOpBoundary` (a bounded wait, at most 10 s, for a file operation to reach a safe point; on both platforms whenever one is still running at exit, and always after Mac ⌘Q; `support::shutdown_waits_for_file_op`) → `DrainAppliedRotations` → `DrainPickerResults` → `RevertStagedEdits` → `SaveSettings` → `FlushSelection` → `WriterBarrier` → `UnregisterFolder`.
+`AwaitFileOpBoundary` (a bounded wait, at most 10 s, for a file operation to reach a safe point; on both platforms whenever one is still running at exit, and always after Mac ⌘Q; `support::shutdown_waits_for_file_op`) → `DrainAppliedRotations` → `DrainPickerResults` → `RevertStagedEdits` → `SaveSettings` → `FlushSelection` → `RemoveDateCaches` → `WriterBarrier` → `UnregisterFolder`.
 
 The order matters. Staged (unconfirmed) key and preset edits must be reverted before settings are saved. The two worker hand-offs must be drained before review data is written. The writer barrier must come after both writes, or they may never reach disk. `SaveSettings` and `FlushSelection` write only if something changed since the last load or save, or if that save is still on its way or failed; switching to another folder uses the same rule (see [Several Falcon windows at once](#several-falcon-windows-at-once)). The test `the_shutdown_tail_runs_its_steps_in_the_one_correct_order` pins this order. `SHUTDOWN_ONCE` makes a second arrival do nothing (on Mac, the quit handler and the ⌘Q key are two doors into the same exit). From the start of the tail every log line is written directly (`log_inline_from_now`), after a 2 s barrier that drains already-queued lines so the log stays in order.
 
@@ -1199,16 +1310,26 @@ Some related settings live elsewhere:
 
 ### How the markup is compiled
 
-All interface markup lives in 18 `.slint` files under `falcon/native/ui/`. `falcon/native/src/ui.rs` defines nothing itself. It is a `slint::slint!` macro that imports and re-exports exactly these items:
+All interface markup lives in 18 `.slint` files under `falcon/native/ui/`. That folder is also its own small Rust library, the **interface crate** (`falcon-ui`): `ui/lib.rs` defines nothing itself. It is a `slint::slint!` macro that imports and re-exports exactly these items:
 
 - `MainWindow` (`main_window.slint`);
 - `MacToolbarWindow` (`mac_toolbar.slint`) and `ToolbarState` (`toolbar.slint`);
 - the `Theme` and `Tip` globals (`theme.slint`);
 - the nine shared row structs from `structs.slint`: `FilmItem`, `SelTileRow`, `ExifRow`, `ExifBrief`, `KeybindRow`, `NotifRow`, `CopyPrefRow`, `WmFontRow`, `DisplaySection`.
 
-The whole interface is one compilation unit. The macro records every imported file, so editing any `.slint` file triggers a rebuild. Look for markup in the `.slint` files; `ui.rs` contains none.
+A second, small macro in the same file compiles the Mac diagnostics bar (`MacExperimentBar`, `mac_experiment.slint`) as its own unit, as before. It is built only for the Mac and for the automatic tests (the crate's `mac-probe` feature), never for a Windows release.
 
-`falcon/native/build.rs` sets `SLINT_EMIT_DEBUG_INFO` only for debug builds, or when `FALCON_RIG_DEBUG_INFO=1` is set in the build environment. That debug information lets the headless layout tests (`tipgeom_tests.rs`, which check geometry without opening a window) find elements by id through `ElementHandle`. Release builds carry no element names, so a release test run without the opt-in finds zero elements. The same script stops the build if a usable `SLINT_SCALE_FACTOR` is set, because the Slint compiler would bake that scale into every shipped pixel. Setting `FALCON_ALLOW_SLINT_SCALE=1` as well turns the stop into a warning, for experiments only. Falcon reads the real scale from the window at run time.
+The app (`falcon-native`) links the interface crate under the name `ui` (`use falcon_ui as ui;` in `main.rs`), so the rest of the code reaches the generated types as `ui::MainWindow` or `crate::ui::Theme`, exactly as when the macro sat in `src/ui.rs`.
+
+The whole main interface is one compilation unit. The macro records every imported file, so editing any `.slint` file rebuilds the interface crate. Look for markup in the `.slint` files; `lib.rs` contains none.
+
+**Why the interface is its own crate.** The generated interface code is large: before 11 November 2026 it made up about 95% of the code the compiler produced for the app, and it was compiled again for every build of the app: the plain debug program, the test program and the release. Each debug compile needed 10 to 19 GB of memory, and on the small Mac machine GitHub gives a public repository (3 cores, 7 GB) the build slowed to about 100 minutes. As its own crate the interface is compiled once per kind of build and reused: an edit to Rust code no longer recompiles the interface, and an edit to a `.slint` file no longer recompiles the app's own code from scratch. See [How the build is set up](#how-the-build-is-set-up).
+
+The interface crate's build script (`falcon/native/ui/build.rs`) holds the settings the Slint compiler reads while the macro expands:
+
+- `SLINT_EMIT_DEBUG_INFO`, set only for debug builds, or when `FALCON_RIG_DEBUG_INFO=1` is set in the build environment. That debug information lets the headless layout tests (`tipgeom_tests.rs`, which check geometry without opening a window) find elements by id through `ElementHandle`. Release builds carry no element names, so a release test run without the opt-in finds zero elements.
+- The bundled translations (see [Languages](#languages)).
+- A stop if a usable `SLINT_SCALE_FACTOR` is set, because the Slint compiler would bake that scale into every shipped pixel. Setting `FALCON_ALLOW_SLINT_SCALE=1` as well turns the stop into a warning, for experiments only. Falcon reads the real scale from the window at run time.
 
 ### File structure
 
@@ -1290,18 +1411,26 @@ The diagram shows how the gates are built from one another; an arrow means "is p
 
 ```mermaid
 flowchart LR
-  DIALOG["dialog-open<br/>About · Settings · browse-speed panel · confirm dialog<br/>export sheet · rotation reminder<br/>forget-display confirm · Mac association prompt"]
-  OPENING["View-only opening phase<br/>opening-photo AND NOT photo-open-edits"]
+  PANELS["Settings · browse-speed panel"]
+  REAL["real-dialog-open<br/>About · confirm dialog · export sheet · rotation reminder<br/>forget-display confirm · Mac association prompt · update prompt"]
+  DIALOG["dialog-open"]
   WELCOME["welcome-open<br/>the welcome guide"]
   MENUS["menu-open<br/>photo menus · sort menu · Open menu · events dropdown"]
   BASE["modal-open-base"]
   MODAL["modal-open<br/>rate, mark, rotate, copy and other edits"]
   FS["modal-open-fs<br/>the F key and full screen"]
   INSP["inspection-blocked<br/>zoom, pan, 1:1, Fit"]
-  PPOP["photo-popup-open<br/>arrow keys, photo wheel, filmstrip wheel"]
-  POP["popup-open<br/>Home and End, undo and redo, compare swap and pin,<br/>compare wheel, hover preview"]
+  PPOP["photo-popup-open<br/>photo wheel, filmstrip wheel, thumbnail clicks"]
+  POP["popup-open<br/>undo and redo, compare swap and pin,<br/>compare wheel, hover preview"]
+  BROWSE["browse-keys-blocked<br/>arrow keys, Home and End, grid arrows"]
+  LANG["Settings' language list"]
+  PANELS --> DIALOG
+  REAL --> DIALOG
+  REAL --> BROWSE
+  WELCOME --> BROWSE
+  MENUS --> BROWSE
+  LANG --> BROWSE
   DIALOG --> BASE
-  OPENING --> BASE
   WAIT["Unfinished batch boundary<br/>opening-boundary-wait"] --> BASE
   BASE --> MODAL
   WELCOME --> MODAL
@@ -1317,13 +1446,15 @@ flowchart LR
 
 The exact definitions:
 
-- **`dialog-open`** = `about-open || settings-open || loading-open || confirm-kind != 0 || export-open || rot-reminder-open || display-del-confirm || assoc-prompt-open`. (`loading-open` is the browse-speed panel.)
-- **`modal-open-base`** = `dialog-open`, plus the View-only opening phase (`opening-photo && !photo-open-edits`) and `opening-boundary-wait`.
-- **`modal-open`** = `modal-open-base || welcome-open`. Edits and culling keys read it, so in View only they wait for the full folder. The boundary-loading wait also blocks edits while a requested neighbour is still unknown.
+- **`real-dialog-open`** = `about-open || confirm-kind != 0 || export-open || rot-reminder-open || display-del-confirm || assoc-prompt-open || update-prompt-open`: every dialog but Settings and the browse-speed panel.
+- **`dialog-open`** = `settings-open || loading-open || real-dialog-open`. (`loading-open` is the browse-speed panel.)
+- **`modal-open-base`** = `dialog-open`, plus `opening-boundary-wait`.
+- **`modal-open`** = `modal-open-base || welcome-open`. Edits and culling keys read it. A folder that is still loading doesn't hold them; the boundary-loading wait does, while a requested neighbour is still unknown. (Until the Delete round a Settings choice, View only, put the loading folder in here too.)
 - **`inspection-blocked`** = `dialog-open || welcome-open`. Zoom, pan, 1:1, Fit and browsing the verified nearby photos read it (Rust callbacks, the Fit key and the Mac menu rows included). They therefore work while the folder is still being scanned.
 - **`menu-open`** = a photo menu (`ctx-open`), the Review-tile menu (`sel-ctx-open`), the sort menu, the Open menu or the events dropdown.
 - **`photo-popup-open`** = `inspection-blocked || menu-open`. **`popup-open`** = `modal-open || menu-open`.
-- **`modal-open-fs`** is the full-screen gate: `modal-open-base` on macOS (`native-window-controls`), `modal-open` on Windows. On macOS it leaves out the welcome guide, so **F** works on the welcome screen.
+- **`browse-blocked`** = `real-dialog-open || welcome-open`: `inspection-blocked` without Settings and the browse-speed panel. Rust's step for Home, End and the grid's arrows reads it (`on_sel_jump`). **`browse-keys-blocked`** = `browse-blocked || menu-open || language-menu-open`; the browsing keys read it. Home and End add `opening-photo`.
+- **`modal-open-fs`** is the full-screen gate: the dialogs, the welcome guide on Windows only, and, while a folder loads, the wait until the opened photo is on screen. On macOS it leaves out the welcome guide (`native-window-controls`), so **F** works on the welcome screen.
 - **`modal-blocking`** is the subset that draws a full-window scrim (dimmed layer) above every panel: About, confirm dialogs, the rotation reminder, the export sheet, the forget-display confirm and the Mac association prompt. It disables the title-bar panel buttons, because their panels would open behind the scrim. Settings and the browse-speed panel are left out because their own buttons close them.
 - **`toast-blocked`** = `modal-blocking || welcome-open || toast-hovered`. The toast countdown pauses while something covers the toast or the pointer rests on it.
 - **`hover-preview-live`** = the hover setting is on, the Review panel is open, and not immersive, not `popup-open`, not compare, and the Review jump list is not open.
@@ -1521,20 +1652,32 @@ the folder scan is called *discovery*.) The clicked photo comes before the folde
 neighbouring previews and before thumbnails. Once it is on screen, zoom and pan work without
 waiting for anything else, while the scan runs in the background.
 
-**While the folder is loading.** Settings → INPUT → **While the folder is loading**
-(`photo_open_edits`) decides what else is allowed during the scan:
+**While the folder is loading.** Stars, flags, rejects and turns work on the photo on screen
+while the rest of its folder is still loading: on the photo you opened and on the checked nearby
+photos you browse to. Each one is saved to the folder's review file straight away, like any other,
+together with the records of the photos not listed yet, and it stays on its photo when the whole
+list arrives, because review records follow the photo's name. The grid's and the Review list's flag
+and reject badges, the photo menu's rows and the Mac menu bar's rows work the same way. Until the
+Delete round (1.1.2), a Settings choice, **While the folder is loading**, decided this, and its
+default, View only, made them wait; the owner chose "always allow and remove the setting".
 
-- **View only** (the default) lets you browse a checked batch of nearby photos but not change
-  anything.
-- **Allow photo edits** also lets you rate, flag, reject and rotate those verified photos before
-  the scan finishes. Selection gestures and sorting still wait for the whole folder. File and
-  whole-folder operations stay blocked at their own callbacks in both modes.
+What still waits for the whole folder, each at its own gate:
+
+- sorting, and the sort menu's rows;
+- selection gestures (Ctrl-click, Shift-click, Ctrl+A, Ctrl+D) and everything done to a selection;
+- **Home** and **End**, because the list on screen doesn't know the folder's first and last photo
+  yet;
+- **Compare**;
+- the file and whole-folder actions: Delete, Copy, Move rejected, Empty, Apply rotations, export,
+  XMP sync, and taking back a delete or a move with Ctrl+Z (Ctrl+Z on a star, a flag, a reject or a
+  turn works);
+- full screen, until the opened photo is on screen.
 
 Zoom, pan, 1:1, Fit and browsing the verified nearby photos read `inspection-blocked` (dialogs and
 the welcome guide) or `photo-popup-open` (those plus open menus), so they work while the scan runs.
-Edits, culling keys, Home/End and Compare read `modal-open` or `popup-open`, which also count the
-View-only opening phase. In View only, Home and End wait for the real first and last photo. See
-[Interface markup (Slint)](#interface-markup-slint) for the input gates.
+Edits and culling keys read `modal-open`, which a loading folder no longer holds; Home and End add
+`opening-photo` to the browsing keys' gate. See [Interface markup (Slint)](#interface-markup-slint) for the input
+gates.
 
 Review marks, rotation and file actions always act on the whole shot (the RAW and its finished
 file together) and on its full identity. Compare needs a second identified shot.
@@ -1786,9 +1929,10 @@ then rate IMG_0007 5★ while it is read again:
 ```
 
 An explicit reopen of the same folder also cancels older opens; internal reloads after file
-operations do not (they cancel only a reopen of their own folder, above). The rescan after a file
-operation still runs on the interface thread (see
-[The rescan after a file operation runs on the interface thread](#the-rescan-after-a-file-operation-runs-on-the-interface-thread)).
+operations do not (they cancel only a reopen of their own folder, above). The reread after a file
+operation runs on its own thread (see [The background reread](#the-background-reread)); what still
+runs on the interface thread is in
+[A changed folder still lands on the interface thread](#a-changed-folder-still-lands-on-the-interface-thread).
 Ratings and marks for a Rating sort come from live memory, and `flush_old` writes finished changes
 before the swap refreshes review and rotation state. So reading a review file that has not been
 written yet cannot bring back cleared ratings or apply a rotation twice. `scan_id` guards both
@@ -2026,7 +2170,11 @@ flowchart TB
 - **Each kind of work is judged by the file it reads** (owner answer 3). A thumbnail and a browse
   preview read a RAW + JPEG pair's JPEG; a full-resolution frame in RAW mode reads the RAW. So a pair
   whose RAW alone is in the cloud still shows its picture, and only its RAW-mode frames ahead are
-  skipped. Copy, Move and export count either file they read, as before. A full-resolution frame
+  skipped. The info panel's colour temperature, which comes from the RAW, follows the same rule (fix
+  round 2, `CS-13`): in Preview it never opens a pair's online-only RAW (`support::wb_read_refused`,
+  metadata only), and the white-balance cell then shows what it shows for a photo with no RAW (the
+  camera's mode alone, no "Color temp" row); turning RAW mode on asks again, since the view then reads
+  the RAW. Copy, Move and export count either file they read, as before. A full-resolution frame
   looks at RAW mode once (`support::detail_job_mode`), so switching between RAW and JPEG while a
   frame is being prepared can never make it check one file and then read the other.
 - **What a cloud tile shows** (owner answer 1). The main view's cloud outline (`CloudGlyph`), alone,
@@ -2045,6 +2193,18 @@ flowchart TB
   folder is reopened.
 - **Ask first, then download.** Copy and Move count the cloud-only files and say they will be
   downloaded (`copy-cloud-notice`, `move-cloud-notice`); if the person goes ahead, they are.
+  - **Copy picks counts files** (fix round 2, `CS-27`): the files the copy will read under the "what
+    to copy" choice (`support::copy_files_of`, which the copy itself uses), that are online-only now
+    and not already in ./Picks (the copy skips those and reads nothing). So a RAW+JPEG pair with both
+    files in the cloud counts 2, and "JPEG only" for a pair whose JPEG was already downloaded counts 0.
+    It is counted when the confirm opens (and again if its set changes), and only when a cloud-tagged
+    photo is among the targets, so a local folder pays nothing. One listing of the folder and one of
+    ./Picks answer it (`support::CopyCountListing`): on Windows the listing carries each file's cloud
+    flag, so there is no call per file (measured: about 2 ms in a folder of 1,000 pairs, 17 ms in one
+    of 16,000 pairs, debug build); on a Mac the listing does not carry it, so each file the copy reads
+    for a cloud-tagged photo is asked once (metadata only), a cost that follows the cloud picks, not
+    the folder (not measured on a Mac). A file freed up after the folder was opened is not counted.
+    Move rejected keeps its photo count.
   - **Web export** asks after Export is pressed (and after the "already exist" question), only when
     the fresh count is above zero: "N cloud-only photos → download, then export", with Cancel (back to
     the sheet) and Download and export (confirm kind 9). The count is exactly the files the run will
@@ -2134,11 +2294,60 @@ flowchart TB
   The classifier is sticky, and it records which shot was pressed at pointer-down, so a strip
   rebuild mid-drag cannot send the neighbouring shot.
 - **Home and End** use the same discontinuous-jump path as a filmstrip click (`prime_jump`).
-- **Position chip.** Clicking the HUD's position chip re-centres the strip and turns follow-current
-  back on (`film-recenter`).
+- **Position chip.** Clicking the toolbar's position chip opens the sort menu. Its first row,
+  **Scroll to current**, re-centres the strip and turns follow-current back on (`film-recenter`).
 - **Clearing a rating.** Pressing a photo's current rating key again clears the rating. This is a
   Settings option (`same_key_clear`, default On) and applies to the keyboard only; clicking the
   current star on a single photo always clears it.
+- **A held mark key marks once** (fix round 2, `F14-input-1`). Holding 0-5, P, X or U past the system's
+  key-repeat delay used to flip the mark on and off with each repeat, one Undo step per flip (and with
+  a selection, the whole selection). The key arm now passes the repeat flag with every printable key
+  (`key-typed(text, repeat)`), and `on_key_typed` ignores a repeat of a mark action
+  (`support::key_repeat_ignored`). Other keys keep repeating as before; the arrow keys never pass
+  through there.
+
+#### Photos slide to their new places
+
+The owner, 3 November 2026, of Undo move: "do not move but the filmstrip and grid should update with an animation", and then the same movement for Move rejected, Del and Recover.
+
+**What a person sees.** After Del, Move rejected, Undo move, Ctrl+Z or Recover, or a reread that brings in a photo another program saved, the filmstrip's and the grid's tiles that stayed slide from where they were to their new places in about a fifth of a second, fast at first, on the strip's own glide curve. A photo that came back fades in where it lands. A photo that left simply goes. The photo on screen, the stage and the Review panel don't move. In the grid the photo on screen keeps its row and may step sideways; a tile at the end of a row moves diagonally. A tile far from its new place starts two cells (or two rows) away and slides in.
+
+```text
+  Undo move of HWU_0040, while you are on HWU_0041 (the filmstrip):
+    before   …  37   38   39  [41]  42  43 …
+    after    …  38   39   40  [41]  42  43 …    40 fades in beside you, 38 and 39 slide a cell left,
+                                                 41 and everything after it hold still
+```
+
+- **What ends it at once,** with every tile at its new place: an arrow or a held key, a wheel or a drag on the strip, a grid or Review panel scroll, a drag or zoom on the stage, a window resize. A Ctrl+Z or a Del pressed during a slide doesn't end it: its own landing carries on from where the tiles are drawn. Moving the pointer doesn't end it.
+- **When nothing slides:** a re-sort, another folder or a reopen (they snap, as before); **Interface motion** off; a held arrow, a scrub, a strip drag, banked wheel notches or a drag from the grid at the landing; nothing in view moving or arriving; the strip or the grid not on screen (full-screen viewing, the strip hidden, the grid closed).
+- **Clicks during the 0.2 s:** a click on the filmstrip goes by the final places; a click in the grid lands on the tile where it is drawn.
+
+**How it works.** One clock in Rust (`tile_slide::TileSlide` in `Film.slide`, `tick::step_tile_slide`), never an `animate` on each tile, because thumbnails landing rebuild the rows and would restart every tile's animation. At a landing, beside the kept view, `apply_scan` reads where each photo of the new list was drawn (`SlideFrom::read`), only when the landing keeps the scroll. The rows' final places are set at the first frame, and the slide is only a paint offset on each tile (`slide-x`, `slide-y` and `arriving` on `FilmItem`) multiplied by the clock (`tile-slide-k`, `tile-fade-k`). The clock falls at the strip's chase rate each frame and is written as exactly 0 once less than a pixel is left (0.19 s for one cell, 0.21 s for two). Offsets are kept by photo and put back on every rebuild, so a thumbnail landing mid-slide moves nothing, and they snap to whole device pixels so a moving tile stays as sharp as a still one. The `tile-slide` term holds the tick at full rate while it runs.
+
+Measured at 16,000 photos in a debug test build: reading the slide at a landing 0.16 ms; the worst slide frame 0.022 ms, against 0.026 ms for a frame of an arrow's glide. The drawing itself isn't measured, and nobody has yet seen the slide in a real window.
+
+#### The blue edge
+
+The owner, 4 November 2026: "if the user already scrolled past the recovered image and it is off the visible filmstrip, the edge of the filmstrip (left or right depending on where it is) should lit up in a blue gradient for a moment and clicking on the gradient should take them to that image immediately", and "the grid do get the blue edge (top/bottom instead of left/right as that's how it scrolls)".
+
+**What a person sees.** When a photo you brought back (with Ctrl+Z, a Recover or Undo move) lands where the filmstrip doesn't show it, that end of the strip glows in the selected blue for about 3 seconds, and the grid's top or bottom does the same. A click on the glow goes to the photo: it shows on the stage, the strip follows it there and the grid recentres on its row, as a click on a grid tile does. In Compare the focused half takes it. You meet it mostly after Undo move far from the photos moved, and in Compare after a Ctrl+Z whose half you have browsed on. In the single view Ctrl+Z already goes to the photo it brings back, unless you moved on before it landed. A Recover's short "Recovered" card shows beside it.
+
+```text
+  On HWU_0060. Undo move brings back HWU_0040 and HWU_0075:
+   ▐▌ … 57  58  59 [60] 61  62  63 … ▐▌
+   ▲ blue, click → HWU_0040              ▲ blue, click → HWU_0075
+```
+
+- **Off the strip** means less than half the photo's tile shows. A photo you scroll straight past counts as seen. The strip and the grid each judge for themselves.
+- **Several photos back:** each side points at the nearest one on that side; once it has been seen, at the next; the side goes dark when none is left. If the landing puts any of the photos on the stage, nothing lights.
+- **A moment:** about 3 seconds from when it first shows (`blue_edge::MOMENT`), fading in and out over 0.2 s; with **Interface motion** off it appears and goes at once, for the same 3 seconds. The pointer resting on a lit edge keeps it lit until it leaves.
+- **What ends it at once:** any move to another photo (an arrow, a Del, either half in Compare), a re-sort, another folder.
+- **With the bell's panel or a sheet open** nothing lights, because the panel's click-away covers the strip; the 3 seconds start when it closes. A strip or grid opened after the photo came back doesn't light.
+- **Only photos you brought back.** Its one source is `FileHistory::brought_back`, which only a Recover's or an Undo move's report fills. A photo another program saved, and one coming back to Falcon brought in, never lights it.
+- **Size and colour:** 48 px deep, from the selected blue (`Theme.accent`) at the edge to clear 48 px in, over the strip's full height or the grid's full width. That band is its click target too, above the strip and the grid while it shows.
+
+**How it works.** `blue_edge::BlueEdge` lives in `Film.edge`, beside the slide. `apply_scan` hands it the photos brought back at the landing, and `tick::step_blue_edge` judges it once a tick after the strip, the grid and the slide, writing four window properties (`blue-edge-left`, `-right`, `-top`, `-bottom`: a photo's index or -1) only when one changes. The edges are `BlueEdge` in `edges.slint`, mounted only while they show; a click calls `sel-jump`. Measured at 16,000 photos in a debug test build: 0.0001 ms a tick with nothing lit, 4.9 ms at the landing after an Undo move of 1,000 photos, 0.060 ms for the worst lit frame. Nobody has yet seen it in a real window.
 
 ## Decoding and display
 
@@ -2559,8 +2768,8 @@ The only drop the user can cause comes from the opt-in setting, because a previe
 on exactly the blank photo that setting forbids. A sole dropped notch is logged
 (`support::wheel_notch_dropped_line`) and shows `support::WHEEL_WAIT_TOAST` ("Still loading — scroll
 again when the next photo appears"). The toast is rate-limited by `REFUSAL_TOAST_GAP_MS` (1.5 s), the
-gap every refusal toast shares: cull keys, Compare 1:1, both halves pinned, close deferral, delete in
-Compare, and the wheel. Excess notches of a spin drop silently, and the macOS held-key drop is
+gap every refusal toast shares: cull keys and Del (a photo not shown yet), Compare 1:1, both halves
+pinned, close deferral, and the wheel. Excess notches of a spin drop silently, and the macOS held-key drop is
 log-only. At the folder's edge nothing is refused, because `scrub_wait_ready` treats `next == cur` as
 ready.
 
@@ -4689,6 +4898,44 @@ Region tiles are used only when the source is larger than `detail_cap`. With Ada
 whole image loads up to the manual Resolution limit (default 16384 px). The Developer **Simulate GPU memory**
 control drives the same function, so every tier can be checked on one machine.
 
+**On a slow machine, a zoom tile's decode starts only for a photo you have stopped on** (fix round 2,
+`CS-77`). A zoom tile needs the whole photo decoded, one at a time, and a decode cannot be stopped once
+started. Stepping quickly while zoomed used to start that decode for a photo you were only passing, and
+the photo you stopped on waited behind it. Now, when the last zoom decode took longer than 0.3 s, a
+decode waits for you to stay on a photo a moment first (`tick::zoom_decode_due`, `tick::zoom_stillness`):
+half of the time over 0.3 s, at most 0.15 s, so 0.15 s from a 0.6 s decode on. The single view and
+Compare each go by their own last decode, and before the first zoom decode of a session there is no wait.
+
+What that means, plainly:
+- **On a slow machine** (a zoom decode of half a second or more: a laptop's processor, RAW mode),
+  stepping quickly and stopping sharpens much sooner (0.35-1.25 s sooner in the table below), and
+  stepping one photo at a time and looking at each sharpens 0.15 s later.
+- **On a machine that sharpens in under a third of a second** (a desktop processor, NVIDIA's decoder),
+  nothing changes.
+- Panning or zooming a photo already stopped on keeps its 70 ms re-crop (`ROI_SETTLE_MS`). With
+  full-size textures (the photo fits `detail_cap`) no zoom tile is ever needed, so nothing changes there.
+
+Measured in a tick-by-tick simulation (`tick::zoom_decode_tests`): the photo stopped on, from the step
+onto it until its zoom tile landed.
+
+| Stepping | Decode | Wait | Before | After |
+|---|---|---|---|---|
+| quick run (3 steps 50 ms apart) | 40 ms (NVIDIA-like) | none | 56 ms | 56 ms |
+| quick run | 205 ms (this PC's processor) | none | 317 ms | 317 ms |
+| quick run | 300 ms | none | 508 ms | 508 ms |
+| quick run | 450 ms | 75 ms | 818 ms | 530 ms |
+| quick run | 600 ms | 150 ms | 1112 ms | 760 ms |
+| quick run | 1.0 s | 150 ms | 1912 ms | 1160 ms |
+| quick run | 1.5 s | 150 ms | 2908 ms | 1660 ms |
+| one step after a pause | 205 ms | none | 221 ms | 221 ms |
+| one step after a pause | 450 ms | 75 ms | 466 ms | 530 ms |
+| one step after a pause | 600 ms | 150 ms | 616 ms | 760 ms |
+| one step after a pause | 1.0 s | 150 ms | 1016 ms | 1160 ms |
+| slow taps (250 ms apart) | 1.0 s | 150 ms | 1512 ms | 1656 ms |
+
+The real cure for both costs left (one step at a time, and stepping on before a photo has sharpened) is a
+decode that can be stopped part-way; see known issues.
+
 ### Sharing the card with other applications
 
 Round 1 of [the sharing plan](docs/planning/gpu-memory-sharing.md), October 2026. Falcon's caches are
@@ -4703,7 +4950,12 @@ consumer:
   default 20 s, clamped on load and on entry); minimising skips it.
 - **Activity reading.** On Windows the foreground window's process must be Falcon's, so Falcon's own
   dialogs count as Falcon. On a Mac it is AppKit's `isActive`. A reading the platform cannot give is
-  unknown, and an unknown reading never starts or ends a release.
+  unknown, and an unknown reading never starts or ends a release. Input that reaches Falcon's window
+  counts as using it for 2 s whichever window is active (`INPUT_KEEPS_ACTIVE`), so browsing an inactive
+  Falcon with the wheel keeps it in use. That input is the wheel, a click, a key, touch and trackpad
+  gestures, never bare pointer movement (fix round 2, `CS-7`; `background_memory::window_input_counts_as_use`):
+  Windows sends pointer movement to an inactive window under the pointer, so sweeping the pointer across
+  Falcon on a second screen used to take back the memory it had freed for the program in use.
 - **Once releasing:**
   - preparing ahead stops: `FastHolds.frames` (never the gesture term, so the RAM cache's pressure
     controller can still shrink), `PublishGate::Park`, and the full-detail fill's `background` term;
@@ -5019,7 +5271,7 @@ allocating.
 | Read | Cap |
 | --- | --- |
 | EXIF | 4 MiB |
-| Date taken | 64 KiB |
+| Date taken | 64 KiB for every file. Only where needed: a HEIC's index up to 1 MiB and its date block up to 256 KiB; a JPEG's cut-off camera data up to 256 KiB in all |
 | JPEG ICC prefix | 512 KB |
 | JPEG source; RAW source | 600,000,000 bytes each |
 | JPEG XL | 600,000,000 bytes, plus a 1 MB header probe |
@@ -5798,7 +6050,14 @@ Falcon converts every photo from the colour space it was saved in (its **source 
 
 **One reader per format.** `file_color_tag(path, kind)` returns a `ColorTag { icc, desc, desc_from_profile }`. Because `shot_source_gamut` checks the file's bytes first, a Display P3 PNG named `.jpg` is read by the PNG reader. The readers:
 
-- JPEG: APP2 `ICC_PROFILE` segments, joined in sequence-number order.
+- JPEG: APP2 `ICC_PROFILE` segments, joined in sequence-number order. With no profile, the camera's
+  EXIF mark for in-camera Adobe RGB decides: `ColorSpace` 2, or `ColorSpace` "Uncalibrated" with the
+  Interop index `R03` (Canon, Sony and Fujifilm write only this mark in Adobe RGB mode). Such a JPEG
+  is Adobe RGB on the stage, in thumbnails, Compare, the chip, the info panel's label and every export
+  (a web export converts it to sRGB). Both come out of the one header read (`jpeg_color_tag`, fix
+  round 2, `F6-colour-2`), which is the only place a JPEG's colour is decided; the extra parse costs
+  about 4 µs a call (measured, debug build) and only for a JPEG with no profile. A RAW-only photo's
+  label keeps reading only the `ColorSpace` tag, because its embedded preview is drawn as sRGB.
 - PNG: `iCCP`. A bare `sRGB` chunk supplies a name only.
 - TIFF: tag 34675, read by its own bounded walk.
 - WebP: `ICCP`.
@@ -6122,6 +6381,16 @@ A new launch starts in finished-image (Preview) mode; RAW mode lasts only for th
 The finished-image side of the selector names the format detected from the file's bytes (JPG, HEIC, PNG and so on), not its extension (`Shot::finished_format`, which also checks `has_jpg`). A RAW whose sibling file cannot be decoded shows Preview. The label updates whenever the current photo's facts change, even if its position in the folder does not, for example after a cloud file finishes downloading. This reads facts already in memory and never opens a file. In Compare, the selector shows the shared format when both halves match, **Images** when they differ or one half is a preview, and **Preview** for two RAW-only photos. Compare has one Preview/RAW switch for both halves.
 
 **One acceptance point for RAW mode.** Both RAW selectors go through `view::accept_raw_mode`. It refuses a request while the clicked photo is still opening, or when the mode would not change, and puts the selector back to the real state. An accepted request updates, in this order: the decoder flag (`raw_mode`), the rotation record's mode (`RotState::set_raw_mode`), the interface, and then the develop epoch (`det_epoch`). Results already in flight carry the old epoch and are not shown. The handler then clears developed full-detail frames and their failure marks, zoom tiles, the zoom overlay and the zoom failure latch, because a failure on one decode path says nothing about the other. Repeating a click on the current mode discards nothing. Glass images are not cleared, because they do not depend on RAW mode. RAW mode is never saved: an old `raw_mode` key in `settings.json` is ignored and not written back.
+
+**The info panel of a RAW with no JPEG beside it** (fix round 2, `CS-2`). The panel's rows come from
+the RAW's own EXIF, read by the same reader and the same row code as a JPEG, so a RAW-only photo shows
+the same rows, written the same way, as the JPEG of a pair would. TIFF-based RAWs (CR2, NEF, ARW, DNG)
+always worked; the RAWs that reader cannot open directly are read from the same 4 MB header read
+(`raw_exif_from_bytes` in `exif_rows`): a Canon CR3 from its three EXIF blocks (proved on 12 real
+CR3+JPEG pairs: every row identical), a Fujifilm RAF from the JPEG it carries (proved on one real
+RAF). Panasonic RW2 and Olympus ORF are TIFF with their own magic number and go through the same
+reader once it is put back; **they were tried on made-up files only, never on a real one.** This runs
+only when the photo's file to read is the RAW, which is the file viewing it reads anyway.
 
 ### A RAW with a file this computer cannot open (a passenger)
 
@@ -6615,47 +6884,58 @@ A stored value out of range is handled three ways:
 
 Compare uses pins: a pinned half stays put while wheel-browsing moves the other (`pin-a` and `pin-b`; A is pinned by default). Panning moves both halves by the same fraction of each half's own maximum pan. Tab switches the active half and Space toggles its pin. Ctrl+wheel (⌘+wheel on Mac) always zooms.
 
+**Send to A or B** (the photo menu, or a drag up from the filmstrip). With Compare closed, the photo goes in the chosen half and the other half shows the next photo, or the previous one at the end of the list, the same as pressing C; nothing an earlier Compare session left behind is used, in this folder or after a folder change. The owner chose this on 11 November 2026: "a, the next photo" (fix round 2, `CS-66`). With Compare already open, the other half stays as it is (`support::compare_halves_after_send`).
+
 Ratings and marks in Compare go to the focused half. `tick::compare_cull_target(focus, a, b)` takes no `current` parameter, so the single-view cursor cannot redirect them. `compare_cull_blocked` refuses a cull key until that half shows, for the current folder, the shot its labels name.
+
+**Del in Compare** works the same way, on the focused half, the one with the accent border (the owner's choice, 3 November 2026). That half takes the next photo that stayed, at the same zoom and spot, never the photo already in the other half; the other half, the focus and the pins stay. A second Del before the new photo shows in that half is refused with "Still loading — press again when this half appears". A right-click Delete on a half moves only that half, and on a photo in neither half nothing on the stage moves. Ctrl+Z puts the photo back in its half if that half still shows what took its place; otherwise the photo returns to the filmstrip and the halves stay. With fewer than two photos left, Compare closes on the one left. A selection is dormant in Compare, so Del there never deletes the selection. Move rejected of a photo in Compare follows the same rule, and Undo move moves neither half. See [Keeping the view when the list changes](#keeping-the-view-when-the-list-changes).
 
 The "Loading…" pill over a half appears only while something is actually coming. `tick::half_says_loading(present, failed)` is true when the half has no frame AND neither the full-detail nor the browsing tier has failed that shot; one `failed_for(idx)` check serves both halves. A half that no tier will ever serve shows what it has (the thumbnail or the browsing frame) and says nothing.
 
 ### Undo history
 
-Falcon's reversible history has three records:
-- the `UndoRedo` stack: ratings, marks, rotations and bulk changes;
-- the `DeleteRecord`: files sent to the Recycle Bin or Trash;
-- `last_move`: files moved to the Rejected folder.
+Falcon keeps one history of what you did, so Ctrl+Z takes back what you just did, then what you did before that. The owner, 2 November 2026: "If they are selected and deleted at the same time, bring back all 3; if sequentially, one by one, then the previous action". It has two parts:
 
-The last two live outside the stack because delete and move both end in a re-scan, and they are single records with their own folder gates. A re-scan of the same folder keeps the stack for the photos that stayed, by file (`remap_history`), with its numbers unchanged. A folder change or a reopen replaces it.
+- the `UndoRedo` stack: ratings, marks, rotations and bulk changes, per folder, up to 500 steps;
+- the file history (`support::FileHistory`): every delete (`DeleteRecord`) and every Move rejected (`MoveRecord`) of the session, oldest first, up to 500 of each.
 
-To put the three in order, every reversible act takes a number from one counter, `main.rs::next_act_seq`. The counter is pre-incremented, so 0 means "never stamped", and it is called only from the ten places that arm something reversible. Ctrl+Z reverses whichever live record has the highest number. So after delete → move → Ctrl+Z, the move is undone, not the delete. The counter lives in `main`, not in `UndoRedo`: a counter reset by a re-scan would let a new edit take a lower number than a delete record that survived the scan.
+The file history lives outside the stack because the stack is replaced at every folder change and moves by position, and a delete must still be there when you come back to its folder. Each record stands on its own: a file that left can't be in a later record, so an older row's Recover or Undo works out of order. A delete or a move made in another folder is kept, but only the folder on screen's records can be reached (below). Until the Delete round the history held only the last delete and the last move, so a second delete lost the first one's way back (see [UX and mental models](docs/design/ux-mental-models.md), "Ctrl+Z after several deletes").
 
-The diagram shows how one counter orders the three records and which surfaces read the answer.
+To put them in order, every reversible act takes a number from one counter, `main.rs::next_act_seq`. The counter is pre-incremented, so 0 means "never stamped", and it is called only from the places that arm something reversible. Ctrl+Z reverses whichever live record has the highest number. So after delete → move → Ctrl+Z, the move is undone, not the delete, and after three deletes three presses bring the three photos back, newest first, then the action before them. A selection deleted together is one record and comes back with one press. The counter lives in `main`, not in `UndoRedo`: a counter reset by a re-scan would let a new edit take a lower number than a delete record that survived the scan.
+
+**A photo's steps go with it.** When a delete or Move rejected takes a photo away, its Undo steps (stars, marks, turns) move into its record by name (`park_steps`). When it comes back they return at their old numbers, once the landing has given the photo its place in the list again (`FileHistory::returning`). So star a photo, Del, Ctrl+Z, Ctrl+Z: the first press brings it back with its star, the second takes the star off that photo. X, X, Move rejected, Ctrl+Z, Ctrl+Z works the same way: the photos come back still rejected, then the last X comes off. A group step (stars set on a selection) keeps its other members when one of them leaves, and the one that left rejoins it on return.
+
+**A press can wait for its photo.** A Ctrl+Z whose step belongs to a photo still on its way back (its Recover or Undo move is on the file queue, or its listing hasn't landed) waits until the photo lands, and the Undo pill, its label and the rims stay on that step meanwhile, so nothing blinks grey.
+
+The diagram shows how one counter orders the records and which surfaces read the answer.
 
 ```mermaid
 flowchart LR
-  ACTS["Reversible acts<br/>7 push_undo* sites, 2 delete arms, the move"] --> SEQ["next_act_seq<br/>one rising number per act"]
+  ACTS["Reversible acts<br/>the push_undo* sites, the delete press, the move"] --> SEQ["next_act_seq<br/>one rising number per act"]
   SEQ --> STACK["UndoRedo stack<br/>top_seq"]
-  SEQ --> DEL["DeleteRecord<br/>live only if recover_offer_live"]
-  SEQ --> MOVE["last_move<br/>live only if move_undo_live"]
+  SEQ --> DEL["FileHistory.deletes<br/>newest live one in the folder on screen"]
+  SEQ --> MOVE["FileHistory.moves<br/>newest live one in the folder on screen"]
+  DEL -. "a leaving photo's steps wait in its record" .- STACK
   STACK & DEL & MOVE --> ARM["support::live_undo_arm<br/>newest live number wins<br/>UndoArm::Stack / Delete / Move, or None"]
   ARM --> D1["Ctrl+Z dispatch: on_undo"]
-  ARM --> D2["Enablement: undo_control_enabled<br/>only Move waits for a running file operation"]
+  ARM --> D2["Enablement: undo_control_enabled<br/>only Undo move waits for a running file operation"]
   ARM --> D3["Pill label: undo_pill_label<br/>'Undo move' or 'Undo'"]
   ARM --> D4["Undo rows in both context menus"]
-  ARM --> D5["Events-centre rims: seq_row_index"]
+  ARM --> D5["Events-centre rims: seq_row_index,<br/>or the newest line of an open folded row"]
   ARM --> D6["Pinned last-action row<br/>when no row matches"]
 ```
 
-`support::live_undo_arm(...)` counts each record only while it is live: the stack's `top_seq`, the delete record through `recover_offer_live`, and the move record through `move_undo_live`. A delete or move record is live only while the folder it happened in is the folder on screen (`scanned_dir`). The last folder that had photos (`cur_dir`) does not count: opening a folder with no photos, or starting Falcon with no folder open, leaves `cur_dir` on the earlier folder, so it cannot answer "is this folder on screen?". A move that finishes after you have left its folder is never offered for undo. `live_undo_arm` returns the newest live one, or `None` when nothing is reversible. Everything that shows or performs Undo reads this one answer:
+`support::live_undo_arm(...)` counts each record only while it is live: the stack's `top_seq`, the newest delete in the folder on screen (`FileHistory::delete_arm`, through `recover_offer_live`) and the newest move there (`FileHistory::move_arm`, through `move_undo_live`). A delete or move record is live only while the folder it happened in is the folder on screen (`scanned_dir`). The last folder that had photos (`cur_dir`) does not count: opening a folder with no photos, or starting Falcon with no folder open, leaves `cur_dir` on the earlier folder, so it cannot answer "is this folder on screen?". A move that finishes after you have left its folder is never offered for undo. `live_undo_arm` returns the newest live one, or `None` when nothing is reversible. Everything that shows or performs Undo reads this one answer:
 - the Ctrl+Z dispatch;
-- enablement (`undo_control_enabled`): only the Move arm runs through `start_op`, which refuses while another file operation holds `sel_busy`, so only Move is greyed out then;
+- enablement (`undo_control_enabled`): only Undo move can be refused by another file operation holding `sel_busy` (a copy, Move rejected, Empty, Apply), so only it greys out then; a delete, Recover or Undo move already on the file queue greys nothing, because a press joins the queue behind it;
 - the pill label (`undo_pill_label`): "Undo move" when a move is newest, otherwise "Undo". The move is the one reversal that moves files on disk, and "Undo delete" would wrongly suggest a matching redo;
 - the Undo rows in both context menus;
 - both highlight rims in the events centre;
 - the pinned last-action row.
 
-Delete and move have no redo, by design.
+**In another folder,** Ctrl+Z on a delete it can't reach says so once, naming it: "IMG_1234 [RAW+JPG] is in another folder. Go back to it to bring it back.", or "3 photos are in another folder…". It touches nothing and forgets nothing; back in that folder, Ctrl+Z brings the photo back. It speaks again in the next folder, or after the next delete.
+
+Delete and move have no redo, by design. Pressing Del or Move rejected empties what Ctrl+Y could re-apply (`note_file_press`), as a fresh edit does, so after Del, Ctrl+Z, Ctrl+Y does nothing and its button is grey (owner, 3 November 2026: "I agree on the Del, Ctrl+Z, then Ctrl+Y->nothing recommendation"). A Recover doesn't empty it.
 
 ### The events centre and notifications
 
@@ -6665,7 +6945,7 @@ Two rims link rows to the history:
 - an accent rim marks the row Undo would reverse;
 - a light rim marks the row Redo would re-apply.
 
-Both come from `support::seq_row_index`, where −1 means no row. When no row describes the newest act, a **pinned last-action row** appears instead. It covers acts that raise no notification (for example "Flagged IMG_1234"), and it is the visible sign of what Ctrl+Z reaches next. After Recover or Undo move it can show an older star again, because that star is the newest act left. A matching row and the pinned row cannot both appear, because both are decided from the same number.
+Both come from `support::seq_row_index`, where −1 means no row. When no row describes the newest act, a **pinned last-action row** appears instead. It covers acts that raise no notification (for example "Flagged IMG_1234"), and it is the visible sign of what Ctrl+Z reaches next. After Recover or Undo move it can show an older star again, because that star is the newest act left. A matching row and the pinned row cannot both appear, because both are decided from the same number. For a delete inside a folded row (below), the pinned row names the photo Ctrl+Z will bring back, "Sent to the Recycle Bin — IMG_1234 [RAW+JPG]" (`platform::pinned_sent_text`), and when the row is open the rim sits on its newest line instead (`tick::line_rim`).
 
 Undo and redo results appear where they can be seen. The events panel covers the toast card, so `main.rs::say_edit_result` asks `support::edit_say_route`:
 - with the panel open, the sentence becomes a persistent `NotifEntry` tagged with its act number;
@@ -6674,6 +6954,46 @@ Undo and redo results appear where they can be seen. The events panel covers the
 **Notifications** are one durable log, keeping the newest 50, plus one toast slot in the foreground. Dismissing a toast acknowledges it. The toast's countdown uses wall-clock time and freezes while `toast-blocked = modal-blocking || welcome-open || toast-hovered`:
 - the first two cover whatever paints over the card;
 - for hover, the card's body TouchArea is the parent of its contents, so its `has-hover` covers every pill on the card. A TouchArea placed beside the pills, underneath them, would not.
+
+#### The card after a delete
+
+The person's eyes are on the photo, so the next photo appearing is the confirmation. A delete that went cleanly is quiet and brief; Falcon speaks up when the photo didn't go, part of it didn't go, or it can't come back (see [UX and mental models](docs/design/ux-mental-models.md), "what someone is thinking when they delete a photo").
+
+- **Every clean delete replaces the card** (owner, 3 November 2026: "1B"), so there is always a name to read: "Sent IMG_1234 to the Recycle Bin", with the photo's small picture where the dot usually sits, and **Recover**, for about 3 seconds (`CLEAN_DELETE_CARD_MS`), with no "+N". A pair reads "IMG_1234 [RAW+JPG]" (`support::photo_subject`, from the pair's finished format). A selection reads "Sent 30 selected photos to the Recycle Bin", with no picture.
+- **The newest press names the card.** A delete pressed twice in quick succession leaves one card, naming the second; both rows are in the list. A delete of a photo that isn't on screen always gets its card.
+- **A problem is never covered by a clean delete.** A red or amber card keeps its full time (8 or 10 seconds) while further clean deletes join the list quietly. A delete's card replaces other information cards, Move rejected's included; that move's Undo stays on its row and on Ctrl+Z.
+- **The picture** is the filmstrip's thumbnail, copied at the press (`FileHistory::pictures`), in memory only, and dropped when its row or line goes. A photo whose thumbnail wasn't loaded gets a blank tile.
+- **Bringing it back.** A clean Ctrl+Z or Recover says nothing when the photo lands on screen, and adds no row; the delete's card goes at once. If you had moved on, a short card names it, "Recovered IMG_1234", for 5 seconds (`RECOVERED_CARD_MS`; never behind the open panel, never over a red or amber card), and the blue edge can point at it (see [The blue edge](#the-blue-edge)). Part of it back gives an amber row; nothing back, a red row. A Recover or an Undo move that takes more than a second says "Recovering IMG_1234…" or "Undoing move…" until the photo is back (`file_queue::WORKING_AFTER`).
+- **Undo move** says "Brought back IMG_1234 [RAW+JPG]" or "Brought back 30 photos" (`support::moved_subject`); with anything skipped or failed, it says what, as before.
+- **A photo that isn't in the bin after all** (found about a second later by the bin check): "IMG_1234 [RAW+JPG] isn't in the Recycle Bin, so it can't be brought back.", amber, and its Recover goes.
+
+#### What lights the bell
+
+The bell's light and count are for what needs attention (owner, 11 November 2026: "2 B just make sure the notification is still there even though the bell doesn't light up"). A clean delete, a clean Move rejected and a clean Undo move don't light it or add to its count (`NotifEntry.clean_move`, `clean_delete()`); their card shows and their row is in the list as always. Red and amber lines light it, so does a move or undo that skipped or failed something, and so do copies, exports, Empty ./Rejected and every other row, because a long copy is what someone might walk away from. "Clean" means the sentence says nothing but the count: a skipped file, a side file left behind or a file needing attention lights it.
+
+#### Folded rows
+
+Deleting one photo after another leaves one row in the list, not one per photo (owner, 3 November 2026, on folding "deleted n photos [expand]-> show each one", and of the layout: "A fits the notification panel better as everything there is a vertical list").
+
+```text
+  ● Sent 3 photos to the Recycle Bin                    ⌄  ×     ← a run, closed: no Recover
+
+  ● Sent 3 photos to the Recycle Bin                    ⌃  ×     ← open
+       ▢ CAT [RAW+JPG]                                Recover
+         10:42                                                   ← the newest first; the rim
+       ▢ BEE                                          Recover      sits here when Ctrl+Z
+         10:41                                                     would bring it back
+       ▢ ANT                                          Recover
+         10:41
+```
+
+- **A run** (`tick::Fold`, `FoldKind::Run`): clean single deletes in this folder join the top row while it is a run of the same kind. Any other row landing on top ends it, such as Move rejected or a delete that failed. Stars and arrows add no row, so they don't split it. A row of one is an ordinary row with Recover and no arrow. Deletes for good from a card or stick fold among themselves ("Deleted 30 photos for good", with no Recover on their lines) and never join a "Sent" run.
+- **A selection** is its own row, "Sent 30 selected photos to the Recycle Bin", with a Recover for all and the same arrow (owner: "2 can use the foldable notification"). It never joins a run. A line's own Recover brings back that one photo (`FileHistory::split_photo` moves it into a record of its own); Ctrl+Z still brings back everything left in one press. The count drops, and at one left it reads by name.
+- **Lines:** the small picture, the name with its "[RAW+JPG]" label (only the name shortens), the time under it, and **Recover**. The newest 50, then "Show 50 more". Several rows can be open at once; all close when the panel opens.
+- **Taking a photo back** takes its line off: the list is what's still gone. With the panel open, a line taken back stays, dimmed, reading "Recovered", until the panel closes, so the next line can't slide under the pointer. A row whose last line goes leaves the list.
+- **Problems are never folded:** a failed or partial delete, and a photo only in OneDrive, are rows of their own.
+- **In another folder,** an open row's lines offer no Recover and say "These are in another folder. Go back to it to bring them back."
+- **How it is kept:** still one row per log entry; the lines are a model of their own, changed by insert, remove and `set_row_data`, never rebuilt, so a hovered Recover doesn't flicker as the times update. Open rows are tracked by the first press's number (`Fold.id`).
 
 ### Context menus
 
@@ -6704,7 +7024,7 @@ Plural rows show their chip whenever they are enabled (`bulk-actions-armed`), be
 **Plural rows.** Both menus show their plural rows on one switch, `ctx-plural`. Counted rows appear only from two selected photos; a selection of one shows the single rows. The rows are:
 - **Select all**, on both menus. Its key comes from the platform table, and it is enabled by the Ctrl+A rule plus a non-empty displayed list (`sel-rows.length` with the panel open, `count-all` with it shut).
 - **Select**, which reads **Deselect** when the target is already selected.
-- **Delete N photos…** on the photo menu, with the Del chip while armed. The photo menu's last row reads **Delete this photo…**.
+- **Delete N photos** on the photo menu, with the Del chip while armed. The photo menu's last row reads **Delete this photo**. Each ends in "…" only where a dialog opens: a drive with no Recycle Bin, a photo only in OneDrive, or a selection that doesn't include the photo on screen (`delete-asks`, `bulk_delete_label`).
 - Single **Flag / Reject / Unmark** for the clicked tile on the tile menu, plus **Unmark N**.
 - **Rotate N right / left** and **Reveal N in Explorer** ("in Finder" on Mac), on both menus.
 
@@ -6714,7 +7034,7 @@ The tile menu shows no shortcut chips on rows that act on the tile. Select all, 
 
 ## File operations, delete and recovery
 
-Falcon copies picks to `./Picks`, moves rejects to `./Rejected`, exports to `./export` (see [Export](#export)) and sends deleted shots to the Recycle Bin or Trash. It never deletes a file permanently. Copies, moves and restores never overwrite an existing file; only an export with **Overwrite** chosen replaces files, and Apply rotations edits files in place as described in [Apply rotations](#apply-rotations). Copy and Move transfer the original bytes, so unapplied manual turns do not travel with them (see [Unapplied rotations](#unapplied-rotations)); each file's XMP sidecar, which holds an applied turn and synced stars, travels with it (see [Side files](#side-files)).
+Falcon copies picks to `./Picks`, moves rejects to `./Rejected`, exports to `./export` (see [Export](#export)) and sends deleted shots to the Recycle Bin or Trash. The one exception is on Windows, where an SD card, a USB stick or a network drive has no Recycle Bin and a photo stored only in OneDrive can't reach it: there Falcon asks first, says the photo can't come back, and then deletes the file itself. Copies, moves and restores never overwrite an existing file; only an export with **Overwrite** chosen replaces files, and Apply rotations edits files in place as described in [Apply rotations](#apply-rotations). Copy and Move transfer the original bytes, so unapplied manual turns do not travel with them (see [Unapplied rotations](#unapplied-rotations)); each file's XMP sidecar, which holds an applied turn and synced stars, travels with it (see [Side files](#side-files)).
 
 ### Side files
 
@@ -6788,81 +7108,93 @@ When a re-export fails, Falcon keeps the earlier record whenever the destination
 
 ### Delete and recovery
 
-Delete is the one action that removes the user's files. It always sends them to the Recycle Bin (Windows) or the Trash (Mac); Falcon never deletes a file permanently.
+Delete is the one action that removes the user's files. On a normal drive it sends them to the Recycle Bin (Windows) or the Trash (Mac) at once, with no dialog, because they can come back (owner, 2 November 2026: "delete at once"). Where a photo can't come back, Falcon asks first and says so. The person's picture, from [UX and mental models](docs/design/ux-mental-models.md): "If it can come back, don't stop me. If it can't, tell me before, not after." Until the Delete round (1.1.2) every delete opened a dialog and the window froze while the file went and the folder was read again.
 
-**Opening the dialog.** The delete key opens the dialog. It is the `delete` row in Basic shortcuts, default Del, and Backspace counts as the same key. It works only when photo shortcuts have focus, so typing in a text field never triggers it. The **Delete…** row in the photo context menus does the same for the menu's own target shot (`delete-shot`). With a multi-photo selection, the key opens the plural dialog instead.
+#### What a person sees
 
-The dialog (`confirm-kind` 6) has three buttons:
+- **Del on a normal drive.** The next photo is on screen at once, at the same zoom and spot, and the photo has already left the filmstrip and the grid, whose tiles slide to their new places. A short card names it, with its small picture and **Recover**: "Sent IMG_1234 to the Recycle Bin", or "Sent IMG_1234 [RAW+JPG] to the Recycle Bin" for a RAW+JPEG pair. Del can be pressed again straight away, and the bell stays unlit (see [The card after a delete](#the-card-after-a-delete)).
+- **When zoomed: Always sharp.** The next photo's preview shows at once and sharpens in place; the deleted photo never stays on screen. An arrow key still waits for the sharp frame, as before.
+- **Holding Del** deletes one photo. **With the bell's panel open** Del does nothing, as the arrow keys don't. **A Del on a photo not yet on screen** (pressed again before the next photo appeared) is refused with "Still loading — press again when the photo appears", at most once every 1.5 seconds, and nothing is deleted.
+- **A selection.** If the photo on screen is one of the selected photos, the whole selection goes at once and comes back with one Ctrl+Z: "Sent 30 selected photos to the Recycle Bin". If it isn't, the count dialog asks first, because the photos going aren't the one you are looking at. A selection of one photo is a single delete, by name.
+- **The right-click menu's Delete** follows the same rule. Deleting a photo that isn't on screen, from its filmstrip or grid tile, leaves you where you are, and the strip, the grid and the Review panel don't jump.
+- **In Compare**, Del works on the focused half (see [Compare](#compare-ab)). **In the Review panel**, Del goes on to the next photo in the folder, as an arrow does.
+- **When a file won't go,** the photo goes back to its place in the strip and you stay where you are: "Couldn't delete IMG_1234 [RAW+JPG], another program may have it open. It's still in the folder." (red). Half a pair: "Sent the RAW of IMG_1234 to the Recycle Bin. The JPG is still in the folder." Falcon can't know why a file refused, so it says "may have it open"; the system's own error goes to the log. Its stars and their Undo steps stay with it.
+- **About a second later** Falcon checks the Recycle Bin. A photo that didn't reach it after all (a drive set not to use the bin, a file too big for it) gets the amber line "IMG_1234 [RAW+JPG] isn't in the Recycle Bin, so it can't be brought back.", and its Recover goes.
+- **Closing Falcon straight after a delete** waits for it to finish, up to 10 seconds, and says "Finishing the file operation — Falcon closes when it's done (close again to force)".
 
-- **Cancel**, styled quietly;
-- **Mark as rejected**, the safe alternative;
-- **Move to Recycle Bin** or **Move to Trash**, in the danger colour (wording from `PlatformStrings`).
+#### Where Falcon asks first
 
-Enter cancels. The dialog names the photo (the shared name for a pair) and counts the Falcon sidecars that will go with it.
+**On Windows,** Falcon asks Windows one question about the folder's drive when the folder is read (`support::delete_asks`, `GetDriveTypeW`). Only a fixed drive goes at once; that includes portable SSDs and hard disks on USB, which have a Recycle Bin. Everything else asks: an SD card, a USB stick, a network drive (a `\\server` path or a mapped letter), or a drive Windows can't answer for. A photo stored only in OneDrive asks too: Falcon reads the file's cloud mark at the press, one attribute read that downloads nothing, because deleting it removes it from OneDrive and Falcon can't bring it back. The drive's answer is kept with the folder's list, refreshed at each reread and never saved. The log has one line per folder open, for example `delete: this folder is on C:\, drive type 3`, with no folder name.
 
-**Folder-scoped identity.** Opening the dialog captures four facts: the folder-open counter, the folder, the shot's index and its name (`del_pending`). The plural dialog captures every target in `del_bulk_pending`. Two things make this necessary. Camera folders often share names and positions: `IMG_0001` sits at index 0 in every import. And the folder can change while the dialog is open, because the title-bar Open button and drag-and-drop stay live.
+There the dialog says what will happen, and Falcon deletes the files itself if you go ahead:
 
-So both buttons re-check all four facts with `delete_identity_check` before touching anything. The check runs in a fixed order: counter, then folder, then whether the index is in range, then name. On the first difference it refuses with "Folder changed — delete cancelled". **Mark as rejected** acts on the verified index, not on whichever photo is current. The plural dialog is all or nothing: if any target has changed, nothing is deleted.
+```text
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Delete photo for good?                                          │
+  │ IMG_1234 [RAW+JPG]. This drive has no Recycle Bin, so it can't  │
+  │ be brought back.                                                │
+  │                      Cancel    Mark as rejected   Delete for good│
+  └─────────────────────────────────────────────────────────────────┘
+  Enter cancels. Afterwards: "Deleted IMG_1234 [RAW+JPG] for good". No Recover;
+  Ctrl+Z reaches what you did before.
+```
 
-Any folder change also closes every open confirmation dialog and context menu and drops the captured identity (`reset_transient_ui`). A delete pressed while a copy, move or empty-bin operation is running is refused with a message.
+- **A photo only in OneDrive:** "Delete photo from OneDrive?", "IMG_1234 is only in OneDrive. Deleting it removes it from OneDrive, and Falcon can't bring it back. OneDrive keeps it in its online recycle bin for a while.", then "Deleted IMG_1234 from OneDrive". A selection with some photos only in OneDrive sends the rest to the Recycle Bin and says both.
+- **How it deletes:** `support::delete_photo_for_good` removes each file with `std::fs::remove_file`, the RAW, its side file, the finished image and its side file, stopping at the first file that refuses, then going on to the next photo. A check of what is still there afterwards decides what the message says.
+- **The words and the call are decided together,** when the dialog opens (`support::DeleteRoute`: to the bin, with or without asking; no bin; only in OneDrive), and the confirm reads only that, so what the dialog said is what happens.
+- **No way back:** a photo deleted for good has no record, so no Recover and no Ctrl+Z entry. Its Undo steps go with it.
+- **Empty ./Rejected** follows the same drive rule: on those drives the confirm says "for good" and Falcon deletes the files itself ("Deleted 3 files from ./Rejected for good.").
 
-**Recycling and rescanning** (`on_delete_recycle`):
+**On the Mac** a delete goes at once on any local volume, cards included, which have a Trash (`NSURLVolumeIsLocalKey`). A network volume, or any error in the question, asks first with the Trash's words, and the photo still goes to the Trash. There is no for-good route on the Mac. Compiled for the Mac only; nothing here has run on one.
 
-1. Save the review data and pending XMP ratings, then wait on the writer (`writer_barrier`, 10 s). A sidecar created by that save is then on disk before the file list is collected.
-2. Collect the shot's files plus Falcon's own sidecars (`sidecar_path_for`): the RAW, the finished image, `name.xmp` and `name.ext.xmp`. Only regular files are included.
-3. Recycle them (`recycle_shot_files`). On Windows the `trash` crate deletes the files one by one (`IFileOperation`). A lock part-way through can leave a partial result even when the call reports failure. On Mac each file goes through `trashItemAtURL`, and Falcon keeps the in-Trash location that macOS returns.
-4. Check which files actually left (`still_present`). Record for recovery only the files confirmed to be in the bin: Windows lists the bin (`confirm_recycled_in_bin`), and Mac uses the captured Trash locations (`mac_confirm_trashed`). A file that something else removed at the same moment is never recorded.
-5. Always rescan, whether the delete succeeded or failed, so the list matches the disk. The rescan carries a landing hint (`reload_req` with the deleted index, clamped by `post_op_land`). The view lands on the neighbouring photo, not the first one, and the "resume where you were" offer is suppressed.
-
-**Recovery: the Recover button and Ctrl+Z.** When at least one file reached the bin, Falcon keeps one `DeleteRecord` for the session. It holds:
-
-- the folder and its folder-open counter;
-- the shot's index and name;
-- the confirmed files;
-- the time just before the delete;
-- an order stamp for undo;
-- on Mac, the pairs of original path and Trash location.
-
-The delete result appears in the events centre with a **Recover** button. Only the newest delete keeps a working Recover button. A new delete overwrites the single record, so older rows lose theirs.
-
-Recover (`on_recover_delete`) and Ctrl+Z run the same code:
-
-- **Same folder only.** `recover_offer_live` allows recovery only while the folder the delete ran in is the one on screen; an empty folder never matches. Otherwise Falcon says the delete happened in another folder, touches nothing and drops the record.
-- **Ctrl+Z undoes the newest action.** Each undoable action carries an order stamp. `undo_arm` compares the top of the undo stack, the delete record and the move record, and undoes whichever is newest. The Undo control and the handler read the same answer (`live_undo_arm`).
-- **No redo for a delete.** Deleting again from a keystroke would be destructive.
-
-The `trash` crate's bin listing and restore (`trash::os_limited`) do not exist on macOS. So the restore has two platform versions with different arguments behind one name, `recover_recycled_files`:
-
-- **Windows** `(name, originals, op_time)` lists the Recycle Bin. It matches each original by full path, with a deletion time no earlier than the recorded time minus 3 seconds; the newest match wins (`match_recycled_items`). It sets aside any original whose path is now occupied, then calls `restore_all`. An occupied name is skipped, never overwritten. A collision that appears during the restore is retried without that file. An emptied bin gives an honest failure message.
-- **macOS** `(name, originals, pairs)` needs no bin listing. Each captured Trash file is renamed straight back with `renamex_np(..., RENAME_EXCL)`. An occupied original is refused by the rename itself, so there is no gap between the check and the move. A volume without `RENAME_EXCL` falls back to a plain rename, which is logged. `trashItemAtURL` writes no Finder "Put Back" data, so restoring from the Finder Trash by hand means dragging the file out. Falcon's own Recover is exact.
-
-Afterwards Falcon rescans and lands on the restored shot. Its rating and marks return from the review data kept for files that left the folder.
-
-The diagram shows the whole delete and recovery path.
+#### How a delete works
 
 ```mermaid
 flowchart TB
-  KEY["Delete key or context-menu Delete…"] --> SEL{"Selection armed?"}
-  SEL -->|no| ONE["open_delete_confirm<br/>capture counter, folder, index, name"]
-  SEL -->|yes| MANY["open_bulk_delete<br/>capture every target"]
-  ONE --> DLG["Delete dialog<br/>Cancel · Mark as rejected · Move to Recycle Bin / Trash<br/>Enter cancels"]
-  MANY --> DLG
-  DLG --> CHECK{"delete_identity_check<br/>all four still match?"}
-  CHECK -->|no| REFUSE["Folder changed — delete cancelled<br/>nothing touched"]
-  CHECK -->|yes, Mark as rejected| REJ["Reject the verified shot(s)"]
-  CHECK -->|yes, Move to bin| FLUSH["Save review data and XMP ratings<br/>writer_barrier, 10 s"]
-  FLUSH --> COLLECT["Collect files plus Falcon .xmp sidecars"]
-  COLLECT --> BIN["recycle_shot_files<br/>Windows: trash::delete_all<br/>Mac: trashItemAtURL, keep Trash location"]
-  BIN --> CONFIRM["Keep only files confirmed in the bin<br/>Windows: bin listing · Mac: captured locations"]
-  CONFIRM --> RESCAN["Rescan, land on the neighbour"]
-  CONFIRM -->|something reached the bin| REC["DeleteRecord, one slot<br/>Recover on the newest event only"]
-  REC --> RECOVER{"Recover or Ctrl+Z<br/>recover_offer_live: same folder?"}
-  RECOVER -->|no| OTHER["Say it was another folder, drop the record"]
-  RECOVER -->|Windows| WREST["List bin, match path and time<br/>restore_all, skip occupied names"]
-  RECOVER -->|Mac| MREST["Rename Trash file back<br/>renamex_np with RENAME_EXCL"]
-  WREST --> BACK["Rescan, land on the restored shot<br/>the message says what came back and what was missing or skipped"]
-  MREST --> BACK
+  KEY["Del, Backspace or the menu's Delete"] --> GATE{"Bell's panel open, held key,<br/>photo not on screen yet?"}
+  GATE -- "yes" --> NOTHING["Nothing deleted<br/>(a photo not shown yet: 'Still loading'…)"]
+  GATE -- "no" --> ROUTE{"DeleteRoute<br/>drive with a bin, photo not only in OneDrive,<br/>and a selection includes the photo on screen?"}
+  ROUTE -- "no" --> DLG["Falcon's dialog<br/>for good, from OneDrive, or the count<br/>Enter cancels · Mark as rejected"]
+  DLG -- "confirm" --> STASH
+  ROUTE -- "yes" --> STASH["Check the photo's identity, hand the tick a TakeOut"]
+  STASH --> TAKE["take_out, the tick's first step<br/>the photo leaves the list (no disk read) · record and parked steps · Ctrl+Y emptied<br/>land on the next photo that stayed, same zoom and spot"]
+  TAKE --> JOB["File queue, in press order<br/>wait for star writes · list the files and side files<br/>to the bin, or remove for good · check what left"]
+  JOB --> FOLD["Report folded at the tick's top<br/>record keeps what left · card and row · steps back if it stayed"]
+  FOLD --> QUIET["After a quiet second"]
+  QUIET --> RR["Background reread<br/>lands only if something else changed"]
+  QUIET --> BIN["Bin check<br/>not there: amber line, Recover goes"]
+  FOLD --> BACK{"Recover, a line's Recover or Ctrl+Z<br/>in the folder the delete ran in?"}
+  BACK -- "another folder" --> OTHER["Says so once, touches nothing, forgets nothing"]
+  BACK -- "yes" --> RESTORE["File queue: Windows restores from the bin by path and time<br/>Mac renames the Trash file back, never over a file"]
+  RESTORE --> LANDS["Lands on the photo if you haven't moved on<br/>its stars and Undo steps come back with it"]
 ```
+
+1. **The press.** The key or menu row runs its gates, works out the route (above) and checks the photo's identity: the folder-open counter, the folder, its position and its name, as captured when the dialog opened, if there was one (`delete_identity_check`). On the first difference it refuses with "Folder changed — delete cancelled". Camera folders often share names and positions (`IMG_0001` sits first in every import), and the folder can change while a dialog is open, because the title-bar Open button and drag-and-drop stay live; any folder change also closes the dialog and forgets what it captured (`reset_transient_ui`). **Mark as rejected** acts on the verified photo. A selection's dialog is all or nothing. The handler only hands the tick a take-out (`file_queue::TakeOut`); nothing is read from disk.
+2. **The take-out** (`take_out` in `main.rs`, the tick's first step). The photo leaves the list on screen (`support::take_out_scan`: the live list without the photo's files, in the same order, no disk read). The history changes at once (`file_queue::press_delete`): a delete record with a new order stamp, the photo's Undo steps parked in it, and Ctrl+Y's list emptied, so the next Ctrl+Z reaches this delete even before its file has gone. The landing goes to the next photo that stayed (below), keeping the view. The small picture is copied from the strip's thumbnail.
+3. **The job** goes on the file queue (`file_queue::FileQueue`, one thread, `falcon-file-queue`), behind any job pressed before it. It waits for the pending star writes (`writer_barrier`, 10 s), so a side file they create is on disk, then lists the photo's files and Falcon's own side files (`sidecar_path_for`: the RAW, the finished image, `name.xmp` and `name.ext.xmp`; only regular files), and sends them to the bin (`recycle_shot_files`: on Windows the `trash` crate's `IFileOperation`, which can leave a partial result after a lock part-way through; on the Mac `trashItemAtURL`, keeping the Trash location it returns) or removes them for good. Then it checks which files really left (`still_present`). It only reports.
+4. **The report** is folded on the interface thread at the tick's top (`file_queue::fold_file_done`). The record keeps only the files that left; nothing left, and the record goes and the photo's steps return. The card and the row are written. If anything stayed, the folder is read again at once, so the photo is back in its place.
+5. **After a quiet second,** so a burst of deletes reads the folder once: the [background reread](#the-background-reread), which lands only if something else changed, and the bin check (`file_queue::BinCheck`, thread `falcon-bin-check`), which lists the Recycle Bin once for every record not checked yet and gives a record whose files aren't there its amber line (`missing_from_bin`). The Mac confirms against the Trash locations it kept, so it asks nothing.
+
+**Nothing waits behind anything else.** The file queue never refuses: Del three times and Ctrl+Z three times, as fast as you like, run one after another and end on the first photo. Copy, Move rejected, Empty, Apply rotations and Export pressed while the queue is working say "Busy with another file operation — try again in a moment". A delete pressed while one of those runs is refused in words ("Busy with another file operation — delete cancelled"), as before. A job that crashes says "Operation failed — the worker crashed mid-run (see log)", and a new thread takes the jobs left.
+
+**Where you land.** Every landing after a delete, a move, their undo and a reread is worked out by photo, never by position (`support::land_by_photo`, `photo_open::settle_by_photo`). You stay on the photo you are on if it stayed. If it left, you go on to the next photo that stayed, by file identity, or the one before it at the end of the folder. So a photo another program saved in the same moment, even one dated earlier under Date taken, can't shift you. Undo move never moves you (owner, 3 November 2026: "do not move but the filmstrip and grid should update with an animation"). A Recover shows the photo that came back, unless you navigated after pressing it (`nav_at_press`); with several Recovers in one reread, the newest press's photo wins. Until the Delete round a landing used a remembered position (`post_op_land`), which was right for one delete and wrong for Move rejected, where photos before yours leave too.
+
+Log lines: `delete: take-out {name} in {ms} ms ({n} photos left, landing by photo {us} us)`; `delete: job {seq} barrier={ms} ms recycle={ms} ms: {n} photo(s) / {n} file(s) reached the bin (of {n} / {n} attempted)`; `delete: bin check {ms} ms ({items} items, {missing} missing)`; `recover: job {seq} restored {n} of {n} file(s) in {ms} ms`; `delete-recycle: Recycle Bin op FAILED ({e})` with the system's error. Clicked on 16,002 generated photos: a take-out took 24 to 27 ms (landing by photo about 8 ms), the worst tick 29 ms, and the rereads 220 to 390 ms, all off the interface thread.
+
+#### Bringing a photo back: Recover and Ctrl+Z
+
+Each delete is its own record (see [Undo history](#undo-history)): three deletes come back with three presses of Ctrl+Z, newest first, then the action before; a selection deleted together comes back with one. Every row's and every line's Recover works while its photo is still in the bin, in any order. The photo comes back with its stars, marks, turns and Undo steps, so star, Del, Ctrl+Z, Ctrl+Z ends unstarred on that photo. What a person sees is in [The card after a delete](#the-card-after-a-delete).
+
+- **Same folder only.** `recover_offer_live` allows recovery only while the folder the delete ran in is the one on screen; an empty folder never matches. Otherwise Falcon says once that the photo is in another folder, touches nothing and keeps the record for when you go back.
+- **On the file queue.** A Recover is a job like a delete, behind any delete still running. More than a second, and the card says "Recovering IMG_1234…" until the photo is back.
+- **No redo for a delete.** Deleting again from a keystroke would be destructive; Del is one key.
+
+The `trash` crate's bin listing and restore (`trash::os_limited`) do not exist on macOS. So the restore has two platform versions behind one name, `recover_recycled_files`:
+
+- **Windows** lists the Recycle Bin. It matches each original by full path, with a deletion time no earlier than the recorded time minus 3 seconds; the newest match wins (`match_recycled_items`). Each bin item is read with its whole file name, its extension taken from the item's id where Windows' default "Hide extensions for known file types" leaves it off the display name (`bin_item_with_whole_name`), so a JPG comes back as a JPG. It sets aside any original whose path is now occupied, then calls `restore_all`. An occupied name is skipped, never overwritten. A collision that appears during the restore is retried without that file. An emptied bin gives an honest failure message.
+- **macOS** needs no bin listing. Each captured Trash file is renamed straight back with `renamex_np(..., RENAME_EXCL)`. An occupied original is refused by the rename itself, so there is no gap between the check and the move. A volume without `RENAME_EXCL` falls back to a plain rename, which is logged. `trashItemAtURL` writes no Finder "Put Back" data, so restoring from the Finder Trash by hand means dragging the file out. Falcon's own Recover is exact.
+
+Afterwards the background reread lists the folder at once, and the landing puts the photo back in its place, with its rating and marks from the review data kept for files that left the folder.
 
 ## Saved state and data safety
 
@@ -6937,6 +7269,7 @@ Owner, 2 November: "once someone settles on one order it usually stays for that 
 
 - **When it is created.** Only when a read finishes in a folder of 2,000 photos or more (owner: "2,000 is fine") on Date taken, with sort memory on, and never empty. Below that the read costs about a second or less, so no file. Once it exists it stays in use however small the folder gets, and it is rewritten only when the read read something new, so an unchanged folder writes nothing. A cancelled read writes nothing.
 - **What a row can do.** It applies only when the name's hash matches and the modified time equals this listing's exactly. It supplies a sort key and nothing else: it never touches names, ratings, pairing or the landing. So a wrong, stale, damaged or foreign file costs a re-read, and nothing else. A hash collision would also need the identical modified time, and could only misplace one photo in the order.
+- **Version 2 (14 November 2026).** A file written before the date-reading fix is version 1. Its dated rows are right and stay in use. Its "read, no date" rows may be the iPhone HEICs and cut-off JPEGs the old reader missed, so those photos alone are read again, once, and the file is rewritten as version 2, where every row is trusted. A version 1 file with no such row is left exactly as it is. An older Falcon that meets a version 2 file reads the folder again once and writes its own version; nothing else happens. With sort memory off Falcon writes nothing, so those photos are read each session, as in any folder it can't write to (`DATE_CACHE_VERSION`, `decode_date_cache`).
 - **A failed write** is a log line with no folder name, never a notice: it never goes near `on_fail` or a save record. A folder Falcon can't write to opens at once in file-date order, reads in the background, and re-sorts while you stay on your photo, each session.
 - **One classifier guards every read, write and removal** (`classify_date_cache_with`), in this order: the folder is a real folder, not a link (`is_safe_dir`); nothing there is Absent; it is a plain file, not a link or folder; it isn't cloud-only, so it is never opened, which would download it; its size is sane; it starts with Falcon's own header. Anything else, or any doubt, is left alone, and someone else's file with this name is never overwritten.
 
@@ -7082,12 +7415,14 @@ The registry names its caller (`RegistryCaller`), and `registry_fsync_inline` pi
 
 So exactly one interface-thread fsync remains, once per event: the shutdown unregister. `open_folders.json` is still a read-modify-write without a cross-process lock, so two Falcon processes racing can lose one entry. The next heartbeat repairs it, and the only cost is a missed or unnecessary "open in another window" warning.
 
-**Flush barriers.** `writer_barrier(timeout)` queues a barrier and waits until everything queued before it has been handled. Four places wait on it, each with a 10-second limit:
+**Flush barriers.** `writer_barrier(timeout)` queues a barrier and waits until everything queued before it has been handled. Six places wait on it, each with a 10-second limit:
 
 1. **Apply rotations**, after the batch, so the review data with the applied turns removed is on disk before the result is shown;
 2. **the plural delete**, before the file list is collected;
 3. **the single delete**, at the same point;
-4. **the shutdown sequence** (`ShutdownStep::WriterBarrier`).
+4. **Copy picks**, before anything is copied, so a carried XMP side file holds the latest star;
+5. **Move rejected**, at the same point and for the same reason;
+6. **the shutdown sequence** (`ShutdownStep::WriterBarrier`).
 
 On timeout it logs and carries on, so a hung network drive can never freeze exit or delete. A barrier promises only that earlier writes were **attempted**, not that they succeeded; failures still arrive through the events centre. A separate 2-second barrier at the very start of shutdown only keeps log lines in order before shutdown switches logging to direct writes (`graceful_shutdown`).
 
@@ -7195,9 +7530,10 @@ The setting's caption states its scope: "Panel, toast and full-screen transition
 
 ### What the motion setting covers
 
-- **Toasts slide and fade in** (8 px, `anim-med`). A toast's buttons are mounted and clickable only once the card is fully shown (`toastcard.hot`), because a faded but enabled button would still catch clicks. A toast that replaces an unread one shows a "+N" counter (`toast-more`). The countdown pauses while the pointer is over the card (`toast-hovered`). That flag comes from the card body's own touch area, which encloses every button. The area is enabled only once the card is fully shown, so the 200 ms slide-in still counts down even under the pointer.
+- **Toasts slide and fade in** (8 px, `anim-med`). A toast's buttons are mounted and clickable only once the card is fully shown (`toastcard.hot`), because a faded but enabled button would still catch clicks. A toast that replaces an unread one shows a "+N" counter (`toast-more`); a delete's card never does. The countdown pauses while the pointer is over the card (`toast-hovered`). That flag comes from the card body's own touch area, which encloses every button. The area is enabled only once the card is fully shown, so the 200 ms slide-in still counts down even under the pointer.
 - **Panels slide in but never out.** The Review panel, Settings, the speed panel and the export sheet slide 8 px and fade in over 200 ms when opened from nothing (`sel-eff`, `set-eff`, `speed-eff`, `export-eff`). Closing is instant. Switching from one panel to another is also an instant swap: every control that opens one panel while closing another sets `panel-switch` first. A panel is clickable from its first frame; input never waits for the animation.
 - **Entering and leaving immersive mode crossfades the interface** (`chrome-eff`). Only opacity animates. Layout, the window-corner radius, the square-corner latch and maximize handling all switch on the same frame. Every touch area inside the fading interface is gated on the `immersive` flag itself, never on opacity, so input stops on the frame immersive mode starts.
+- **The filmstrip and the grid slide** to their new places after a delete, a move, their undo, a Recover or a reread, and a photo that came back fades in (`tile-slide-k`, `tile-fade-k`; see [Photos slide to their new places](#photos-slide-to-their-new-places)). With motion Off everything snaps. **The blue edge** fades in and out over 200 ms; with motion Off it appears and goes at once, for the same 3 seconds (see [The blue edge](#the-blue-edge)).
 - **Toolbar status chips fade in** (`chips-eff`, 120 ms). Whether a chip shows, and the space it reserves, switch at once, and only opacity animates. A chip disappears instantly and frees its space on the same frame, because a fading ghost would overlap the path text that takes the space back.
 
 ### Immersive mode
@@ -7205,8 +7541,7 @@ The setting's caption states its scope: "Panel, toast and full-screen transition
 **Immersive mode** is entered and left with F (the `full` shortcut) or F11. Esc also leaves it.
 
 During folder discovery, F/F11 and the Mac fullscreen menu work once the first photo is ready,
-including while waiting at an unfinished batch edge. Real dialogs still own input, and View only
-still prevents editing until discovery completes. The existing Mac welcome-screen exception stays.
+including while waiting at an unfinished batch edge. Real dialogs still own input. The existing Mac welcome-screen exception stays.
 
 - **Windows: cover the monitor, never change the window frame** (`immersive_enter` / `immersive_exit` in `main.rs`). Falcon never calls `set_fullscreen` on Windows. Leaving winit's fullscreen briefly puts the decorated window style back, which would flash a title-bar frame. Instead, entering saves the window's outer position, inner size and maximized state in physical pixels, on the first enter only. It then moves the window to cover the current monitor's exact bounds. Windows treats an undecorated window that exactly fills a monitor as full screen, so the taskbar drops behind it. Leaving restores the saved bounds. If the window was maximized, Falcon maximizes it again instead and lets Windows recompute the work area. The window style never changes, so nothing flashes. The saved bounds are virtual-desktop coordinates and stay valid even if a monitor is unplugged.
 - **macOS: native full screen.** A Mac window with a title bar cannot cover the menu bar, so immersive mode uses Mac full screen and coordinates with the green button (`immersive_fs_transition`). It requests full screen only if the window is not already in it. On exit it releases only a full screen that it started itself. F always works as the full-screen toggle (see [Mac fullscreen states](#mac-fullscreen-states)).
@@ -7264,7 +7599,7 @@ Other examples are the full-screen helpers `immersive_fs_transition`, `mac_f_key
 | `platform.rs` | Per-platform wording (`PlatformStrings`), shared with Windows. |
 | `support.rs`, Mac parts | `apply_mac_window_chrome`, the `mac_titlebar` window-button code for the in-window fallback, power and display-colour probes, `claim_primary_instance`. |
 | `falcon/vendor/winit` | Falcon's modified window library; its `falcon-macos-hosted-view` feature keeps the toolbar's drawing surface alive. |
-| `falcon/native/tests/mac_hosted_view.rs` | The native AppKit surface-move test that Mac CI runs. |
+| `falcon/native/platform-tests/mac_hosted_view.rs` | The native AppKit surface-move test that Mac CI runs. |
 | `scripts/mac-bundle.sh`, `scripts/mac-experiment-bundle.py`, `scripts/test-mac-chrome-smoke.py` | Packaging, bundle checks and the launch check. |
 
 ### Mac startup
@@ -7346,7 +7681,7 @@ All user-visible text that differs between Windows and macOS comes from one tabl
 | `gamut_copy` | names Windows Auto Colour Management and HDR | names ColorSync in System Settings → Displays |
 | `accel_unavail_note` | No CUDA/nvJPEG GPU detected … | empty (Image I/O is always present) |
 
-Sentences that include a platform word are built by small pure functions in the same file, and production code calls them: `recycle_toast_text`, `partial_recycle_toast_text`, `empty_rejected_toast_text`, `recover_unavailable_text`, `recover_missing_text`, `cross_folder_recover_text`, `cloud_not_downloaded_text`, `heic_decode_failed_text`, `empty_rejected_confirm_body`, `empty_confirm_title`, `overwrite_confirm_body`, `accel_toggle_label`, `heic_assoc_missing_tip`, `mode_performance_line` and `battery_switch_clause`. The tests call the same functions, so they check the real text rather than a re-typed copy.
+Sentences that include a platform word are built by small pure functions in the same file, and production code calls them: the delete sentences (`sent_one_text`, `sent_selected_text`, `sent_run_text`, `pinned_sent_text`, `could_not_delete_one_text`, `not_in_bin_text`, the `no_bin_*` and `cloud_only_*` dialog words and the `deleted_*` for-good results), `partial_recycle_toast_text`, `empty_rejected_toast_text`, `recover_unavailable_text`, `recover_missing_text`, `cross_folder_recover_text`, `cloud_not_downloaded_text`, `heic_decode_failed_text`, `empty_rejected_confirm_body`, `empty_confirm_title`, `overwrite_confirm_body`, `accel_toggle_label`, `heic_assoc_missing_tip`, `mode_performance_line` and `battery_switch_clause`. The tests call the same functions, so they check the real text rather than a re-typed copy.
 
 Rules:
 - `windows_strings_unchanged` (a Windows-only test in `main.rs`) pins every Windows value byte for byte. Change Windows wording only together with that test.
@@ -7813,8 +8148,8 @@ Isolation rules:
 Mac apps are built only on GitHub Actions (`macos-15`, Apple Silicon), and runs are started by hand (`workflow_dispatch`). `.github/workflows/mac-proto.yml` builds the normal app; `mac-chrome-experiment.yml` builds the diagnostic `candidate` app (see [Mac diagnostic builds](#mac-diagnostic-builds)): the same tests with `mac-chrome-experiment` compiled in (its runtime modes stay off under `cfg(test)`), a `candidate` package and the same launch check. The normal-app run:
 
 1. validates the release notices (`scripts/release_materials.py`) before compiling;
-2. installs the pinned Rust toolchain, stops unless the runner is a native Apple Silicon machine (`arm64`, host `aarch64-apple-darwin`), and records the source revision;
-3. overrides `CARGO_TARGET_DIR`, because the repository's `.cargo/config.toml` points at a Windows-only path;
+2. installs the pinned Rust toolchain and removes any other, stops unless the runner is a native Apple Silicon machine (`arm64`, host `aarch64-apple-darwin`), and records the source revision;
+3. overrides `CARGO_TARGET_DIR`, because the repository's `.cargo/config.toml` points at a Windows-only path, and restores the compiled libraries from the last run on the same branch if GitHub still keeps them (it drops a cache unused for 7 days). The cache's name includes every installed Rust version; until 11 November 2026 the runner's own Rust, which changes with GitHub's image updates, was left installed, so the 1.1.1 run found no cache;
 4. runs the whole workspace test suite with `--locked`, including the native title-bar move test, before the long release build;
 5. builds with `--locked --release`, then runs the packaging, icon, winit-patch and JPEG-patch script tests;
 6. packages the app with `scripts/mac-bundle.sh`;
@@ -7927,7 +8262,7 @@ Windows looks up icons per file type, so every file whose default is the old sha
 - **Failure is optional.** If installing or registering the helper fails, Update still succeeds: the shared type falls back to the static generic icon, only Falcon's handler binding is detached, and the failure is logged when diagnostic logging is on. Inert registration metadata may remain for a later retry or Remove. A DLL known to be damaged is never kept just because its file exists. Errors in the essential registration still fail Update.
 - **Startup check.** Inside the registered-copy check, startup keeps the helper only if the registered DLL path still exists as a file. Otherwise it restores the generic icon and detaches Falcon's binding, without deploying anything.
 - **Remove** unregisters the helper with everything else. Loaded helper bytes may stay in the `shell-icons` folder; Falcon never replaces a DLL that is in use and never restarts Explorer.
-- **Tests.** The build also makes a test-only helper with a different identity for native Windows Shell tests (`falcon/native/tests/windows_shell_icons.rs`); it is never embedded in the app. Direct DLL tests redirect the registry. Real-Shell tests briefly register made-up file types, so they are opt-in (ignored by default) and run one at a time within their test process, even when `--include-ignored` selects both kinds.
+- **Tests.** The Shell tests' own package (`falcon/native/platform-tests/`) builds the helper again from the same source, plus a test-only helper with a different identity (`windows_shell_icons.rs`); neither copy is embedded in the app. Direct DLL tests redirect the registry. Real-Shell tests briefly register made-up file types, so they are opt-in (ignored by default) and run one at a time within their test process, even when `--include-ignored` selects both kinds.
 
 Macs neither build nor install either helper.
 
@@ -7947,7 +8282,7 @@ Falcon registers one Windows file type per extension (a "ProgID" such as `Falcon
 
 ### Icons for files still opened with the old shared type (corrected text)
 
-Windows looks up icons per file type, so every file whose default is the old shared `Falcon.Image` would show the same icon. For that type only, Falcon registers a small icon helper. It is a shell-extension DLL built from `falcon/native/shell-icons/handler.cpp` and embedded in the executable by `windows_icon_bridge.rs`. When Explorer asks for an icon, the helper reads only the filename's extension (length-limited, case-insensitive) and never opens the photo. It answers with Falcon's matching per-format icon, or the generic icon for unknown types. Update first finishes the essential registration: open commands, file-type claims and capabilities. Then it copies the helper to `%LOCALAPPDATA%\Falcon\shell-icons\` and registers it. The helper's file name contains a build hash for caching only. Falcon compares every byte before reusing an existing copy, and never overwrites a different file, because Explorer may have it loaded. If installing or registering the helper fails, Update still succeeds. The shared type falls back to the generic icon, and the failure is logged when diagnostic logging is on. At startup, the registered copy keeps the helper only if the registered DLL file still exists; otherwise it restores the generic icon. Remove unregisters the helper with everything else. Falcon never restarts Explorer. The build also makes a test-only helper with a different identity for Windows Shell tests (`falcon/native/tests/windows_shell_icons.rs`); it is never embedded in the app. Those tests briefly register made-up file types, so they are opt-in (ignored by default) and run one at a time. Macs neither build nor install either helper.
+Windows looks up icons per file type, so every file whose default is the old shared `Falcon.Image` would show the same icon. For that type only, Falcon registers a small icon helper. It is a shell-extension DLL built from `falcon/native/shell-icons/handler.cpp` and embedded in the executable by `windows_icon_bridge.rs`. When Explorer asks for an icon, the helper reads only the filename's extension (length-limited, case-insensitive) and never opens the photo. It answers with Falcon's matching per-format icon, or the generic icon for unknown types. Update first finishes the essential registration: open commands, file-type claims and capabilities. Then it copies the helper to `%LOCALAPPDATA%\Falcon\shell-icons\` and registers it. The helper's file name contains a build hash for caching only. Falcon compares every byte before reusing an existing copy, and never overwrites a different file, because Explorer may have it loaded. If installing or registering the helper fails, Update still succeeds. The shared type falls back to the generic icon, and the failure is logged when diagnostic logging is on. At startup, the registered copy keeps the helper only if the registered DLL file still exists; otherwise it restores the generic icon. Remove unregisters the helper with everything else. Falcon never restarts Explorer. The Shell tests' package also builds a test-only helper with a different identity for Windows Shell tests (`falcon/native/platform-tests/windows_shell_icons.rs`); it is never embedded in the app. Those tests briefly register made-up file types, so they are opt-in (ignored by default) and run one at a time. Macs neither build nor install either helper.
 
 ### File associations: one list for both platforms
 
@@ -7995,17 +8330,23 @@ contributor guide is [docs/development/translations.md](docs/development/transla
   - `falcon/native/translations/languages.json` is the language list: code, own name, matched
     system tags, plural rule.
   - `translations/<code>.json` holds one pack per listed language, keyed by the exact English text.
-  - Plural rules live in `src/i18n_rules.rs`, shared by the build script and the app.
-- **Build.**
-  - `build_translations.rs` (called from `build.rs`) validates every pack and writes
-    `OUT_DIR/translations/<code>/LC_MESSAGES/falcon-native.po` for Slint, with all entries under
-    context `falcon`.
-  - It also writes `OUT_DIR/packs.rs`, the `LANGUAGES` table with each pack embedded by
-    `include_str!`.
+  - Plural rules live in `src/i18n_rules.rs`, shared by the build scripts and the app.
+- **Build.** `falcon/native/build_translations.rs` is shared by two build scripts, because the
+  interface and the app are separate crates (see [How the markup is compiled](#how-the-markup-is-compiled)).
+  - The interface crate's script (`ui/build.rs`) validates every pack and writes
+    `OUT_DIR/translations/<code>/LC_MESSAGES/falcon-ui.po` for Slint, with all entries under
+    context `falcon`. The file is named after the crate (`falcon-ui`) because that is the name the
+    `slint!` macro looks the catalogue up by.
   - It sets `SLINT_BUNDLE_TRANSLATIONS` only when there is at least one pack, because Slint fails on
     an empty folder. It sets `FALCON_TRANSLATIONS_HASH` so a pack edit recompiles the `slint!`
-    units, which do not track `.po` files.
-  - `i-slint-compiler`'s `bundle-translations` feature is a build dependency.
+    units, which do not track `.po` files. `i-slint-compiler`'s `bundle-translations` feature is
+    its build dependency.
+  - The app's script (`build.rs`) writes `OUT_DIR/packs.rs`, the `LANGUAGES` table with each pack
+    embedded by `include_str!`.
+  - Both decide from the same build profile whether to add the test language `xx-TEST`, so the
+    Slint side and the Rust side always carry the same languages.
+  - Which language is shown is one setting for the whole program (`slint::select_bundled_translation`),
+    so the app selects it the same way whichever crate compiled the markup.
 - **Choosing.**
   - `i18n::init` runs once, right after `load_settings`, before any window exists.
   - `Settings.language` decides: `""` follows the system, `"en"` is English, anything else is a pack
@@ -8139,6 +8480,49 @@ How the notice generator treats upstream notices (tests: `scripts/test-generate-
 - Close translations explicitly credited to other projects also get verified upstream notices; other mentions of ports have recorded, scoped decisions.
 - Notice excerpts keep the original contiguous spacing and portion headers verbatim. Recorded author names must match the fresh dependency report exactly, including accents, and helpers read those records as UTF-8.
 - A fresh regeneration verifies the generator version and the target graph; saved, unverified output is never a production input. Upstream notice text is checked out with LF line endings, and notice and lock hashes normalise line endings, so Windows checkout settings cannot change the result.
+
+### How the build is set up
+
+The code is split into packages (Rust "crates"), all in one workspace under `falcon/`:
+
+| Crate | Folder | What it is |
+| --- | --- | --- |
+| `falcon-native` | `falcon/native/` | The app: its window, workers, settings and everything else in `src/`. It makes the `falcon` program. |
+| `falcon-ui` (the interface crate) | `falcon/native/ui/` | The interface markup (the `.slint` files), compiled once into a library the app links. See [How the markup is compiled](#how-the-markup-is-compiled). |
+| `falcon-platform-tests` | `falcon/native/platform-tests/` | Two tests that each need a process of their own: the Mac title-bar move test and the Windows Shell icon tests. It is a separate package so that `cargo test` does not also compile a plain copy of the app for them. |
+| `falcon-decode`, `falcon-color`, `falcon-gpu`, `falcon-hwdec`, `falcon-nvjpeg` | `falcon/crates/` | Decoding, colour, GPU work, Windows hardware HEIC and NVIDIA JPEG decoding. |
+
+There are two kinds of build, each with its own settings in `falcon/Cargo.toml`:
+
+- **The test build** (debug), used by `cargo test` and while developing. Libraries Falcon uses (decoders, Slint, wgpu) and Falcon's own decode, colour and GPU crates are optimised as in a release, because the photo work is about 20 times slower otherwise. The app and the interface crate are not optimised, so they compile quickly and the app keeps its safety checks. Debug information (the data that ties machine code back to source lines) is kept only where it is used: Falcon's own crates keep file and line numbers, so a crash report still names the line; the interface crate and the libraries carry none. Nobody steps through this code in a debugger.
+- **The release build**, the program people download: fully optimised (`opt-level = 3`), optimised across crates at the end (`lto = "thin"`), each crate as one optimisation unit (`codegen-units = 1`), symbols stripped. These settings decide how fast the shipped program runs; the build-time work of 11 November 2026 did not change them.
+
+**Why it is split this way (11 November 2026).** The Mac build on GitHub grew from 18 minutes (3 October) to about 100 minutes (1.1.1, 3 November). Two things came together. The interface's generated code was about 95% of what the compiler produced for the app, it was rebuilt in full for the plain debug program, for the test program and for the release, and each debug compile needed 10 to 19 GB of memory. And from 4 October the Mac builds ran in the public repository, where GitHub's Mac machine has 3 cores and 7 GB; until then they had run in the private repository, whose machine has 5 cores and 14 GB (see [Which Mac machine a run gets](#which-mac-machine-a-run-gets) below). On 14 GB the old build still fitted; on 7 GB it did not. Measured once each on the developer PC (20 threads, 95 GB), before and after:
+
+| Build | Before: time | Before: largest compiler process | After: time | After: largest compiler process |
+| --- | --- | --- | --- | --- |
+| Test build from nothing | 341 s | 19.1 GB (the test program; the plain program 18.4 GB beside it) | 256 s | 10.1 GB (the interface crate, alone); the app's test program 3.8 GB after it |
+| Test build after a one-line change in `support.rs` | 70 s | 12.1 GB (plain program 10.1 GB beside it) | 18 s | 3.7 GB |
+| Release build from nothing | 905 s | 10.7 GB | 720 s | 9.7 GB (the interface crate, then the app 4.1 GB after it) |
+| Release build after a one-line change | 813 s | 10.7 GB | 264 s | 4.2 GB |
+
+The interface crate is now the one large compile. It is built once, and only again when a `.slint` file or a language pack changes; Cargo builds the app only after it, so the two are never compiled side by side. The test build no longer makes a plain copy of the app: the two tests that needed one are in `falcon-platform-tests`. The build folder after these four builds dropped from 26 GB to about 10 GB.
+
+#### Which Mac machine a run gets
+
+GitHub gives the two repositories different Mac machines for the same `macos-15` label. Falcon's own launch log in each run's saved logs says how much memory the machine had, and every run fits this table:
+
+| Where the run was | Machine | Runs | Test step | Release step |
+| --- | --- | --- | --- | --- |
+| Private repository | 5 cores, 14 GB (Apple M2 Pro, virtual) | 25 and 27 September; 11 November | 5 to 6 min | 8 to 11 min |
+| Public repository, its first run on 3 October | 14 GB | 3 October | 7 min | 9 min |
+| Public repository since 4 October | 7 GB (3 cores) | all 11 runs, 4 October to 3 November | 38 to 72 min | 17 to 32 min |
+
+On the small machine even the unchanged libraries compile about three times slower (they reached the same crate 69 s after the start on 3 October and 207 s after it on 3 November), before Falcon's own code is touched.
+
+**The Mac run of 11 November** (private repository, run 42948965254, commit `4f47b7a`, nothing cached) was the first with the new build: 18.3 minutes in all, the test step 6.0 minutes and the release step 10.5. The largest compiler process held 8.0 GB during the test step and 8.4 GB during the release step, and the machine did not swap. That is on the 14 GB machine, where the old build was fast too (18 minutes on 3 October, with a smaller app). So this run shows the new build works on a real Mac and what it needs there; it does not yet show the time on the 7 GB machine.
+
+On the 7 GB machine the largest single compile is now one of about 8 GB at a time, instead of two much larger ones side by side. The expected run there is roughly 25 to 45 minutes instead of about 100. That stays an estimate until the next run in the public repository. Since 11 November the workflow prints the machine (chip, cores, memory) and, for the test and release steps, the largest compiler process's memory and the swap in use, so that run's log will say what it got and whether memory held it back.
 
 ### Release packages
 

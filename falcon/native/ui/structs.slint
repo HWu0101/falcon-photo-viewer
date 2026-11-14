@@ -35,6 +35,13 @@
         // it reads the SelectSet, so the strip, the grid dock and the Selection panel cannot
         // disagree about what is selected. VOID cells arrive as FilmItem::default() => false.
         selected: bool,
+        // Delete round (R41, R42): this tile's offset at the start of a slide, which the window's
+        // `tile-slide-k` scales down to 0, and whether its photo arrived at that landing, which fades it in
+        // by `tile-fade-k` (`tile_slide.rs`). 0 and false on every row no slide is moving. The filmstrip
+        // reads `slide-x`; the grid dock both. The Review panel reads neither.
+        slide-x: length,
+        slide-y: length,
+        arriving: bool,
     }
 
     // One row of the Selection tile grid (2 tiles; `has-b` false on a trailing odd item).
@@ -84,6 +91,20 @@
     // disabled Reset (no captured incumbent and Preview unavailable for that type).
     export struct MacAssocRow { label: string, current: string, reset-enabled: bool, note: string }
 
+    // Delete round (R34, owner chose version A): one photo in an open fold. Its small picture, its name with
+    // the pair's label, the time under it, and its own Recover.
+    export struct NotifLine {
+        key: int,           // which line this is, within its fold
+        seq: int,           // the delete its Recover takes (-1 = none: it went for good)
+        name: string,       // the photo's name: a selection's line brings back that photo
+        title: string,      // the name as shown, the part that shortens
+        tag: string,        // the pair's label, "[RAW+JPG]", which stays whole ("" = none)
+        when: string,
+        picture: image,     // from the strip's thumbnail at the press; empty if it hadn't loaded (R35)
+        recover: bool,      // it can come back from here: this folder, and a record (R39)
+        recovered: bool,    // R37: brought back with the panel open
+    }
+
     // A single entry in the unified events/notifications centre (top-right bell).
     export struct NotifRow {
         text: string,
@@ -91,12 +112,13 @@
         when: string,       // relative time, e.g. "just now" / "2m" / "1h"
         reveal-path: string, // absolute result-folder path for a "Show" button ("" = none)
         undoable: bool,     // a still-reversible "Move rejected" → an "Undo" button
+        seq: int,           // Delete round: the act this row's Undo or Recover takes back (-1 = none)
         jump-to: int,       // D2 resume: >= 0 → a "Resume" button (< 0 = none)
         jump-name: string,  // R6: the photo that button goes to, found by name at the click
         // v0.8.120 (design-sweep O5): this row is a DELETE result that offered Recover. The pill
         // mounts only while `can-recover` is also live (the same shape `undoable` + `can-undo-move`
-        // has), i.e. while the delete record still exists AND the user is still on the folder the
-        // delete ran in — so a logged row can never fire a recovery into a different folder.
+        // has). The flag is cleared when its own record is taken and false in another folder
+        // (`rebuild_notif_model`), so a logged row can never fire a recovery into a different folder.
         recover: bool,
         // v0.8.121 (Round-B fix F19 = audit Y16): this row carried an "Open Settings" pill on its
         // toast. It was the ONLY toast action with no persisted twin — Undo, Resume and Recover all
@@ -105,6 +127,18 @@
         // leaving a logged row that states the colour problem and offers nothing. No live gate: the
         // Settings panel is always openable, so unlike Recover/Resume this one cannot go stale.
         open-settings: bool,
+        // ── Delete round (R32 to R39): THE FOLD. A row of clean deletes one at a time (a run), or a
+        // selection deleted together, lists its photos under its own arrow (owner: "folding into an
+        // expandable notification card like deleted n photos [expand]-> show each one"; the list layout,
+        // "A fits the notification panel better as everything there is a vertical list"). Still one row
+        // per log entry: `notif-dismiss(i)` and the rims index this list. ──
+        fold: int,          // how many lines its fold has: 2 or more shows the arrow (0 = no fold)
+        fold-id: int,       // R34: the fold's own id, its first press's stamp, for the arrow and "Show more"
+        open: bool,         // the fold is open, and `lines` are its newest
+        lines: [NotifLine], // the open fold's lines, newest first; empty while it's closed
+        more: int,          // how many more "Show {n} more" adds (0 = all are shown)
+        away: bool,         // R39: the fold is about another folder, so its lines offer nothing here
+        recovered: bool,    // R37: brought back with the panel open, so it stays, dimmed, until it closes
     }
 
     // One row in the configurable Ctrl+C copy-priority list (§33 Settings). Order in the model IS the
