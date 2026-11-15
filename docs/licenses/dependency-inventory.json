@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "tool": "cargo-about 0.9.2",
-  "lock_sha256": "f6d868a207b2c742112bf0fa8ad9f620633a80cb0a80c16c5cc506a6b7de380b",
+  "lock_sha256": "ab0a19978b3d3b22f3c2830493db782f7e88d3d6bd0ab023920c9bac96faee5f",
   "text_hash_format": "UTF-8, LF line endings",
   "project_inputs": {
     "falcon/Cargo.toml": "80fd24bed0fd9e9aee83ea2b00252ce443f51971602a06b0ceacf819375d615c",
@@ -11,7 +11,7 @@
     "falcon/crates/falcon-gpu/Cargo.toml": "6a33547cdbde1dc23360f889c8824b4a5e1a91e17a67d78d19a9ca59cefb9c86",
     "falcon/crates/falcon-hwdec/Cargo.toml": "5518a8095d56abc56a2e2fcff68dbaaf31dbb99c019837a5a4e5a18509e71b3c",
     "falcon/crates/falcon-nvjpeg/Cargo.toml": "6be1c4244b39794f85ef1a5833fc58b96ab3bb501601ec943308d2768f8b24ef",
-    "falcon/native/Cargo.toml": "58817cf7d9adeb12b42176ff4861acc41499662591dfcbb3d0f11352fbb20360",
+    "falcon/native/Cargo.toml": "5f7f0487258f6a74d32167800c5e74f21dc40d8b61421d1ff7226146c5277983",
     "falcon/native/platform-tests/Cargo.toml": "af14128b487f080999241971264576c246f38ac394c6e0574b230d2e303dda89",
     "falcon/native/ui/Cargo.toml": "54ffe41cb10e81e4b1f908b762c686f33e78804548dd33f9a31f86a60c071ce7",
     "falcon/vendor/femtovg/Cargo.toml": "52ce2ade2f33c14aa023dcc4e26972db738ab598ae4df08906603c655dce49e7",
@@ -886,7 +886,7 @@
     },
     {
       "name": "falcon-native",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "declared": "Apache-2.0",
       "selected": [
         "Apache-2.0"
@@ -3535,5 +3535,5 @@
       ]
     }
   ],
-  "notices_sha256": "474263981d3d668373a69c85b13ec51913b78f9113daa4cf32ea144a1b0a936c"
+  "notices_sha256": "be2c024289dd04b1dbf6e108aff92fe5699bed12ee2064d610a4a979629e75c9"
 }
